@@ -1,0 +1,97 @@
+services:
+  composegen:
+    build:
+      context: ./composegen
+      dockerfile: Dockerfile
+    volumes:
+      - ./composegen:/app
+      - ./fuzzer/configs:/configs
+    environment:
+      PYTHONUNBUFFERED: 1
+
+  hargen:
+    build:
+      context: ./hargen
+      dockerfile: Dockerfile
+    volumes:
+      - ./hargen:/app:ro
+      - ./fuzzer/resources:/resources:ro
+      - ./fuzzer/configs:/configs
+    environment:
+      PYTHONUNBUFFERED: 1
+    stdin_open: true # docker run -i
+    tty: true # docker run -t
+
+  crawler:
+    build:
+      context: ./crawler
+      dockerfile: Dockerfile
+    volumes:
+      - ./crawler:/app:rw
+      - ./fuzzer/automated_logins:/automated_logins:ro
+    environment:
+      PYTHONUNBUFFERED: 1
+    stdin_open: true # docker run -i
+    tty: true # docker run -t
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    environment:
+      APPLICATION_TYPE: wordpress
+      FUZZER_COVERAGE_PATH: /var/www/html/wp-content/plugins/show-all-comments-in-one-page/
+      FUZZER_COMPRESS: 1
+      FUZZER_ENABLE_UOPZ: 1
+      FUZZER_HOOK_OUTPUT_DIR: /shared-tmpfs/hook-coverage
+      REQUIRES_DB: 1
+      WP_TARGET_PLUGIN: show-all-comments-in-one-page
+    volumes:
+      - ./web/applications:/applications/
+      - shared-tmpfs:/shared-tmpfs
+    ports:
+      - 8080:80
+      - 8181:8181
+
+  db:
+    image: mysql
+    command: mysqld
+    environment:
+      MYSQL_DATABASE: db
+      MYSQL_USER: user
+      MYSQL_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_USER_HOST: "%"
+
+  fuzzer-wordpress-show-all-comments-in-one-page-1:
+    build:
+      context: ./fuzzer
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: 1
+      FUZZER_NODE_ID: 1
+      FUZZER_CONFIG: wordpress/show-all-comments-in-one-page
+      FUZZER_CLEANUP: 1
+      FUZZER_COMPRESS: 1
+    volumes:
+      - ./fuzzer:/app
+      - shared-tmpfs:/shared-tmpfs
+      - sync-tmpfs-wordpress-show-all-comments-in-one-page:/sync-tmpfs
+
+
+volumes:
+  shared-tmpfs:
+    driver: local
+    driver_opts:
+      type: "tmpfs"
+      device: "tmpfs"
+      o: "size=1024m,uid=1000"
+  sync-tmpfs-wordpress-show-all-comments-in-one-page:
+    driver: local
+    driver_opts:
+      type: "tmpfs"
+      device: "tmpfs"
+      o: "size=1024m,uid=1000"
+
+  
