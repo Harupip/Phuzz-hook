@@ -1,145 +1,57 @@
 from __future__ import annotations
 
 import json
-import logging
-import os
-import time
-from typing import Dict
+from pathlib import Path
 
-logger = logging.getLogger(__name__)
-SNAPSHOT_SCHEMA_VERSION = "uopz-energy-state-v2"
+from .models import CallbackDescriptor
 
 
-class GlobalCoverageState:
-    def __init__(self):
-        self.executed_counts: Dict[str, int] = {}
-        self.registered_callbacks: Dict[str, dict] = {}
-        self.executed_callbacks: Dict[str, dict] = {}
-        self.seen_hooks: set = set()
-        self.total_requests: int = 0
-        self.start_time: float = time.time()
-
-    @property
-    def blindspot_ids(self) -> set:
-        return set(self.registered_callbacks.keys()) - set(self.executed_counts.keys())
-
-    @property
-    def coverage_percent(self) -> float:
-        total = len(self.registered_callbacks)
-        if total == 0:
-            return 0.0
-        covered = len(set(self.executed_counts.keys()) & set(self.registered_callbacks.keys()))
-        return round(covered / total * 100, 2)
-
-    def update_from_request(self, request_data: dict) -> None:
-        self.total_requests += 1
-        hook_cov = request_data.get("hook_coverage", {})
-
-        for cb_id, info in hook_cov.get("registered_callbacks", {}).items():
-            if cb_id not in self.registered_callbacks:
-                self.registered_callbacks[cb_id] = info
-            hook_name = info.get("hook_name", "")
-            if hook_name:
-                self.seen_hooks.add(hook_name)
-
-        for cb_id, info in hook_cov.get("executed_callbacks", {}).items():
-            count = int(info.get("executed_count", 1))
-            self.executed_counts[cb_id] = self.executed_counts.get(cb_id, 0) + count
-
-            if cb_id not in self.executed_callbacks:
-                self.executed_callbacks[cb_id] = info.copy()
-            else:
-                existing = self.executed_callbacks[cb_id]
-                existing["executed_count"] = self.executed_counts[cb_id]
-                for field_name in ("last_seen", "fired_hook", "request_id", "endpoint"):
-                    if field_name in info:
-                        existing[field_name] = info[field_name]
-
-            hook_name = info.get("hook_name", "")
-            if hook_name:
-                self.seen_hooks.add(hook_name)
-
-    def get_historical_count(self, callback_id: str) -> int:
-        return self.executed_counts.get(callback_id, 0)
-
-    def is_blindspot(self, callback_id: str) -> bool:
-        return callback_id in self.registered_callbacks and callback_id not in self.executed_counts
-
-    def is_new_hook(self, hook_name: str) -> bool:
-        return hook_name not in self.seen_hooks
+class HookEnergyDemoState:
+    def __init__(self) -> None:
+        self.callbacks: dict[str, CallbackDescriptor] = {}
+        self.processed_request_ids: set[str] = set()
 
     def snapshot(self) -> dict:
-        covered_executed = {}
-        blindspots = {}
-
-        for cb_id, info in self.registered_callbacks.items():
-            if cb_id in self.executed_counts:
-                covered_executed[cb_id] = self.executed_callbacks.get(cb_id, info)
-            else:
-                blindspots[cb_id] = info
-
         return {
-            "schema_version": SNAPSHOT_SCHEMA_VERSION,
-            "metadata": {
-                "total_registered_callbacks": len(self.registered_callbacks),
-                "total_executed_callbacks": len(covered_executed),
-                "coverage_percent": self.coverage_percent,
-                "total_requests_processed": self.total_requests,
-                "total_blindspots": len(blindspots),
-                "uptime_seconds": round(time.time() - self.start_time, 2),
-            },
-            "data": {
-                "registered_callbacks": self.registered_callbacks,
-                "executed_callbacks": covered_executed,
-                "blindspot_callbacks": blindspots,
-                "seen_hooks": sorted(self.seen_hooks),
-            },
+            "schema_version": "hook-energy-demo-state-v1",
+            "callbacks": {callback_id: item.to_dict() for callback_id, item in sorted(self.callbacks.items())},
+            "processed_request_ids": sorted(self.processed_request_ids),
         }
 
-    def save_snapshot(self, filepath: str) -> None:
-        data = self.snapshot()
-        tmp = filepath + f".tmp.{os.getpid()}"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            if os.name == "nt" and os.path.exists(filepath):
-                os.remove(filepath)
-            os.rename(tmp, filepath)
-        except OSError:
-            logger.exception("Failed to save snapshot to %s", filepath)
-            if os.path.exists(tmp):
-                os.remove(tmp)
+    def save(self, filepath: str) -> None:
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        content = json.dumps(self.snapshot(), indent=2, ensure_ascii=False)
+        path.write_text(content, encoding="utf-8")
 
-    def load_snapshot(self, filepath: str) -> None:
-        if not os.path.exists(filepath):
-            logger.warning("Snapshot file not found: %s", filepath)
-            return
+    @classmethod
+    def load(cls, filepath: str) -> "HookEnergyDemoState":
+        path = Path(filepath)
+        state = cls()
+        if not path.exists():
+            return state
 
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            logger.exception("Failed to load snapshot from %s", filepath)
-            return
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for callback_id, item in payload.get("callbacks", {}).items():
+            state.callbacks[callback_id] = CallbackDescriptor(
+                callback_id=callback_id,
+                hook_name=str(item.get("hook_name", "")),
+                callback_identity=str(item.get("callback_identity", item.get("callback_repr", callback_id))),
+                priority=int(item.get("priority", 10)),
+                callback_type=str(item.get("callback_type", item.get("type", "unknown"))),
+                is_active=bool(item.get("is_active", True)),
+                status=str(item.get("status", "registered_only")),
+                source_file=item.get("source_file"),
+                source_line=item.get("source_line"),
+                callback_runtime_id=item.get("callback_runtime_id"),
+                stable_id=item.get("stable_id"),
+                runtime_id=item.get("runtime_id"),
+                total_execution_count=int(item.get("total_execution_count", 0)),
+                total_request_count=int(item.get("total_request_count", 0)),
+            )
 
-        payload = data.get("data", {})
+        state.processed_request_ids = {str(item) for item in payload.get("processed_request_ids", [])}
+        return state
 
-        for hook_name in payload.get("seen_hooks", []):
-            if hook_name:
-                self.seen_hooks.add(str(hook_name))
 
-        for cb_id, info in payload.get("registered_callbacks", {}).items():
-            if cb_id not in self.registered_callbacks:
-                self.registered_callbacks[cb_id] = info
-            hook_name = info.get("hook_name", "")
-            if hook_name:
-                self.seen_hooks.add(hook_name)
-
-        for cb_id, info in payload.get("executed_callbacks", {}).items():
-            count = int(info.get("executed_count", 0))
-            self.executed_counts[cb_id] = self.executed_counts.get(cb_id, 0) + count
-            if cb_id not in self.executed_callbacks:
-                self.executed_callbacks[cb_id] = info.copy()
-            hook_name = info.get("hook_name", "")
-            if hook_name:
-                self.seen_hooks.add(hook_name)
+GlobalCoverageState = HookEnergyDemoState

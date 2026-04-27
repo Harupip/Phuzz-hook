@@ -1,5 +1,6 @@
 import html
 import os
+from pathlib import Path
 
 import bleach
 import esprima
@@ -390,15 +391,26 @@ class ParamBasedPathTraversalVulnCheck(VulnCheck):
 
 class WebPathBasedPathTraversalVulnCheck(VulnCheck):
     NAME = "PathTraversal"
+    WEB_PATHS_FILE = Path("/shared-tmpfs/web-paths.txt")
 
     def __init__(self, pathtraversal_errors_folder):
         self.pathtraversal_errors_folder = pathtraversal_errors_folder
         self.web_paths = []
-        with open(os.path.join("/shared-tmpfs", "web-paths.txt")) as f:
-            for path in f:
-                self.web_paths.append(path.strip())
+        self.refresh_web_paths()
+
+    def refresh_web_paths(self):
+        path = Path(self.WEB_PATHS_FILE)
+        if not path.exists():
+            self.web_paths = []
+            return
+
+        with path.open(encoding="utf-8") as f:
+            self.web_paths = [line.strip() for line in f if line.strip()]
 
     def check(self, candidate):
+        if not self.web_paths:
+            self.refresh_web_paths()
+
         pathtraversal_file = os.path.join(
             self.pathtraversal_errors_folder, f"{candidate.coverage_id}.json"
         )

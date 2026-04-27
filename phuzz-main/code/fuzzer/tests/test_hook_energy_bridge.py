@@ -34,26 +34,34 @@ def build_request_payload() -> dict:
 
 class HookEnergyBridgeTests(unittest.TestCase):
     def test_bridge_calculates_energy_and_updates_state(self) -> None:
-        from hook_energy import GlobalCoverageState
+        from hook_energy import HookEnergyDemoState
 
-        state = GlobalCoverageState()
+        state = HookEnergyDemoState()
         result = calculate_hook_coverage_energy(build_request_payload(), state=state, update_state=True)
 
-        self.assertEqual(result.new_callback_ids, ["cb-1"])
-        self.assertEqual(result.score, 22)
-        self.assertEqual(state.get_historical_count("cb-1"), 1)
-        self.assertIn("cb-2", state.blindspot_ids)
+        self.assertEqual(result.request_id, "req-1")
+        self.assertEqual(result.hook_energy, 1.0)
+        self.assertEqual(result.hook_energy_avg, 1.0)
+        self.assertEqual(len(result.executed_callbacks), 1)
+        self.assertEqual(result.executed_callbacks[0].callback_id, "cb-1")
+        self.assertEqual(state.callbacks["cb-1"].total_execution_count, 1)
+        self.assertEqual(state.callbacks["cb-1"].total_request_count, 1)
+        self.assertIn("req-1", state.processed_request_ids)
+        self.assertIn("cb-2", state.callbacks)
+        self.assertEqual(state.callbacks["cb-2"].total_execution_count, 0)
 
     def test_bridge_can_calculate_without_mutating_state(self) -> None:
-        from hook_energy import GlobalCoverageState
+        from hook_energy import HookEnergyDemoState
 
-        state = GlobalCoverageState()
+        state = HookEnergyDemoState()
         result = calculate_hook_coverage_energy(build_request_payload(), state=state, update_state=False)
 
-        self.assertEqual(result.new_callback_ids, ["cb-1"])
-        self.assertEqual(result.score, 22)
-        self.assertEqual(state.get_historical_count("cb-1"), 0)
-        self.assertEqual(len(state.registered_callbacks), 0)
+        self.assertEqual(result.request_id, "req-1")
+        self.assertEqual(result.hook_energy, 1.0)
+        self.assertEqual(len(result.executed_callbacks), 1)
+        self.assertEqual(result.executed_callbacks[0].callback_id, "cb-1")
+        self.assertEqual(state.callbacks, {})
+        self.assertEqual(state.processed_request_ids, set())
 
 
 if __name__ == "__main__":
