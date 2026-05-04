@@ -28,3 +28,34 @@ Here, scoring formulas to rate candidates can be implemented. For now, PHUZZ onl
 ## VulnCheck
 
 The `VulnChecker` classes implement a call to a set of different `VulnChecks` that are used to identify client-side and server-side vulnerabilities in the target application, e.g. by checking the instrumentation's output for a specific candidate.
+
+## Hook visualization reports
+
+Generate an after-run report for one hook-aware run:
+
+```bash
+python hook_energy/cli.py report \
+  --run-label hook-run \
+  --mode hook-aware \
+  --decisions output/fuzzer-1/hook-energy-decisions.jsonl \
+  --exceptions output/fuzzer-1/exceptions-and-errors.json \
+  --vulnerabilities output/fuzzer-1/vulnerable-candidates.json \
+  --requests-dir /shared-tmpfs/hook-coverage/requests \
+  --coverage-summary /shared-tmpfs/hook-coverage/total_coverage.json \
+  --output-dir output/hook-report
+```
+
+Generate a hook-aware report and compare it against a previously exported baseline `report.json`:
+
+```bash
+python hook_energy/cli.py report \
+  --run-label hook-run \
+  --mode hook-aware \
+  --decisions output/fuzzer-1/hook-energy-decisions.jsonl \
+  --exceptions output/fuzzer-1/exceptions-and-errors.json \
+  --vulnerabilities output/fuzzer-1/vulnerable-candidates.json \
+  --requests-dir /shared-tmpfs/hook-coverage/requests \
+  --coverage-summary /shared-tmpfs/hook-coverage/total_coverage.json \
+  --output-dir output/hook-report \
+  --baseline-report-json output/baseline-report/report.json
+```

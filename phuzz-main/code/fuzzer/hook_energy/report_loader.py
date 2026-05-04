@@ -39,10 +39,53 @@ def _load_requests_dir(requests_dir: Path) -> dict[str, dict]:
         return {}
     payloads = {}
     for path in sorted(requests_dir.glob("*.json")):
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = _normalize_request_payload(json.loads(path.read_text(encoding="utf-8")))
         request_id = str(payload.get("request_id", path.stem))
         payloads[request_id] = payload
     return payloads
+
+
+def _normalize_callbacks_section(section) -> list[dict]:
+    if isinstance(section, dict):
+        return [item for item in section.values() if isinstance(item, dict)]
+    if isinstance(section, list):
+        return [item for item in section if isinstance(item, dict)]
+    return []
+
+
+def _normalize_coverage_summary(payload: dict) -> dict:
+    if not payload:
+        return {}
+
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    if metadata or data:
+        registered_callbacks = _normalize_callbacks_section(data.get("registered_callbacks", {}))
+        executed_callbacks = _normalize_callbacks_section(data.get("executed_callbacks", {}))
+        blindspot_callbacks = _normalize_callbacks_section(data.get("blindspot_callbacks", {}))
+        return {
+            "registered_total": int(metadata.get("total_registered_callbacks", len(registered_callbacks))),
+            "executed_total": int(metadata.get("total_executed_callbacks", len(executed_callbacks))),
+            "coverage_percent": str(metadata.get("coverage_percent", payload.get("coverage_percent", "0%"))),
+            "registered_callbacks": registered_callbacks,
+            "executed_callbacks": executed_callbacks,
+            "blindspot_callbacks": blindspot_callbacks,
+        }
+
+    normalized = dict(payload)
+    normalized["blindspot_callbacks"] = _normalize_callbacks_section(normalized.get("blindspot_callbacks", []))
+    return normalized
+
+
+def _normalize_request_payload(payload: dict) -> dict:
+    normalized = dict(payload)
+    normalized["request_method"] = str(
+        normalized.get("request_method") or normalized.get("http_method") or ""
+    )
+    if "request_time_ms" not in normalized:
+        response = normalized.get("response", {}) if isinstance(normalized.get("response"), dict) else {}
+        normalized["request_time_ms"] = float(response.get("time_ms", 0.0))
+    return normalized
 
 
 def load_run_artifacts(
@@ -61,6 +104,6 @@ def load_run_artifacts(
         exception_candidates=_read_json_file(exceptions_path, []),
         vulnerability_candidates=_read_json_file(vulnerabilities_path, {}),
         requests=_load_requests_dir(requests_dir),
-        coverage_summary=_read_json_file(coverage_summary_path, {}),
+        coverage_summary=_normalize_coverage_summary(_read_json_file(coverage_summary_path, {})),
         warnings=[],
     )

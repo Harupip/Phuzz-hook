@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -9,12 +10,36 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from hook_energy.calculator import HookEnergyCalculator
     from hook_energy.collector import HookCollector
+    from hook_energy.report_builder import build_run_pair_comparison, build_single_run_report
+    from hook_energy.report_loader import load_run_artifacts
+    from hook_energy.report_models import (
+        CallbackRecord,
+        ComparisonSummary,
+        DecisionRecord,
+        HookVisualizationReport,
+        RequestRecord,
+        RunMetadata,
+        RunSummary,
+    )
     from hook_energy.reporter import HookEnergyReporter
+    from hook_energy.report_render import write_html_report, write_json_report, write_markdown_summary
     from hook_energy.state import HookEnergyDemoState
 else:
     from .calculator import HookEnergyCalculator
     from .collector import HookCollector
+    from .report_builder import build_run_pair_comparison, build_single_run_report
+    from .report_loader import load_run_artifacts
+    from .report_models import (
+        CallbackRecord,
+        ComparisonSummary,
+        DecisionRecord,
+        HookVisualizationReport,
+        RequestRecord,
+        RunMetadata,
+        RunSummary,
+    )
     from .reporter import HookEnergyReporter
+    from .report_render import write_html_report, write_json_report, write_markdown_summary
     from .state import HookEnergyDemoState
 
 
@@ -22,13 +47,28 @@ def build_argument_parser() -> argparse.ArgumentParser:
     repo_root = Path(__file__).resolve().parents[3]
     output_dir = repo_root / "output"
 
-    parser = argparse.ArgumentParser(description="Standalone hook energy demo for request artifacts.")
-    parser.add_argument("--requests-dir", default=str(output_dir / "requests"))
-    parser.add_argument("--state-file", default=str(output_dir / "hook_energy_state.json"))
-    parser.add_argument("--summary-file", default=str(output_dir / "hook_energy_summary.json"))
-    parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--watch", action="store_true")
-    parser.add_argument("--interval", type=float, default=1.0)
+    parser = argparse.ArgumentParser(description="Hook energy tooling for request artifacts and reports.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    watch_parser = subparsers.add_parser("watch")
+    watch_parser.add_argument("--requests-dir", default=str(output_dir / "requests"))
+    watch_parser.add_argument("--state-file", default=str(output_dir / "hook_energy_state.json"))
+    watch_parser.add_argument("--summary-file", default=str(output_dir / "hook_energy_summary.json"))
+    watch_parser.add_argument("--limit", type=int, default=0)
+    watch_parser.add_argument("--watch", action="store_true")
+    watch_parser.add_argument("--interval", type=float, default=1.0)
+
+    report_parser = subparsers.add_parser("report")
+    report_parser.add_argument("--run-label", required=True)
+    report_parser.add_argument("--mode", choices=["baseline", "hook-aware"], required=True)
+    report_parser.add_argument("--decisions", required=True)
+    report_parser.add_argument("--exceptions", required=True)
+    report_parser.add_argument("--vulnerabilities", required=True)
+    report_parser.add_argument("--requests-dir", required=True)
+    report_parser.add_argument("--coverage-summary", required=True)
+    report_parser.add_argument("--output-dir", required=True)
+    report_parser.add_argument("--baseline-report-json")
+
     return parser
 
 
@@ -64,9 +104,49 @@ def requests_dir_has_artifacts(requests_dir: str) -> bool:
     return base.exists() and any(base.glob("*.json"))
 
 
+def _report_from_dict(payload: dict) -> HookVisualizationReport:
+    comparison_payload = payload.get("comparison")
+    comparison = ComparisonSummary(**comparison_payload) if comparison_payload else None
+    return HookVisualizationReport(
+        metadata=RunMetadata(**payload["metadata"]),
+        summary=RunSummary(**payload["summary"]),
+        decision_records=[DecisionRecord(**item) for item in payload.get("decision_records", [])],
+        callback_records=[CallbackRecord(**item) for item in payload.get("callback_records", [])],
+        request_records=[RequestRecord(**item) for item in payload.get("request_records", [])],
+        comparison=comparison,
+        warnings=payload.get("warnings", []),
+    )
+
+
 def main() -> int:
     parser = build_argument_parser()
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    if not argv or argv[0].startswith("-"):
+        argv = ["watch", *argv]
+    args = parser.parse_args(argv)
+
+    if args.command == "report":
+        loaded = load_run_artifacts(
+            run_label=args.run_label,
+            mode=args.mode,
+            decisions_path=Path(args.decisions),
+            exceptions_path=Path(args.exceptions),
+            vulnerabilities_path=Path(args.vulnerabilities),
+            requests_dir=Path(args.requests_dir),
+            coverage_summary_path=Path(args.coverage_summary),
+        )
+        report = build_single_run_report(loaded)
+
+        if args.baseline_report_json:
+            baseline_payload = json.loads(Path(args.baseline_report_json).read_text(encoding="utf-8"))
+            baseline_report = _report_from_dict(baseline_payload)
+            report.comparison = build_run_pair_comparison(baseline_report, report)
+
+        output_dir = Path(args.output_dir)
+        write_json_report(report, output_dir / "report.json")
+        write_markdown_summary(report, output_dir / "report-summary.md")
+        write_html_report(report, output_dir / "report.html")
+        return 0
 
     has_request_artifacts = requests_dir_has_artifacts(args.requests_dir)
     state = HookEnergyDemoState.load(args.state_file) if has_request_artifacts else HookEnergyDemoState()

@@ -131,6 +131,94 @@ class HookVisualizationLoaderTests(unittest.TestCase):
             self.assertEqual(loaded.requests, {})
             self.assertEqual(loaded.coverage_summary, {})
 
+    def test_loader_normalizes_uopz_v3_coverage_and_request_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            run_dir = Path(tmp_dir)
+            requests_dir = run_dir / "requests"
+            requests_dir.mkdir()
+
+            (run_dir / "hook-energy-decisions.jsonl").write_text("", encoding="utf-8")
+            (run_dir / "exceptions-and-errors.json").write_text("[]", encoding="utf-8")
+            (run_dir / "vulnerable-candidates.json").write_text("{}", encoding="utf-8")
+            (run_dir / "total_coverage.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "uopz-total-coverage-v3",
+                        "metadata": {
+                            "total_registered_callbacks": 6,
+                            "total_executed_callbacks": 5,
+                            "coverage_percent": "83.33%",
+                        },
+                        "data": {
+                            "registered_callbacks": {
+                                "cb-1": {"callback_id": "cb-1"},
+                                "cb-blind": {"callback_id": "cb-blind"},
+                            },
+                            "executed_callbacks": {
+                                "cb-1": {"callback_id": "cb-1", "executed_count": 2}
+                            },
+                            "blindspot_callbacks": {
+                                "cb-blind": {"callback_id": "cb-blind", "hook_name": "rare_hook"}
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (requests_dir / "req-1.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "uopz-request-v3",
+                        "request_id": "req-1",
+                        "endpoint": "GET:/",
+                        "http_method": "GET",
+                        "response": {"time_ms": 1568.41},
+                        "hook_coverage": {
+                            "registered_callbacks": {
+                                "cb-1": {
+                                    "callback_id": "cb-1",
+                                    "hook_name": "hook_a",
+                                    "callback_repr": "callback_a",
+                                }
+                            },
+                            "executed_callbacks": {
+                                "cb-1": {
+                                    "callback_id": "cb-1",
+                                    "hook_name": "hook_a",
+                                    "callback_repr": "callback_a",
+                                    "executed_count": 2,
+                                }
+                            },
+                            "blindspot_callbacks": {
+                                "cb-blind": {
+                                    "callback_id": "cb-blind",
+                                    "hook_name": "hook_b",
+                                    "callback_repr": "callback_b",
+                                }
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = load_run_artifacts(
+                run_label="hook-run",
+                mode="hook-aware",
+                decisions_path=run_dir / "hook-energy-decisions.jsonl",
+                exceptions_path=run_dir / "exceptions-and-errors.json",
+                vulnerabilities_path=run_dir / "vulnerable-candidates.json",
+                requests_dir=requests_dir,
+                coverage_summary_path=run_dir / "total_coverage.json",
+            )
+
+            self.assertEqual(loaded.coverage_summary["registered_total"], 6)
+            self.assertEqual(loaded.coverage_summary["executed_total"], 5)
+            self.assertEqual(loaded.coverage_summary["coverage_percent"], "83.33%")
+            self.assertEqual(len(loaded.coverage_summary["blindspot_callbacks"]), 1)
+            self.assertEqual(loaded.requests["req-1"]["request_method"], "GET")
+            self.assertAlmostEqual(loaded.requests["req-1"]["request_time_ms"], 1568.41)
+
 
 if __name__ == "__main__":
     unittest.main()

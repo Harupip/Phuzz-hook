@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from hook_energy.report_models import (
 )
 from hook_energy.report_loader import LoadedRunArtifacts
 from hook_energy.report_builder import build_run_pair_comparison, build_single_run_report
+from hook_energy.report_render import write_html_report, write_json_report, write_markdown_summary
 
 
 class HookVisualizationModelTests(unittest.TestCase):
@@ -198,6 +200,90 @@ class HookVisualizationModelTests(unittest.TestCase):
         self.assertEqual(comparison.metric_deltas["blindspots_delta"], -1)
         self.assertIn("cb-rare", comparison.callbacks_only_in_hook)
         self.assertIn("hook improved rare callback exploration", comparison.interpretation_flags)
+
+    def test_single_run_builder_warns_about_repeated_decisions_and_missing_request_artifacts(self) -> None:
+        loaded = LoadedRunArtifacts(
+            metadata={"label": "hook-run", "mode": "hook-aware"},
+            decisions=[
+                {
+                    "coverage_id": "cov-1",
+                    "http_target": "http://web/wp-admin/admin-ajax.php",
+                    "http_method": "GET",
+                    "base_score": 1,
+                    "score": 1,
+                    "base_priority": 1,
+                    "priority": 2,
+                    "base_energy": 1,
+                    "final_energy": 2,
+                    "hook_request_id": "req-missing",
+                    "hook_energy": 1.0,
+                    "hook_energy_avg": 1.0,
+                },
+                {
+                    "coverage_id": "cov-1",
+                    "http_target": "http://web/wp-admin/admin-ajax.php",
+                    "http_method": "GET",
+                    "base_score": 1,
+                    "score": 1,
+                    "base_priority": 1,
+                    "priority": 2,
+                    "base_energy": 1,
+                    "final_energy": 2,
+                    "hook_request_id": "req-missing",
+                    "hook_energy": 1.0,
+                    "hook_energy_avg": 1.0,
+                },
+            ],
+            exception_candidates=[],
+            vulnerability_candidates={},
+            requests={},
+            coverage_summary={},
+            warnings=[],
+        )
+
+        report = build_single_run_report(loaded)
+
+        self.assertTrue(any("Missing request artifacts" in warning for warning in report.warnings))
+        self.assertTrue(any("repeated rows" in warning for warning in report.warnings))
+
+    def test_renderers_write_json_markdown_and_html_files(self) -> None:
+        report = HookVisualizationReport(
+            metadata=RunMetadata(label="hook-run", mode="hook-aware"),
+            summary=RunSummary(
+                requests_total=1,
+                registered_callbacks_total=2,
+                executed_callbacks_total=1,
+                blindspots_total=1,
+                coverage_ratio=0.5,
+                exceptions_count=1,
+                vulnerability_counts={"WebFuzzXSSVulnCheck": 0},
+                boosted_decisions_count=1,
+                avg_hook_energy=0.5,
+                max_hook_energy=0.5,
+                avg_priority_delta=0.5,
+                max_priority_delta=0.5,
+                avg_energy_delta=1.0,
+                max_energy_delta=1.0,
+            ),
+            decision_records=[],
+            callback_records=[],
+            request_records=[],
+            warnings=["missing request artifact timing"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            json_path = Path(tmp_dir) / "report.json"
+            md_path = Path(tmp_dir) / "report-summary.md"
+            html_path = Path(tmp_dir) / "report.html"
+
+            write_json_report(report, json_path)
+            write_markdown_summary(report, md_path)
+            write_html_report(report, html_path)
+
+            self.assertIn("\"label\": \"hook-run\"", json_path.read_text(encoding="utf-8"))
+            self.assertIn("boosted_decisions_count", md_path.read_text(encoding="utf-8"))
+            self.assertIn("Concrete boosted candidate", html_path.read_text(encoding="utf-8"))
+            self.assertIn("missing request artifact timing", html_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

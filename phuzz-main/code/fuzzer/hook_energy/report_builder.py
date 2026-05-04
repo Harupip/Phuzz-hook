@@ -25,6 +25,7 @@ def build_single_run_report(loaded) -> HookVisualizationReport:
     decision_records = []
     priority_deltas = []
     energy_deltas = []
+    warnings = list(loaded.warnings)
 
     exception_by_coverage = {item.get("coverage_id"): item for item in loaded.exception_candidates}
 
@@ -96,6 +97,36 @@ def build_single_run_report(loaded) -> HookVisualizationReport:
             )
         )
 
+    decision_signatures = {
+        (
+            record.coverage_id,
+            record.hook_request_id,
+            record.base_priority,
+            record.priority,
+            record.base_energy,
+            record.final_energy,
+            record.hook_energy,
+            record.hook_energy_avg,
+        )
+        for record in decision_records
+    }
+    if decision_records and len(decision_signatures) < len(decision_records):
+        warnings.append(
+            "Decision log contains repeated rows; summary deltas reflect repeated scheduling events, not only unique candidates."
+        )
+
+    missing_request_ids = sorted(
+        {
+            record.hook_request_id
+            for record in decision_records
+            if record.hook_request_id and record.hook_request_id not in loaded.requests
+        }
+    )
+    if missing_request_ids:
+        warnings.append(
+            f"Missing request artifacts for {len(missing_request_ids)} hook_request_id values; callback drilldown is partial."
+        )
+
     blindspot_ids = {
         str(item.get("callback_id", ""))
         for item in loaded.coverage_summary.get("blindspot_callbacks", [])
@@ -153,7 +184,7 @@ def build_single_run_report(loaded) -> HookVisualizationReport:
         decision_records=decision_records,
         callback_records=callback_records,
         request_records=request_records,
-        warnings=list(loaded.warnings),
+        warnings=warnings,
     )
 
 
