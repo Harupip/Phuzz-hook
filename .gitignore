@@ -2,5 +2,8 @@
 .claude
 .worktrees/
 
+phuzz-main/code/fuzzer/output/*
+!phuzz-main/code/fuzzer/output/.gitkeep
+
 AGENTS.md
 CLAUDE.md
