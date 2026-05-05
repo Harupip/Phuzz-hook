@@ -56,21 +56,159 @@ def calculate_hook_coverage_energy(request_data, state=None, config=None, update
     return report
 
 
-class DefaultScoringFormula(ScoringFormula):
+# Agent note:
+# Read `SCORING_MODES_MINI.md` before changing this file again.
+# This module now keeps both the original PHUZZ logic and the additive
+# hook-energy layer side by side so future edits can be compared locally.
+#
+# Change only `ACTIVE_SCORING_MODE` when you want to switch runtime behavior:
+#   1 = original PHUZZ scoring
+#   2 = PHUZZ scoring plus hook-energy bonus
+# Keep the commented old PHUZZ block below for direct line-by-line comparison.
+# If you change the mode wiring or bonus rules, update the mini doc and tests
+# in `tests/test_scoring_modes.py` in the same patch.
+# Use explicit constants here so mode changes stay visible inside this file.
+SCORING_MODE_PHUZZ = 1
+SCORING_MODE_PHUZZ_HOOK = 2
+ACTIVE_SCORING_MODE = SCORING_MODE_PHUZZ_HOOK
+
+DEFAULT_HOOK_REQUESTS_DIR = "/shared-tmpfs/hook-coverage/requests"
+DEFAULT_HOOK_PRIORITY_WEIGHT = 1.0
+DEFAULT_HOOK_ENERGY_WEIGHT = 1.0
+
+
+# Original PHUZZ scoring kept here for side-by-side comparison.
+# class DefaultScoringFormula(ScoringFormula):
+#     def calculate_score(self, candidate):
+#         hit_counter=0
+#         for path in candidate.new_paths:
+#             filename, lines = path.split('::::')
+#             hit_counter += lines.count("_")
+#
+#         return hit_counter + len(candidate.paths)
+#
+#     def calculate_priority(self, candidate):
+#         return self.calculate_score(candidate)
+#
+#     def calculate_energy(self, candidate):
+#         if candidate.parent is not None:
+#             energy = max(1, candidate.parent.number_of_new_paths + abs(candidate.parent.score - candidate.score))
+#         else:
+#             energy = max(1, len(candidate.new_paths))
+#         return energy
+
+
+class PhuzzScoringFormula(ScoringFormula):
     def calculate_score(self, candidate):
         hit_counter=0
         for path in candidate.new_paths:
             filename, lines = path.split('::::')
             hit_counter += lines.count("_")
 
-        return hit_counter + len(candidate.paths)
+        score = hit_counter + len(candidate.paths)
+        candidate.base_score = score
+        candidate.score = score
+        return score
 
     def calculate_priority(self, candidate):
-        return self.calculate_score(candidate)
+        priority = self.calculate_score(candidate)
+        candidate.base_priority = priority
+        candidate.priority = priority
+        return priority
 
     def calculate_energy(self, candidate):
+        current_score = getattr(candidate, "score", None)
+        if current_score is None or (current_score == 0 and (candidate.paths or candidate.new_paths)):
+            current_score = self.calculate_score(candidate)
+
         if candidate.parent is not None:
-            energy = max(1, candidate.parent.number_of_new_paths + abs(candidate.parent.score - candidate.score))
+            energy = max(1, candidate.parent.number_of_new_paths + abs(candidate.parent.score - current_score))
         else:
             energy = max(1, len(candidate.new_paths))
+        candidate.base_energy = int(energy)
+        candidate.final_energy = int(energy)
         return energy 
+
+
+class PhuzzHookScoringFormula(PhuzzScoringFormula):
+    def __init__(self, requests_dir=None, priority_weight=None, energy_weight=None):
+        from hook_energy.integration import HookEnergyTracker
+
+        self.requests_dir = requests_dir or DEFAULT_HOOK_REQUESTS_DIR
+        self.priority_weight = float(
+            priority_weight if priority_weight is not None else DEFAULT_HOOK_PRIORITY_WEIGHT
+        )
+        self.energy_weight = float(
+            energy_weight if energy_weight is not None else DEFAULT_HOOK_ENERGY_WEIGHT
+        )
+        self.tracker = HookEnergyTracker(self.requests_dir)
+
+    def _apply_hook_report(self, candidate):
+        report = self.tracker.consume_candidate(getattr(candidate, "coverage_id", ""))
+        if report is None:
+            candidate.hook_request_id = ""
+            candidate.hook_energy = 0.0
+            candidate.hook_energy_avg = 0.0
+            return None
+
+        candidate.hook_request_id = report.request_id
+        candidate.hook_energy = float(report.hook_energy)
+        candidate.hook_energy_avg = float(report.hook_energy_avg)
+        return report
+
+    def calculate_priority(self, candidate):
+        from hook_energy.integration import apply_hook_priority_bonus
+
+        base_priority = super().calculate_priority(candidate)
+        self._apply_hook_report(candidate)
+        final_priority = apply_hook_priority_bonus(
+            base_priority,
+            candidate.hook_energy,
+            self.priority_weight,
+        )
+        candidate.base_priority = base_priority
+        candidate.priority = final_priority
+        return final_priority
+
+    def calculate_energy(self, candidate):
+        from hook_energy.integration import apply_hook_energy_bonus
+
+        base_energy = super().calculate_energy(candidate)
+        self._apply_hook_report(candidate)
+        final_energy = apply_hook_energy_bonus(
+            base_energy,
+            candidate.hook_energy,
+            self.energy_weight,
+        )
+        candidate.base_energy = int(base_energy)
+        candidate.final_energy = int(final_energy)
+        return final_energy
+
+
+class DefaultScoringFormula(ScoringFormula):
+    def __init__(self, mode=None, requests_dir=None, priority_weight=None, energy_weight=None):
+        # Keep selector logic narrow here so the old/new scoring split stays easy
+        # to audit from this file alone.
+        self.mode = ACTIVE_SCORING_MODE if mode is None else int(mode)
+        if self.mode == SCORING_MODE_PHUZZ:
+            self._formula = PhuzzScoringFormula()
+        elif self.mode == SCORING_MODE_PHUZZ_HOOK:
+            self._formula = PhuzzHookScoringFormula(
+                requests_dir=requests_dir,
+                priority_weight=priority_weight,
+                energy_weight=energy_weight,
+            )
+        else:
+            raise ValueError(
+                f"Unknown scoring mode '{self.mode}'. Expected {SCORING_MODE_PHUZZ} (PHUZZ) "
+                f"or {SCORING_MODE_PHUZZ_HOOK} (PHUZZ+hook)."
+            )
+
+    def calculate_score(self, candidate):
+        return self._formula.calculate_score(candidate)
+
+    def calculate_priority(self, candidate):
+        return self._formula.calculate_priority(candidate)
+
+    def calculate_energy(self, candidate):
+        return self._formula.calculate_energy(candidate)
