@@ -47,13 +47,13 @@ class HookCollector:
         )
 
         hook_coverage = request_data.get("hook_coverage", {})
-        registered_payload = hook_coverage.get("registered_callbacks", {})
+        registered_payload = self._normalize_callback_mapping(hook_coverage.get("registered_callbacks", {}))
         for callback_id, item in registered_payload.items():
             descriptor = self._descriptor_from_payload(str(callback_id), item)
             observation.registered_callbacks[descriptor.callback_id] = descriptor
             self._merge_descriptor_into_state(descriptor)
 
-        executed_payload = hook_coverage.get("executed_callbacks", {})
+        executed_payload = self._normalize_callback_mapping(hook_coverage.get("executed_callbacks", {}))
         for callback_id, item in sorted(executed_payload.items()):
             callback_id_str = str(callback_id)
             descriptor = observation.registered_callbacks.get(callback_id_str) or self.state.callbacks.get(callback_id_str)
@@ -72,6 +72,22 @@ class HookCollector:
             )
 
         return observation
+
+    def _normalize_callback_mapping(self, payload) -> dict[str, dict]:
+        if isinstance(payload, dict):
+            return {str(callback_id): item for callback_id, item in payload.items() if isinstance(item, dict)}
+
+        if isinstance(payload, list):
+            normalized: dict[str, dict] = {}
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                callback_id = str(item.get("callback_id", "")).strip()
+                if callback_id:
+                    normalized[callback_id] = item
+            return normalized
+
+        return {}
 
     def finalize_request(self, report) -> None:
         for item in report.executed_callbacks:

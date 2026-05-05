@@ -12,7 +12,9 @@ class Candidate:
         self.coverage_id = str(int(time.time())) + "-" + str(uuid4())
         self.parent = parent
         self.score = score
+        self.base_score = score
         self.priority = priority
+        self.base_priority = priority
         self.http_target = http_target
         self.http_method = http_method
         self.fixed_params = {
@@ -51,6 +53,11 @@ class Candidate:
         self.is_initial_candidate = is_initial_candidate
         self.mutated_param_type=mutated_param_type
         self.mutated_param_name=mutated_param_name
+        self.base_energy = 0
+        self.final_energy = 0
+        self.hook_request_id = ""
+        self.hook_energy = 0.0
+        self.hook_energy_avg = 0.0
         
         self.hash = None
 
@@ -80,11 +87,18 @@ class Candidate:
             'new_paths': list(self.new_paths),
             'vulns': self.vulns,
             'score': self.score,
+            'base_score': self.base_score,
+            'base_priority': self.base_priority,
             'is_interesting': self.is_interesting,
             'fuzzer_id': self.fuzzer_id,
             'is_initial_candidate': self.is_initial_candidate,
             'mutated_param_type': self.mutated_param_type,
-            'mutated_param_name': self.mutated_param_name
+            'mutated_param_name': self.mutated_param_name,
+            'base_energy': self.base_energy,
+            'final_energy': self.final_energy,
+            'hook_request_id': self.hook_request_id,
+            'hook_energy': self.hook_energy,
+            'hook_energy_avg': self.hook_energy_avg
         }
 
     def __str__(self):
