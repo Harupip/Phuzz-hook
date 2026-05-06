@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .models import ImportedSeedRequest, ImportedSeedResult
+from .models import ImportedSeedRequest, ImportedSeedResult, ManualAnalysisEntry
 
 ACCEPTED_AUTH_MODES = {"authenticated", "unauth-capable"}
 
@@ -22,6 +22,8 @@ class HookSeedImporter:
 
         for callback in payload.get("callbacks", []):
             if not self._is_replayable(callback):
+                if self._is_manual_only(callback):
+                    result.manual_analysis_queue.append(self._build_manual_entry(callback))
                 continue
 
             imported_request = self._build_request(callback)
@@ -48,8 +50,28 @@ class HookSeedImporter:
                 "callback_name": callback["callback_name"],
                 "seed_priority": callback["seed_priority"],
                 "target_family": callback["target_family"],
+                "source_file": callback.get("source_file"),
+                "source_line": callback.get("source_line"),
+                "priority": callback.get("priority"),
+                "accepted_args": callback.get("accepted_args"),
             },
         )
+
+    def _build_manual_entry(self, callback: dict[str, Any]) -> dict[str, Any]:
+        return ManualAnalysisEntry(
+            callback_id=callback["callback_id"],
+            hook_name=callback["hook_name"],
+            callback_name=callback["callback_name"],
+            status=callback["status"],
+            is_active=bool(callback["is_active"]),
+            direct_http_supported=bool(callback["direct_http_supported"]),
+            generation_status=callback["generation_status"],
+            seed_priority=callback["seed_priority"],
+            target_family=callback["target_family"],
+            source_file=callback.get("source_file"),
+            source_line=callback.get("source_line"),
+            accepted_args=callback.get("accepted_args"),
+        ).__dict__
 
     def _is_replayable(self, callback: dict[str, Any]) -> bool:
         seed = callback.get("seed")
@@ -64,4 +86,14 @@ class HookSeedImporter:
             and isinstance(seed.get("content_type"), str)
             and isinstance(seed.get("body"), Mapping)
             and seed.get("auth_mode") in ACCEPTED_AUTH_MODES
+        )
+
+    def _is_manual_only(self, callback: dict[str, Any]) -> bool:
+        return (
+            callback.get("status") == "uncovered"
+            and callback.get("is_active") is True
+            and (
+                callback.get("direct_http_supported") is False
+                or callback.get("generation_status") == "manual_analysis_required"
+            )
         )

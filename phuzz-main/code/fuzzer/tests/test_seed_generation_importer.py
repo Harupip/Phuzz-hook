@@ -179,5 +179,66 @@ class HookSeedImporterReplayableTests(unittest.TestCase):
             self.assertEqual(result.unauthenticated_queue, [])
 
 
+class HookSeedImporterBacklogTests(unittest.TestCase):
+    def test_importer_preserves_metadata_and_backlogs_manual_callbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            handoff_dir = root / "handoff"
+            handoff_dir.mkdir()
+            replayable = build_callback(
+                "cb-auth",
+                "admin_post_shop_demo_export_orders",
+                auth_mode="authenticated",
+            )
+            replayable["target_family"] = "admin_post"
+            replayable["priority"] = 10
+
+            manual_only = {
+                "callback_id": "cb-manual",
+                "hook_name": "template_redirect",
+                "callback_name": "shop_render_test_ui",
+                "status": "uncovered",
+                "is_active": True,
+                "direct_http_supported": False,
+                "generation_status": "manual_analysis_required",
+                "seed_priority": "low",
+                "target_family": "internal_or_manual",
+                "source_file": "/var/www/html/wp-content/plugins/shop-demo/shop-demo.php",
+                "source_line": 321,
+                "accepted_args": 1,
+                "seed": None,
+            }
+            (handoff_dir / "hook_gap_report.json").write_text(
+                json.dumps(
+                    {
+                        "summary": {"direct_http_seed_candidates": 1},
+                        "callbacks": [replayable, manual_only],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (handoff_dir / "suggested_seeds.json").write_text(
+                json.dumps({"suggested_seeds": []}),
+                encoding="utf-8",
+            )
+
+            importer = HookSeedImporter(
+                handoff_doc=handoff_dir / "SEED_HANDOFF_FOR_AGENTS.md",
+                hook_gap_report=handoff_dir / "hook_gap_report.json",
+                suggested_seeds=handoff_dir / "suggested_seeds.json",
+            )
+            result = importer.import_from_handoff()
+
+            self.assertEqual(result.authenticated_queue[0].metadata["source_file"], replayable["source_file"])
+            self.assertEqual(result.authenticated_queue[0].metadata["source_line"], 200)
+            self.assertEqual(result.authenticated_queue[0].metadata["priority"], 10)
+            self.assertEqual(result.authenticated_queue[0].metadata["accepted_args"], 1)
+            self.assertEqual(result.authenticated_queue[0].metadata["target_family"], "admin_post")
+            self.assertEqual(len(result.manual_analysis_queue), 1)
+            self.assertEqual(result.manual_analysis_queue[0]["callback_id"], "cb-manual")
+            self.assertEqual(result.manual_analysis_queue[0]["hook_name"], "template_redirect")
+            self.assertNotIn("request_id", result.manual_analysis_queue[0])
+
+
 if __name__ == "__main__":
     unittest.main()

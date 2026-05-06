@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
@@ -128,6 +131,21 @@ class ScoringModeTests(unittest.TestCase):
             self.assertEqual(candidate.hook_request_id, "req-hook")
             self.assertEqual(candidate.hook_energy, 1.0)
             self.assertEqual(candidate.hook_energy_avg, 1.0)
+
+    def test_phuzz_mode_emits_score_debug_when_enabled(self) -> None:
+        formula = DefaultScoringFormula(mode=SCORING_MODE_PHUZZ)
+        candidate = build_child_candidate(coverage_id="cov-debug")
+        candidate.paths = ["plugin.php::::1_2_3", "other.php::::5_9_11"]
+        candidate.new_paths = {"other.php::::5_9_11"}
+
+        with patch.dict(os.environ, {"PHUZZ_SCORE_DEBUG": "1"}, clear=False):
+            with patch("sys.stdout", new_callable=StringIO) as stdout:
+                score = formula.calculate_score(candidate)
+
+        self.assertEqual(score, 4)
+        debug_output = stdout.getvalue()
+        self.assertIn("[score-debug] new_path file=other.php raw=5_9_11 segments=3 underscores=2", debug_output)
+        self.assertIn("[score-debug] total hit_counter=2 total_paths=2 score=4", debug_output)
 
 
 if __name__ == "__main__":

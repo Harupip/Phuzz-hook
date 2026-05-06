@@ -7,6 +7,12 @@ class ScoringFormula():
         pass
 
 
+def _score_debug_enabled():
+    import os
+
+    return os.environ.get("PHUZZ_SCORE_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def calculate_hook_coverage_energy(request_data, state=None, config=None, update_state=False):
     """
     Bridge helper added on top of the original PHUZZ scoring module.
@@ -101,11 +107,24 @@ DEFAULT_HOOK_ENERGY_WEIGHT = 1.0
 class PhuzzScoringFormula(ScoringFormula):
     def calculate_score(self, candidate):
         hit_counter=0
+        debug_enabled = _score_debug_enabled()
         for path in candidate.new_paths:
-            filename, lines = path.split('::::')
-            hit_counter += lines.count("_")
+            filename, lines = path.split('::::')  #phuzz-main/code/fuzzer/utils.py:50  -  stringify_hit_or_line
+            underscore_count = lines.count("_")
+            hit_counter += underscore_count
+            if debug_enabled:
+                line_segments = len(lines.split("_")) if lines else 0
+                print(
+                    f"[score-debug] new_path file={filename} raw={lines} "
+                    f"segments={line_segments} underscores={underscore_count}"
+                )
 
         score = hit_counter + len(candidate.paths)
+        if debug_enabled:
+            print(
+                f"[score-debug] total hit_counter={hit_counter} total_paths={len(candidate.paths)} "
+                f"score={score}"
+            )
         candidate.base_score = score
         candidate.score = score
         return score
@@ -125,6 +144,7 @@ class PhuzzScoringFormula(ScoringFormula):
             energy = max(1, candidate.parent.number_of_new_paths + abs(candidate.parent.score - current_score))
         else:
             energy = max(1, len(candidate.new_paths))
+        # Plain PHUZZ mode has no hook bonus, so base/final stay identical here.
         candidate.base_energy = int(energy)
         candidate.final_energy = int(energy)
         return energy 
@@ -152,6 +172,9 @@ class PhuzzHookScoringFormula(PhuzzScoringFormula):
             return None
 
         candidate.hook_request_id = report.request_id
+        # These two numbers come from the hook-energy request report:
+        # - `hook_energy`: strongest rare-callback signal in this request
+        # - `hook_energy_avg`: average rarity across all callbacks in this request
         candidate.hook_energy = float(report.hook_energy)
         candidate.hook_energy_avg = float(report.hook_energy_avg)
         return report
@@ -180,6 +203,9 @@ class PhuzzHookScoringFormula(PhuzzScoringFormula):
             candidate.hook_energy,
             self.energy_weight,
         )
+        # Keep both numbers for debug output:
+        # - `base_energy` shows original PHUZZ queue energy
+        # - `final_energy` shows PHUZZ energy after hook bonus is rounded up and added
         candidate.base_energy = int(base_energy)
         candidate.final_energy = int(final_energy)
         return final_energy

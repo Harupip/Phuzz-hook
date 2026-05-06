@@ -13,7 +13,6 @@ if [ 0 -lt ${REQUIRES_DB} ]; then
 	echo "DB appears online!"
 fi
 
-
 if [ -f /var/www/html/init.sh ]; then
     chmod +x /var/www/html/init.sh
     /var/www/html/init.sh
