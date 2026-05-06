@@ -13,7 +13,25 @@ class ImportedSeedRequest:
     content_type: str
     body: dict[str, Any]
     auth_mode: str
+    query_params: dict[str, Any] = field(default_factory=dict)
+    headers: dict[str, Any] = field(default_factory=dict)
+    cookies: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "source": self.source,
+            "http_method": self.http_method,
+            "path": self.path,
+            "content_type": self.content_type,
+            "body": self.body,
+            "query_params": self.query_params,
+            "headers": self.headers,
+            "cookies": self.cookies,
+            "auth_mode": self.auth_mode,
+            "metadata": self.metadata,
+        }
 
 
 @dataclass
@@ -21,6 +39,7 @@ class ImportedSeedResult:
     authenticated_queue: list[ImportedSeedRequest] = field(default_factory=list)
     unauthenticated_queue: list[ImportedSeedRequest] = field(default_factory=list)
     manual_analysis_queue: list[dict[str, Any]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass

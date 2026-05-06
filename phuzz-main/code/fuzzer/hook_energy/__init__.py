@@ -8,6 +8,7 @@ from .models import (
     RequestObservation,
 )
 from .reporter import HookEnergyReporter
+from .seed_generation import HookSeedImporter
 from .state import GlobalCoverageState, HookEnergyDemoState
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "HookEnergyCalculator",
     "HookEnergyDemoState",
     "HookEnergyReporter",
+    "HookSeedImporter",
     "RequestCallbackExecution",
     "RequestEnergyReport",
     "RequestObservation",
