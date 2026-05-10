@@ -38,6 +38,8 @@ class HookEnergyCalculator:
             total_score += score
             max_score = max(max_score, score)
 
+        # Per-callback score shrinks as same callback appears more often overall:
+        # first sighting = 1.0, second = 0.5, third = 0.333..., etc.
         hook_energy_avg = total_score / len(scored_callbacks) if scored_callbacks else 0.0
         return RequestEnergyReport(
             request_id=observation.request_id,
@@ -45,7 +47,9 @@ class HookEnergyCalculator:
             endpoint=observation.endpoint,
             request_file=observation.request_file,
             executed_callbacks=scored_callbacks,
+            # `hook_energy` keeps the strongest rare-callback signal from this request.
             hook_energy=max_score if scored_callbacks else 0.0,
+            # `hook_energy_avg` keeps the average rarity across all executed callbacks.
             hook_energy_avg=hook_energy_avg,
         )
 

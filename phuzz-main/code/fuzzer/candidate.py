@@ -53,11 +53,11 @@ class Candidate:
         self.is_initial_candidate = is_initial_candidate
         self.mutated_param_type=mutated_param_type
         self.mutated_param_name=mutated_param_name
-        self.base_energy = 0
-        self.final_energy = 0
+        self.base_energy = 0            # `base_energy` = original PHUZZ queue energy before hook bonus.
+        self.final_energy = 0           # `final_energy` = queue energy after hook bonus is added.
         self.hook_request_id = ""
-        self.hook_energy = 0.0
-        self.hook_energy_avg = 0.0
+        self.hook_energy = 0.0          # `hook_energy` = strongest "rare callback" score seen in this request.
+        self.hook_energy_avg = 0.0      # `hook_energy_avg` = average "rare callback" score across callbacks in this request.
         
         self.hash = None
 
