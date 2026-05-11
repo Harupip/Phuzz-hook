@@ -68,6 +68,8 @@ services:
     build:
       context: ./fuzzer
       dockerfile: Dockerfile
+    env_file:
+      - ./fuzzer/scoring.env
     environment:
       PYTHONUNBUFFERED: 1
       FUZZER_NODE_ID: 1

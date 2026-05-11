@@ -7,6 +7,37 @@ class ScoringFormula():
         pass
 
 
+def _env_int(name, default):
+    import os
+
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw_value!r}") from exc
+
+
+def _env_float(name, default):
+    import os
+
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a float, got {raw_value!r}") from exc
+
+
+def _env_str(name, default):
+    import os
+
+    raw_value = os.environ.get(name, "").strip()
+    return raw_value or default
+
+
 def _score_debug_enabled():
     import os
 
@@ -76,11 +107,11 @@ def calculate_hook_coverage_energy(request_data, state=None, config=None, update
 # Use explicit constants here so mode changes stay visible inside this file.
 SCORING_MODE_PHUZZ = 1
 SCORING_MODE_PHUZZ_HOOK = 2
-ACTIVE_SCORING_MODE = SCORING_MODE_PHUZZ_HOOK
+ACTIVE_SCORING_MODE = _env_int("PHUZZ_SCORING_MODE", SCORING_MODE_PHUZZ_HOOK)
 
-DEFAULT_HOOK_REQUESTS_DIR = "/shared-tmpfs/hook-coverage/requests"
-DEFAULT_HOOK_PRIORITY_WEIGHT = 1.0
-DEFAULT_HOOK_ENERGY_WEIGHT = 1.0
+DEFAULT_HOOK_REQUESTS_DIR = _env_str("FUZZER_HOOK_REQUESTS_DIR", "/shared-tmpfs/hook-coverage/requests")
+DEFAULT_HOOK_PRIORITY_WEIGHT = _env_float("FUZZER_HOOK_PRIORITY_WEIGHT", 1.0)
+DEFAULT_HOOK_ENERGY_WEIGHT = _env_float("FUZZER_HOOK_ENERGY_WEIGHT", 1.0)
 
 
 # Original PHUZZ scoring kept here for side-by-side comparison.

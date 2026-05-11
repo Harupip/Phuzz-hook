@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -17,6 +18,9 @@ from candidate import Candidate
 from scoring import (
     ACTIVE_SCORING_MODE,
     DefaultScoringFormula,
+    DEFAULT_HOOK_ENERGY_WEIGHT,
+    DEFAULT_HOOK_PRIORITY_WEIGHT,
+    DEFAULT_HOOK_REQUESTS_DIR,
     SCORING_MODE_PHUZZ,
     SCORING_MODE_PHUZZ_HOOK,
 )
@@ -146,6 +150,39 @@ class ScoringModeTests(unittest.TestCase):
         debug_output = stdout.getvalue()
         self.assertIn("[score-debug] new_path file=other.php raw=5_9_11 segments=3 underscores=2", debug_output)
         self.assertIn("[score-debug] total hit_counter=2 total_paths=2 score=4", debug_output)
+
+    def test_env_can_select_scoring_mode_and_hook_constants(self) -> None:
+        import scoring
+
+        old_values = {
+            "active_mode": ACTIVE_SCORING_MODE,
+            "requests_dir": DEFAULT_HOOK_REQUESTS_DIR,
+            "priority_weight": DEFAULT_HOOK_PRIORITY_WEIGHT,
+            "energy_weight": DEFAULT_HOOK_ENERGY_WEIGHT,
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "PHUZZ_SCORING_MODE": "1",
+                "FUZZER_HOOK_REQUESTS_DIR": "/tmp/hook-requests",
+                "FUZZER_HOOK_PRIORITY_WEIGHT": "2.5",
+                "FUZZER_HOOK_ENERGY_WEIGHT": "3.5",
+            },
+            clear=False,
+        ):
+            reloaded_scoring = importlib.reload(scoring)
+            try:
+                self.assertEqual(reloaded_scoring.ACTIVE_SCORING_MODE, reloaded_scoring.SCORING_MODE_PHUZZ)
+                self.assertEqual(reloaded_scoring.DEFAULT_HOOK_REQUESTS_DIR, "/tmp/hook-requests")
+                self.assertEqual(reloaded_scoring.DEFAULT_HOOK_PRIORITY_WEIGHT, 2.5)
+                self.assertEqual(reloaded_scoring.DEFAULT_HOOK_ENERGY_WEIGHT, 3.5)
+                self.assertEqual(reloaded_scoring.DefaultScoringFormula().mode, reloaded_scoring.SCORING_MODE_PHUZZ)
+            finally:
+                os.environ["PHUZZ_SCORING_MODE"] = str(old_values["active_mode"])
+                os.environ["FUZZER_HOOK_REQUESTS_DIR"] = old_values["requests_dir"]
+                os.environ["FUZZER_HOOK_PRIORITY_WEIGHT"] = str(old_values["priority_weight"])
+                os.environ["FUZZER_HOOK_ENERGY_WEIGHT"] = str(old_values["energy_weight"])
+                importlib.reload(scoring)
 
 
 if __name__ == "__main__":

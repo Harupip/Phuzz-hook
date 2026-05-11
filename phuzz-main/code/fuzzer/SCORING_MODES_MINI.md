@@ -5,6 +5,7 @@
 - `DefaultScoringFormula` trong `scoring.py` bay gio la bo chon mode scoring.
 - Mac dinh mode moi la `2`, tuc `PHUZZ+hook`.
 - Mode cu `1`, tuc `PHUZZ`, van con de anh tat hook bonus khi can doi chieu.
+- Co the doi mode va weight bang file `phuzz-main/code/fuzzer/scoring.env`.
 - Hook energy da duoc noi truc tiep vao `calculate_priority(...)` va `calculate_energy(...)`.
 - `calculate_score(...)` van giu cong thuc PHUZZ goc de de so sanh voi score path-based.
 - Doan `DefaultScoringFormula` goc da duoc giu lai duoi dang comment ngay trong `scoring.py` de doi chieu.
@@ -12,10 +13,12 @@
 ## Agent note
 
 - Truoc khi sua tiep `phuzz-main/code/fuzzer/scoring.py`, doc file nay truoc.
-- Khi can doi mode, uu tien sua `ACTIVE_SCORING_MODE` trong `scoring.py`, khong doi flow sang file khac neu chua can.
+- Khi can doi mode luc chay, uu tien sua `phuzz-main/code/fuzzer/scoring.env`.
+- Neu can doi default trong code, sua `ACTIVE_SCORING_MODE` trong `scoring.py`.
 - Neu sua cong thuc bonus hook hoac selector mode, cap nhat cung luc:
   - `phuzz-main/code/fuzzer/scoring.py`
   - `phuzz-main/code/fuzzer/tests/test_scoring_modes.py`
+  - `phuzz-main/code/fuzzer/scoring.env`
   - file mini doc nay
 - Giữ logic PHUZZ goc de doi chieu. Neu can refactor, khong xoa block comment cua scoring cu khi chua co ban doi chieu ro rang.
 
@@ -25,14 +28,22 @@
   - Them hang so:
     - `SCORING_MODE_PHUZZ = 1`
     - `SCORING_MODE_PHUZZ_HOOK = 2`
-    - `ACTIVE_SCORING_MODE = 2`
+    - `ACTIVE_SCORING_MODE` doc tu `PHUZZ_SCORING_MODE`, mac dinh `2`
+    - `DEFAULT_HOOK_REQUESTS_DIR` doc tu `FUZZER_HOOK_REQUESTS_DIR`
+    - `DEFAULT_HOOK_PRIORITY_WEIGHT` doc tu `FUZZER_HOOK_PRIORITY_WEIGHT`
+    - `DEFAULT_HOOK_ENERGY_WEIGHT` doc tu `FUZZER_HOOK_ENERGY_WEIGHT`
   - Them `PhuzzScoringFormula`
   - Them `PhuzzHookScoringFormula`
   - `DefaultScoringFormula` chon mode theo hang so
+- Add: `phuzz-main/code/fuzzer/scoring.env`
+  - File env co comment de bat/tat mode va weight khi chay fuzzer container
+- Modify: `phuzz-main/code/docker-compose.yml`
+  - Fuzzer service nap `./fuzzer/scoring.env` bang `env_file`
 - Add: `phuzz-main/code/fuzzer/tests/test_scoring_modes.py`
   - Test mode mac dinh
   - Test mode `1`
   - Test mode `2`
+  - Test env override cho mode, request dir, priority weight, energy weight
 
 ## Hanh vi moi
 
@@ -59,36 +70,45 @@
   - `hook_energy`
   - `hook_energy_avg`
 
-## Cach doi mode
+## Cach doi mode bang env
 
-Chinh truc tiep trong `phuzz-main/code/fuzzer/scoring.py`:
+Sua file `phuzz-main/code/fuzzer/scoring.env`:
 
-```python
-SCORING_MODE_PHUZZ = 1
-SCORING_MODE_PHUZZ_HOOK = 2
-ACTIVE_SCORING_MODE = SCORING_MODE_PHUZZ_HOOK
+```env
+# 1 = PHUZZ goc
+# 2 = PHUZZ + hook coverage bonus
+PHUZZ_SCORING_MODE=2
 ```
 
 Neu muon quay ve PHUZZ goc:
 
-```python
-ACTIVE_SCORING_MODE = SCORING_MODE_PHUZZ
+```env
+PHUZZ_SCORING_MODE=1
 ```
 
 Neu muon bat lai PHUZZ+hook:
 
-```python
-ACTIVE_SCORING_MODE = SCORING_MODE_PHUZZ_HOOK
+```env
+PHUZZ_SCORING_MODE=2
 ```
 
 ## Bien moi truong lien quan
 
+- `PHUZZ_SCORING_MODE`
+  - mac dinh: `2`
+  - `1` = PHUZZ goc, `2` = PHUZZ+hook
 - `FUZZER_HOOK_REQUESTS_DIR`
   - mac dinh: `/shared-tmpfs/hook-coverage/requests`
+  - noi fuzzer doc request artifact hook coverage de ghep voi `candidate.coverage_id`
 - `FUZZER_HOOK_PRIORITY_WEIGHT`
   - mac dinh: `1.0`
+  - cong vao priority theo `base_priority + hook_energy * weight`
 - `FUZZER_HOOK_ENERGY_WEIGHT`
   - mac dinh: `1.0`
+  - cong vao energy theo `base_energy + ceil(hook_energy * weight)`
+- `PHUZZ_SCORE_DEBUG`
+  - mac dinh: `0`
+  - `1` de in log chi tiet khi `calculate_score()` dem path/line
 
 ## Ghi chu quan trong
 
@@ -96,7 +116,7 @@ ACTIVE_SCORING_MODE = SCORING_MODE_PHUZZ_HOOK
 - Viec noi hook bonus duoc lam ngay trong `scoring.py` nhu anh yeu cau.
 - `hook_energy` van doc tu request artifact `hook_coverage` thong qua `coverage_id` cua candidate.
 - Cang mot callback bi execute nhieu lan truoc do, hook bonus cang giam theo cong thuc `1 / (N + 1)`.
-- Viec chon `PHUZZ` hay `PHUZZ+hook` bay gio khong di qua env nua, ma xem ngay duoc trong `scoring.py`.
+- Viec chon `PHUZZ` hay `PHUZZ+hook` bay gio di qua `scoring.env`, nhung constants `1` va `2` van nam ngay trong `scoring.py` de de audit.
 
 ## Test da chay
 
