@@ -7,6 +7,53 @@ class ScoringFormula():
         pass
 
 
+def _env_int(name, default):
+    import os
+
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw_value!r}") from exc
+
+
+def _env_float(name, default):
+    import os
+
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a float, got {raw_value!r}") from exc
+
+
+def _env_float_alias(name, alias, default):
+    import os
+
+    raw_value = os.environ.get(name, "").strip()
+    source_name = name
+    if not raw_value:
+        raw_value = os.environ.get(alias, "").strip()
+        source_name = alias
+    if not raw_value:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{source_name} must be a float, got {raw_value!r}") from exc
+
+
+def _env_str(name, default):
+    import os
+
+    raw_value = os.environ.get(name, "").strip()
+    return raw_value or default
+
+
 def _score_debug_enabled():
     import os
 
@@ -63,24 +110,30 @@ def calculate_hook_coverage_energy(request_data, state=None, config=None, update
 
 
 # Agent note:
-# Read `SCORING_MODES_MINI.md` before changing this file again.
-# This module now keeps both the original PHUZZ logic and the additive
-# hook-energy layer side by side so future edits can be compared locally.
+# Read `docs/reference/scoring-modes-mini.md` before changing this file again.
+# This module now keeps both the original PHUZZ logic and the hook-aware
+# layer side by side so future edits can be compared locally.
 #
 # Change only `ACTIVE_SCORING_MODE` when you want to switch runtime behavior:
 #   1 = original PHUZZ scoring
-#   2 = PHUZZ scoring plus hook-energy bonus
+#   2 = PHUZZ scoring plus hook-aware feedback
 # Keep the commented old PHUZZ block below for direct line-by-line comparison.
-# If you change the mode wiring or bonus rules, update the mini doc and tests
+# If you change the mode wiring or hook-feedback rules, update the mini doc and tests
 # in `tests/test_scoring_modes.py` in the same patch.
 # Use explicit constants here so mode changes stay visible inside this file.
 SCORING_MODE_PHUZZ = 1
 SCORING_MODE_PHUZZ_HOOK = 2
-ACTIVE_SCORING_MODE = SCORING_MODE_PHUZZ_HOOK
+ACTIVE_SCORING_MODE = _env_int("PHUZZ_SCORING_MODE", SCORING_MODE_PHUZZ_HOOK)
 
-DEFAULT_HOOK_REQUESTS_DIR = "/shared-tmpfs/hook-coverage/requests"
-DEFAULT_HOOK_PRIORITY_WEIGHT = 1.0
-DEFAULT_HOOK_ENERGY_WEIGHT = 1.0
+DEFAULT_HOOK_REQUESTS_DIR = _env_str("FUZZER_HOOK_REQUESTS_DIR", "/shared-tmpfs/hook-coverage/requests")
+DEFAULT_HOOK_PRIORITY_WEIGHT = _env_float("FUZZER_HOOK_PRIORITY_WEIGHT", 1.0)
+DEFAULT_HOOK_ENERGY_BASE_WEIGHT = _env_float_alias(
+    "FUZZER_HOOK_ENERGY_BASE_WEIGHT",
+    "FUZZER_HOOK_ENERGY_WEIGHT",
+    0.8,
+)
+DEFAULT_HOOK_ENERGY_WEIGHT = DEFAULT_HOOK_ENERGY_BASE_WEIGHT
+DEFAULT_HOOK_MIN_ENERGY_SCALE = _env_int("FUZZER_HOOK_MIN_ENERGY_SCALE", 4)
 
 
 # Original PHUZZ scoring kept here for side-by-side comparison.
@@ -144,14 +197,14 @@ class PhuzzScoringFormula(ScoringFormula):
             energy = max(1, candidate.parent.number_of_new_paths + abs(candidate.parent.score - current_score))
         else:
             energy = max(1, len(candidate.new_paths))
-        # Plain PHUZZ mode has no hook bonus, so base/final stay identical here.
+        # Plain PHUZZ mode has no hook feedback, so base/final stay identical here.
         candidate.base_energy = int(energy)
         candidate.final_energy = int(energy)
         return energy 
 
 
 class PhuzzHookScoringFormula(PhuzzScoringFormula):
-    def __init__(self, requests_dir=None, priority_weight=None, energy_weight=None):
+    def __init__(self, requests_dir=None, priority_weight=None, energy_weight=None, min_hook_scale=None):
         from hook_energy.integration import HookEnergyTracker
 
         self.requests_dir = requests_dir or DEFAULT_HOOK_REQUESTS_DIR
@@ -159,7 +212,11 @@ class PhuzzHookScoringFormula(PhuzzScoringFormula):
             priority_weight if priority_weight is not None else DEFAULT_HOOK_PRIORITY_WEIGHT
         )
         self.energy_weight = float(
-            energy_weight if energy_weight is not None else DEFAULT_HOOK_ENERGY_WEIGHT
+            energy_weight if energy_weight is not None else DEFAULT_HOOK_ENERGY_BASE_WEIGHT
+        )
+        self.min_hook_scale = max(
+            1,
+            int(min_hook_scale if min_hook_scale is not None else DEFAULT_HOOK_MIN_ENERGY_SCALE),
         )
         self.tracker = HookEnergyTracker(self.requests_dir)
 
@@ -202,17 +259,18 @@ class PhuzzHookScoringFormula(PhuzzScoringFormula):
             base_energy,
             candidate.hook_energy,
             self.energy_weight,
+            self.min_hook_scale,
         )
         # Keep both numbers for debug output:
         # - `base_energy` shows original PHUZZ queue energy
-        # - `final_energy` shows PHUZZ energy after hook bonus is rounded up and added
+        # - `final_energy` shows the blended scheduler budget after hook feedback
         candidate.base_energy = int(base_energy)
         candidate.final_energy = int(final_energy)
         return final_energy
 
 
 class DefaultScoringFormula(ScoringFormula):
-    def __init__(self, mode=None, requests_dir=None, priority_weight=None, energy_weight=None):
+    def __init__(self, mode=None, requests_dir=None, priority_weight=None, energy_weight=None, min_hook_scale=None):
         # Keep selector logic narrow here so the old/new scoring split stays easy
         # to audit from this file alone.
         self.mode = ACTIVE_SCORING_MODE if mode is None else int(mode)
@@ -223,6 +281,7 @@ class DefaultScoringFormula(ScoringFormula):
                 requests_dir=requests_dir,
                 priority_weight=priority_weight,
                 energy_weight=energy_weight,
+                min_hook_scale=min_hook_scale,
             )
         else:
             raise ValueError(

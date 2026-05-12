@@ -43,6 +43,8 @@ class Fuzzer:
         self.unique_vulnerable_candidates = {}
         self.exceptions_and_errors_candidates = []
         self.seen_mutations = set()
+        self.trace_requests = os.environ.get("PHUZZ_TRACE_REQUESTS", "0") == "1"
+        self.request_counter = 0
 
         self.session = requests.Session()
         self.login_script = None
@@ -107,6 +109,46 @@ class Fuzzer:
 
     def _open(self, filepath):
         return os.open(filepath, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o777)
+
+    def _short_repr(self, value, limit=120):
+        text = repr(value)
+        if len(text) > limit:
+            return text[: limit - 3] + "..."
+        return text
+
+    def _trace_request(self, candidate, prepared_req=None, response=None, error=None):
+        if not self.trace_requests:
+            return
+
+        self.request_counter += 1
+        parts = [f"[req {self.request_counter}]"]
+
+        if prepared_req is not None:
+            parts.append(prepared_req.method)
+            parts.append(prepared_req.url)
+        else:
+            parts.append(candidate.http_method)
+            parts.append(candidate.http_target)
+
+        if candidate.mutated_param_type and candidate.mutated_param_name:
+            mutated_value = candidate.fuzz_params.get(
+                candidate.mutated_param_type, {}
+            ).get(candidate.mutated_param_name)
+            parts.append(
+                f"mutated={candidate.mutated_param_type}.{candidate.mutated_param_name}"
+            )
+            parts.append(f"value={self._short_repr(mutated_value)}")
+        elif candidate.is_initial_candidate:
+            parts.append("candidate=initial")
+
+        if response is not None:
+            parts.append(f"status={response.status_code}")
+            parts.append(f"bytes={len(response.text)}")
+
+        if error is not None:
+            parts.append(f"error={self._short_repr(str(error))}")
+
+        print(" ".join(parts))
 
     def save_output_vulnerable(self):
         with open(
@@ -375,6 +417,7 @@ class Fuzzer:
                                                 priority=100,
                                                 http_target=self.config['target'],
                                                 http_method=req_method,
+                                                is_initial_candidate=True,
                                                 fixed_params={
                                                     'headers': self._param_tuple_to_dict(fixed_header_comb),
                                                     'cookies': self._param_tuple_to_dict(fixed_cookie_comb),
@@ -551,13 +594,16 @@ class Fuzzer:
         return new_candidate
 
     def ff_send_request(self, c):
+        prepared_req = None
         try:
             with requests.Session() as s:
-                #print(f'Testing candidate: {c.priority} {c.fuzz_params}')  
+                # Optional request-level tracing for plugin/debug runs.
                 prepared_req = self.prepare_request(c)
                 response = s.send(prepared_req, timeout=self.request_timeout, allow_redirects=False)
                 c.response = response
+                self._trace_request(c, prepared_req=prepared_req, response=response)
         except Exception as e:
+            self._trace_request(c, prepared_req=prepared_req, error=e)
             print(f"Exception encountered: {e}")
             c.response = None
 
