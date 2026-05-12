@@ -99,16 +99,20 @@ class HookEnergyIntegrationTests(unittest.TestCase):
             self.assertEqual(report.executed_callbacks, [])
             self.assertIn("req-empty", tracker.state.processed_request_ids)
 
-    def test_additive_priority_and_energy_formulas_keep_phuzz_base(self) -> None:
+    def test_priority_stays_additive_while_energy_uses_weighted_blend(self) -> None:
         self.assertEqual(apply_hook_priority_bonus(5, 0.0, 1.0), 5.0)
         self.assertEqual(apply_hook_priority_bonus(5, 1.0, 1.5), 6.5)
 
-        self.assertEqual(apply_hook_energy_bonus(3, 0.0, 1.0), 3)
-        self.assertEqual(apply_hook_energy_bonus(3, 1.0, 1.0), 4)
-        self.assertEqual(apply_hook_energy_bonus(3, 0.5, 2.0), 4)
-        self.assertEqual(apply_hook_energy_bonus(1, 0.25, 3.0), 2)
+        self.assertEqual(apply_hook_energy_bonus(2, 1.0, 0.8, 4), 3)
+        self.assertEqual(apply_hook_energy_bonus(10, 0.1, 0.8, 4), 9)
+        self.assertEqual(apply_hook_energy_bonus(2, 0.5, 0.0, 4), 2)
+        self.assertEqual(apply_hook_energy_bonus(3, 1.0, 1.0, 4), 3)
+        self.assertEqual(apply_hook_energy_bonus(3, -0.5, 0.8, 4), 3)
+        self.assertEqual(apply_hook_energy_bonus(3, 1.7, 0.8, 4), 4)
+        self.assertEqual(apply_hook_energy_bonus(0, 1.0, 0.8, 4), 2)
+        self.assertEqual(apply_hook_energy_bonus(-5, 1.0, 0.8, 4), 2)
 
-    def test_candidate_feedback_keeps_base_values_and_adds_hook_bonus(self) -> None:
+    def test_candidate_feedback_keeps_base_values_and_uses_weighted_energy_blend(self) -> None:
         candidate = Candidate()
         candidate.coverage_id = "cov-xyz"
         report = RequestEnergyReport(
@@ -127,7 +131,8 @@ class HookEnergyIntegrationTests(unittest.TestCase):
             base_priority=3,
             base_energy=3,
             priority_weight=1.5,
-            energy_weight=2.0,
+            energy_weight=0.8,
+            min_hook_scale=4,
         )
 
         self.assertEqual(candidate.hook_request_id, "req-for-cov-xyz")
@@ -136,9 +141,9 @@ class HookEnergyIntegrationTests(unittest.TestCase):
         self.assertEqual(candidate.base_priority, 3)
         self.assertEqual(candidate.base_energy, 3)
         self.assertEqual(final_priority, 4.5)
-        self.assertEqual(final_energy, 5)
+        self.assertEqual(final_energy, 4)
         self.assertEqual(candidate.priority, 4.5)
-        self.assertEqual(candidate.final_energy, 5)
+        self.assertEqual(candidate.final_energy, 4)
 
 
 if __name__ == "__main__":

@@ -15,12 +15,27 @@ def apply_hook_priority_bonus(base_priority: float, hook_energy: float, weight: 
     return float(base_priority) + (float(hook_energy) * float(weight))
 
 
-def apply_hook_energy_bonus(base_energy: int, hook_energy: float, weight: float) -> int:
-    base_value = max(1, int(base_energy))
-    bonus = 0
-    if hook_energy > 0:
-        bonus = int(math.ceil(float(hook_energy) * float(weight)))
-    return max(1, base_value + bonus)
+def apply_hook_energy_bonus(
+    base_energy: int,
+    hook_energy: float,
+    weight: float,
+    min_hook_scale: int = 4,
+) -> int:
+    # Keep PHUZZ base energy as the main scheduler signal while still letting
+    # rare/new callbacks rescue low-base candidates through `min_hook_scale`.
+    # The scheduler still spends integer mutation budgets, so rounding happens
+    # only at this queue-boundary helper.
+    base = max(1, int(base_energy))
+    hook = max(0.0, min(1.0, float(hook_energy)))
+    W = min(1.0, max(0.0, float(weight)))
+    H = max(max(1, int(min_hook_scale)), base)
+
+    final_energy = (
+        (base * W)
+        + (hook * (1.0 - W) * H)
+    )
+
+    return max(1, int(math.ceil(final_energy)))
 
 
 def apply_candidate_hook_feedback(
@@ -31,6 +46,7 @@ def apply_candidate_hook_feedback(
     base_energy: Optional[int],
     priority_weight: float,
     energy_weight: float,
+    min_hook_scale: Optional[int] = None,
 ) -> tuple[float, Optional[int]]:
     if report is None:
         candidate.hook_request_id = ""
@@ -47,8 +63,13 @@ def apply_candidate_hook_feedback(
 
     final_energy: Optional[int] = None
     if base_energy is not None:
-        candidate.base_energy = int(base_energy)
-        final_energy = apply_hook_energy_bonus(base_energy, candidate.hook_energy, energy_weight)
+        candidate.base_energy = max(1, int(base_energy))
+        final_energy = apply_hook_energy_bonus(
+            candidate.base_energy,
+            candidate.hook_energy,
+            energy_weight,
+            4 if min_hook_scale is None else min_hook_scale,
+        )
         candidate.final_energy = final_energy
 
     return final_priority, final_energy

@@ -18,7 +18,9 @@ from candidate import Candidate
 from scoring import (
     ACTIVE_SCORING_MODE,
     DefaultScoringFormula,
+    DEFAULT_HOOK_ENERGY_BASE_WEIGHT,
     DEFAULT_HOOK_ENERGY_WEIGHT,
+    DEFAULT_HOOK_MIN_ENERGY_SCALE,
     DEFAULT_HOOK_PRIORITY_WEIGHT,
     DEFAULT_HOOK_REQUESTS_DIR,
     SCORING_MODE_PHUZZ,
@@ -54,20 +56,29 @@ def build_request_payload(
     }
 
 
-def build_parent_candidate() -> Candidate:
-    parent = Candidate(score=27, priority=27)
-    parent.score = 27
-    parent.priority = 27
-    parent.base_score = 27
-    parent.base_priority = 27
-    parent.number_of_new_paths = 1
+def build_parent_candidate(*, score: int = 27, number_of_new_paths: int = 1) -> Candidate:
+    parent = Candidate(score=score, priority=score)
+    parent.score = score
+    parent.priority = score
+    parent.base_score = score
+    parent.base_priority = score
+    parent.number_of_new_paths = number_of_new_paths
     parent.paths = ["plugin.php::::1_2_3"]
     parent.new_paths = {"plugin.php::::1_2_3"}
     return parent
 
 
-def build_child_candidate(*, coverage_id: str) -> Candidate:
-    child = Candidate(parent=build_parent_candidate(), score=0, priority=0)
+def build_child_candidate(
+    *,
+    coverage_id: str,
+    parent_score: int = 27,
+    parent_number_of_new_paths: int = 1,
+) -> Candidate:
+    child = Candidate(
+        parent=build_parent_candidate(score=parent_score, number_of_new_paths=parent_number_of_new_paths),
+        score=0,
+        priority=0,
+    )
     child.coverage_id = coverage_id
     child.paths = ["plugin.php::::1_2_3"]
     child.new_paths = set()
@@ -80,6 +91,9 @@ class ScoringModeTests(unittest.TestCase):
         formula = DefaultScoringFormula()
         self.assertEqual(formula.mode, ACTIVE_SCORING_MODE)
         self.assertEqual(formula.mode, SCORING_MODE_PHUZZ_HOOK)
+        self.assertEqual(DEFAULT_HOOK_ENERGY_BASE_WEIGHT, 0.8)
+        self.assertEqual(DEFAULT_HOOK_ENERGY_WEIGHT, 0.8)
+        self.assertEqual(DEFAULT_HOOK_MIN_ENERGY_SCALE, 4)
 
     def test_phuzz_mode_keeps_original_priority_and_energy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -106,7 +120,7 @@ class ScoringModeTests(unittest.TestCase):
             self.assertEqual(candidate.hook_energy, 0.0)
             self.assertEqual(candidate.hook_energy_avg, 0.0)
 
-    def test_hook_mode_adds_hook_bonus_and_keeps_base_values(self) -> None:
+    def test_hook_mode_uses_weighted_energy_blend_and_keeps_base_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             payload = build_request_payload(
                 "req-hook",
@@ -123,15 +137,15 @@ class ScoringModeTests(unittest.TestCase):
             (Path(tmp_dir) / "req-hook.json").write_text(json.dumps(payload), encoding="utf-8")
 
             formula = DefaultScoringFormula(mode=SCORING_MODE_PHUZZ_HOOK, requests_dir=tmp_dir)
-            candidate = build_child_candidate(coverage_id="cov-hook")
+            candidate = build_child_candidate(coverage_id="cov-hook", parent_score=2)
 
             self.assertEqual(formula.calculate_score(candidate), 1)
             self.assertEqual(formula.calculate_priority(candidate), 2.0)
-            self.assertEqual(formula.calculate_energy(candidate), 28)
+            self.assertEqual(formula.calculate_energy(candidate), 3)
             self.assertEqual(candidate.base_score, 1)
             self.assertEqual(candidate.base_priority, 1)
-            self.assertEqual(candidate.base_energy, 27)
-            self.assertEqual(candidate.final_energy, 28)
+            self.assertEqual(candidate.base_energy, 2)
+            self.assertEqual(candidate.final_energy, 3)
             self.assertEqual(candidate.hook_request_id, "req-hook")
             self.assertEqual(candidate.hook_energy, 1.0)
             self.assertEqual(candidate.hook_energy_avg, 1.0)
@@ -151,14 +165,16 @@ class ScoringModeTests(unittest.TestCase):
         self.assertIn("[score-debug] new_path file=other.php raw=5_9_11 segments=3 underscores=2", debug_output)
         self.assertIn("[score-debug] total hit_counter=2 total_paths=2 score=4", debug_output)
 
-    def test_env_can_select_scoring_mode_and_hook_constants(self) -> None:
+    def test_env_can_select_scoring_mode_and_new_hook_energy_constants(self) -> None:
         import scoring
 
         old_values = {
             "active_mode": ACTIVE_SCORING_MODE,
             "requests_dir": DEFAULT_HOOK_REQUESTS_DIR,
             "priority_weight": DEFAULT_HOOK_PRIORITY_WEIGHT,
+            "energy_base_weight": DEFAULT_HOOK_ENERGY_BASE_WEIGHT,
             "energy_weight": DEFAULT_HOOK_ENERGY_WEIGHT,
+            "min_hook_scale": DEFAULT_HOOK_MIN_ENERGY_SCALE,
         }
         with patch.dict(
             os.environ,
@@ -166,7 +182,8 @@ class ScoringModeTests(unittest.TestCase):
                 "PHUZZ_SCORING_MODE": "1",
                 "FUZZER_HOOK_REQUESTS_DIR": "/tmp/hook-requests",
                 "FUZZER_HOOK_PRIORITY_WEIGHT": "2.5",
-                "FUZZER_HOOK_ENERGY_WEIGHT": "3.5",
+                "FUZZER_HOOK_ENERGY_BASE_WEIGHT": "0.6",
+                "FUZZER_HOOK_MIN_ENERGY_SCALE": "7",
             },
             clear=False,
         ):
@@ -175,12 +192,40 @@ class ScoringModeTests(unittest.TestCase):
                 self.assertEqual(reloaded_scoring.ACTIVE_SCORING_MODE, reloaded_scoring.SCORING_MODE_PHUZZ)
                 self.assertEqual(reloaded_scoring.DEFAULT_HOOK_REQUESTS_DIR, "/tmp/hook-requests")
                 self.assertEqual(reloaded_scoring.DEFAULT_HOOK_PRIORITY_WEIGHT, 2.5)
-                self.assertEqual(reloaded_scoring.DEFAULT_HOOK_ENERGY_WEIGHT, 3.5)
+                self.assertEqual(reloaded_scoring.DEFAULT_HOOK_ENERGY_BASE_WEIGHT, 0.6)
+                self.assertEqual(reloaded_scoring.DEFAULT_HOOK_ENERGY_WEIGHT, 0.6)
+                self.assertEqual(reloaded_scoring.DEFAULT_HOOK_MIN_ENERGY_SCALE, 7)
                 self.assertEqual(reloaded_scoring.DefaultScoringFormula().mode, reloaded_scoring.SCORING_MODE_PHUZZ)
             finally:
                 os.environ["PHUZZ_SCORING_MODE"] = str(old_values["active_mode"])
                 os.environ["FUZZER_HOOK_REQUESTS_DIR"] = old_values["requests_dir"]
                 os.environ["FUZZER_HOOK_PRIORITY_WEIGHT"] = str(old_values["priority_weight"])
+                os.environ["FUZZER_HOOK_ENERGY_BASE_WEIGHT"] = str(old_values["energy_base_weight"])
+                os.environ["FUZZER_HOOK_ENERGY_WEIGHT"] = str(old_values["energy_weight"])
+                os.environ["FUZZER_HOOK_MIN_ENERGY_SCALE"] = str(old_values["min_hook_scale"])
+                importlib.reload(scoring)
+
+    def test_deprecated_energy_weight_env_still_falls_back_when_new_name_is_absent(self) -> None:
+        import scoring
+
+        old_values = {
+            "energy_base_weight": DEFAULT_HOOK_ENERGY_BASE_WEIGHT,
+            "energy_weight": DEFAULT_HOOK_ENERGY_WEIGHT,
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "FUZZER_HOOK_ENERGY_WEIGHT": "0.65",
+            },
+            clear=False,
+        ):
+            os.environ.pop("FUZZER_HOOK_ENERGY_BASE_WEIGHT", None)
+            reloaded_scoring = importlib.reload(scoring)
+            try:
+                self.assertEqual(reloaded_scoring.DEFAULT_HOOK_ENERGY_BASE_WEIGHT, 0.65)
+                self.assertEqual(reloaded_scoring.DEFAULT_HOOK_ENERGY_WEIGHT, 0.65)
+            finally:
+                os.environ["FUZZER_HOOK_ENERGY_BASE_WEIGHT"] = str(old_values["energy_base_weight"])
                 os.environ["FUZZER_HOOK_ENERGY_WEIGHT"] = str(old_values["energy_weight"])
                 importlib.reload(scoring)
 
