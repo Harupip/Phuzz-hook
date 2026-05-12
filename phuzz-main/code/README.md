@@ -127,7 +127,7 @@ Ensure that the web application is running as expected, fully initialized and re
 Once the web application is ready to be fuzzed, the `fuzzer` can be started. Depending on the 
 way the `docker-compose.yml` was created (either with composegen or without), the name of the fuzzer's container may be different. 
 
-For example, run `docker-compose up fuzzer-wordpress-show-all-comments-in-one-page-1 --build --force-recreate`
+For example, run `docker-compose up fuzzer-wordpress-plugin --build --force-recreate`
 
 One or more fuzzer containers can be run in parallel for multi-instance fuzzing. In that case, you can either extend the checked-in compose file or generate a larger one with `./composegen/`.
 

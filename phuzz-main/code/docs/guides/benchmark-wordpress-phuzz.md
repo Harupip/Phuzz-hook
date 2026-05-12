@@ -251,14 +251,14 @@ Ly do:
 
 Muon mo rong them plugin, can them it nhat:
 
-- plugin -> service mapping trong `benchmark-wordpress-phuzz.ps1`
+- plugin -> service mapping trong `scripts/benchmarks/benchmark-wordpress-phuzz.ps1`
 - compose/runtime tuong ung cho plugin do
 
 ## 9. Cac thay doi toi da them trong benchmark pass nay
 
 Nhung thay doi moi phuc vu benchmark:
 
-- them `benchmark-wordpress-phuzz.ps1`
+- them `scripts/benchmarks/benchmark-wordpress-phuzz.ps1`
 - them package `fuzzer/benchmarking/`
 - them `fuzzer/tests/test_benchmark_summary.py`
 - them docs nay

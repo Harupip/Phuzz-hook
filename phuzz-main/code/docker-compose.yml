@@ -64,7 +64,7 @@ services:
       MYSQL_ROOT_HOST: "%"
       MYSQL_USER_HOST: "%"
 
-  fuzzer-wordpress-show-all-comments-in-one-page-1:
+  fuzzer-wordpress-plugin:
     build:
       context: ./fuzzer
       dockerfile: Dockerfile
@@ -79,7 +79,7 @@ services:
     volumes:
       - ./fuzzer:/app
       - shared-tmpfs:/shared-tmpfs
-      - sync-tmpfs-wordpress-show-all-comments-in-one-page:/sync-tmpfs
+      - sync-tmpfs-wordpress-plugin:/sync-tmpfs
 
 
 volumes:
@@ -89,7 +89,7 @@ volumes:
       type: "tmpfs"
       device: "tmpfs"
       o: "size=1024m,uid=1000"
-  sync-tmpfs-wordpress-show-all-comments-in-one-page:
+  sync-tmpfs-wordpress-plugin:
     driver: local
     driver_opts:
       type: "tmpfs"
