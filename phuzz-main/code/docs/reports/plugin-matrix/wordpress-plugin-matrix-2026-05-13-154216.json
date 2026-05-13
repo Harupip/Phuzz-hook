@@ -1,0 +1,62 @@
+[
+    {
+        "slug":  "crm-perks-forms",
+        "category":  "XSS",
+        "status":  "success",
+        "note":  "WordPress active and PHUZZ request trace observed.",
+        "request_count":  171,
+        "fuzzer_config":  "wordpress/crm-perks-forms",
+        "active_plugins":  "crm-perks-forms",
+        "download_notes":  "existing:crm-perks-forms.zip",
+        "sample_log":  [
+                           "fuzzer-wordpress-plugin-1  | [req 604] GET http://web/wp-content/plugins/crm-perks-forms/templates/sample_file.php?Company=fuzz\u0026LastName=fuzzY\u0026FirstName=fuzz mutated=query_params.LastName value=\u0027fuzzY\u0027 status=200 bytes=18",
+                           "fuzzer-wordpress-plugin-1  | [req 605] GET http://web/wp-content/plugins/crm-perks-forms/templates/sample_file.php?Company=fuzz\u0026LastName=fuzz\u0026FirstName=fpuzz mutated=query_params.FirstName value=\u0027fpuzz\u0027 status=200 bytes=18",
+                           "fuzzer-wordpress-plugin-1  | [req 606] GET http://web/wp-content/plugins/crm-perks-forms/templates/sample_file.php?Company=fuzz\u0026LastName=%3Efuzz\u0026FirstName=fuzz mutated=query_params.LastName value=\u0027\u003efuzz\u0027 status=200 bytes=18"
+                       ]
+    },
+    {
+        "slug":  "seo-local-rank",
+        "category":  "PathTraversal",
+        "status":  "success",
+        "note":  "WordPress active and PHUZZ request trace observed.",
+        "request_count":  400,
+        "fuzzer_config":  "wordpress/seo-local-rank",
+        "active_plugins":  "seo-local-rank",
+        "download_notes":  "existing:seo-local-rank.zip",
+        "sample_log":  [
+                           "fuzzer-wordpress-plugin-1  | [req 207] POST http://web/wp-content/plugins/seo-local-rank/admin/vendor/datatables/examples/resources/examples.php mutated=body_params.src value=\u0027fuzzp\u0027 status=200 bytes=2",
+                           "fuzzer-wordpress-plugin-1  | [req 208] POST http://web/wp-content/plugins/seo-local-rank/admin/vendor/datatables/examples/resources/examples.php mutated=body_params.src value=\u0027f;x~uzz\u0027 status=200 bytes=2",
+                           "fuzzer-wordpress-plugin-1  | [req 209] POST http://web/wp-content/plugins/seo-local-rank/admin/vendor/datatables/examples/resources/examples.php mutated=body_params.src value=\u0027f\\x02uzz\u0027 status=200 bytes=2"
+                       ]
+    },
+    {
+        "slug":  "totop-link",
+        "category":  "Deserialization",
+        "status":  "success",
+        "note":  "WordPress active and PHUZZ request trace observed.",
+        "request_count":  55,
+        "fuzzer_config":  "wordpress/totop-link",
+        "active_plugins":  "totop-link",
+        "download_notes":  "existing:totop-link.zip",
+        "sample_log":  [
+                           "fuzzer-wordpress-plugin-1  | [req 1] GET http://web/wp-content/plugins/totop-link/totop-link.css.php?vars=fuzz candidate=initial status=200 bytes=762",
+                           "fuzzer-wordpress-plugin-1  | [req 2] GET http://web/wp-content/plugins/totop-link/totop-link.css.php?vars=uzz mutated=query_params.vars value=\u0027uzz\u0027 status=200 bytes=762",
+                           "fuzzer-wordpress-plugin-1  | [req 3] GET http://web/wp-content/plugins/totop-link/totop-link.css.php?vars=fu%7Bz mutated=query_params.vars value=\u0027fu{z\u0027 status=200 bytes=762"
+                       ]
+    },
+    {
+        "slug":  "webp-converter-for-media",
+        "category":  "OpenRedirect",
+        "status":  "success",
+        "note":  "WordPress active and PHUZZ request trace observed.",
+        "request_count":  4,
+        "fuzzer_config":  "wordpress/webp-converter-for-media",
+        "active_plugins":  "webp-converter-for-media",
+        "download_notes":  "existing:webp-converter-for-media.zip",
+        "sample_log":  [
+                           "fuzzer-wordpress-plugin-1  | [req 51] GET http://web/wp-content/plugins/webp-converter-for-media/includes/passthru.php?src=fuzz2 mutated=query_params.src value=\u0027fuzz2\u0027 status=302 bytes=2",
+                           "fuzzer-wordpress-plugin-1  | [req 52] GET http://web/wp-content/plugins/webp-converter-for-media/includes/passthru.php?src=fjzz mutated=query_params.src value=\u0027fjzz\u0027 status=302 bytes=2",
+                           "fuzzer-wordpress-plugin-1  | [req 53] GET http://web/wp-content/plugins/webp-converter-for-media/includes/passthru.php?src=fuRzz mutated=query_params.src value=\u0027fuRzz\u0027 status=302 bytes=2"
+                       ]
+    }
+]

@@ -1,7 +1,14 @@
 param(
     [int]$RunsPerMode = 5,
     [int]$RunMinutes = 30,
-    [string]$Plugin = "show-all-comments-in-one-page",
+    [Alias("Plugin")]
+    [string[]]$Plugins = @(
+        "photo-gallery",
+        "crm-perks-forms",
+        "seo-local-rank",
+        "totop-link",
+        "webp-converter-for-media"
+    ),
     [string]$OutputRoot = "fuzzer\output\benchmarks",
     [int]$WebTimeoutSeconds = 240,
     [int]$FirstRequestTimeoutSeconds = 180,
@@ -15,24 +22,44 @@ $scriptRoot = (Resolve-Path -LiteralPath (Join-Path $scriptDir "..\..")).Path
 $scoringEnvPath = Join-Path $scriptRoot "fuzzer\scoring.env"
 $localFuzzerOutputDir = Join-Path $scriptRoot "fuzzer\output\fuzzer-1"
 $summaryCliPath = Join-Path $scriptRoot "fuzzer\benchmarking\summary.py"
+$pluginZipRoot = Join-Path $scriptRoot "web\applications\wordpress\_plugins"
 $webUrl = "http://localhost:8080/"
+$fuzzerService = "fuzzer-wordpress-plugin"
+$composeBaseArgs = @("docker", "compose", "-f", "docker-compose.yml")
 $supportedPlugins = @{
-    "show-all-comments-in-one-page" = "fuzzer-wordpress-plugin"
+    "show-all-comments-in-one-page" = @{ Category = "XSS"; Service = $fuzzerService; ZipFiles = @("show-all-comments-in-one-page.zip") }
+    "photo-gallery" = @{ Category = "SQLi"; Service = $fuzzerService; ZipFiles = @("photo-gallery.zip") }
+    "crm-perks-forms" = @{ Category = "XSS"; Service = $fuzzerService; ZipFiles = @("crm-perks-forms.zip") }
+    "seo-local-rank" = @{ Category = "PathTraversal"; Service = $fuzzerService; ZipFiles = @("seo-local-rank.zip") }
+    "totop-link" = @{ Category = "Deserialization"; Service = $fuzzerService; ZipFiles = @("totop-link.zip") }
+    "webp-converter-for-media" = @{ Category = "OpenRedirect"; Service = $fuzzerService; ZipFiles = @("webp-converter-for-media.zip") }
+}
+$selectedPlugins = @()
+foreach ($pluginName in $Plugins) {
+    $normalizedPlugin = [string]$pluginName
+    $normalizedPlugin = $normalizedPlugin.Trim()
+    if (-not $normalizedPlugin) {
+        continue
+    }
+    if (-not $supportedPlugins.ContainsKey($normalizedPlugin)) {
+        throw "Supported benchmark plugins: $($supportedPlugins.Keys -join ', '). Received unsupported plugin: $normalizedPlugin"
+    }
+    if ($selectedPlugins -notcontains $normalizedPlugin) {
+        $selectedPlugins += $normalizedPlugin
+    }
+}
+if ($selectedPlugins.Count -eq 0) {
+    throw "No plugins selected for benchmarking."
 }
 
-if (-not $supportedPlugins.ContainsKey($Plugin)) {
-    throw "This first benchmark pass only supports plugin '$($supportedPlugins.Keys -join "', '")'. Received: $Plugin"
-}
-
-$fuzzerService = $supportedPlugins[$Plugin]
 $benchmarkTimestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$benchmarkRoot = if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
+$benchmarkBaseRoot = if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
     $OutputRoot
 } else {
     Join-Path $scriptRoot $OutputRoot
 }
-$benchmarkRoot = Join-Path $benchmarkRoot "$benchmarkTimestamp-$Plugin"
 $originalScoringEnv = Get-Content -Path $scoringEnvPath -Raw
+$completedBenchmarkRoots = @()
 
 function Assert-PathExists {
     param(
@@ -42,6 +69,38 @@ function Assert-PathExists {
 
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Missing required file: $Path`n$Hint"
+    }
+}
+
+function Assert-PluginZipAssets {
+    param(
+        [string]$PluginSlug,
+        [hashtable]$PluginConfig
+    )
+
+    foreach ($zipFile in @($PluginConfig.ZipFiles)) {
+        $zipPath = Join-Path $pluginZipRoot $zipFile
+        if (-not (Test-Path -LiteralPath $zipPath)) {
+            throw "Missing plugin ZIP '$zipFile' for '$PluginSlug'. Download it into $pluginZipRoot before benchmarking."
+        }
+    }
+}
+
+function Get-ComposeArgs {
+    param([string]$OverridePath)
+
+    return @("docker", "compose", "-f", "docker-compose.yml", "-f", $OverridePath)
+}
+
+function Invoke-Compose {
+    param(
+        [string[]]$ComposeArgs,
+        [string[]]$AdditionalArgs
+    )
+
+    & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] @AdditionalArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "docker compose command failed: $($AdditionalArgs -join ' ')"
     }
 }
 
@@ -99,24 +158,30 @@ function Clear-LocalFuzzerOutput {
 }
 
 function Reset-ComposeState {
+    param(
+        [string[]]$ComposeArgs
+    )
+
     Write-Host "Resetting Docker Compose state"
-    docker compose down --volumes --remove-orphans
+    Invoke-Compose -ComposeArgs $ComposeArgs -AdditionalArgs @("down", "--volumes", "--remove-orphans")
 }
 
 function Get-ComposeContainerId {
     param(
+        [string[]]$ComposeArgs,
         [string]$ServiceName
     )
 
-    return (docker compose ps -q $ServiceName).Trim()
+    return (& $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] ps -q $ServiceName).Trim()
 }
 
 function Assert-ServiceRunning {
     param(
+        [string[]]$ComposeArgs,
         [string]$ServiceName
     )
 
-    $containerId = Get-ComposeContainerId -ServiceName $ServiceName
+    $containerId = Get-ComposeContainerId -ComposeArgs $ComposeArgs -ServiceName $ServiceName
     if (-not $containerId) {
         throw "Could not resolve container id for service '$ServiceName'."
     }
@@ -148,8 +213,10 @@ function Wait-ForFirstRequestArtifact {
 
 function Copy-RunArtifacts {
     param(
+        [string[]]$ComposeArgs,
         [string]$RunDir,
-        [string]$WebContainerId
+        [string]$WebContainerId,
+        [string]$FuzzerServiceName
     )
 
     $requestsDir = Join-Path $RunDir "requests"
@@ -167,11 +234,99 @@ function Copy-RunArtifacts {
     if ($LASTEXITCODE -eq 0) {
         docker cp "${WebContainerId}:/shared-tmpfs/hook-coverage/total_coverage.json" (Join-Path $RunDir "total_coverage.json") | Out-Null
     }
+
+    $fuzzerLogPath = Join-Path $RunDir "fuzzer.log"
+    $lines = & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] logs $FuzzerServiceName --tail=400
+    if ($LASTEXITCODE -eq 0) {
+        Set-Content -Path $fuzzerLogPath -Value $lines -Encoding UTF8
+    }
+}
+
+function Get-ActivePlugins {
+    param([string[]]$ComposeArgs)
+
+    $output = & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] exec -T web sh -lc "cd /var/www/html && ./wp-cli.phar plugin list --allow-root --status=active --field=name"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to read active plugins."
+    }
+    return @(
+        $output | Where-Object {
+            (-not [string]::IsNullOrWhiteSpace($_)) -and
+            ($_ -notmatch "Deprecated:") -and
+            ($_ -notmatch "Cannot load Zend OPcache")
+        }
+    )
+}
+
+function Get-ContainerEnvValue {
+    param(
+        [string[]]$ComposeArgs,
+        [string]$ServiceName,
+        [string]$VariableName
+    )
+
+    $value = & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] exec -T $ServiceName printenv $VariableName
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to read environment variable '$VariableName' from service '$ServiceName'."
+    }
+    return ($value | Select-Object -First 1).Trim()
+}
+
+function Assert-PluginRuntimeState {
+    param(
+        [string[]]$ComposeArgs,
+        [string]$PluginSlug,
+        [string]$FuzzerServiceName
+    )
+
+    $activePlugins = Get-ActivePlugins -ComposeArgs $ComposeArgs
+    if ($activePlugins -notcontains $PluginSlug) {
+        throw "Plugin '$PluginSlug' is not active after WordPress bootstrap."
+    }
+
+    $fuzzerConfig = Get-ContainerEnvValue -ComposeArgs $ComposeArgs -ServiceName $FuzzerServiceName -VariableName "FUZZER_CONFIG"
+    $expectedFuzzerConfig = "wordpress/$PluginSlug"
+    if ($fuzzerConfig -ne $expectedFuzzerConfig) {
+        throw "Expected FUZZER_CONFIG=$expectedFuzzerConfig but got '$fuzzerConfig'."
+    }
+
+    $webTargetPlugin = Get-ContainerEnvValue -ComposeArgs $ComposeArgs -ServiceName "web" -VariableName "WP_TARGET_PLUGIN"
+    if ($webTargetPlugin -ne $PluginSlug) {
+        throw "Expected WP_TARGET_PLUGIN=$PluginSlug but got '$webTargetPlugin'."
+    }
+
+    $coveragePath = Get-ContainerEnvValue -ComposeArgs $ComposeArgs -ServiceName "web" -VariableName "FUZZER_COVERAGE_PATH"
+    $expectedCoverageSuffix = "/wp-content/plugins/$PluginSlug/"
+    if (-not $coveragePath.EndsWith($expectedCoverageSuffix, [System.StringComparison]::Ordinal)) {
+        throw "Expected FUZZER_COVERAGE_PATH to end with '$expectedCoverageSuffix' but got '$coveragePath'."
+    }
+}
+
+function New-OverrideFile {
+    param(
+        [string]$PluginSlug,
+        [string]$FuzzerServiceName
+    )
+
+    $path = Join-Path $env:TEMP ("phuzz-benchmark-{0}.override.yml" -f $PluginSlug)
+    $content = @(
+        "services:"
+        "  web:"
+        "    environment:"
+        "      FUZZER_COVERAGE_PATH: /var/www/html/wp-content/plugins/$PluginSlug/"
+        "      WP_TARGET_PLUGIN: $PluginSlug"
+        "  ${FuzzerServiceName}:"
+        "    environment:"
+        "      FUZZER_CONFIG: wordpress/$PluginSlug"
+    )
+    Set-Content -LiteralPath $path -Value $content -Encoding ASCII
+    return $path
 }
 
 function Invoke-RunSummary {
     param(
         [string]$RunDir,
+        [string]$PluginSlug,
         [string]$ModeLabel,
         [int]$ModeValue,
         [int]$RunIndex,
@@ -181,7 +336,7 @@ function Invoke-RunSummary {
     $outputPath = Join-Path $RunDir "benchmark_summary.json"
     python $summaryCliPath summarize-run `
         --run-dir $RunDir `
-        --plugin $Plugin `
+        --plugin $PluginSlug `
         --mode-label $ModeLabel `
         --mode-value $ModeValue `
         --run-id $RunIndex `
@@ -201,7 +356,7 @@ function Invoke-BatchSummary {
 
 Assert-PathExists -Path $scoringEnvPath -Hint "Benchmarking needs the shared scoring env file."
 Assert-PathExists -Path $summaryCliPath -Hint "Benchmarking needs the Python summarizer."
-New-Item -ItemType Directory -Force -Path $benchmarkRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $benchmarkBaseRoot | Out-Null
 
 $modes = @(
     @{ Label = "PHUZZ"; Value = 1 },
@@ -213,50 +368,74 @@ try {
     docker compose version | Out-Null
     python --version | Out-Null
 
-    foreach ($mode in $modes) {
-        for ($runIndex = 1; $runIndex -le $RunsPerMode; $runIndex++) {
-            $modeLabel = [string]$mode.Label
-            $modeValue = [int]$mode.Value
-            $runName = "{0}-run-{1:d2}" -f $modeLabel, $runIndex
-            $runDir = Join-Path $benchmarkRoot $runName
-            New-Item -ItemType Directory -Force -Path $runDir | Out-Null
+    foreach ($pluginSlug in $selectedPlugins) {
+        $pluginConfig = $supportedPlugins[$pluginSlug]
+        Assert-PluginZipAssets -PluginSlug $pluginSlug -PluginConfig $pluginConfig
+        $pluginBenchmarkRoot = Join-Path $benchmarkBaseRoot "$benchmarkTimestamp-$pluginSlug"
+        $overridePath = New-OverrideFile -PluginSlug $pluginSlug -FuzzerServiceName $pluginConfig.Service
+        $composeArgs = Get-ComposeArgs -OverridePath $overridePath
+        New-Item -ItemType Directory -Force -Path $pluginBenchmarkRoot | Out-Null
 
-            Write-Host "=== Starting $runName ($Plugin, mode=$modeValue, ${RunMinutes}m) ==="
-            Set-ScoringMode -Mode $modeValue
-            Reset-ComposeState
-            Clear-LocalFuzzerOutput
+        try {
+            foreach ($mode in $modes) {
+                for ($runIndex = 1; $runIndex -le $RunsPerMode; $runIndex++) {
+                    $modeLabel = [string]$mode.Label
+                    $modeValue = [int]$mode.Value
+                    $runName = "{0}-run-{1:d2}" -f $modeLabel, $runIndex
+                    $runDir = Join-Path $pluginBenchmarkRoot $runName
+                    New-Item -ItemType Directory -Force -Path $runDir | Out-Null
 
-            Write-Host "Starting db and web"
-            docker compose up -d db web --build
-            Wait-ForWebReady -Url $webUrl -TimeoutSeconds $WebTimeoutSeconds
+                    Write-Host "=== Starting $runName ($pluginSlug, mode=$modeValue, ${RunMinutes}m) ==="
+                    Set-ScoringMode -Mode $modeValue
+                    Reset-ComposeState -ComposeArgs $composeArgs
+                    Clear-LocalFuzzerOutput
 
-            Write-Host "Starting fuzzer service $fuzzerService"
-            docker compose up -d $fuzzerService --build
-            Assert-ServiceRunning -ServiceName $fuzzerService
+                    Write-Host "Starting db and web for $pluginSlug"
+                    Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", "db", "web", "--build")
+                    Wait-ForWebReady -Url $webUrl -TimeoutSeconds $WebTimeoutSeconds
 
-            $webContainerId = Get-ComposeContainerId -ServiceName "web"
-            if (-not $webContainerId) {
-                throw "Could not resolve web container id."
+                    Write-Host "Starting fuzzer service $($pluginConfig.Service)"
+                    Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", $pluginConfig.Service, "--build")
+                    Assert-ServiceRunning -ComposeArgs $composeArgs -ServiceName $pluginConfig.Service
+                    Assert-PluginRuntimeState -ComposeArgs $composeArgs -PluginSlug $pluginSlug -FuzzerServiceName $pluginConfig.Service
+
+                    $webContainerId = Get-ComposeContainerId -ComposeArgs $composeArgs -ServiceName "web"
+                    if (-not $webContainerId) {
+                        throw "Could not resolve web container id."
+                    }
+
+                    Wait-ForFirstRequestArtifact -WebContainerId $webContainerId -TimeoutSeconds $FirstRequestTimeoutSeconds
+
+                    $benchmarkDeadline = (Get-Date).AddMinutes($RunMinutes)
+                    while ((Get-Date) -lt $benchmarkDeadline) {
+                        Assert-ServiceRunning -ComposeArgs $composeArgs -ServiceName $pluginConfig.Service
+                        Start-Sleep -Seconds 15
+                    }
+
+                    Copy-RunArtifacts -ComposeArgs $composeArgs -RunDir $runDir -WebContainerId $webContainerId -FuzzerServiceName $pluginConfig.Service
+                    Invoke-RunSummary -RunDir $runDir -PluginSlug $pluginSlug -ModeLabel $modeLabel -ModeValue $modeValue -RunIndex $runIndex -TimeBudgetSeconds ($RunMinutes * 60)
+                }
             }
 
-            Wait-ForFirstRequestArtifact -WebContainerId $webContainerId -TimeoutSeconds $FirstRequestTimeoutSeconds
-
-            $benchmarkDeadline = (Get-Date).AddMinutes($RunMinutes)
-            while ((Get-Date) -lt $benchmarkDeadline) {
-                Assert-ServiceRunning -ServiceName $fuzzerService
-                Start-Sleep -Seconds 15
+            Invoke-BatchSummary -BenchmarkRoot $pluginBenchmarkRoot
+            $completedBenchmarkRoots += $pluginBenchmarkRoot
+            Write-Host "Benchmark artifacts written to: $pluginBenchmarkRoot"
+        } finally {
+            if (Test-Path -LiteralPath $overridePath) {
+                Remove-Item -Force -LiteralPath $overridePath
             }
-
-            Copy-RunArtifacts -RunDir $runDir -WebContainerId $webContainerId
-            Invoke-RunSummary -RunDir $runDir -ModeLabel $modeLabel -ModeValue $modeValue -RunIndex $runIndex -TimeBudgetSeconds ($RunMinutes * 60)
         }
     }
-
-    Invoke-BatchSummary -BenchmarkRoot $benchmarkRoot
-    Write-Host "Benchmark artifacts written to: $benchmarkRoot"
 } finally {
     Set-Content -Path $scoringEnvPath -Value $originalScoringEnv -Encoding UTF8
     if ($TearDownAfterBenchmark) {
-        Reset-ComposeState
+        Reset-ComposeState -ComposeArgs $composeBaseArgs
+    }
+}
+
+if ($completedBenchmarkRoots.Count -gt 0) {
+    Write-Host "Completed benchmark roots:"
+    foreach ($path in $completedBenchmarkRoots) {
+        Write-Host " - $path"
     }
 }
