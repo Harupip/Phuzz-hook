@@ -261,6 +261,56 @@ class BenchmarkSummaryTests(unittest.TestCase):
         self.assertEqual(hook["median_requests_to_first_unique_vuln"], 455.0)
         self.assertEqual(hook["median_unique_vulns_found_after_30min"], 3.5)
 
+    def test_analyze_run_treats_missing_vulnerable_candidates_as_zero_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            run_dir = Path(tmp_dir)
+            requests_dir = run_dir / "requests"
+            requests_dir.mkdir()
+
+            request_payload = build_request_payload(
+                "190000_GET_wp-admin_admin-ajax_php_0001",
+                "2026-05-12 19:00:00",
+                "1778094000-run-1",
+                executed_callbacks={
+                    "cb-auth": {
+                        "callback_id": "cb-auth",
+                        "hook_name": "wp_ajax_demo",
+                    }
+                },
+            )
+            (requests_dir / "req-1.json").write_text(json.dumps(request_payload), encoding="utf-8")
+
+            fuzzer_output = run_dir / "fuzzer-output"
+            fuzzer_output.mkdir()
+            (fuzzer_output / "exceptions-and-errors.json").write_text("{}", encoding="utf-8")
+            (run_dir / "total_coverage.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "total_registered_callbacks": 1,
+                            "total_executed_callbacks": 1,
+                        },
+                        "data": {
+                            "blindspot_callbacks": {},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = analyze_run(
+                run_dir,
+                plugin="udraw",
+                mode_label="PHUZZ",
+                mode_value=1,
+                run_id=1,
+                time_budget_seconds=600,
+            )
+
+        self.assertEqual(summary["unique_vulns_found_after_30min"], 0)
+        self.assertEqual(summary["unique_vuln_signatures"], [])
+        self.assertEqual(summary["notes"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -443,16 +443,19 @@ class Fuzzer:
 
 
     def calculate_score(self, candidate):
+        # Outer wrapper: the fuzz loop calls this after coverage is collected.
         score = self.scoring_formula.calculate_score(candidate)
         candidate.score = score
         return score
 
     def calculate_priority(self, candidate):
+        # Outer wrapper: queue ordering uses the priority written here.
         priority = self.scoring_formula.calculate_priority(candidate)
         candidate.priority = priority
         return priority
 
     def calculate_energy(self, c):
+        # Outer wrapper: after parent selection, delegate to the scoring formula for the final mutate budget.
         return self.scoring_formula.calculate_energy(c)
 
     def cleanup(self, candidate):
@@ -768,8 +771,10 @@ class Fuzzer:
             candidate_hash = candidate.get_params_hash()
             #print("Candidate priority / score: ", candidate.priority, candidate.score, candidate_hash, candidate.fuzz_params)
 
+            # This is the handoff from score/priority land into scheduler budget.
             energy = self.calculate_energy(candidate)
             #print(energy)
+            # This loop is where integer `energy` becomes actual mutation attempts.
             for i in range(energy):
                 if os.path.exists("/sync-tmpfs/vuln_found"):
                     sys.exit(1337)
