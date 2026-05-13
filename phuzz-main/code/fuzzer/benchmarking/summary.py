@@ -247,7 +247,8 @@ def analyze_run(
     run_path = Path(run_dir)
     requests_dir = run_path / "requests"
     fuzzer_output_dir = run_path / "fuzzer-output"
-    vulnerable_payload = _load_json(fuzzer_output_dir / "vulnerable-candidates.json")
+    vulnerable_candidates_path = fuzzer_output_dir / "vulnerable-candidates.json"
+    vulnerable_payload = _load_json(vulnerable_candidates_path)
     total_coverage_payload = _load_json(run_path / "total_coverage.json")
 
     notes: list[str] = []
@@ -266,8 +267,14 @@ def analyze_run(
     if first_request_timestamp is not None:
         cutoff_timestamp = first_request_timestamp.timestamp() + int(time_budget_seconds)
 
+    has_other_fuzzer_output = fuzzer_output_dir.exists() and any(
+        child.is_file() for child in fuzzer_output_dir.iterdir()
+    )
     if not isinstance(vulnerable_payload, dict):
-        notes.append("missing vulnerable-candidates.json")
+        if vulnerable_candidates_path.exists():
+            notes.append("invalid vulnerable-candidates.json")
+        elif not has_other_fuzzer_output:
+            notes.append("missing vulnerable-candidates.json")
         vulnerable_payload = {}
 
     vulnerability_rows = _flatten_vulnerabilities(vulnerable_payload, request_records_by_coverage_id)

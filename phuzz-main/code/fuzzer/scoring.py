@@ -159,6 +159,7 @@ DEFAULT_HOOK_MIN_ENERGY_SCALE = _env_int("FUZZER_HOOK_MIN_ENERGY_SCALE", 4)
 
 class PhuzzScoringFormula(ScoringFormula):
     def calculate_score(self, candidate):
+        # Innermost PHUZZ score calculation. `Fuzzer.calculate_score()` delegates here.
         hit_counter=0
         debug_enabled = _score_debug_enabled()
         for path in candidate.new_paths:
@@ -183,12 +184,14 @@ class PhuzzScoringFormula(ScoringFormula):
         return score
 
     def calculate_priority(self, candidate):
+        # Priority stays close to score in plain PHUZZ. `ff_choose_next()` later reads this value.
         priority = self.calculate_score(candidate)
         candidate.base_priority = priority
         candidate.priority = priority
         return priority
 
     def calculate_energy(self, candidate):
+        # Innermost PHUZZ base-energy calculation. The scheduler later spends it in `for i in range(energy)`.
         current_score = getattr(candidate, "score", None)
         if current_score is None or (current_score == 0 and (candidate.paths or candidate.new_paths)):
             current_score = self.calculate_score(candidate)
@@ -239,6 +242,7 @@ class PhuzzHookScoringFormula(PhuzzScoringFormula):
     def calculate_priority(self, candidate):
         from hook_energy.integration import apply_hook_priority_bonus
 
+        # Hook-aware priority starts from plain PHUZZ priority, then overlays hook feedback.
         base_priority = super().calculate_priority(candidate)
         self._apply_hook_report(candidate)
         final_priority = apply_hook_priority_bonus(
@@ -253,6 +257,7 @@ class PhuzzHookScoringFormula(PhuzzScoringFormula):
     def calculate_energy(self, candidate):
         from hook_energy.integration import apply_hook_energy_bonus
 
+        # Hook-aware energy starts from plain PHUZZ energy, then blends in `hook_energy`.
         base_energy = super().calculate_energy(candidate)
         self._apply_hook_report(candidate)
         final_energy = apply_hook_energy_bonus(
@@ -273,6 +278,7 @@ class DefaultScoringFormula(ScoringFormula):
     def __init__(self, mode=None, requests_dir=None, priority_weight=None, energy_weight=None, min_hook_scale=None):
         # Keep selector logic narrow here so the old/new scoring split stays easy
         # to audit from this file alone.
+        # `Fuzzer.__init__()` instantiates this selector once and all outer wrappers delegate to it.
         self.mode = ACTIVE_SCORING_MODE if mode is None else int(mode)
         if self.mode == SCORING_MODE_PHUZZ:
             self._formula = PhuzzScoringFormula()

@@ -28,8 +28,12 @@ $fuzzerService = "fuzzer-wordpress-plugin"
 $composeBaseArgs = @("docker", "compose", "-f", "docker-compose.yml")
 $supportedPlugins = @{
     "show-all-comments-in-one-page" = @{ Category = "XSS"; Service = $fuzzerService; ZipFiles = @("show-all-comments-in-one-page.zip") }
+    "ubigeo-peru" = @{ Category = "SQLi"; Service = $fuzzerService; ZipFiles = @("ubigeo-peru.zip") }
     "photo-gallery" = @{ Category = "SQLi"; Service = $fuzzerService; ZipFiles = @("photo-gallery.zip") }
+    "udraw" = @{ Category = "PathTraversal"; Service = $fuzzerService; ZipFiles = @("udraw.zip", "woocommerce.zip") }
     "crm-perks-forms" = @{ Category = "XSS"; Service = $fuzzerService; ZipFiles = @("crm-perks-forms.zip") }
+    "joomsport-sports-league-results-management" = @{ Category = "Deserialization"; Service = $fuzzerService; ZipFiles = @("joomsport-sports-league-results-management.zip") }
+    "phastpress" = @{ Category = "OpenRedirect"; Service = $fuzzerService; ZipFiles = @("phastpress.zip") }
     "seo-local-rank" = @{ Category = "PathTraversal"; Service = $fuzzerService; ZipFiles = @("seo-local-rank.zip") }
     "totop-link" = @{ Category = "Deserialization"; Service = $fuzzerService; ZipFiles = @("totop-link.zip") }
     "webp-converter-for-media" = @{ Category = "OpenRedirect"; Service = $fuzzerService; ZipFiles = @("webp-converter-for-media.zip") }
