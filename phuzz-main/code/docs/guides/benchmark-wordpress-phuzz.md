@@ -7,10 +7,15 @@ Tai lieu nay mo ta benchmark moi de so sanh:
 
 Scope hien tai:
 
-- Chay `30 phut / run`
-- `1 plugin` truoc: `show-all-comments-in-one-page`
+- Chay benchmark theo plugin WordPress bang override Compose tam thoi
 - Runner tu dong chay ca `PHUZZ` va `HOOK`
 - Moi mode mac dinh `5 runs`
+- Lenh mac dinh benchmark `5` plugin dai dien:
+  - `photo-gallery`
+  - `crm-perks-forms`
+  - `seo-local-rank`
+  - `totop-link`
+  - `webp-converter-for-media`
 
 ## 1. Muc tieu benchmark
 
@@ -41,16 +46,18 @@ Day la host-side runner de chay benchmark.
 No lam cac viec sau cho tung run:
 
 1. Dat `PHUZZ_SCORING_MODE` trong `fuzzer/scoring.env`
-2. `docker compose down --volumes --remove-orphans`
-3. Xoa `fuzzer/output/fuzzer-1`
-4. Start lai `db` va `web`
-5. Doi `http://localhost:8080/` tra `200`
-6. Start fuzzer service
-7. Doi request fuzz dau tien xuat hien trong `/shared-tmpfs/hook-coverage/requests`
-8. Bat dau cua so do `30 phut`
-9. Sau khi het thoi gian, copy artifact ve local
-10. Goi Python summarizer de tinh metric cho run do
-11. Sau khi xong tat ca runs, gom batch summary JSON/CSV
+2. Tao Compose override tam thoi theo plugin
+3. `docker compose down --volumes --remove-orphans`
+4. Xoa `fuzzer/output/fuzzer-1`
+5. Start lai `db` va `web`
+6. Doi `http://localhost:8080/` tra `200`
+7. Verify plugin active, `WP_TARGET_PLUGIN`, `FUZZER_COVERAGE_PATH`
+8. Start fuzzer service va verify `FUZZER_CONFIG`
+9. Doi request fuzz dau tien xuat hien trong `/shared-tmpfs/hook-coverage/requests`
+10. Bat dau cua so do benchmark
+11. Sau khi het thoi gian, copy artifact ve local
+12. Goi Python summarizer de tinh metric cho run do
+13. Sau khi xong tat ca runs cua tung plugin, gom batch summary JSON/CSV
 
 Luu y:
 
@@ -190,10 +197,10 @@ Mac dinh output root:
 fuzzer/output/benchmarks/
 ```
 
-Moi dot benchmark se tao:
+Moi plugin benchmark se tao:
 
 ```text
-fuzzer/output/benchmarks/<timestamp>-show-all-comments-in-one-page/
+fuzzer/output/benchmarks/<timestamp>-<plugin>/
 ```
 
 Ben trong moi run:
@@ -227,32 +234,52 @@ Lenh mac dinh:
 Lenh ro rang hon:
 
 ```powershell
-.\benchmark-wordpress-phuzz.ps1 -RunsPerMode 5 -RunMinutes 30
+.\benchmark-wordpress-phuzz.ps1 -RunsPerMode 1 -RunMinutes 10
+```
+
+Chi benchmark mot plugin:
+
+```powershell
+.\benchmark-wordpress-phuzz.ps1 -Plugins photo-gallery -RunsPerMode 1 -RunMinutes 10
+```
+
+Benchmark nhieu plugin cu the:
+
+```powershell
+.\benchmark-wordpress-phuzz.ps1 -Plugins photo-gallery,crm-perks-forms,seo-local-rank,totop-link,webp-converter-for-media -RunsPerMode 1 -RunMinutes 10
 ```
 
 Neu muon compose down sau khi chay xong:
 
 ```powershell
-.\benchmark-wordpress-phuzz.ps1 -RunsPerMode 5 -RunMinutes 30 -TearDownAfterBenchmark
+.\benchmark-wordpress-phuzz.ps1 -Plugins photo-gallery -RunsPerMode 1 -RunMinutes 10 -TearDownAfterBenchmark
 ```
 
 ## 8. Script nay hien tai support gi
 
-Hien tai script chi support plugin:
+Hien tai script support cac plugin benchmark:
 
 ```text
 show-all-comments-in-one-page
+photo-gallery
+crm-perks-forms
+seo-local-rank
+totop-link
+webp-converter-for-media
 ```
 
-Ly do:
+Runner khong sua tay `docker-compose.yml`.
 
-- `docker-compose.yml` hien tai dang hard-code service va target plugin cho case nay
-- runner dang map plugin -> fuzzer service bang bang nho trong script
+No tao file override tam thoi de doi:
 
-Muon mo rong them plugin, can them it nhat:
+- `web.environment.WP_TARGET_PLUGIN`
+- `web.environment.FUZZER_COVERAGE_PATH`
+- `fuzzer-wordpress-plugin.environment.FUZZER_CONFIG`
 
-- plugin -> service mapping trong `scripts/benchmarks/benchmark-wordpress-phuzz.ps1`
-- compose/runtime tuong ung cho plugin do
+Neu muon mo rong them plugin, can them it nhat:
+
+- plugin metadata trong `scripts/benchmarks/benchmark-wordpress-phuzz.ps1`
+- verify plugin da smoke-pass tren matrix truoc khi benchmark dai
 
 ## 9. Cac thay doi toi da them trong benchmark pass nay
 
@@ -274,16 +301,15 @@ Nhung file nay khong phai thay doi benchmark cua toi, nhung runner co doc/dua va
 
 Benchmark nay chua:
 
-- tu dong doi plugin qua nhieu target WordPress
 - tu dong phan loai false positive / instrumentation noise nang hon schema dedupe hien tai
 - tu dong freeze seed corpus hay request budget theo `N request`
 - tu dong xuat bang markdown bao cao cuoi cung
 
 No hien tai tap trung vao:
 
-- 1 plugin
+- mot nhom plugin dai dien
 - 2 modes
-- 30 phut / run
+- so phut benchmark do nguoi chay chon, vi du `10 phut / mode / plugin`
 - artifact ro rang cho tung run
 - dedupe on dinh de so sanh giua baseline va hook-aware
 - median aggregation de giam noise
@@ -303,7 +329,7 @@ Da verify PowerShell script parse OK truoc khi ket luan implementation xong.
 Mo file:
 
 ```text
-fuzzer/output/benchmarks/<timestamp>-show-all-comments-in-one-page/benchmark_results.csv
+fuzzer/output/benchmarks/<timestamp>-<plugin>/benchmark_results.csv
 ```
 
 Bang nay se co dang:
