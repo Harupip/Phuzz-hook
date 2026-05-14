@@ -79,9 +79,19 @@ class HookEnergyTracker:
     def __init__(self, requests_dir: str, state: Optional[HookEnergyDemoState] = None) -> None:
         self.requests_dir = Path(requests_dir)
         self.state = state or HookEnergyDemoState()
+        self.current_max_energy_scale = 1
         self._indexed_request_files: set[str] = set()
         self._coverage_payloads: dict[str, tuple[dict, str]] = {}
         self._cached_reports_by_request_id: dict[str, RequestEnergyReport] = {}
+
+    def remember_max_energy_scale(self, base_energy: int, min_hook_scale: int) -> int:
+        base = max(1, int(base_energy))
+        self.current_max_energy_scale = max(
+            self.current_max_energy_scale,
+            max(1, int(min_hook_scale)),
+            base,
+        )
+        return self.current_max_energy_scale
 
     def consume_candidate(self, coverage_id: str) -> Optional[RequestEnergyReport]:
         if not coverage_id:

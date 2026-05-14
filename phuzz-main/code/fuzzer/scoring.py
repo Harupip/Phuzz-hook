@@ -260,11 +260,15 @@ class PhuzzHookScoringFormula(PhuzzScoringFormula):
         # Hook-aware energy starts from plain PHUZZ energy, then blends in `hook_energy`.
         base_energy = super().calculate_energy(candidate)
         self._apply_hook_report(candidate)
+        remembered_energy_scale = self.tracker.remember_max_energy_scale(
+            base_energy,
+            self.min_hook_scale,
+        )
         final_energy = apply_hook_energy_bonus(
             base_energy,
             candidate.hook_energy,
             self.energy_weight,
-            self.min_hook_scale,
+            remembered_energy_scale,
         )
         # Keep both numbers for debug output:
         # - `base_energy` shows original PHUZZ queue energy

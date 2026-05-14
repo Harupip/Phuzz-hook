@@ -150,6 +150,51 @@ class ScoringModeTests(unittest.TestCase):
             self.assertEqual(candidate.hook_energy, 1.0)
             self.assertEqual(candidate.hook_energy_avg, 1.0)
 
+    def test_hook_mode_keeps_max_energy_scale_across_candidates_in_same_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            first_payload = build_request_payload(
+                "req-hook-1",
+                "cov-hook-1",
+                executed_callbacks={
+                    "cb-1": {
+                        "callback_id": "cb-1",
+                        "hook_name": "wp_ajax_sac_post_type_call",
+                        "callback_repr": "sac_post_type_call_callback",
+                        "executed_count": 1,
+                    }
+                },
+            )
+            second_payload = build_request_payload(
+                "req-hook-2",
+                "cov-hook-2",
+                executed_callbacks={
+                    "cb-1": {
+                        "callback_id": "cb-1",
+                        "hook_name": "wp_ajax_sac_post_type_call",
+                        "callback_repr": "sac_post_type_call_callback",
+                        "executed_count": 1,
+                    }
+                },
+            )
+            (Path(tmp_dir) / "req-hook-1.json").write_text(json.dumps(first_payload), encoding="utf-8")
+            (Path(tmp_dir) / "req-hook-2.json").write_text(json.dumps(second_payload), encoding="utf-8")
+
+            formula = DefaultScoringFormula(
+                mode=SCORING_MODE_PHUZZ_HOOK,
+                requests_dir=tmp_dir,
+                energy_weight=0.5,
+            )
+            first_candidate = build_child_candidate(coverage_id="cov-hook-1", parent_score=6)
+            second_candidate = build_child_candidate(coverage_id="cov-hook-2", parent_score=2)
+
+            self.assertEqual(formula.calculate_energy(first_candidate), 6)
+            self.assertEqual(first_candidate.base_energy, 6)
+            self.assertEqual(first_candidate.hook_energy, 1.0)
+
+            self.assertEqual(formula.calculate_energy(second_candidate), 3)
+            self.assertEqual(second_candidate.base_energy, 2)
+            self.assertEqual(second_candidate.hook_energy, 0.5)
+
     def test_phuzz_mode_emits_score_debug_when_enabled(self) -> None:
         formula = DefaultScoringFormula(mode=SCORING_MODE_PHUZZ)
         candidate = build_child_candidate(coverage_id="cov-debug")
