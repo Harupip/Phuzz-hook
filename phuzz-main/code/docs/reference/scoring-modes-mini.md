@@ -89,6 +89,25 @@ Sua file `phuzz-main/code/fuzzer/scoring.env`:
 PHUZZ_SCORING_MODE=2
 ```
 
+## Benchmark mode moi
+
+Benchmark runner khong sua truc tiep `scoring.env` nua. No inject env bang
+Compose override cho tung mode:
+
+- `PHUZZ_RAW`: `PHUZZ_SCORING_MODE=1`, `FUZZER_ENABLE_UOPZ=0`.
+- `PHUZZ_TRACE`: `PHUZZ_SCORING_MODE=1`, `FUZZER_ENABLE_UOPZ=1`.
+- `HOOK_TRACE`: `PHUZZ_SCORING_MODE=2`, `FUZZER_ENABLE_UOPZ=1`.
+- `HOOK_FAST`: trace truoc bang `HOOK_TRACE`, export seed, sau do chay fast
+  phase voi `PHUZZ_SCORING_MODE=1`, `FUZZER_ENABLE_UOPZ=0`, va
+  `FUZZER_CONFIG_FILE=/app/output/.../hook-fast-config.json`.
+
+Khac biet quan trong:
+
+- `PHUZZ_RAW` moi la toc do PHUZZ goc khong co overhead UOPZ.
+- `PHUZZ_TRACE` giu PHUZZ scoring nhung bat UOPZ de co hook coverage curve.
+- `HOOK_TRACE` dung hook-aware scoring va bat UOPZ full-time.
+- `HOOK_FAST` dung hook discovery nhu pha khoi dong, roi tat UOPZ de lay EPS cao hon.
+
 Neu muon quay ve PHUZZ goc:
 
 ```env
@@ -124,6 +143,13 @@ PHUZZ_SCORING_MODE=2
 - `PHUZZ_SCORE_DEBUG`
   - mac dinh: `0`
   - `1` de in log chi tiet khi `calculate_score()` dem path/line
+- `FUZZER_CONFIG_FILE`
+  - optional
+  - neu set, fuzzer doc config JSON tu path nay thay vi `fuzzer/configs/<FUZZER_CONFIG>.json`
+  - dung cho `HOOK_FAST` generated config
+- `PHUZZ_WRITE_REQUEST_EVENTS`
+  - mac dinh: `1`
+  - ghi `fuzzer/output/fuzzer-<id>/request-events.jsonl` de tinh EPS ca khi UOPZ tat
 
 ## Ghi chu quan trong
 

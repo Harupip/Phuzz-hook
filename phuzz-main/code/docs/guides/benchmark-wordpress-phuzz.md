@@ -1,9 +1,43 @@
-# Benchmark WordPress PHUZZ 30-Phut
+# Benchmark WordPress PHUZZ
+
+## Long-run update
+
+Benchmark nay khong con xem `30 phut` la cua so ket luan chinh. `20-30 phut`
+chi nen dung de smoke/discovery: Docker da on dinh, request artifacts duoc ghi,
+summary co EPS, va hook registry co du lieu. De danh gia fuzzing campaign, dung
+`4-6 gio` cho pilot va `12-24 gio` cho moi target khi can bang chung paper-quality.
+
+Runner hien co bon mode:
+
+- `PHUZZ_RAW`: PHUZZ goc, `PHUZZ_SCORING_MODE=1`, `FUZZER_ENABLE_UOPZ=0`.
+- `PHUZZ_TRACE`: PHUZZ goc nhung bat UOPZ de do coverage curve, `PHUZZ_SCORING_MODE=1`.
+- `HOOK_TRACE`: Hook-aware scoring va UOPZ bat full-time, `PHUZZ_SCORING_MODE=2`.
+- `HOOK_FAST`: trace bang UOPZ trong `-TraceMinutes`, export seed, sau do tat UOPZ va fuzz nhanh bang `FUZZER_CONFIG_FILE`.
+
+Ly do tach `PHUZZ_RAW` va `PHUZZ_TRACE`: neu PHUZZ baseline van bat UOPZ thi ta chi
+do algorithm trong moi truong cham, chua do toc do PHUZZ goc. EPS phai doc theo
+mode:
+
+- `PHUZZ_RAW` la moc toc do brute-force that.
+- `PHUZZ_TRACE / HOOK_TRACE` cho overhead cua UOPZ.
+- `HOOK_FAST` cho chien thuat hai pha `Tracing -> Fast Fuzzing`.
+
+Moi run ghi them:
+
+- `run_manifest.json`
+- `coverage_timeline.json`
+- `coverage_timeline.csv`
+- `benchmark_summary.json`
+
+`benchmark_summary.json` giu alias cu `unique_vulns_found_after_30min`, nhung metric
+chinh moi la `unique_vulns_found_within_budget`.
 
 Tai lieu nay mo ta benchmark moi de so sanh:
 
-- `PHUZZ_SCORING_MODE=1` -> baseline PHUZZ
-- `PHUZZ_SCORING_MODE=2` -> PHUZZ + hook coverage
+- `PHUZZ_RAW` -> baseline PHUZZ, khong UOPZ
+- `PHUZZ_TRACE` -> baseline PHUZZ, co UOPZ de do hook coverage
+- `HOOK_TRACE` -> PHUZZ + hook coverage
+- `HOOK_FAST` -> trace ngan, seed export, roi fuzz nhanh khong UOPZ
 
 Scope hien tai:
 
@@ -27,13 +61,17 @@ Chi so chinh:
 - `requests_to_first_unique_vuln`
 - `time_to_3_unique_vulns_seconds`
 - `requests_to_3_unique_vulns`
-- `unique_vulns_found_after_30min`
+- `unique_vulns_found_within_budget`
 - `requests_per_unique_vuln`
+- `requests_per_second`
+- `requests_per_minute`
 
 Chi so phu:
 
 - `unique_executed_callbacks`
 - `blindspots_reduced`
+- `hook_signal_request_ratio`
+- `uopz_overhead_ratio` trong aggregate JSON khi co `PHUZZ_RAW`
 
 Ket qua tong hop giua nhieu run dung `median`, khong dung average don thuan, vi fuzzing rat nhieu noise.
 
@@ -249,6 +287,18 @@ Benchmark nhieu plugin cu the:
 .\benchmark-wordpress-phuzz.ps1 -Plugins photo-gallery,crm-perks-forms,seo-local-rank,totop-link,webp-converter-for-media -RunsPerMode 1 -RunMinutes 10
 ```
 
+Sanity long-run mode:
+
+```powershell
+.\benchmark-wordpress-phuzz.ps1 -Plugins photo-gallery,crm-perks-forms -RunsPerMode 1 -RunMinutes 10 -Modes PHUZZ_RAW,PHUZZ_TRACE,HOOK_TRACE
+```
+
+Pilot 6 gio:
+
+```powershell
+.\benchmark-wordpress-phuzz.ps1 -Plugins crm-perks-forms,photo-gallery -RunsPerMode 1 -RunHours 6 -Modes PHUZZ_RAW,PHUZZ_TRACE,HOOK_TRACE,HOOK_FAST -TraceMinutes 20 -FastSeedLimit 5
+```
+
 Neu muon compose down sau khi chay xong:
 
 ```powershell
@@ -337,11 +387,15 @@ Bang nay se co dang:
 - `plugin`
 - `mode`
 - `run`
+- `total_requests`
+- `requests_per_second`
+- `requests_per_minute`
 - `time_to_first_unique_vuln_seconds`
 - `requests_to_first_unique_vuln`
 - `time_to_3_unique_vulns_seconds`
 - `requests_to_3_unique_vulns`
-- `unique_vulns_found_after_30min`
+- `unique_vulns_found_within_budget`
+- `unique_vulns_found_after_30min` (compat alias)
 - `requests_per_unique_vuln`
 - `unique_executed_callbacks`
 - `blindspots_reduced`

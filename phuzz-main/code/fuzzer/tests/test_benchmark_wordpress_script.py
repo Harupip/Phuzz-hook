@@ -55,6 +55,32 @@ class BenchmarkWordPressScriptTests(unittest.TestCase):
             ["udraw.zip", "woocommerce.zip"],
         )
 
+    def test_runner_defines_long_run_mode_matrix_without_mutating_scoring_env(self) -> None:
+        script_text = SCRIPT_PATH.read_text(encoding="utf-8")
+
+        for mode_name in ("PHUZZ_RAW", "PHUZZ_TRACE", "HOOK_TRACE", "HOOK_FAST"):
+            self.assertIn(mode_name, script_text)
+
+        self.assertNotIn("function Set-ScoringMode", script_text)
+        self.assertNotIn("$originalScoringEnv", script_text)
+        self.assertIn("FUZZER_ENABLE_UOPZ", script_text)
+        self.assertIn("PHUZZ_SCORING_MODE", script_text)
+
+    def test_runner_exposes_long_run_and_hook_fast_parameters(self) -> None:
+        script_text = SCRIPT_PATH.read_text(encoding="utf-8")
+
+        for parameter_name in ("RunHours", "BucketMinutes", "TraceMinutes", "FastSeedLimit"):
+            self.assertRegex(script_text, rf"\${parameter_name}\b")
+
+        self.assertIn("run_manifest.json", script_text)
+        self.assertIn("hook_gap_report.json", script_text)
+        self.assertIn("FUZZER_CONFIG_FILE", script_text)
+
+    def test_runner_accepts_comma_separated_selection_values(self) -> None:
+        script_text = SCRIPT_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('([string]$value).Split(",")', script_text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -311,6 +311,128 @@ class BenchmarkSummaryTests(unittest.TestCase):
         self.assertEqual(summary["unique_vuln_signatures"], [])
         self.assertEqual(summary["notes"], "")
 
+    def test_analyze_run_reports_scheduler_diagnostics_and_target_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            run_dir = Path(tmp_dir)
+            requests_dir = run_dir / "requests"
+            requests_dir.mkdir()
+
+            direct_request = build_request_payload(
+                "190000_GET_plugin_file_0001",
+                "2026-05-12 19:00:00",
+                "1778094000-run-1",
+                executed_callbacks={},
+            )
+            direct_request["http_target"] = "/wp-content/plugins/demo/vulnerable.php"
+            direct_request["request_params"]["headers"]["X-FUZZER-COVID"] = "1778094000-run-1"
+            (requests_dir / "req-1.json").write_text(json.dumps(direct_request), encoding="utf-8")
+
+            fuzzer_output = run_dir / "fuzzer-output"
+            fuzzer_output.mkdir()
+            decisions = [
+                {
+                    "coverage_id": "1778094000-run-1",
+                    "base_energy": 1,
+                    "final_energy": 4,
+                    "hook_energy": 1.0,
+                },
+                {
+                    "coverage_id": "1778094001-run-2",
+                    "base_energy": 3,
+                    "final_energy": 2,
+                    "hook_energy": 0.0,
+                },
+            ]
+            (fuzzer_output / "hook-energy-decisions.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in decisions) + "\n",
+                encoding="utf-8",
+            )
+            (fuzzer_output / "exceptions-and-errors.json").write_text("{}", encoding="utf-8")
+            (run_dir / "total_coverage.json").write_text(
+                json.dumps({"metadata": {"total_registered_callbacks": 0}, "data": {"blindspot_callbacks": {}}}),
+                encoding="utf-8",
+            )
+
+            summary = analyze_run(
+                run_dir,
+                plugin="demo",
+                mode_label="HOOK",
+                mode_value=2,
+                run_id=1,
+                time_budget_seconds=600,
+            )
+
+        self.assertEqual(summary["target_surface"], "direct-file")
+        self.assertTrue(summary["low_hook_signal"])
+        self.assertEqual(summary["scheduler_decisions"], 2)
+        self.assertEqual(summary["scheduler_decisions_with_hook_energy"], 1)
+        self.assertEqual(summary["scheduler_decisions_with_hook_energy_ratio"], 0.5)
+        self.assertEqual(summary["median_energy_delta"], 1.0)
+        self.assertEqual(summary["max_energy_delta"], 3)
+
+    def test_analyze_run_falls_back_to_fuzzer_request_events_and_builds_timeline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            run_dir = Path(tmp_dir)
+            fuzzer_output = run_dir / "fuzzer-output"
+            fuzzer_output.mkdir()
+
+            events = [
+                {
+                    "timestamp": "2026-05-12T19:00:00",
+                    "coverage_id": "1778094000-run-1",
+                    "http_method": "GET",
+                    "http_target": "http://web/wp-admin/admin-ajax.php",
+                    "status_code": 200,
+                },
+                {
+                    "timestamp": "2026-05-12T19:04:59",
+                    "coverage_id": "1778094299-run-2",
+                    "http_method": "GET",
+                    "http_target": "http://web/wp-admin/admin-ajax.php",
+                    "status_code": 200,
+                },
+                {
+                    "timestamp": "2026-05-12T19:05:00",
+                    "coverage_id": "1778094300-run-3",
+                    "http_method": "GET",
+                    "http_target": "http://web/wp-admin/admin-ajax.php",
+                    "status_code": 500,
+                },
+            ]
+            (fuzzer_output / "request-events.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in events) + "\n",
+                encoding="utf-8",
+            )
+            vulnerable = {
+                "WebFuzzXSSVulnCheck": [
+                    build_candidate("1778094300-run-3", "fuzz-fast", errline=777),
+                ]
+            }
+            (fuzzer_output / "vulnerable-candidates.json").write_text(
+                json.dumps(vulnerable),
+                encoding="utf-8",
+            )
+
+            summary = analyze_run(
+                run_dir,
+                plugin="photo-gallery",
+                mode_label="PHUZZ_RAW",
+                mode_value=1,
+                run_id=1,
+                time_budget_seconds=600,
+                bucket_minutes=5,
+            )
+
+        self.assertEqual(summary["total_requests"], 3)
+        self.assertEqual(summary["unique_vulns_found_within_budget"], 1)
+        self.assertEqual(summary["unique_vulns_found_after_30min"], 1)
+        self.assertAlmostEqual(summary["requests_per_second"], 3 / 600)
+        self.assertAlmostEqual(summary["requests_per_minute"], 0.3)
+        self.assertEqual(len(summary["coverage_timeline"]), 2)
+        self.assertEqual(summary["coverage_timeline"][0]["requests"], 2)
+        self.assertEqual(summary["coverage_timeline"][1]["requests"], 1)
+        self.assertEqual(summary["coverage_timeline"][1]["unique_vulns"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

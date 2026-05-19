@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import statistics
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -15,9 +16,18 @@ def _parse_timestamp(raw_value: Any) -> datetime | None:
     if not raw_value:
         return None
 
+    if isinstance(raw_value, (int, float)):
+        return datetime.fromtimestamp(float(raw_value), tz=timezone.utc).replace(tzinfo=None)
+
     value = str(raw_value).strip()
     if not value:
         return None
+
+    try:
+        if value.replace(".", "", 1).isdigit():
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).replace(tzinfo=None)
+    except (OSError, OverflowError, ValueError):
+        pass
 
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
         try:
@@ -77,9 +87,101 @@ def _extract_executed_callback_ids(request_payload: dict[str, Any]) -> set[str]:
     return set()
 
 
-def _load_request_records(requests_dir: Path) -> list[dict[str, Any]]:
-    if not requests_dir.exists():
+def _request_target_path(record: dict[str, Any]) -> str:
+    payload = record.get("payload", {})
+    if not isinstance(payload, dict):
+        return ""
+    target = str(payload.get("http_target", "")).strip()
+    parsed = urlparse(target)
+    return parsed.path or target
+
+
+def _classify_target_surface(request_records: list[dict[str, Any]]) -> str:
+    if not request_records:
+        return "unknown"
+
+    direct_count = 0
+    mediated_count = 0
+    for record in request_records:
+        path = _request_target_path(record)
+        if path.startswith("/wp-content/plugins/"):
+            direct_count += 1
+        elif path:
+            mediated_count += 1
+
+    if direct_count > 0 and direct_count >= mediated_count:
+        return "direct-file"
+    return "wordpress-mediated"
+
+
+def _load_scheduler_decisions(run_path: Path) -> list[dict[str, Any]]:
+    candidates = [
+        run_path / "fuzzer-output" / "hook-energy-decisions.jsonl",
+        run_path / "hook-energy-decisions.jsonl",
+    ]
+    path = next((item for item in candidates if item.exists()), None)
+    if path is None:
         return []
+
+    records: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            records.append(payload)
+    return records
+
+
+def _energy_delta(decision: dict[str, Any]) -> int | None:
+    try:
+        return int(decision.get("final_energy")) - int(decision.get("base_energy"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_fuzzer_request_event_records(fuzzer_output_dir: Path) -> list[dict[str, Any]]:
+    path = fuzzer_output_dir / "request-events.jsonl"
+    if not path.exists():
+        return []
+
+    records: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        records.append(
+            {
+                "request_id": str(payload.get("request_id") or payload.get("coverage_id") or path.stem),
+                "coverage_id": str(payload.get("coverage_id", "")).strip(),
+                "timestamp": _parse_timestamp(payload.get("timestamp")),
+                "executed_callback_ids": set(),
+                "payload": payload,
+            }
+        )
+
+    records.sort(
+        key=lambda item: (
+            item["timestamp"] or datetime.max,
+            item["request_id"],
+        )
+    )
+    for index, record in enumerate(records, start=1):
+        record["ordinal"] = index
+    return records
+
+
+def _load_request_records(requests_dir: Path, fuzzer_output_dir: Path | None = None) -> list[dict[str, Any]]:
+    if not requests_dir.exists():
+        return _load_fuzzer_request_event_records(fuzzer_output_dir) if fuzzer_output_dir is not None else []
 
     records: list[dict[str, Any]] = []
     for path in sorted(requests_dir.glob("*.json")):
@@ -105,7 +207,9 @@ def _load_request_records(requests_dir: Path) -> list[dict[str, Any]]:
     )
     for index, record in enumerate(records, start=1):
         record["ordinal"] = index
-    return records
+    if records:
+        return records
+    return _load_fuzzer_request_event_records(fuzzer_output_dir) if fuzzer_output_dir is not None else []
 
 
 def _normalize_endpoint(candidate: dict[str, Any]) -> str:
@@ -235,6 +339,68 @@ def _median(values: list[float | int | None]) -> float | None:
     return float(statistics.median(normalized))
 
 
+def _build_coverage_timeline(
+    request_records: list[dict[str, Any]],
+    unique_vulns: list[dict[str, Any]],
+    *,
+    time_budget_seconds: int,
+    bucket_minutes: int,
+) -> list[dict[str, Any]]:
+    if not request_records:
+        return []
+
+    bucket_seconds = max(1, int(bucket_minutes) * 60)
+    total_seconds = max(bucket_seconds, int(time_budget_seconds))
+    bucket_count = max(1, int(math.ceil(total_seconds / bucket_seconds)))
+    first_request_timestamp = request_records[0]["timestamp"]
+    cumulative_callbacks: set[str] = set()
+    seen_vuln_signatures: set[str] = set()
+    rows: list[dict[str, Any]] = []
+
+    def seconds_since_start(timestamp: datetime | None) -> int | None:
+        if first_request_timestamp is None or timestamp is None:
+            return None
+        return max(0, int(round((timestamp - first_request_timestamp).total_seconds())))
+
+    for bucket_index in range(bucket_count):
+        bucket_start = bucket_index * bucket_seconds
+        bucket_end = min((bucket_index + 1) * bucket_seconds, total_seconds)
+        bucket_requests = 0
+
+        for record in request_records:
+            elapsed = seconds_since_start(record["timestamp"])
+            if elapsed is None:
+                elapsed = int(record.get("ordinal", 1)) - 1
+            if bucket_start <= elapsed < bucket_end:
+                bucket_requests += 1
+            if elapsed < bucket_end:
+                cumulative_callbacks.update(record["executed_callback_ids"])
+
+        for vuln in unique_vulns:
+            elapsed = seconds_since_start(vuln.get("request_timestamp"))
+            if elapsed is None:
+                ordinal = vuln.get("request_ordinal")
+                elapsed = int(ordinal) - 1 if ordinal is not None else 0
+            if elapsed < bucket_end:
+                seen_vuln_signatures.add(str(vuln.get("signature", "")))
+
+        rows.append(
+            {
+                "bucket_index": bucket_index + 1,
+                "elapsed_start_seconds": bucket_start,
+                "elapsed_end_seconds": bucket_end,
+                "requests": bucket_requests,
+                "requests_per_second": bucket_requests / bucket_seconds,
+                "requests_per_minute": bucket_requests / (bucket_seconds / 60),
+                "cumulative_unique_callbacks": len(cumulative_callbacks),
+                "blindspots_reduced": len(cumulative_callbacks),
+                "unique_vulns": len([item for item in seen_vuln_signatures if item]),
+            }
+        )
+
+    return rows
+
+
 def analyze_run(
     run_dir: str | Path,
     *,
@@ -243,6 +409,7 @@ def analyze_run(
     mode_value: int,
     run_id: int,
     time_budget_seconds: int = 1800,
+    bucket_minutes: int = 5,
 ) -> dict[str, Any]:
     run_path = Path(run_dir)
     requests_dir = run_path / "requests"
@@ -250,9 +417,10 @@ def analyze_run(
     vulnerable_candidates_path = fuzzer_output_dir / "vulnerable-candidates.json"
     vulnerable_payload = _load_json(vulnerable_candidates_path)
     total_coverage_payload = _load_json(run_path / "total_coverage.json")
+    scheduler_decisions = _load_scheduler_decisions(run_path)
 
     notes: list[str] = []
-    request_records = _load_request_records(requests_dir)
+    request_records = _load_request_records(requests_dir, fuzzer_output_dir)
     if not request_records:
         notes.append("missing request artifacts")
 
@@ -304,10 +472,13 @@ def analyze_run(
             unique_vulns_within_budget.append(row)
 
     executed_callback_ids: set[str] = set()
+    requests_with_executed_callbacks = 0
     for record in request_records:
         if cutoff_timestamp is not None and record["timestamp"] is not None:
             if record["timestamp"].timestamp() > cutoff_timestamp:
                 continue
+        if record["executed_callback_ids"]:
+            requests_with_executed_callbacks += 1
         executed_callback_ids.update(record["executed_callback_ids"])
 
     blindspots_reduced = None
@@ -327,6 +498,21 @@ def analyze_run(
     requests_per_unique_vuln = None
     if unique_count > 0 and total_requests > 0:
         requests_per_unique_vuln = total_requests / unique_count
+    requests_per_second = total_requests / int(time_budget_seconds) if int(time_budget_seconds) > 0 else None
+    requests_per_minute = requests_per_second * 60 if requests_per_second is not None else None
+
+    target_surface = _classify_target_surface(request_records)
+    hook_signal_request_ratio = (requests_with_executed_callbacks / total_requests) if total_requests else None
+    decisions_with_hook_energy = [
+        item for item in scheduler_decisions if float(item.get("hook_energy") or 0.0) > 0.0
+    ]
+    energy_deltas = [delta for delta in (_energy_delta(item) for item in scheduler_decisions) if delta is not None]
+    coverage_timeline = _build_coverage_timeline(
+        request_records,
+        unique_vulns_within_budget,
+        time_budget_seconds=time_budget_seconds,
+        bucket_minutes=bucket_minutes,
+    )
 
     summary = {
         "plugin": plugin,
@@ -335,17 +521,34 @@ def analyze_run(
         "run": int(run_id),
         "run_dir": str(run_path),
         "time_budget_seconds": int(time_budget_seconds),
+        "bucket_minutes": int(bucket_minutes),
         "total_requests": total_requests,
+        "requests_per_second": requests_per_second,
+        "requests_per_minute": requests_per_minute,
         "time_to_first_unique_vuln_seconds": _seconds_since_start(first_unique["request_timestamp"]) if first_unique else None,
         "requests_to_first_unique_vuln": first_unique["request_ordinal"] if first_unique else None,
         "time_to_3_unique_vulns_seconds": _seconds_since_start(third_unique["request_timestamp"]) if third_unique else None,
         "requests_to_3_unique_vulns": third_unique["request_ordinal"] if third_unique else None,
+        "unique_vulns_found_within_budget": unique_count,
         "unique_vulns_found_after_30min": unique_count,
         "requests_per_unique_vuln": requests_per_unique_vuln,
         "unique_executed_callbacks": len(executed_callback_ids),
+        "requests_with_executed_callbacks": requests_with_executed_callbacks,
+        "hook_signal_request_ratio": hook_signal_request_ratio,
+        "target_surface": target_surface,
+        "low_hook_signal": target_surface == "direct-file" or hook_signal_request_ratio == 0.0,
+        "scheduler_decisions": len(scheduler_decisions),
+        "scheduler_decisions_with_hook_energy": len(decisions_with_hook_energy),
+        "scheduler_decisions_with_hook_energy_ratio": (
+            len(decisions_with_hook_energy) / len(scheduler_decisions) if scheduler_decisions else None
+        ),
+        "median_energy_delta": _median(energy_deltas),
+        "max_energy_delta": max(energy_deltas) if energy_deltas else None,
+        "uopz_overhead_ratio": None,
         "blindspots_reduced": blindspots_reduced,
         "notes": "; ".join(notes),
         "unique_vuln_signatures": [row["signature"] for row in unique_vulns_within_budget],
+        "coverage_timeline": coverage_timeline,
     }
     return summary
 
@@ -387,14 +590,43 @@ def aggregate_results(run_summaries: list[dict[str, Any]]) -> dict[str, Any]:
                 "median_requests_per_unique_vuln": _median(
                     [item.get("requests_per_unique_vuln") for item in items]
                 ),
+                "median_requests_per_second": _median(
+                    [item.get("requests_per_second") for item in items]
+                ),
+                "median_requests_per_minute": _median(
+                    [item.get("requests_per_minute") for item in items]
+                ),
                 "median_unique_executed_callbacks": _median(
                     [item.get("unique_executed_callbacks") for item in items]
                 ),
                 "median_blindspots_reduced": _median(
                     [item.get("blindspots_reduced") for item in items]
                 ),
+                "median_scheduler_decisions": _median(
+                    [item.get("scheduler_decisions") for item in items]
+                ),
+                "median_scheduler_decisions_with_hook_energy": _median(
+                    [item.get("scheduler_decisions_with_hook_energy") for item in items]
+                ),
+                "median_scheduler_decisions_with_hook_energy_ratio": _median(
+                    [item.get("scheduler_decisions_with_hook_energy_ratio") for item in items]
+                ),
+                "median_energy_delta": _median(
+                    [item.get("median_energy_delta") for item in items]
+                ),
+                "median_max_energy_delta": _median(
+                    [item.get("max_energy_delta") for item in items]
+                ),
+                "median_uopz_overhead_ratio": None,
             }
         )
+
+    raw_mode = next((item for item in mode_summaries if item["mode"] == "PHUZZ_RAW"), None)
+    raw_eps = raw_mode.get("median_requests_per_second") if raw_mode else None
+    if raw_eps:
+        for item in mode_summaries:
+            eps = item.get("median_requests_per_second")
+            item["median_uopz_overhead_ratio"] = (eps / raw_eps) if eps is not None else None
 
     return {
         "plugin": plugin_names[0] if len(plugin_names) == 1 else ",".join(plugin_names),
@@ -411,6 +643,35 @@ def write_run_summary(path: str | Path, summary: dict[str, Any]) -> None:
     Path(path).write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
+def write_coverage_timeline_outputs(run_dir: str | Path, summary: dict[str, Any]) -> None:
+    output_path = Path(run_dir)
+    timeline = summary.get("coverage_timeline", [])
+    if not isinstance(timeline, list):
+        timeline = []
+
+    (output_path / "coverage_timeline.json").write_text(
+        json.dumps(timeline, indent=2),
+        encoding="utf-8",
+    )
+
+    fieldnames = [
+        "bucket_index",
+        "elapsed_start_seconds",
+        "elapsed_end_seconds",
+        "requests",
+        "requests_per_second",
+        "requests_per_minute",
+        "cumulative_unique_callbacks",
+        "blindspots_reduced",
+        "unique_vulns",
+    ]
+    with (output_path / "coverage_timeline.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in timeline:
+            writer.writerow({key: row.get(key) for key in fieldnames})
+
+
 def write_batch_outputs(output_root: str | Path, aggregate: dict[str, Any]) -> None:
     output_path = Path(output_root)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -424,13 +685,29 @@ def write_batch_outputs(output_root: str | Path, aggregate: dict[str, Any]) -> N
         "plugin",
         "mode",
         "run",
+        "time_budget_seconds",
+        "bucket_minutes",
+        "total_requests",
+        "requests_per_second",
+        "requests_per_minute",
         "time_to_first_unique_vuln_seconds",
         "requests_to_first_unique_vuln",
         "time_to_3_unique_vulns_seconds",
         "requests_to_3_unique_vulns",
+        "unique_vulns_found_within_budget",
         "unique_vulns_found_after_30min",
         "requests_per_unique_vuln",
         "unique_executed_callbacks",
+        "requests_with_executed_callbacks",
+        "hook_signal_request_ratio",
+        "target_surface",
+        "low_hook_signal",
+        "scheduler_decisions",
+        "scheduler_decisions_with_hook_energy",
+        "scheduler_decisions_with_hook_energy_ratio",
+        "median_energy_delta",
+        "max_energy_delta",
+        "uopz_overhead_ratio",
         "blindspots_reduced",
         "notes",
         "run_dir",
@@ -463,6 +740,7 @@ def _build_cli() -> argparse.ArgumentParser:
     run_parser.add_argument("--mode-value", required=True, type=int)
     run_parser.add_argument("--run-id", required=True, type=int)
     run_parser.add_argument("--time-budget-seconds", type=int, default=1800)
+    run_parser.add_argument("--bucket-minutes", type=int, default=5)
     run_parser.add_argument("--output", required=True)
 
     batch_parser = subparsers.add_parser("summarize-batch", help="Aggregate multiple run summaries.")
@@ -483,8 +761,10 @@ def main() -> int:
             mode_value=args.mode_value,
             run_id=args.run_id,
             time_budget_seconds=args.time_budget_seconds,
+            bucket_minutes=args.bucket_minutes,
         )
         write_run_summary(args.output, summary)
+        write_coverage_timeline_outputs(args.run_dir, summary)
         return 0
 
     if args.command == "summarize-batch":

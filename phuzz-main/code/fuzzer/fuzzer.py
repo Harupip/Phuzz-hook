@@ -22,7 +22,13 @@ import requests
 import utils
 from candidate import Candidate
 from mutator import DefaultMutator, EmptyQueueMutator, SingleMutator
-from scoring import DefaultScoringFormula
+from scoring import (
+    ACTIVE_SCORING_MODE,
+    DEFAULT_HOOK_ENERGY_BASE_WEIGHT,
+    DEFAULT_HOOK_MIN_ENERGY_SCALE,
+    DEFAULT_HOOK_PRIORITY_WEIGHT,
+    DefaultScoringFormula,
+)
 from vulncheck import DefaultVulnChecker, ParamBasedVulnChecker
 from utils import fuzz_open
 
@@ -44,6 +50,7 @@ class Fuzzer:
         self.exceptions_and_errors_candidates = []
         self.seen_mutations = set()
         self.trace_requests = os.environ.get("PHUZZ_TRACE_REQUESTS", "0") == "1"
+        self.write_request_events = os.environ.get("PHUZZ_WRITE_REQUEST_EVENTS", "1") not in {"0", "false", "False"}
         self.request_counter = 0
 
         self.session = requests.Session()
@@ -150,6 +157,56 @@ class Fuzzer:
 
         print(" ".join(parts))
 
+    def _write_hook_energy_decision(self, candidate, scheduler_energy):
+        path = os.path.join(self.output_dir, "hook-energy-decisions.jsonl")
+        record = {
+            "timestamp": time.time(),
+            "fuzzer_id": self.fuzzer_id,
+            "coverage_id": candidate.coverage_id,
+            "parent_coverage_id": candidate.parent.coverage_id if candidate.parent else "",
+            "http_target": candidate.http_target,
+            "http_method": candidate.http_method,
+            "score": candidate.score,
+            "base_score": candidate.base_score,
+            "priority": candidate.priority,
+            "base_priority": candidate.base_priority,
+            "base_energy": candidate.base_energy,
+            "final_energy": candidate.final_energy,
+            "scheduler_energy": int(scheduler_energy),
+            "hook_request_id": candidate.hook_request_id,
+            "hook_energy": candidate.hook_energy,
+            "hook_energy_avg": candidate.hook_energy_avg,
+            "mutated_param_type": candidate.mutated_param_type,
+            "mutated_param_name": candidate.mutated_param_name,
+            "scoring_mode": ACTIVE_SCORING_MODE,
+            "hook_priority_weight": DEFAULT_HOOK_PRIORITY_WEIGHT,
+            "hook_energy_base_weight": DEFAULT_HOOK_ENERGY_BASE_WEIGHT,
+            "hook_min_energy_scale": DEFAULT_HOOK_MIN_ENERGY_SCALE,
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _write_request_event(self, candidate, prepared_req=None, response=None, error=None):
+        if not self.write_request_events:
+            return
+
+        path = os.path.join(self.output_dir, "request-events.jsonl")
+        record = {
+            "timestamp": time.time(),
+            "fuzzer_id": self.fuzzer_id,
+            "coverage_id": candidate.coverage_id,
+            "http_target": candidate.http_target,
+            "http_method": candidate.http_method,
+            "prepared_url": getattr(prepared_req, "url", ""),
+            "mutated_param_type": candidate.mutated_param_type,
+            "mutated_param_name": candidate.mutated_param_name,
+            "status_code": getattr(response, "status_code", 0) if response is not None else 0,
+            "response_body_length": len(getattr(response, "text", "") or "") if response is not None else 0,
+            "error": str(error) if error is not None else "",
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
     def save_output_vulnerable(self):
         with open(
             self._open(
@@ -206,6 +263,10 @@ class Fuzzer:
         print("Exceptions and errors candidates saved!")
 
     def load_request_data(self):
+        if isinstance(self.config.get("seed_requests"), list):
+            self.config['print_timestamps'] = self.config.get('print_timestamps', False)
+            return
+
         potential = {}
         potential['methods'] = []
         potential['headers'] = []
@@ -329,14 +390,18 @@ class Fuzzer:
 
     def load_config(self, config_path):
         try:
-            self.config = json.load(
-                open(os.path.join("./configs", f"{config_path}.json"))
-            )
+            if os.path.exists(config_path):
+                config_file = config_path
+            else:
+                config_file = os.path.join("./configs", f"{config_path}.json")
+            with open(config_file, encoding="utf-8") as handle:
+                self.config = json.load(handle)
         except Exception as e:
             print(e)
             sys.exit(f"Failed to parse fuzzer config: {config_path}")
 
-        if not self.config["target"].startswith("http"):
+        has_seed_requests = isinstance(self.config.get("seed_requests"), list)
+        if not has_seed_requests and not self.config["target"].startswith("http"):
             sys.exit(f"Target does not start with http!")
 
         if "login" in self.config and not os.path.exists(
@@ -366,6 +431,10 @@ class Fuzzer:
         return dict(ChainMap(*list(map(lambda x: {x['name']: x['value']}, tpl))))
 
     def generate_initial_candidates(self):
+        if isinstance(self.config.get("seed_requests"), list):
+            for seed_request in self.config["seed_requests"]:
+                yield self._candidate_from_seed_request(seed_request)
+            return
 
         print("Fixed headers", self.fixed_headers)
         print("Fixed Cookies", self.fixed_cookies)
@@ -440,6 +509,39 @@ class Fuzzer:
                                                 #is_initial_candidate=True
                                                 )
                                             yield c
+
+    def _candidate_from_seed_request(self, seed_request):
+        target = str(seed_request.get("target", "")).strip()
+        if not target:
+            target_base = str(self.config.get("target_base", "http://web")).rstrip("/")
+            path = str(seed_request.get("path", "")).strip()
+            target = target_base + "/" + path.lstrip("/")
+
+        if not target.startswith("http"):
+            sys.exit(f"Seed request target does not start with http: {target}")
+
+        fixed_params = seed_request.get("fixed_params", {})
+        fuzz_params = seed_request.get("fuzz_params", {})
+        fuzz_weights = seed_request.get("fuzz_weights", {})
+
+        if not isinstance(fixed_params, dict):
+            fixed_params = {}
+        if not isinstance(fuzz_params, dict):
+            fuzz_params = {}
+        if not isinstance(fuzz_weights, dict):
+            fuzz_weights = {}
+
+        return Candidate(
+            score=100,
+            priority=100,
+            http_target=target,
+            http_method=str(seed_request.get("http_method", seed_request.get("method", "GET"))).upper(),
+            is_initial_candidate=True,
+            fixed_params=fixed_params,
+            fuzz_params=fuzz_params,
+            fuzz_weights=fuzz_weights,
+            fuzzer_id=self.fuzzer_id,
+        )
 
 
     def calculate_score(self, candidate):
@@ -605,8 +707,10 @@ class Fuzzer:
                 response = s.send(prepared_req, timeout=self.request_timeout, allow_redirects=False)
                 c.response = response
                 self._trace_request(c, prepared_req=prepared_req, response=response)
+                self._write_request_event(c, prepared_req=prepared_req, response=response)
         except Exception as e:
             self._trace_request(c, prepared_req=prepared_req, error=e)
+            self._write_request_event(c, prepared_req=prepared_req, error=e)
             print(f"Exception encountered: {e}")
             c.response = None
 
@@ -773,6 +877,7 @@ class Fuzzer:
 
             # This is the handoff from score/priority land into scheduler budget.
             energy = self.calculate_energy(candidate)
+            self._write_hook_energy_decision(candidate, energy)
             #print(energy)
             # This loop is where integer `energy` becomes actual mutation attempts.
             for i in range(energy):
@@ -879,9 +984,9 @@ if __name__ == "__main__":
     if not "FUZZER_COMPRESS" in os.environ:
         os.environ["FUZZER_COMPRESS"] = "0"
 
-    if not "FUZZER_CONFIG" in os.environ:
-        sys.exit("No config provided in ENV FUZZER_CONFIG")
+    if not "FUZZER_CONFIG" in os.environ and not "FUZZER_CONFIG_FILE" in os.environ:
+        sys.exit("No config provided in ENV FUZZER_CONFIG or FUZZER_CONFIG_FILE")
 
     fuzzer = Fuzzer(fuzzer_id=os.environ['FUZZER_NODE_ID'])
-    fuzzer.load_config(os.environ['FUZZER_CONFIG'])
+    fuzzer.load_config(os.environ.get("FUZZER_CONFIG_FILE") or os.environ['FUZZER_CONFIG'])
     fuzzer.run()

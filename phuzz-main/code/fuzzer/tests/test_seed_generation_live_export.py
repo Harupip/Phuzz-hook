@@ -11,6 +11,8 @@ if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
 from hook_energy.seed_generation.generator import LiveHookSeedGenerator
+from hook_energy.seed_generation.config_export import build_fast_seed_config
+from hook_energy.seed_generation.models import ImportedSeedRequest, ImportedSeedResult
 
 
 def build_live_coverage_payload() -> dict:
@@ -142,6 +144,58 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
 
             suggested = json.loads((output_dir / "suggested_seeds.json").read_text(encoding="utf-8"))
             self.assertEqual(suggested["summary"]["direct_http_seed_candidates"], 1)
+
+    def test_fast_seed_config_uses_unauthenticated_seeds_and_reports_authenticated_skips(self) -> None:
+        source_config = {
+            "target": "http://web/wp-admin/admin-ajax.php",
+            "methods": ["POST"],
+            "body_params": {
+                "data": [
+                    {"name": "filter_tag", "value": "fuzz"},
+                    {"name": "action", "value": "GalleryBox"},
+                ],
+                "fixed": ["action"],
+                "fuzz": ["filter_tag"],
+                "weight": 1,
+            },
+        }
+        result = ImportedSeedResult(
+            unauthenticated_queue=[
+                ImportedSeedRequest(
+                    request_id="seed-public",
+                    source="unit",
+                    http_method="POST",
+                    path="/wp-admin/admin-ajax.php",
+                    content_type="application/x-www-form-urlencoded",
+                    body={"action": "public_hook"},
+                    auth_mode="unauth-capable",
+                )
+            ],
+            authenticated_queue=[
+                ImportedSeedRequest(
+                    request_id="seed-auth",
+                    source="unit",
+                    http_method="POST",
+                    path="/wp-admin/admin-ajax.php",
+                    content_type="application/x-www-form-urlencoded",
+                    body={"action": "private_hook"},
+                    auth_mode="authenticated",
+                )
+            ],
+        )
+
+        config, warnings = build_fast_seed_config(
+            result,
+            source_config=source_config,
+            target_base="http://web",
+            seed_limit=5,
+        )
+
+        self.assertEqual(len(config["seed_requests"]), 1)
+        self.assertEqual(config["seed_requests"][0]["target"], "http://web/wp-admin/admin-ajax.php")
+        self.assertEqual(config["seed_requests"][0]["fixed_params"]["body_params"]["action"], "public_hook")
+        self.assertEqual(config["seed_requests"][0]["fuzz_params"]["body_params"]["filter_tag"], "fuzz")
+        self.assertIn("Skipped 1 authenticated seed", warnings[0])
 
 
 if __name__ == "__main__":

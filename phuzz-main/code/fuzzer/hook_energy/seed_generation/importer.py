@@ -5,8 +5,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .models import ImportedSeedRequest, ImportedSeedResult, ManualAnalysisEntry
-from .stale_check import detect_stale_seed_artifacts
+try:
+    from .models import ImportedSeedRequest, ImportedSeedResult, ManualAnalysisEntry
+    from .stale_check import detect_stale_seed_artifacts
+except ImportError:
+    from models import ImportedSeedRequest, ImportedSeedResult, ManualAnalysisEntry
+    from stale_check import detect_stale_seed_artifacts
 
 ACCEPTED_AUTH_MODES = {"authenticated", "unauth-capable"}
 
