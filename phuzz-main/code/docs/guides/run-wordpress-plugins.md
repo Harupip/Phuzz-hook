@@ -72,6 +72,7 @@ Runner se chay tung plugin mot. Voi moi plugin, no se:
 
 - kiem tra config PHUZZ tai `fuzzer/configs/wordpress/<plugin>.json`
 - kiem tra hoac tai ZIP plugin vao `web/applications/wordpress/_plugins/`
+- doc metadata plugin tu `scripts/wordpress/run-wordpress-plugin-matrix.config.ps1`
 - tao Docker override tam thoi de doi plugin
 - restart WordPress va fuzzer cho plugin do
 - kiem tra plugin da active trong WordPress
@@ -187,16 +188,44 @@ Ly do trong report gan nhat:
 
 Khi demo hoac benchmark nhanh, nen uu tien cac plugin trong muc "da validate thanh cong".
 
-## 10. Cac slug hop le
+## 10. CVE target da them
+
+Nhung target CVE co config va result notes rieng:
+
+| Plugin slug | CVE | Config chinh | Result notes |
+| --- | --- | --- | --- |
+| `booking` | CVE-2024-1207 | `fuzzer/configs/wordpress/booking-9.9-cve-2024-1207.json` | `docs/results/booking-9.9-cve-2024-1207.md` |
+| `country-state-city-auto-dropdown` | CVE-2024-3495 | `fuzzer/configs/wordpress/country-state-city-auto-dropdown-2.7.2-cve-2024-3495.json` | `docs/results/country-state-city-auto-dropdown-2.7.2-cve-2024-3495.md` |
+| `email-subscribers` | CVE-2024-2876 | `fuzzer/configs/wordpress/email-subscribers-5.7.14-cve-2024-2876.json` | `docs/results/email-subscribers-5.7.14-cve-2024-2876.md` |
+| `gamipress` | CVE-2024-13496 | `fuzzer/configs/wordpress/gamipress.json` | `docs/results/gamipress-7.3.1-cve-2024-13496.md` |
+| `wp-google-map-plugin` | CVE-2026-3222 | `fuzzer/configs/wordpress/wp-google-map-plugin-4.9.1-cve-2026-3222.json` | `docs/results/wp-google-map-plugin-4.9.1-cve-2026-3222.md` |
+
+Tat ca result notes duoc index tai:
+
+```text
+docs/results/README.md
+```
+
+## 11. Cac slug hop le
+
+Tat ca slug runner biet nam trong:
+
+```text
+scripts/wordpress/run-wordpress-plugin-matrix.config.ps1
+```
 
 Tat ca slug co config PHUZZ trong repo:
 
 ```text
 all-in-one-wp-security-and-firewall
 arprice-responsive-pricing-table
+booking
+country-state-city-auto-dropdown
 crm-perks-forms
+email-subscribers
 essential-real-estate
 gallery-album
+gamipress
 hypercomments
 joomsport-sports-league-results-management
 kivicare-clinic-management-system
@@ -214,9 +243,10 @@ ubigeo-peru
 udraw
 usc-e-shop
 webp-converter-for-media
+wp-google-map-plugin
 ```
 
-## 11. Tom tat cach nho nhanh
+## 12. Tom tat cach nho nhanh
 
 Mac dinh:
 
