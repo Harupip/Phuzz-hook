@@ -1,0 +1,59 @@
+{
+  "target": "http://web/wp-admin/admin-ajax.php",
+  "methods": [
+    "POST"
+  ],
+  "body_params": {
+    "data": [
+      {
+        "name": "action",
+        "value": "gamipress_get_logs"
+      },
+      {
+        "name": "orderby",
+        "seeds": [
+          "fuzz"
+        ]
+      },
+      {
+        "name": "order",
+        "value": "ASC"
+      },
+      {
+        "name": "limit",
+        "value": "10"
+      },
+      {
+        "name": "page",
+        "value": "1"
+      },
+      {
+        "name": "nonce",
+        "value": "fuzz"
+      }
+    ],
+    "fixed": [
+      "^action$",
+      "^order$",
+      "^limit$",
+      "^page$",
+      "^nonce$"
+    ],
+    "fuzz": [
+      "^orderby$"
+    ],
+    "weight": 1
+  },
+  "query_params": {
+    "data": [],
+    "fixed": [],
+    "fuzz": [],
+    "weight": 0
+  },
+  "cookies": {
+    "data": [],
+    "fixed": [],
+    "fuzz": [],
+    "weight": 0
+  }
+}
