@@ -379,6 +379,15 @@ function __uopz_callback_identity($callback, $hookName = '', $priority = null): 
         'callback_repr' => $repr,
         'source_file' => $origin['file'] ?? null,
         'source_line' => $origin['line'] ?? null,
+        'function_name' => $origin['function_name'] ?? null,
+        'class_name' => $origin['class_name'] ?? null,
+        'method_name' => $origin['method_name'] ?? null,
+        'is_static' => $origin['is_static'] ?? false,
+        'is_closure' => $origin['is_closure'] ?? false,
+        'is_invokable' => $origin['is_invokable'] ?? false,
+        'start_line' => $origin['start_line'] ?? ($origin['line'] ?? null),
+        'end_line' => $origin['end_line'] ?? null,
+        'formal_parameters' => $origin['formal_parameters'] ?? [],
         'origin_label' => $origin['caller_info'] ?? 'framework-core',
     ];
 }
@@ -467,6 +476,17 @@ function __uopz_register_callback(
     $timestamp = __uopz_now_iso8601();
     $existing = $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId] ?? null;
     [$type, $source] = __uopz_merge_registration_semantics(is_array($existing) ? $existing : null, $type, $source);
+    $metadataKeys = [
+        'function_name',
+        'class_name',
+        'method_name',
+        'is_static',
+        'is_closure',
+        'is_invokable',
+        'start_line',
+        'end_line',
+        'formal_parameters',
+    ];
 
     if (!isset($GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId])) {
         $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId] = [
@@ -492,6 +512,9 @@ function __uopz_register_callback(
             'status' => 'registered_only',
             'source' => $source,
         ];
+        foreach ($metadataKeys as $key) {
+            $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId][$key] = $identity[$key] ?? null;
+        }
         return;
     }
 
@@ -505,6 +528,9 @@ function __uopz_register_callback(
     $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['accepted_args'] = $acceptedArgs;
     $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['source_file'] = $identity['source_file'];
     $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['source_line'] = $identity['source_line'];
+    foreach ($metadataKeys as $key) {
+        $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId][$key] = $identity[$key] ?? null;
+    }
     $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['registered_from'] = $identity['origin_label'];
     $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['request_id'] = $GLOBALS['__uopz_request']['request_id'];
     $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['endpoint'] = $GLOBALS['__uopz_request']['endpoint'];
@@ -1187,6 +1213,70 @@ function __uopz_reflect_callback($callback): ?ReflectionFunctionAbstract
     return null;
 }
 
+function __uopz_is_simple_default_value($value): bool
+{
+    return $value === null || is_bool($value) || is_int($value) || is_float($value) || is_string($value);
+}
+
+function __uopz_describe_formal_parameters(ReflectionFunctionAbstract $reflection): array
+{
+    $parameters = [];
+
+    foreach ($reflection->getParameters() as $parameter) {
+        $type = $parameter->getType();
+        $item = [
+            'name' => $parameter->getName(),
+            'type' => $type !== null ? (string) $type : null,
+            'has_default' => $parameter->isDefaultValueAvailable(),
+            'is_optional' => $parameter->isOptional(),
+            'is_variadic' => $parameter->isVariadic(),
+            'allows_null' => $parameter->allowsNull(),
+        ];
+
+        if ($parameter->isDefaultValueAvailable()) {
+            try {
+                $defaultValue = $parameter->getDefaultValue();
+                if (__uopz_is_simple_default_value($defaultValue)) {
+                    $item['default_value'] = $defaultValue;
+                }
+            } catch (Throwable $e) {
+                // Some internal/default constants cannot be materialized safely.
+            }
+        }
+
+        $parameters[] = $item;
+    }
+
+    return $parameters;
+}
+
+function __uopz_describe_callback_reflection($callback, ReflectionFunctionAbstract $reflection): array
+{
+    $file = $reflection->getFileName() ?: null;
+    $startLine = $reflection->getStartLine() ?: null;
+    $endLine = $reflection->getEndLine() ?: null;
+    $isMethod = $reflection instanceof ReflectionMethod;
+    $className = $isMethod ? $reflection->getDeclaringClass()->getName() : null;
+    $methodName = $isMethod ? $reflection->getName() : null;
+    $functionName = (!$isMethod && !($callback instanceof Closure)) ? $reflection->getName() : null;
+
+    return [
+        'file' => $file,
+        'line' => $startLine,
+        'source_file' => $file,
+        'source_line' => $startLine,
+        'start_line' => $startLine,
+        'end_line' => $endLine,
+        'function_name' => $functionName,
+        'class_name' => $className,
+        'method_name' => $methodName,
+        'is_static' => $isMethod ? $reflection->isStatic() : false,
+        'is_closure' => $callback instanceof Closure,
+        'is_invokable' => is_object($callback) && !($callback instanceof Closure) && method_exists($callback, '__invoke'),
+        'formal_parameters' => __uopz_describe_formal_parameters($reflection),
+    ];
+}
+
 function __uopz_describe_callback_origin($callback): array
 {
     $cacheKey = __uopz_callback_origin_cache_key($callback);
@@ -1200,17 +1290,27 @@ function __uopz_describe_callback_origin($callback): array
         'caller_info' => 'framework-core',
         'is_target' => false,
         'resolved_by' => 'none',
+        'function_name' => null,
+        'class_name' => null,
+        'method_name' => null,
+        'is_static' => false,
+        'is_closure' => $callback instanceof Closure,
+        'is_invokable' => is_object($callback) && !($callback instanceof Closure) && method_exists($callback, '__invoke'),
+        'source_file' => null,
+        'source_line' => null,
+        'start_line' => null,
+        'end_line' => null,
+        'formal_parameters' => [],
     ];
 
     try {
         $reflection = __uopz_reflect_callback($callback);
         if ($reflection instanceof ReflectionFunctionAbstract) {
-            $file = $reflection->getFileName() ?: null;
-            $line = $reflection->getStartLine() ?: null;
+            $origin = array_merge($origin, __uopz_describe_callback_reflection($callback, $reflection));
+            $file = $origin['file'] ?? null;
+            $line = $origin['line'] ?? null;
 
             if ($file !== null) {
-                $origin['file'] = $file;
-                $origin['line'] = $line;
                 $origin['caller_info'] = basename($file) . ':' . ($line ?? '?');
                 $origin['is_target'] = __uopz_path_matches_target($file);
                 $origin['resolved_by'] = 'reflection';

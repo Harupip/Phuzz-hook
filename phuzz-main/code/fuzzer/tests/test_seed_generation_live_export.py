@@ -143,6 +143,60 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
             suggested = json.loads((output_dir / "suggested_seeds.json").read_text(encoding="utf-8"))
             self.assertEqual(suggested["summary"]["direct_http_seed_candidates"], 1)
 
+    def test_generator_adds_extracted_fuzzable_params_to_direct_seed(self) -> None:
+        source = "\n".join(
+            [
+                "<?php",
+                "function sac_post_type_call_callback() {",
+                "    $action = $_REQUEST['action'];",
+                "    $orderby = sanitize_text_field($_REQUEST['orderby']);",
+                "    $page = absint($_GET['page']);",
+                "}",
+                "",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_file = Path(tmp_dir) / "bt-comments.php"
+            source_file.write_text(source, encoding="utf-8")
+
+            payload = build_live_coverage_payload()
+            callback = payload["data"]["registered_callbacks"]["cb-unauth"]
+            callback["source_file"] = str(source_file)
+            callback["source_line"] = 2
+            callback["start_line"] = 2
+            callback["end_line"] = 6
+
+            gap_report, seed_report = LiveHookSeedGenerator().build_reports(payload)
+
+        callback_row = next(
+            item for item in gap_report["callbacks"] if item["hook_name"] == "wp_ajax_nopriv_sac_post_type_call"
+        )
+        direct_seed = next(
+            item for item in seed_report["suggested_seeds"] if item["hook_name"] == "wp_ajax_nopriv_sac_post_type_call"
+        )["seed"]
+
+        self.assertIn({"source": "REQUEST", "name": "orderby"}, [
+            {"source": item["source"], "name": item["name"]} for item in callback_row["input_params"]
+        ])
+        self.assertEqual(direct_seed["body"]["action"], "sac_post_type_call")
+        self.assertEqual(direct_seed["body"]["orderby"], "FUZZ")
+        self.assertEqual(direct_seed["query_params"]["page"], "FUZZ")
+        self.assertEqual(direct_seed["fixed_params"], ["action"])
+        self.assertIn("orderby", direct_seed["fuzzable_params"])
+        self.assertIn("page", direct_seed["fuzzable_params"])
+        self.assertNotIn("action", direct_seed["fuzzable_params"])
+
+    def test_generator_prioritizes_nopriv_over_authenticated_hooks(self) -> None:
+        generator = LiveHookSeedGenerator()
+
+        auth_priority, auth_rank, _ = generator._classify_seed_priority("wp_ajax_demo", True)
+        nopriv_priority, nopriv_rank, _ = generator._classify_seed_priority("wp_ajax_nopriv_demo", True)
+
+        self.assertEqual(nopriv_priority, "highest")
+        self.assertEqual(auth_priority, "high")
+        self.assertGreater(nopriv_rank, auth_rank)
+
 
 if __name__ == "__main__":
     unittest.main()
