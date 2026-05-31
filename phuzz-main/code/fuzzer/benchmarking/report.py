@@ -23,6 +23,13 @@ MODE_COLORS = {
     "HOOK_FAST": "#d62728",
 }
 
+MODE_LABELS = {
+    "PHUZZ_RAW": "PHUZZ raw",
+    "PHUZZ_TRACE": "PHUZZ original",
+    "HOOK_TRACE": "HookPHuzz",
+    "HOOK_FAST": "HookPHuzz fast",
+}
+
 
 @dataclass(frozen=True)
 class ReportArtifacts:
@@ -256,6 +263,36 @@ def _panel_max(series: dict[str, list[dict[str, float]]], metric: str) -> float:
     return max(values + [1.0])
 
 
+def _primary_coverage_series(series: dict[str, list[dict[str, float]]]) -> dict[str, list[dict[str, float]]]:
+    primary = {mode: rows for mode, rows in series.items() if mode in {"PHUZZ_TRACE", "HOOK_TRACE"}}
+    return primary or series
+
+
+def _axis_label(value: float) -> str:
+    if value >= 60:
+        return f"{value / 60:.0f}m"
+    return f"{value:.0f}s"
+
+
+def _coverage_summary(mode: str, rows: list[dict[str, float]], metric: str) -> str:
+    label = MODE_LABELS.get(mode, mode)
+    if not rows:
+        return f"{label}: no timeline"
+    first = rows[0].get(metric, 0.0)
+    last = rows[-1].get(metric, 0.0)
+    delta = last - first
+    direction = "growth" if delta > 0 else "plateau"
+    return f"{mode} {direction}: {first:.0f} -> {last:.0f} ({delta:+.0f})"
+
+
+def _text(lines: list[str], x: int | float, y: int | float, text: str, *, size: int = 12, color: str = "#111111", weight: int | None = None) -> None:
+    weight_attr = f' font-weight="{weight}"' if weight else ""
+    lines.append(
+        f'<text x="{x}" y="{y}" font-family="Arial, sans-serif" font-size="{size}" fill="{color}"{weight_attr}>'
+        f"{html.escape(text)}</text>"
+    )
+
+
 def _draw_panel(
     lines: list[str],
     *,
@@ -294,69 +331,92 @@ def _draw_panel(
 
 
 def _write_svg(path: Path, series: dict[str, list[dict[str, float]]]) -> None:
-    width = 1060
-    height = 740
-    all_rows = [row for rows in series.values() for row in rows]
+    width = 1180
+    height = 700
+    metric = "cumulative_unique_callbacks"
+    coverage_series = _primary_coverage_series(series)
+    all_rows = [row for rows in coverage_series.values() for row in rows]
     max_x = max([row.get("elapsed_end_seconds", 0.0) for row in all_rows] + [1.0])
-    left = 86
-    plot_width = 800
-    plot_height = 145
+    max_y = _panel_max(coverage_series, metric)
+    left = 92
+    top = 108
+    plot_width = 760
+    plot_height = 420
+    bottom = top + plot_height
+    right = left + plot_width
 
     lines = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<text x="86" y="28" font-family="Arial, sans-serif" font-size="20" font-weight="700">HookPHuzz pilot timeline</text>',
-        '<text x="86" y="52" font-family="Arial, sans-serif" font-size="12" fill="#555">Flat lines mean plateau: value reached early and did not increase later.</text>',
     ]
+    _text(lines, left, 34, "Coverage over time", size=24, weight=700)
+    _text(lines, left, 58, "Y-axis: cumulative unique WordPress callbacks covered. A flat line means the run stopped discovering new callbacks.", size=12, color="#555555")
+    _text(lines, left, 82, "Primary comparison: PHUZZ original vs HookPHuzz", size=13, color="#333333", weight=700)
 
-    _draw_panel(
-        lines,
-        title="Callback coverage",
-        metric="cumulative_unique_callbacks",
-        series=series,
-        top=90,
-        left=left,
-        plot_width=plot_width,
-        plot_height=plot_height,
-        max_x=max_x,
-        max_y=_panel_max(series, "cumulative_unique_callbacks"),
-    )
-    _draw_panel(
-        lines,
-        title="Unique vulns",
-        metric="unique_vulns",
-        series=series,
-        top=310,
-        left=left,
-        plot_width=plot_width,
-        plot_height=plot_height,
-        max_x=max_x,
-        max_y=_panel_max(series, "unique_vulns"),
-        dashed=True,
-    )
-    _draw_panel(
-        lines,
-        title="Requests per second",
-        metric="requests_per_second",
-        series=series,
-        top=530,
-        left=left,
-        plot_width=plot_width,
-        plot_height=plot_height,
-        max_x=max_x,
-        max_y=_panel_max(series, "requests_per_second"),
-    )
-    lines.append(f'<text x="{left}" y="710" font-family="Arial, sans-serif" font-size="12">elapsed seconds</text>')
+    lines.append(f'<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="#fbfbfb" stroke="#d0d0d0"/>')
+    for step in range(0, 5):
+        y = top + plot_height - (plot_height * step / 4)
+        value = max_y * step / 4
+        lines.append(f'<line x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}" stroke="#e6e6e6" stroke-width="1"/>')
+        _text(lines, left - 46, y + 4, f"{value:.0f}", size=11, color="#555555")
+    for step in range(0, 5):
+        x = left + plot_width * step / 4
+        value = max_x * step / 4
+        lines.append(f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{bottom}" stroke="#eeeeee" stroke-width="1"/>')
+        _text(lines, x - 10, bottom + 24, _axis_label(value), size=11, color="#555555")
+    _text(lines, left + plot_width / 2 - 52, bottom + 50, "elapsed time", size=12, color="#333333")
+    _text(lines, 20, top + plot_height / 2, "covered callbacks", size=12, color="#333333")
 
-    legend_y = 92
-    for mode in sorted(series.keys(), key=_mode_sort_key):
+    for mode in sorted(coverage_series.keys(), key=_mode_sort_key):
         color = MODE_COLORS.get(mode, "#444444")
-        label = html.escape(mode)
-        lines.append(f'<rect x="914" y="{legend_y - 10}" width="14" height="4" fill="{color}"/>')
-        lines.append(
-            f'<text x="936" y="{legend_y}" font-family="Arial, sans-serif" font-size="12">{label} callbacks</text>'
+        rows = coverage_series[mode]
+        points = _points(
+            rows,
+            metric,
+            left=left,
+            top=top,
+            plot_width=plot_width,
+            plot_height=plot_height,
+            max_x=max_x,
+            max_y=max_y,
         )
-        legend_y += 22
+        width_attr = "4" if mode in {"PHUZZ_TRACE", "HOOK_TRACE"} else "2"
+        opacity_attr = "1" if mode in {"PHUZZ_TRACE", "HOOK_TRACE"} else "0.45"
+        dash_attr = ' stroke-dasharray="7 5"' if mode == "PHUZZ_TRACE" else ""
+        lines.append(
+            f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="{width_attr}" '
+            f'stroke-linejoin="round" stroke-linecap="round" opacity="{opacity_attr}"{dash_attr}/>'
+        )
+        for row in rows:
+            x_value = row.get("elapsed_end_seconds", 0.0)
+            y_value = row.get(metric, 0.0)
+            x = left + (x_value / max_x * plot_width if max_x else 0)
+            y = top + plot_height - (y_value / max_y * plot_height if max_y else 0)
+            lines.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.8" fill="#ffffff" stroke="{color}" stroke-width="2"/>')
+        if rows:
+            last = rows[-1]
+            x_value = last.get("elapsed_end_seconds", 0.0)
+            y_value = last.get(metric, 0.0)
+            x = left + (x_value / max_x * plot_width if max_x else 0)
+            y = top + plot_height - (y_value / max_y * plot_height if max_y else 0)
+            _text(lines, min(x + 8, right - 110), y - 8, f"{MODE_LABELS.get(mode, mode)}: {y_value:.0f}", size=12, color=color, weight=700)
+
+    panel_left = 890
+    lines.append(f'<rect x="{panel_left}" y="{top}" width="250" height="240" fill="#f7f7f7" stroke="#d0d0d0"/>')
+    _text(lines, panel_left + 18, top + 30, "Plateau check", size=17, weight=700)
+    summary_y = top + 66
+    for mode in sorted(coverage_series.keys(), key=_mode_sort_key):
+        color = MODE_COLORS.get(mode, "#444444")
+        lines.append(f'<rect x="{panel_left + 18}" y="{summary_y - 10}" width="22" height="4" fill="{color}"/>')
+        _text(lines, panel_left + 50, summary_y, _coverage_summary(mode, coverage_series[mode], metric), size=12, color="#222222")
+        summary_y += 28
+
+    lines.append(f'<rect x="{panel_left}" y="{top + 270}" width="250" height="150" fill="#ffffff" stroke="#d0d0d0"/>')
+    _text(lines, panel_left + 18, top + 300, "How to read", size=16, weight=700)
+    _text(lines, panel_left + 18, top + 328, "PHUZZ plateau = early ceiling.", size=12, color="#444444")
+    _text(lines, panel_left + 18, top + 352, "HookPHuzz growth = new callbacks", size=12, color="#444444")
+    _text(lines, panel_left + 18, top + 376, "continue appearing later.", size=12, color="#444444")
+    _text(lines, panel_left + 18, top + 404, "Numbers come from coverage_timeline.csv.", size=12, color="#444444")
 
     lines.append("</svg>")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

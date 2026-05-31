@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
-import shutil
 import sys
+import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,17 +17,8 @@ from benchmarking.report import generate_report
 
 @contextmanager
 def temporary_workspace(name: str):
-    base = FUZZER_DIR / "output" / "test-temp"
-    base.mkdir(parents=True, exist_ok=True)
-    path = base / name
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir()
-    try:
-        yield path
-    finally:
-        if path.exists():
-            shutil.rmtree(path)
+    with tempfile.TemporaryDirectory(prefix=f"{name}-", dir="C:\\tmp") as temp_dir:
+        yield Path(temp_dir)
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -87,8 +78,14 @@ def build_run(root: Path, mode: str, requests_per_second: float, unique_vulns: i
                 "requests": 150,
                 "requests_per_second": requests_per_second,
                 "requests_per_minute": requests_per_second * 60,
-                "cumulative_unique_callbacks": 0 if mode in {"PHUZZ_RAW", "HOOK_FAST"} else 8,
-                "blindspots_reduced": 0 if mode in {"PHUZZ_RAW", "HOOK_FAST"} else 8,
+                "cumulative_unique_callbacks": {
+                    "PHUZZ_TRACE": 14,
+                    "HOOK_TRACE": 8,
+                }.get(mode, 0),
+                "blindspots_reduced": {
+                    "PHUZZ_TRACE": 14,
+                    "HOOK_TRACE": 8,
+                }.get(mode, 0),
                 "unique_vulns": 0,
             },
             {
@@ -98,8 +95,14 @@ def build_run(root: Path, mode: str, requests_per_second: float, unique_vulns: i
                 "requests": 180,
                 "requests_per_second": requests_per_second,
                 "requests_per_minute": requests_per_second * 60,
-                "cumulative_unique_callbacks": 0 if mode in {"PHUZZ_RAW", "HOOK_FAST"} else 14,
-                "blindspots_reduced": 0 if mode in {"PHUZZ_RAW", "HOOK_FAST"} else 14,
+                "cumulative_unique_callbacks": {
+                    "PHUZZ_TRACE": 14,
+                    "HOOK_TRACE": 14,
+                }.get(mode, 0),
+                "blindspots_reduced": {
+                    "PHUZZ_TRACE": 14,
+                    "HOOK_TRACE": 14,
+                }.get(mode, 0),
                 "unique_vulns": unique_vulns,
             },
         ],
@@ -168,7 +171,10 @@ class BenchmarkReportTests(unittest.TestCase):
             self.assertIn("HOOK_FAST fast phase runs with UOPZ off", markdown)
             self.assertIn("<svg", svg)
             self.assertIn("HOOK_TRACE callbacks", svg)
-            self.assertIn("Requests per second", svg)
+            self.assertIn("Coverage over time", svg)
+            self.assertIn("Plateau check", svg)
+            self.assertIn("PHUZZ_TRACE plateau", svg)
+            self.assertIn("HOOK_TRACE growth", svg)
             self.assertIn("polyline", svg)
 
     def test_generate_report_flags_missing_hook_fast_artifacts(self) -> None:
