@@ -39,6 +39,9 @@ class Candidate:
         self.vulns = []
         self.errors = None
         self.exceptions = None
+        self.raw_errors = 0
+        self.filtered_benign_errors = 0
+        self.vulnerability_relevant_errors = 0
         self.new_paths = {}
         self.paths = {}
         self.number_of_new_paths = 0
@@ -72,6 +75,9 @@ class Candidate:
             'fuzz_weights': self.fuzz_weights,
             'errors': self.errors,
             'exceptions': self.exceptions,
+            'raw_errors': self.raw_errors,
+            'filtered_benign_errors': self.filtered_benign_errors,
+            'vulnerability_relevant_errors': self.vulnerability_relevant_errors,
             'response_body': self.response.text if self.response else "",
             'response.body.length': len(self.response.text) if self.response else 0,
             'response.headers': dict(self.response.headers) if self.response else {},

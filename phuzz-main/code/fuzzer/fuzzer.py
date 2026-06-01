@@ -466,6 +466,14 @@ class Fuzzer:
         if os.path.exists(coverage_file_path):
             os.unlink(coverage_file_path)
 
+    def is_benign_instrumentation_error(self, error):
+        message = str(error.get("errstr") or error.get("message") or error.get("error") or "")
+        normalized = " ".join(message.split())
+        return (
+            "No index used in query/prepared statement" in normalized
+            and "SELECT option_name" in normalized
+        )
+
     def check_for_exception_or_error(self, candidate):
         exception_file = os.path.join(
             self.exception_files_folder, f"{candidate.coverage_id}.json"
@@ -480,10 +488,17 @@ class Fuzzer:
             self.error_files_folder, f"{candidate.coverage_id}.json"
         )
         if os.path.exists(error_file):
+            raw_errors = []
             candidate.errors = []
             for line in fuzz_open(error_file, "r"):
                 if line.strip():
-                    candidate.errors.append(json.loads(line))
+                    error = json.loads(line)
+                    raw_errors.append(error)
+                    if not self.is_benign_instrumentation_error(error):
+                        candidate.errors.append(error)
+            candidate.raw_errors = len(raw_errors)
+            candidate.filtered_benign_errors = len(raw_errors) - len(candidate.errors)
+            candidate.vulnerability_relevant_errors = len(candidate.errors)
 
 
         if candidate.errors or candidate.exceptions:

@@ -108,6 +108,40 @@ def _load_request_records(requests_dir: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _is_benign_mysql_instrumentation_warning(error: dict[str, Any]) -> bool:
+    message = str(error.get("errstr") or error.get("message") or error.get("error") or "")
+    normalized = " ".join(message.split())
+    return (
+        "No index used in query/prepared statement" in normalized
+        and "SELECT option_name" in normalized
+    )
+
+
+def _count_error_records(fuzzer_output_dir: Path) -> dict[str, int]:
+    exceptions_errors_path = fuzzer_output_dir / "exceptions-and-errors.json"
+    payload = _load_json(exceptions_errors_path)
+    raw_errors = 0
+    filtered_benign_errors = 0
+
+    if isinstance(payload, list):
+        for candidate in payload:
+            if not isinstance(candidate, dict):
+                continue
+            for error in candidate.get("errors") or []:
+                if not isinstance(error, dict):
+                    continue
+                raw_errors += 1
+                if _is_benign_mysql_instrumentation_warning(error):
+                    filtered_benign_errors += 1
+
+    vulnerability_relevant_errors = max(0, raw_errors - filtered_benign_errors)
+    return {
+        "raw_errors": raw_errors,
+        "filtered_benign_errors": filtered_benign_errors,
+        "vulnerability_relevant_errors": vulnerability_relevant_errors,
+    }
+
+
 def _normalize_endpoint(candidate: dict[str, Any]) -> str:
     http_method = str(candidate.get("http_method", "GET")).upper()
     target = str(candidate.get("http_target", "")).strip()
@@ -250,6 +284,7 @@ def analyze_run(
     vulnerable_candidates_path = fuzzer_output_dir / "vulnerable-candidates.json"
     vulnerable_payload = _load_json(vulnerable_candidates_path)
     total_coverage_payload = _load_json(run_path / "total_coverage.json")
+    error_counts = _count_error_records(fuzzer_output_dir)
 
     notes: list[str] = []
     request_records = _load_request_records(requests_dir)
@@ -344,6 +379,9 @@ def analyze_run(
         "requests_per_unique_vuln": requests_per_unique_vuln,
         "unique_executed_callbacks": len(executed_callback_ids),
         "blindspots_reduced": blindspots_reduced,
+        "raw_errors": error_counts["raw_errors"],
+        "filtered_benign_errors": error_counts["filtered_benign_errors"],
+        "vulnerability_relevant_errors": error_counts["vulnerability_relevant_errors"],
         "notes": "; ".join(notes),
         "unique_vuln_signatures": [row["signature"] for row in unique_vulns_within_budget],
     }

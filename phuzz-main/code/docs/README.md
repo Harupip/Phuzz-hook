@@ -8,6 +8,7 @@ Start here when you need to run, debug, or explain the current WordPress PHUZZ s
 | --- | --- |
 | `guides/run-wordpress-plugins.md` | You need exact commands for the default plugin, one plugin, many plugins, or the full plugin matrix. |
 | `guides/benchmark-wordpress-phuzz.md` | You need to compare `PHUZZ_SCORING_MODE=1` with hook-aware scoring mode `2`. |
+| `guides/hook-aware-seed-generation.md` | You need to export `hook_gap_report.json` / `suggested_seeds.json` and understand extracted fuzzable params. |
 
 ## Reference
 
