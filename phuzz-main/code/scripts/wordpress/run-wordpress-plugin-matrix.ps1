@@ -44,6 +44,7 @@ function Get-PluginMatrix {
         @{ Slug = "phastpress"; Category = "OpenRedirect"; Url = "https://downloads.wordpress.org/plugin/phastpress.1.110.zip" }
         @{ Slug = "all-in-one-wp-security-and-firewall"; Category = "OpenRedirect"; Url = "https://downloads.wordpress.org/plugin/all-in-one-wp-security-and-firewall.4.4.0.zip" }
         @{ Slug = "pie-register"; Category = "OpenRedirect"; Url = "https://downloads.wordpress.org/plugin/pie-register.3.7.2.3.zip" }
+        @{ Slug = "file-provider"; Category = "SQLi"; Url = "https://downloads.wordpress.org/plugin/file-provider.1.2.3.zip"; Config = "file_provider_sqli" }
     )
 }
 
@@ -136,6 +137,7 @@ function New-OverrideFile {
     param([hashtable]$Plugin)
 
     $path = Join-Path $env:TEMP ("phuzz-{0}.override.yml" -f $Plugin.Slug)
+    $config = if ($Plugin.ContainsKey("Config")) { $Plugin.Config } else { $Plugin.Slug }
     $content = @(
         "services:"
         "  web:"
@@ -144,7 +146,7 @@ function New-OverrideFile {
         "      WP_TARGET_PLUGIN: $($Plugin.Slug)"
         "  ${fuzzerService}:"
         "    environment:"
-        "      FUZZER_CONFIG: wordpress/$($Plugin.Slug)"
+        "      FUZZER_CONFIG: wordpress/$config"
     )
     Set-Content -LiteralPath $path -Value $content -Encoding ASCII
     return $path
@@ -326,7 +328,8 @@ try {
         Write-Host "=== $slug ==="
         $overridePath = $null
         try {
-            Assert-PathExists -Path (Join-Path $configDir "$slug.json") -Hint "Missing PHUZZ config for $slug."
+            $config = if ($plugin.ContainsKey("Config")) { $plugin.Config } else { $slug }
+            Assert-PathExists -Path (Join-Path $configDir "$config.json") -Hint "Missing PHUZZ config for $config."
             $result.download_notes = Ensure-Zip -Plugin $plugin -DownloadMissing:$DownloadMissing -ForceDownload:$ForceDownload
             $overridePath = New-OverrideFile -Plugin $plugin
             $composeArgs = Get-ComposeArgs -OverridePath $overridePath
@@ -344,7 +347,7 @@ try {
             Start-Sleep -Seconds $FuzzWarmupSeconds
 
             $result.fuzzer_config = Get-FuzzerEnvSlug -ComposeArgs $composeArgs
-            if ($result.fuzzer_config -ne "wordpress/$slug") {
+            if ($result.fuzzer_config -ne "wordpress/$config") {
                 throw "Fuzzer config mismatch: $($result.fuzzer_config)"
             }
 
