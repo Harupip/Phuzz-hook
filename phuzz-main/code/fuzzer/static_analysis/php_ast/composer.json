@@ -1,0 +1,15 @@
+{
+  "name": "hookphuzz/php-ast-static-analysis",
+  "description": "Read-only PHP AST artifact scanner for HookPhuzz.",
+  "type": "project",
+  "license": "GPL-3.0-or-later",
+  "require": {
+    "php": ">=7.4",
+    "nikic/php-parser": "^4.19"
+  },
+  "autoload": {
+    "psr-4": {
+      "HookPhuzz\\StaticAnalysis\\PhpAst\\": "src/"
+    }
+  }
+}
