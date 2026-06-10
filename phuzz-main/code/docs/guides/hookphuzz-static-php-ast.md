@@ -12,6 +12,20 @@ The helper keeps its Composer dependency local to the module and does not vendor
 composer install --working-dir phuzz-main/code/fuzzer/static_analysis/php_ast
 ```
 
+For repeatable runs on machines that only have Docker, use the isolated Compose service instead of installing PHP or Composer on the host:
+
+```powershell
+cd phuzz-main/code
+.\run-static-seed.ps1 `
+  -PluginPath fuzzer/tmp_static_seed_tests/scan_maps/plugin `
+  -PluginSlug demo `
+  -IncludeRest `
+  -IncludeUnresolved `
+  -RunAst
+```
+
+The `static-seed` service has its own image and Composer dependencies. It does not change the `fuzzer-wordpress-plugin` image, so PHUZZ fuzzing speed is not affected unless you explicitly run this pre-seeding step.
+
 ## Run
 
 ```powershell

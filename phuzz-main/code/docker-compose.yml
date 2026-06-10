@@ -81,6 +81,17 @@ services:
       - shared-tmpfs:/shared-tmpfs
       - sync-tmpfs-wordpress-plugin:/sync-tmpfs
 
+  static-seed:
+    build:
+      context: ./fuzzer
+      dockerfile: static_analysis/Dockerfile
+    working_dir: /app
+    entrypoint: ["python", "-m", "hook_energy.static_seed_generation.cli"]
+    environment:
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - .:/workspace/code
+
 
 volumes:
   shared-tmpfs:

@@ -10,6 +10,7 @@ Start here when you need to run, debug, or explain the current WordPress PHUZZ s
 | `guides/benchmark-wordpress-phuzz.md` | You need to compare `PHUZZ_SCORING_MODE=1` with hook-aware scoring mode `2`. |
 | `guides/hook-aware-seed-generation.md` | You need to export `hook_gap_report.json` / `suggested_seeds.json` and understand extracted fuzzable params. |
 | `guides/demo-hook-seed-input-signatures.md` | You need to demo the current branch's hook seed input extraction and generated-seed evaluation workflow. |
+| `guides/hookphuzz-static-php-ast.md` | You need to run static seed generation or PHP AST analysis without adding Composer/PHP dependencies to the PHUZZ runtime image. |
 
 ## Reference
 
@@ -31,5 +32,6 @@ See `../scripts/README.md` for the script layout. Use root wrappers from `phuzz-
 ```powershell
 .\run-wordpress-phuzz.ps1 -NoFollowLogs
 .\run-wordpress-plugin-matrix.ps1 -DownloadMissing
+.\run-static-seed.ps1 -PluginPath <path-to-plugin-source> -PluginSlug <slug> -IncludeRest -RunAst
 .\benchmark-wordpress-phuzz.ps1 -RunsPerMode 5 -RunMinutes 30
 ```
