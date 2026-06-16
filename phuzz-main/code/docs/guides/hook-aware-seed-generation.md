@@ -155,6 +155,190 @@ Placement rules:
 - `POST`, `REQUEST`, `FILES`, and `BODY_JSON` params go into `seed.body`.
 - `action` stays in `fixed_params` and is not added to `fuzzable_params`.
 
+## Entrypoint Replay Validation
+
+Entrypoint replay validation is a runtime check for generated HTTP entrypoint candidates. It answers:
+
+- Which registered hooks can be mapped to a concrete WordPress HTTP request?
+- Can a selected candidate be replayed against a running WordPress target?
+- Did that replay create fresh HookPhuzz request artifacts that show the expected hook or callback?
+
+The pipeline is intentionally separate from PHUZZ fuzzing. It validates replayability and hook-correlation for one candidate at a time. It does not prove that PHUZZ has consumed generated seeds unless the later fuzzing run also points `FUZZER_CONFIG` at a generated adapter config.
+
+The generic flow is:
+
+```text
+bootstrap_probe_runner.py -> entry_classifier.py -> seed_validator.py
+```
+
+### 1. Warm WordPress Entrypoints
+
+`bootstrap_probe_runner.py` sends a fixed set of WordPress bootstrap requests and records which new `hook-coverage/requests/*.json` artifacts each probe creates.
+
+Default probes cover:
+
+- `/`
+- `/wp-admin/admin-ajax.php?action=hookphuzz_probe`
+- `/wp-admin/admin-post.php?action=hookphuzz_probe`
+- `/wp-json/`
+- `/?rest_route=/`
+- `/wp-login.php?action=lostpassword`
+- `/wp-admin/index.php`
+- `/wp-admin/admin.php`
+- `/xmlrpc.php`
+- `/wp-cron.php`
+
+Run:
+
+```powershell
+cd C:\Users\chuda\OneDrive\Desktop\phuzz-hook-cv\phuzz-main\code\fuzzer
+python hook_energy\bootstrap_probe_runner.py `
+  --base-url http://localhost:8080 `
+  --hook-coverage-dir output\hook-coverage `
+  --output-dir output\bootstrap_probe `
+  --timeout 10
+```
+
+Output:
+
+- `output/bootstrap_probe/bootstrap_probe_report.json`
+
+The report includes per-probe method, path, status code, duration, error, and `new_request_artifacts`. Failed probes are recorded in the report instead of stopping the whole run.
+
+### 2. Classify Entrypoint Candidates
+
+`entry_classifier.py` reads either `total_coverage.json` or `hook_gap_report.json` and writes candidate sets grouped by replayability.
+
+Run:
+
+```powershell
+python hook_energy\entry_classifier.py `
+  --input-file output\total_coverage.json `
+  --output-dir output\entry_classifier `
+  --format auto `
+  --pretty
+```
+
+Outputs:
+
+- `entrypoint_candidates.json`
+- `direct_http_candidates.json`
+- `setup_required_candidates.json`
+- `non_entry_hooks.json`
+
+Direct HTTP candidates receive an `http_template` with method, path, and fixed params. Supported direct mappings include:
+
+| Hook family | Entry type | Method | Path | Auth |
+| --- | --- | --- | --- | --- |
+| `wp_ajax_nopriv_*` | `ajax_unauthenticated` | `POST` | `/wp-admin/admin-ajax.php` | no |
+| `wp_ajax_*` | `ajax_authenticated` | `POST` | `/wp-admin/admin-ajax.php` | yes |
+| `admin_post_nopriv_*` | `admin_post_unauthenticated` | `POST` | `/wp-admin/admin-post.php` | no |
+| `admin_post_*` | `admin_post_authenticated` | `POST` | `/wp-admin/admin-post.php` | yes |
+| `admin_action_*` | `admin_action` | `GET` | `/wp-admin/admin.php` | yes |
+| `login_form_*` | `login_form` | `POST` | `/wp-login.php` | no |
+| `heartbeat_received` | `heartbeat_authenticated` | `POST` | `/wp-admin/admin-ajax.php` | yes |
+| `heartbeat_nopriv_received` | `heartbeat_unauthenticated` | `POST` | `/wp-admin/admin-ajax.php` | no |
+
+`setup_required` means the hook can be HTTP-relevant but needs extra setup before automatic PHUZZ config generation, for example shortcode pages, rewrite endpoints, REST route records, or XML-RPC method maps.
+
+`non_entry` means the hook is currently treated as non-replayable or manual-only, for example lifecycle, admin menu, enqueue, or unknown custom hooks.
+
+Compact candidate shape:
+
+```json
+{
+  "candidate_id": "cb-public",
+  "classification": "direct_http",
+  "hook_name": "wp_ajax_nopriv_demo_lookup",
+  "callback_id": "cb-public",
+  "entry_type": "ajax_unauthenticated",
+  "action": "demo_lookup",
+  "http_template": {
+    "method": "POST",
+    "path": "/wp-admin/admin-ajax.php",
+    "query_params": {},
+    "body_params": {
+      "action": "demo_lookup"
+    }
+  },
+  "auth_required": false,
+  "confidence": "high"
+}
+```
+
+### 3. Replay One Candidate
+
+`seed_validator.py` replays one selected candidate or one single seed JSON and writes `validation_result.json`. It diffs the hook coverage request directory before and after replay, then inspects only the new artifacts created by that replay.
+
+This validation proves that a generated entrypoint candidate can be replayed and correlated with hook coverage artifacts. It does not mean generated seeds are automatically consumed by the PHUZZ runtime.
+
+Run against one candidate from `entrypoint_candidates.json`:
+
+```powershell
+python hook_energy\seed_validator.py `
+  --base-url http://localhost:8080 `
+  --candidate-file output\entry_classifier\entrypoint_candidates.json `
+  --candidate-id cb-public `
+  --hook-coverage-dir output\hook-coverage `
+  --output-file output\validation_result.json `
+  --timeout 10 `
+  --pretty
+```
+
+The validator can also read one generated seed JSON directly when the file contains a `seed` object with `method`, `path`, `body`, and `query_params`.
+
+Compact `validation_result.json` shape:
+
+```json
+{
+  "schema_version": 1,
+  "candidate_id": "cb-public",
+  "hook_name": "wp_ajax_nopriv_demo_lookup",
+  "result": {
+    "expected_hook_fired": true,
+    "expected_callback_reached": true,
+    "confidence": "high",
+    "reason": "Expected callback id was found in executed_callbacks"
+  },
+  "artifacts": {
+    "artifact_count": 1
+  },
+  "observed": {
+    "executed_callback_ids": [
+      "cb-public"
+    ],
+    "executed_hook_names": [
+      "wp_ajax_nopriv_demo_lookup"
+    ]
+  }
+}
+```
+
+Result confidence:
+
+- `high`: the expected callback id or callback repr was found in `executed_callbacks`.
+- `medium`: the expected hook was observed, but the expected callback was not found in `executed_callbacks`.
+- `low`: no fresh artifact was created, or the expected hook and callback were not observed.
+
+Common failure reasons:
+
+- `No new hook coverage request artifacts were created`: the replay did not hit instrumentation, the target was not running, or the hook coverage output path is wrong.
+- `Expected callback was registered but was not executed`: the request reached a bootstrap path but did not execute the selected callback.
+- `Expected callback was reported as a blindspot and was not executed`: HookPhuzz observed the callback as registered or blindspot-only, not reached.
+
+### Focused Tests
+
+Run the tests for this pipeline from the fuzzer directory:
+
+```powershell
+cd C:\Users\chuda\OneDrive\Desktop\phuzz-hook-cv\phuzz-main\code\fuzzer
+python -m unittest `
+  tests.test_bootstrap_probe_runner `
+  tests.test_entry_classifier `
+  tests.test_seed_validator `
+  -v
+```
+
 ## Report Fields
 
 `hook_gap_report.json` keeps the richer callback context for auditing:
