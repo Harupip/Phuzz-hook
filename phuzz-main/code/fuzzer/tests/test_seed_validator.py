@@ -266,6 +266,64 @@ class SeedValidatorTests(unittest.TestCase):
         self.assertEqual(candidate["candidate_id"], "cb-public")
         self.assertEqual(candidate["http_template"]["body_params"], {"action": "demo_lookup"})
 
+    def test_seed_validator_reports_new_child_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            requests_dir = Path(tmp_dir) / "hook-coverage" / "requests"
+            requests_dir.mkdir(parents=True)
+            artifact = build_request_artifact(
+                executed={
+                    "cb-level1": {
+                        "callback_id": "cb-level1",
+                        "hook_name": "wp_ajax_nopriv_hookphuzz_level1",
+                        "fired_hook": "wp_ajax_nopriv_hookphuzz_level1",
+                    }
+                },
+                registered={
+                    "cb-level2": {
+                        "callback_id": "cb-level2",
+                        "hook_name": "wp_ajax_nopriv_hookphuzz_level2",
+                        "callback_repr": "hookphuzz_level2",
+                        "registered_inside_callback": True,
+                        "hook_level": 1,
+                        "parent_callback_id": "cb-level1",
+                        "parent_callback_repr": "hookphuzz_level1",
+                        "parent_callback": {
+                            "hook_name": "wp_ajax_nopriv_hookphuzz_level1",
+                            "callback_id": "cb-level1",
+                            "callback_repr": "hookphuzz_level1",
+                            "hook_level": 0,
+                        },
+                    }
+                },
+            )
+            http_client = FakeHttpClient(FakeResponse(200), requests_dir, artifact)
+
+            result = validate_candidate(
+                candidate=build_candidate(
+                    candidate_id="cb-level1",
+                    callback_id="cb-level1",
+                    hook_name="wp_ajax_nopriv_hookphuzz_level1",
+                    body_params={"action": "hookphuzz_level1"},
+                ),
+                base_url="http://web",
+                hook_coverage_dir=requests_dir.parent,
+                timeout=5,
+                validation_id="validation-child",
+                http_client=http_client,
+            )
+
+        self.assertEqual(
+            result["observed"]["newly_registered_child_hooks"],
+            [
+                {
+                    "hook_name": "wp_ajax_nopriv_hookphuzz_level2",
+                    "callback_id": "cb-level2",
+                    "hook_level": 1,
+                    "parent_callback_id": "cb-level1",
+                }
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

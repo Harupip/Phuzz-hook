@@ -122,6 +122,13 @@ class NormalizedCallback:
     priority: int | None
     status: str | None
     executed_count: int | None
+    registered_inside_callback: bool | None
+    parent_callback: dict[str, Any] | None
+    hook_level: int | None
+    parent_hook_name: str | None
+    parent_callback_id: str | None
+    parent_callback_repr: str | None
+    registration_stack_depth: int | None
     raw: dict[str, Any]
 
 
@@ -241,6 +248,13 @@ def _normalize_callback(row: dict[str, Any]) -> NormalizedCallback:
         priority=_optional_int(row.get("priority")),
         status=_optional_string(row.get("status", row.get("registration_status"))),
         executed_count=_optional_int(row.get("executed_count", row.get("execute_count"))),
+        registered_inside_callback=_optional_bool(row.get("registered_inside_callback")),
+        parent_callback=dict(row["parent_callback"]) if isinstance(row.get("parent_callback"), dict) else None,
+        hook_level=_optional_int(row.get("hook_level")),
+        parent_hook_name=_optional_string(row.get("parent_hook_name")),
+        parent_callback_id=_optional_string(row.get("parent_callback_id")),
+        parent_callback_repr=_optional_string(row.get("parent_callback_repr")),
+        registration_stack_depth=_optional_int(row.get("registration_stack_depth")),
         raw=dict(row),
     )
 
@@ -418,6 +432,12 @@ def _optional_int(value: Any) -> int | None:
     if value in (None, ""):
         return None
     return int(value)
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value in (None, ""):
+        return None
+    return bool(value)
 
 
 def _safe_slug(value: str) -> str:

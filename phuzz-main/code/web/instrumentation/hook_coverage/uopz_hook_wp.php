@@ -24,6 +24,7 @@ $GLOBALS['__uopz_hooks_installed'] = false;
 $GLOBALS['__uopz_hook_failures'] = [];
 $GLOBALS['__uopz_runtime_hook_contexts'] = [];
 $GLOBALS['__uopz_callback_origin_cache'] = [];
+$GLOBALS['__hookphuzz_callback_stack'] = [];
 
 // Tạo request_id thân thiện: <Giờ-Phút-Giây>_<Method>_<Path>_<Random>
 $__uopz_method = $_SERVER['REQUEST_METHOD'] ?? 'CLI';
@@ -392,6 +393,132 @@ function __uopz_callback_identity($callback, $hookName = '', $priority = null): 
     ];
 }
 
+function __uopz_parent_callback_metadata_from_entry(array $entry): array
+{
+    return [
+        'hook_name' => $entry['hook_name'] ?? null,
+        'callback_id' => $entry['callback_id'] ?? null,
+        'stable_id' => $entry['stable_id'] ?? null,
+        'runtime_id' => $entry['runtime_id'] ?? null,
+        'callback_repr' => $entry['callback_repr'] ?? null,
+        'function_name' => $entry['function_name'] ?? null,
+        'class_name' => $entry['class_name'] ?? null,
+        'method_name' => $entry['method_name'] ?? null,
+        'source_file' => $entry['source_file'] ?? null,
+        'source_line' => $entry['source_line'] ?? null,
+        'hook_level' => (int) ($entry['hook_level'] ?? 0),
+    ];
+}
+
+function __uopz_current_parent_callback_metadata(): ?array
+{
+    $stack = $GLOBALS['__hookphuzz_callback_stack'] ?? [];
+    if (is_array($stack) && count($stack) > 0) {
+        $parent = $stack[count($stack) - 1];
+        return is_array($parent) ? $parent : null;
+    }
+
+    return __uopz_infer_parent_callback_from_backtrace();
+}
+
+function __uopz_registration_stack_depth(): int
+{
+    $stack = $GLOBALS['__hookphuzz_callback_stack'] ?? [];
+    return is_array($stack) ? count($stack) : 0;
+}
+
+function __uopz_registration_context_metadata(): array
+{
+    $parent = __uopz_current_parent_callback_metadata();
+    $stackDepth = __uopz_registration_stack_depth();
+    if ($parent === null) {
+        return [
+            'registered_inside_callback' => false,
+            'parent_callback' => null,
+            'hook_level' => 0,
+            'parent_hook_name' => null,
+            'parent_callback_id' => null,
+            'parent_callback_repr' => null,
+            'registration_stack_depth' => $stackDepth,
+        ];
+    }
+
+    return [
+        'registered_inside_callback' => true,
+        'parent_callback' => $parent,
+        'hook_level' => ((int) ($parent['hook_level'] ?? 0)) + 1,
+        'parent_hook_name' => $parent['hook_name'] ?? null,
+        'parent_callback_id' => $parent['callback_id'] ?? null,
+        'parent_callback_repr' => $parent['callback_repr'] ?? null,
+        'registration_stack_depth' => max(1, $stackDepth),
+    ];
+}
+
+function __uopz_push_callback_stack(array $entry): void
+{
+    if (!isset($GLOBALS['__hookphuzz_callback_stack']) || !is_array($GLOBALS['__hookphuzz_callback_stack'])) {
+        $GLOBALS['__hookphuzz_callback_stack'] = [];
+    }
+
+    $GLOBALS['__hookphuzz_callback_stack'][] = __uopz_parent_callback_metadata_from_entry($entry);
+}
+
+function __uopz_pop_callback_stack(): void
+{
+    if (!isset($GLOBALS['__hookphuzz_callback_stack']) || !is_array($GLOBALS['__hookphuzz_callback_stack'])) {
+        $GLOBALS['__hookphuzz_callback_stack'] = [];
+        return;
+    }
+
+    array_pop($GLOBALS['__hookphuzz_callback_stack']);
+}
+
+function __uopz_infer_parent_callback_from_backtrace(): ?array
+{
+    $context = __uopz_get_runtime_hook_context();
+    $contextHook = is_array($context) ? (string) ($context['hook_name'] ?? '') : '';
+    if ($contextHook === '') {
+        return null;
+    }
+
+    $registered = $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'] ?? [];
+    foreach (__uopz_limit_backtrace(16) as $frame) {
+        foreach ($registered as $entry) {
+            if (!is_array($entry) || (string) ($entry['hook_name'] ?? '') !== $contextHook) {
+                continue;
+            }
+
+            if (__uopz_callback_frame_matches_entry($frame, $entry)) {
+                return __uopz_parent_callback_metadata_from_entry($entry);
+            }
+        }
+    }
+
+    return null;
+}
+
+function __uopz_callback_frame_matches_entry(array $frame, array $entry): bool
+{
+    $frameFunction = (string) ($frame['function'] ?? '');
+    $frameClass = (string) ($frame['class'] ?? '');
+    if ($frameFunction === '') {
+        return false;
+    }
+
+    $functionName = (string) ($entry['function_name'] ?? '');
+    if ($functionName !== '' && $frameFunction === $functionName) {
+        return true;
+    }
+
+    $methodName = (string) ($entry['method_name'] ?? '');
+    $className = (string) ($entry['class_name'] ?? '');
+    if ($methodName !== '' && $frameFunction === $methodName && ($className === '' || $frameClass === $className)) {
+        return true;
+    }
+
+    return $frameFunction === (string) ($entry['callback_repr'] ?? '');
+}
+
 function __uopz_get_hook_depth(): int
 {
     if (!isset($GLOBALS['wp_current_filter']) || !is_array($GLOBALS['wp_current_filter'])) {
@@ -476,6 +603,7 @@ function __uopz_register_callback(
     $timestamp = __uopz_now_iso8601();
     $existing = $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId] ?? null;
     [$type, $source] = __uopz_merge_registration_semantics(is_array($existing) ? $existing : null, $type, $source);
+    $registrationContext = __uopz_registration_context_metadata();
     $metadataKeys = [
         'function_name',
         'class_name',
@@ -511,6 +639,13 @@ function __uopz_register_callback(
             'is_active' => true,
             'status' => 'registered_only',
             'source' => $source,
+            'registered_inside_callback' => $registrationContext['registered_inside_callback'],
+            'parent_callback' => $registrationContext['parent_callback'],
+            'hook_level' => $registrationContext['hook_level'],
+            'parent_hook_name' => $registrationContext['parent_hook_name'],
+            'parent_callback_id' => $registrationContext['parent_callback_id'],
+            'parent_callback_repr' => $registrationContext['parent_callback_repr'],
+            'registration_stack_depth' => $registrationContext['registration_stack_depth'],
         ];
         foreach ($metadataKeys as $key) {
             $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId][$key] = $identity[$key] ?? null;
@@ -539,6 +674,13 @@ function __uopz_register_callback(
     $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['removed_from'] = null;
     $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['is_active'] = true;
     $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['source'] = $source;
+    $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['registered_inside_callback'] = $registrationContext['registered_inside_callback'];
+    $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['parent_callback'] = $registrationContext['parent_callback'];
+    $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['hook_level'] = $registrationContext['hook_level'];
+    $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['parent_hook_name'] = $registrationContext['parent_hook_name'];
+    $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['parent_callback_id'] = $registrationContext['parent_callback_id'];
+    $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['parent_callback_repr'] = $registrationContext['parent_callback_repr'];
+    $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['registration_stack_depth'] = $registrationContext['registration_stack_depth'];
     $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['status'] =
         isset($GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'][$callbackId]) ? 'covered' : 'registered_only';
 }
@@ -673,17 +815,22 @@ function __uopz_record_actual_callback_invocation($callback, int $actualArgCount
         return;
     }
 
-    __uopz_mark_callback_executed(
-        (string) ($registered['type'] ?? ($context['type'] ?? 'unknown')),
-        $hookName,
-        $callback,
-        $priority,
-        (int) ($registered['accepted_args'] ?? $actualArgCount),
-        ($registered['type'] ?? '') === 'action' ? 'do_action' : 'apply_filters',
-        (string) ($context['fired_hook'] ?? $hookName)
-    );
+    __uopz_push_callback_stack($registered);
+    try {
+        __uopz_mark_callback_executed(
+            (string) ($registered['type'] ?? ($context['type'] ?? 'unknown')),
+            $hookName,
+            $callback,
+            $priority,
+            (int) ($registered['accepted_args'] ?? $actualArgCount),
+            ($registered['type'] ?? '') === 'action' ? 'do_action' : 'apply_filters',
+            (string) ($context['fired_hook'] ?? $hookName)
+        );
 
-    $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['status'] = 'covered';
+        $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['status'] = 'covered';
+    } finally {
+        __uopz_pop_callback_stack();
+    }
 }
 
 // Duyet cau truc noi bo cua WP_Hook de lay snapshot callbacks theo priority.

@@ -144,6 +144,10 @@ def validate_candidate(
             "executed_hook_names": sorted(observed["executed_hook_names"]),
             "registered_callback_ids": sorted(observed["registered_callback_ids"]),
             "blindspot_callback_ids": sorted(observed["blindspot_callback_ids"]),
+            "newly_registered_child_hooks": sorted(
+                observed["newly_registered_child_hooks"].values(),
+                key=lambda item: (item["hook_name"] or "", item["callback_id"]),
+            ),
             "endpoints": sorted(observed["endpoints"]),
             "http_methods": sorted(observed["http_methods"]),
             "http_targets": sorted(observed["http_targets"]),
@@ -270,6 +274,7 @@ def _collect_observed(hook_coverage_dir: str | Path, artifact_paths: list[str]) 
         "http_targets": set(),
         "registered_callback_ids": set(),
         "blindspot_callback_ids": set(),
+        "newly_registered_child_hooks": {},
     }
 
     for relative_path in artifact_paths:
@@ -314,10 +319,13 @@ def _collect_observed(hook_coverage_dir: str | Path, artifact_paths: list[str]) 
                     observed["executed_callback_reprs"].add(value)
 
         observed["registered_callback_ids"].update(registered.keys())
-        for entry in registered.values():
+        for callback_id, entry in registered.items():
             explicit_id = _optional_string(entry.get("callback_id"))
             if explicit_id:
                 observed["registered_callback_ids"].add(explicit_id)
+            child_hook = _child_hook_summary(callback_id, entry)
+            if child_hook is not None:
+                observed["newly_registered_child_hooks"][child_hook["callback_id"]] = child_hook
 
         observed["blindspot_callback_ids"].update(blindspots.keys())
         for entry in blindspots.values():
@@ -413,6 +421,20 @@ def _normalize_callback_mapping(payload: Any) -> dict[str, dict[str, Any]]:
     return {}
 
 
+def _child_hook_summary(callback_id: str, entry: Mapping[str, Any]) -> dict[str, Any] | None:
+    hook_level = _optional_int(entry.get("hook_level"))
+    if not bool(entry.get("registered_inside_callback")) and (hook_level is None or hook_level <= 0):
+        return None
+
+    resolved_callback_id = _optional_string(entry.get("callback_id")) or callback_id
+    return {
+        "hook_name": _optional_string(entry.get("hook_name")),
+        "callback_id": resolved_callback_id,
+        "hook_level": hook_level,
+        "parent_callback_id": _optional_string(entry.get("parent_callback_id")),
+    }
+
+
 def _send_request(http_client: Any, **kwargs):
     if http_client is None:
         if requests is None:
@@ -464,6 +486,12 @@ def _optional_string(value: Any) -> str | None:
     if value in (None, ""):
         return None
     return str(value)
+
+
+def _optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    return int(value)
 
 
 def _utc_now() -> str:

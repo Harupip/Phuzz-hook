@@ -1,8 +1,10 @@
-# Hook-Aware Seed Generation
+# Runtime Hook Seed Generation
 
-Hook-aware seed generation turns uncovered WordPress callbacks into PHUZZ-compatible HTTP seed suggestions.
+Runtime hook seed generation turns uncovered WordPress callbacks into PHUZZ-compatible HTTP seed suggestions.
 
 The generator reads a UOPZ `total_coverage.json` snapshot, finds active uncovered callbacks, maps direct WordPress HTTP hooks to endpoints, extracts callback input parameters from source, and writes machine-readable seed artifacts.
+
+This exporter does not push seeds into PHUZZ's live `Candidate` queue by itself. The output is a discovery artifact for the next pipeline stages: classify entrypoint, generate PHUZZ config, replay, then validate callback reachability.
 
 ## Inputs
 
@@ -75,10 +77,10 @@ Example extractor result:
 
 ```json
 {
-  "callback": "GamiPress_Ajax::get_logs",
+  "callback": "Example_Plugin::handle_lookup",
   "input_params": [
     {
-      "name": "orderby",
+      "name": "item_id",
       "source": "REQUEST",
       "location": "body_or_query",
       "confidence": "static_regex",
@@ -109,13 +111,21 @@ Direct script mode also works:
 python hook_energy\seed_generation\export_cli.py --coverage-file output\total_coverage.json --output-dir output\seed_generation
 ```
 
+Convert unauth-capable seed suggestions into PHUZZ config JSON:
+
+```powershell
+python hook_energy\seed_generation\seed_to_config_cli.py --suggested-seeds output\seed_generation\suggested_seeds.json --output-config-dir configs\generated-hooks --summary output\seed_generation\generated_config_summary.json
+```
+
+Generated configs can be run later with `FUZZER_CONFIG=generated-hooks/<config-slug>`. The converter skips authenticated seeds with `auth_required`; it does not perform login automation or start fuzzing the generated configs.
+
 Example `suggested_seeds.json` entry:
 
 ```json
 {
-  "hook_name": "wp_ajax_nopriv_gamipress_get_logs",
+  "hook_name": "wp_ajax_nopriv_example_lookup",
   "callback_id": "...",
-  "callback_name": "gamipress_ajax_get_logs",
+  "callback_name": "example_lookup_handler",
   "seed_priority": "highest",
   "generation_status": "supported_http_seed",
   "seed": {
@@ -123,19 +133,19 @@ Example `suggested_seeds.json` entry:
     "path": "/wp-admin/admin-ajax.php",
     "content_type": "application/x-www-form-urlencoded",
     "body": {
-      "action": "gamipress_get_logs",
-      "orderby": "FUZZ"
+      "action": "example_lookup",
+      "item_id": "FUZZ"
     },
     "auth_mode": "unauth-capable",
     "fixed_params": [
       "action"
     ],
     "fuzzable_params": [
-      "orderby"
+      "item_id"
     ],
     "input_params": [
       {
-        "name": "orderby",
+        "name": "item_id",
         "source": "REQUEST",
         "location": "body_or_query",
         "confidence": "static_regex",
@@ -191,7 +201,7 @@ Default probes cover:
 Run:
 
 ```powershell
-cd C:\Users\chuda\OneDrive\Desktop\phuzz-hook-cv\phuzz-main\code\fuzzer
+cd C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\phuzz-main\code\fuzzer
 python hook_energy\bootstrap_probe_runner.py `
   --base-url http://localhost:8080 `
   --hook-coverage-dir output\hook-coverage `
@@ -243,6 +253,8 @@ Direct HTTP candidates receive an `http_template` with method, path, and fixed p
 
 `non_entry` means the hook is currently treated as non-replayable or manual-only, for example lifecycle, admin menu, enqueue, or unknown custom hooks.
 
+The classifier preserves multi-stage registration metadata when UOPZ reports that a hook was registered inside another callback. These fields include `registered_inside_callback`, `parent_callback`, `hook_level`, `parent_hook_name`, and `parent_callback_id`. They are useful for auditing level 1/level 2 child hook discovery, but they do not change entry classification by themselves. A level 2 hook is still only replayable automatically if it also matches a supported direct HTTP rule.
+
 Compact candidate shape:
 
 ```json
@@ -252,6 +264,10 @@ Compact candidate shape:
   "hook_name": "wp_ajax_nopriv_demo_lookup",
   "callback_id": "cb-public",
   "entry_type": "ajax_unauthenticated",
+  "registered_inside_callback": false,
+  "hook_level": 0,
+  "parent_hook_name": null,
+  "parent_callback_id": null,
   "action": "demo_lookup",
   "http_template": {
     "method": "POST",
@@ -265,6 +281,8 @@ Compact candidate shape:
   "confidence": "high"
 }
 ```
+
+For the detailed parent/child artifact contract, replay evidence, and current recursive-seed boundary, see `multistage-hook-discovery-metadata.md`.
 
 ### 3. Replay One Candidate
 
@@ -331,11 +349,13 @@ Common failure reasons:
 Run the tests for this pipeline from the fuzzer directory:
 
 ```powershell
-cd C:\Users\chuda\OneDrive\Desktop\phuzz-hook-cv\phuzz-main\code\fuzzer
+cd C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\phuzz-main\code\fuzzer
 python -m unittest `
   tests.test_bootstrap_probe_runner `
   tests.test_entry_classifier `
+  tests.test_bootstrap_entry_discovery `
   tests.test_seed_validator `
+  tests.test_uopz_multistage_metadata_contract `
   -v
 ```
 
@@ -345,16 +365,16 @@ python -m unittest `
 
 ```json
 {
-  "hook_name": "wp_ajax_nopriv_gamipress_get_logs",
-  "callback_name": "gamipress_ajax_get_logs",
-  "function_name": "gamipress_ajax_get_logs",
+  "hook_name": "wp_ajax_nopriv_example_lookup",
+  "callback_name": "example_lookup_handler",
+  "function_name": "example_lookup_handler",
   "class_name": null,
   "method_name": null,
   "is_static": false,
   "is_closure": false,
   "is_invokable": false,
   "formal_parameters": [],
-  "source_file": "/var/www/html/wp-content/plugins/gamipress/includes/ajax-functions.php",
+  "source_file": "/var/www/html/wp-content/plugins/example-plugin/includes/ajax.php",
   "source_line": 39,
   "start_line": 39,
   "end_line": 70,
@@ -362,23 +382,11 @@ python -m unittest `
 }
 ```
 
-## Validation Notes
+## Validation Boundary
 
-For GamiPress, expected seed when callback source is readable and the callback reads `$_REQUEST['orderby']`:
+The seed generator is valid when it writes deterministic discovery artifacts from `total_coverage.json`. The config converter is valid when it writes PHUZZ config JSON for unauth-capable seeds and records skipped seeds in `generated_config_summary.json`. Runtime validation is a separate stage: run a generated config and verify that the target callback id appears in request-level hook coverage.
 
-- `hook_name`: `wp_ajax_nopriv_gamipress_get_logs`
-- `seed.method`: `POST`
-- `seed.path`: `/wp-admin/admin-ajax.php`
-- `seed.body.action`: `gamipress_get_logs`
-- `seed.body.orderby`: `FUZZ`
-- `seed.fuzzable_params`: includes `orderby`
-
-For Country State City Dropdown CF7, expected seeds when callback source is readable:
-
-- `tc_csca_get_cities` includes `sid=FUZZ`
-- `tc_csca_get_states` includes `cnt=FUZZ`
-
-If those params are missing, first check whether `source_file` resolves on the host and whether `start_line`/`end_line` are present in the coverage artifact.
+If expected params are missing, first check whether `source_file` resolves on the host and whether `start_line`/`end_line` are present in the coverage artifact.
 
 ## Tests
 
@@ -387,6 +395,7 @@ Relevant tests:
 ```powershell
 cd C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\phuzz-main\code\fuzzer
 python -m unittest tests.test_seed_generation_input_extractor tests.test_input_signature_extractor tests.test_seed_generation_with_input_params -v
+python -m unittest tests.test_seed_to_config_exporter -v
 ```
 
 Broader regression set:

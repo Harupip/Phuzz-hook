@@ -33,6 +33,34 @@ def build_registered_callback(hook_name: str, callback_id: str | None = None) ->
     }
 
 
+def build_child_registered_callback() -> dict:
+    child = build_registered_callback("wp_ajax_nopriv_hookphuzz_level2", "cb-level2")
+    child.update(
+        {
+            "registered_inside_callback": True,
+            "hook_level": 1,
+            "parent_hook_name": "wp_ajax_nopriv_hookphuzz_level1",
+            "parent_callback_id": "cb-level1",
+            "parent_callback_repr": "hookphuzz_level1",
+            "registration_stack_depth": 1,
+            "parent_callback": {
+                "hook_name": "wp_ajax_nopriv_hookphuzz_level1",
+                "callback_id": "cb-level1",
+                "stable_id": "stable-level1",
+                "runtime_id": "runtime-level1",
+                "callback_repr": "hookphuzz_level1",
+                "function_name": "hookphuzz_level1",
+                "class_name": None,
+                "method_name": None,
+                "source_file": "/var/www/html/wp-content/plugins/demo/plugin.php",
+                "source_line": 10,
+                "hook_level": 0,
+            },
+        }
+    )
+    return child
+
+
 def build_total_coverage(*hooks: str) -> dict:
     registered = {}
     executed = {}
@@ -153,6 +181,22 @@ class EntryClassifierTests(unittest.TestCase):
         self.assertIsNone(candidate["accepted_args"])
         self.assertIsNone(candidate["priority"])
         self.assertIsNone(candidate["executed_count"])
+
+    def test_entry_classifier_preserves_multistage_hook_metadata(self) -> None:
+        callbacks, _ = load_registry_from_payload({"callbacks": [build_child_registered_callback()]})
+
+        report = classify_callbacks(callbacks, "hook_gap_report.json")
+        candidate = report["candidates"][0]
+
+        self.assertEqual(candidate["classification"], "direct_http")
+        self.assertTrue(candidate["registered_inside_callback"])
+        self.assertEqual(candidate["hook_level"], 1)
+        self.assertEqual(candidate["parent_hook_name"], "wp_ajax_nopriv_hookphuzz_level1")
+        self.assertEqual(candidate["parent_callback_id"], "cb-level1")
+        self.assertEqual(candidate["parent_callback_repr"], "hookphuzz_level1")
+        self.assertEqual(candidate["registration_stack_depth"], 1)
+        self.assertEqual(candidate["parent_callback"]["callback_id"], "cb-level1")
+        self.assertEqual(candidate["parent_callback"]["hook_level"], 0)
 
     def test_artifact_writer_splits_candidates_and_recalculates_counts(self) -> None:
         callbacks, _ = load_registry_from_payload(
