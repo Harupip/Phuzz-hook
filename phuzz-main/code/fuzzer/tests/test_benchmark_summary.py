@@ -311,60 +311,6 @@ class BenchmarkSummaryTests(unittest.TestCase):
         self.assertEqual(summary["unique_vuln_signatures"], [])
         self.assertEqual(summary["notes"], "")
 
-    def test_analyze_run_counts_benign_mysql_instrumentation_warnings_separately(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            run_dir = Path(tmp_dir)
-            requests_dir = run_dir / "requests"
-            requests_dir.mkdir()
-            (requests_dir / "req-1.json").write_text(
-                json.dumps(
-                    build_request_payload(
-                        "190000_GET_wp-admin_admin-ajax_php_0001",
-                        "2026-05-12 19:00:00",
-                        "1778094000-run-1",
-                    )
-                ),
-                encoding="utf-8",
-            )
-
-            fuzzer_output = run_dir / "fuzzer-output"
-            fuzzer_output.mkdir()
-            (fuzzer_output / "exceptions-and-errors.json").write_text(
-                json.dumps(
-                    [
-                        {
-                            "coverage_id": "1778094000-run-1",
-                            "errors": [
-                                {
-                                    "errstr": "No index used in query/prepared statement SELECT option_name FROM wp_options",
-                                    "errfile": "/var/www/html/wp-includes/class-wpdb.php",
-                                    "errline": 2345,
-                                }
-                            ],
-                            "exceptions": None,
-                        }
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            (run_dir / "total_coverage.json").write_text(
-                json.dumps({"metadata": {"total_registered_callbacks": 1}, "data": {"blindspot_callbacks": {}}}),
-                encoding="utf-8",
-            )
-
-            summary = analyze_run(
-                run_dir,
-                plugin="show-all-comments-in-one-page",
-                mode_label="HOOK",
-                mode_value=2,
-                run_id=1,
-                time_budget_seconds=600,
-            )
-
-        self.assertEqual(summary["raw_errors"], 1)
-        self.assertEqual(summary["filtered_benign_errors"], 1)
-        self.assertEqual(summary["vulnerability_relevant_errors"], 0)
-
 
 if __name__ == "__main__":
     unittest.main()

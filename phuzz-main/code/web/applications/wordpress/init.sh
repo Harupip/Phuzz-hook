@@ -30,10 +30,6 @@ export HOME=/tmp
 if [[ ${WP_TARGET_PLUGIN} == 'udraw' ]]; then
 ./wp-cli.phar plugin install ./_plugins/woocommerce.zip --activate
 fi
-if [[ ${WP_TARGET_PLUGIN} == 'country-state-city-auto-dropdown' ]]; then
-./wp-cli.phar plugin install ./_plugins/contact-form-7.zip --activate
-./wp-cli.phar plugin is-active contact-form-7
-fi
 ./wp-cli.phar plugin install ./_plugins/${WP_TARGET_PLUGIN}.zip --activate
 
 # SQLi (5/5)
