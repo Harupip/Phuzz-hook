@@ -25,6 +25,16 @@ A `Mutator` is a class implementing a set of `ParamMutators` that will take a ca
 
 Here, scoring formulas to rate candidates can be implemented. For now, PHUZZ only supports basic scoring formulas.
 
+## Runtime Hook Seed Generation
+
+Runtime hook seed generation lives under `hook_energy/seed_generation/`. It exports `hook_gap_report.json`, `suggested_seeds.json`, and `suggested_seeds.md` from a UOPZ `total_coverage.json` snapshot.
+
+The exporter maps direct WordPress HTTP hooks such as `wp_ajax_*`, `wp_ajax_nopriv_*`, `admin_post_*`, and `admin_post_nopriv_*` to replayable PHUZZ seed templates. It also scans callback source for request-controlled inputs and injects discovered params as `FUZZ`, while keeping `action` fixed.
+
+These are discovery artifacts, not automatic inserts into PHUZZ's live `Candidate` queue. `seed_to_config_cli.py` can convert unauth-capable suggestions into `configs/generated-hooks/*.json`; authenticated seeds are skipped until login automation is wired. See `../docs/guides/hook-aware-seed-generation.md` for commands, output shape, and validation boundary.
+
+The UOPZ hook registry also records multi-stage registration metadata when one callback registers another hook. These fields include `registered_inside_callback`, `parent_callback`, `hook_level`, `parent_hook_name`, and `parent_callback_id`. The classifier and validator preserve this metadata so replay can report child hooks discovered at runtime. This is metadata only: recursive seed generation for child hooks is not wired yet. See `../docs/guides/multistage-hook-discovery-metadata.md`.
+
 ## VulnCheck
 
 The `VulnChecker` classes implement a call to a set of different `VulnChecks` that are used to identify client-side and server-side vulnerabilities in the target application, e.g. by checking the instrumentation's output for a specific candidate.

@@ -109,4 +109,3 @@ cat > /etc/apache2/sites-enabled/001-wordpress.conf <<EOF
 EOF
 
 grep -qxF 'Listen 8181' /etc/apache2/ports.conf || echo 'Listen 8181' >> /etc/apache2/ports.conf
-

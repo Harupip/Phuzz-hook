@@ -91,6 +91,26 @@ function Export-LiveSeedSuggestions {
     python $exportCli --coverage-file $coverageSnapshot --output-dir $outputDir
 }
 
+function Convert-LiveSeedSuggestionsToConfigs {
+    param(
+        [string]$ScriptRoot
+    )
+
+    $seedOutputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
+    $suggestedSeeds = Join-Path $seedOutputDir "suggested_seeds.json"
+    $outputConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-hooks"
+    $summaryPath = Join-Path $seedOutputDir "generated_config_summary.json"
+    $configCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\seed_to_config_cli.py"
+
+    Assert-PathExists -Path $suggestedSeeds -Hint "Run hook seed export before converting seeds into PHUZZ configs."
+
+    Write-Host "Converting unauth-capable suggested seeds into PHUZZ configs"
+    python $configCli `
+        --suggested-seeds $suggestedSeeds `
+        --output-config-dir $outputConfigDir `
+        --summary $summaryPath
+}
+
 Push-Location $scriptRoot
 try {
     Write-Host "Checking Docker availability"
@@ -121,12 +141,15 @@ try {
     docker compose up -d $fuzzerService --build
 
     Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds
+    Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot
 
     if ($NoFollowLogs) {
         Write-Host "PHUZZ started. To follow logs later, run:"
         Write-Host "  docker compose logs -f $fuzzerService"
         Write-Host "Suggested seed artifacts:"
         Write-Host "  $scriptRoot\fuzzer\output\seed_generation"
+        Write-Host "Generated hook config artifacts:"
+        Write-Host "  $scriptRoot\fuzzer\configs\generated-hooks"
     } else {
         Write-Host "Following fuzzer logs. Press Ctrl+C to stop following without stopping containers."
         docker compose logs -f $fuzzerService

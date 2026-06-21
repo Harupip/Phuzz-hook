@@ -5,8 +5,26 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .input_extractor import InputSignatureExtractor
+from .source_resolver import SourcePathResolver
+
 
 class LiveHookSeedGenerator:
+    def __init__(
+        self,
+        input_extractor: InputSignatureExtractor | None = None,
+        *,
+        container_source_root: str | Path | None = None,
+        host_source_root: str | Path | None = None,
+        source_root: str | Path | None = None,
+    ) -> None:
+        resolver = SourcePathResolver(
+            container_source_root=container_source_root,
+            host_source_root=host_source_root,
+            source_root=source_root,
+        )
+        self.input_extractor = input_extractor or InputSignatureExtractor(source_resolver=resolver)
+
     def build_reports(self, coverage_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         callback_rows = self._build_callback_rows(coverage_payload)
         suggested_rows = [item for item in callback_rows if item["status"] == "uncovered" and item["is_active"]]
@@ -30,6 +48,11 @@ class LiveHookSeedGenerator:
                 "hook_name": item["hook_name"],
                 "callback_id": item["callback_id"],
                 "callback_name": item["callback_name"],
+                "source_file": item["source_file"],
+                "source_line": item["source_line"],
+                "start_line": item["start_line"],
+                "end_line": item["end_line"],
+                "source_resolution": item["source_resolution"],
                 "seed_priority": item["seed_priority"],
                 "generation_status": item["generation_status"],
             }
@@ -89,7 +112,17 @@ class LiveHookSeedGenerator:
             is_active = bool(registered_entry.get("is_active", True))
             status = "covered" if execute_count > 0 else "uncovered"
             seed_priority, priority_rank, target_family = self._classify_seed_priority(hook_name, is_active)
-            seed, generation_status = self._generate_seed_template(hook_name, is_active, status)
+            extraction = self.input_extractor.extract(registered_entry)
+            input_params = extraction.get("input_params", [])
+            source_resolution = extraction.get(
+                "source_resolution",
+                {
+                    "source_file": str(registered_entry.get("source_file") or ""),
+                    "status": "unresolved",
+                    "resolved_source_file": None,
+                },
+            )
+            seed, generation_status = self._generate_seed_template(hook_name, is_active, status, input_params)
 
             rows.append(
                 {
@@ -98,10 +131,21 @@ class LiveHookSeedGenerator:
                     "callback_name": self._resolve_callback_name(str(callback_id), registered_entry),
                     "callback_raw": str(registered_entry.get("callback_repr") or callback_id),
                     "callback_type": str(registered_entry.get("type", registered_entry.get("callback_type", "unknown"))),
+                    "function_name": registered_entry.get("function_name"),
+                    "class_name": registered_entry.get("class_name"),
+                    "method_name": registered_entry.get("method_name"),
+                    "is_static": bool(registered_entry.get("is_static", False)),
+                    "is_closure": bool(registered_entry.get("is_closure", False)),
+                    "is_invokable": bool(registered_entry.get("is_invokable", False)),
+                    "formal_parameters": registered_entry.get("formal_parameters", []),
                     "priority": self._safe_int(registered_entry.get("priority"), default=10),
                     "accepted_args": self._safe_int(registered_entry.get("accepted_args"), default=1),
                     "source_file": registered_entry.get("source_file"),
                     "source_line": self._safe_int(registered_entry.get("source_line")),
+                    "start_line": self._safe_int(registered_entry.get("start_line")),
+                    "end_line": self._safe_int(registered_entry.get("end_line")),
+                    "source_resolution": source_resolution,
+                    "input_params": input_params,
                     "is_active": is_active,
                     "registration_status": str(registered_entry.get("status", "registered_only")),
                     "register_count": 1,
@@ -135,44 +179,84 @@ class LiveHookSeedGenerator:
                 return value
         return callback_id
 
-    def _generate_seed_template(self, hook_name: str, is_active: bool, coverage_status: str) -> tuple[dict[str, Any] | None, str]:
+    def _generate_seed_template(
+        self,
+        hook_name: str,
+        is_active: bool,
+        coverage_status: str,
+        input_params: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
         if not is_active:
             return None, "inactive_callback"
         if coverage_status != "uncovered":
             return None, "already_covered"
         if hook_name.startswith("wp_ajax_nopriv_"):
-            return {
+            return self._attach_fuzzable_params({
                 "method": "POST",
                 "path": "/wp-admin/admin-ajax.php",
                 "content_type": "application/x-www-form-urlencoded",
                 "body": {"action": hook_name.removeprefix("wp_ajax_nopriv_")},
                 "auth_mode": "unauth-capable",
-            }, "supported_http_seed"
+            }, input_params), "supported_http_seed"
         if hook_name.startswith("wp_ajax_"):
-            return {
+            return self._attach_fuzzable_params({
                 "method": "POST",
                 "path": "/wp-admin/admin-ajax.php",
                 "content_type": "application/x-www-form-urlencoded",
                 "body": {"action": hook_name.removeprefix("wp_ajax_")},
                 "auth_mode": "authenticated",
-            }, "supported_http_seed"
+            }, input_params), "supported_http_seed"
         if hook_name.startswith("admin_post_nopriv_"):
-            return {
+            return self._attach_fuzzable_params({
                 "method": "POST",
                 "path": "/wp-admin/admin-post.php",
                 "content_type": "application/x-www-form-urlencoded",
                 "body": {"action": hook_name.removeprefix("admin_post_nopriv_")},
                 "auth_mode": "unauth-capable",
-            }, "supported_http_seed"
+            }, input_params), "supported_http_seed"
         if hook_name.startswith("admin_post_"):
-            return {
+            return self._attach_fuzzable_params({
                 "method": "POST",
                 "path": "/wp-admin/admin-post.php",
                 "content_type": "application/x-www-form-urlencoded",
                 "body": {"action": hook_name.removeprefix("admin_post_")},
                 "auth_mode": "authenticated",
-            }, "supported_http_seed"
+            }, input_params), "supported_http_seed"
         return None, "manual_analysis_required"
+
+    def _attach_fuzzable_params(
+        self,
+        seed: dict[str, Any],
+        input_params: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        seed["fixed_params"] = ["action"]
+        seed["fuzzable_params"] = []
+        seed["input_params"] = input_params or []
+
+        if "query_params" not in seed:
+            seed["query_params"] = {}
+        if "cookies" not in seed:
+            seed["cookies"] = {}
+
+        for item in input_params or []:
+            name = str(item.get("name", "")).strip()
+            source = str(item.get("source", "REQUEST")).upper()
+            if not name or name == "action":
+                continue
+
+            if source == "GET":
+                target = seed["query_params"]
+            elif source == "COOKIE":
+                target = seed["cookies"]
+            else:
+                target = seed["body"]
+
+            if name not in target:
+                target[name] = "FUZZ"
+            if name not in seed["fuzzable_params"]:
+                seed["fuzzable_params"].append(name)
+
+        return seed
 
     def _classify_seed_priority(self, hook_name: str, is_active: bool) -> tuple[str, int, str]:
         if not is_active:
@@ -180,11 +264,11 @@ class LiveHookSeedGenerator:
         if hook_name.startswith("wp_ajax_nopriv_"):
             return "highest", 400, "wp_ajax_nopriv"
         if hook_name.startswith("wp_ajax_"):
-            return "highest", 390, "wp_ajax"
+            return "high", 300, "wp_ajax"
         if hook_name.startswith("admin_post_nopriv_"):
-            return "highest", 380, "admin_post_nopriv"
+            return "highest", 400, "admin_post_nopriv"
         if hook_name.startswith("admin_post_"):
-            return "highest", 370, "admin_post"
+            return "high", 300, "admin_post"
         lowered = hook_name.lower()
         if lowered in {"init", "plugins_loaded", "wp_loaded"}:
             return "low", 100, "lifecycle"

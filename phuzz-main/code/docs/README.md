@@ -7,7 +7,9 @@ Start here when you need to run, debug, or explain the current WordPress PHUZZ s
 | File | Use it when |
 | --- | --- |
 | `guides/run-wordpress-plugins.md` | You need exact commands for the default plugin, one plugin, many plugins, or the full plugin matrix. |
-| `guides/benchmark-wordpress-phuzz.md` | You need to compare `PHUZZ_SCORING_MODE=1` with hook-aware scoring mode `2`. |
+| `guides/benchmark-wordpress-phuzz.md` | Legacy benchmark notes for comparing `PHUZZ_SCORING_MODE=1` with hook-aware scoring mode `2`. |
+| `guides/hook-aware-seed-generation.md` | You need to export runtime hook seed discovery artifacts and understand extracted fuzzable params. |
+| `guides/multistage-hook-discovery-metadata.md` | You need to explain or verify parent/child hook metadata such as `hook_level`, `parent_callback`, and child hooks discovered during replay. |
 
 ## Reference
 
