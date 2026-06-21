@@ -68,11 +68,33 @@ class SeedToConfigExporterTests(unittest.TestCase):
         self.assertEqual(config["headers"]["fixed"], ["X-Seed"])
         self.assertEqual(config["cookies"]["fixed"], ["wordpress_test_cookie"])
 
-    def test_authenticated_seed_is_skipped_with_auth_required_reason(self):
-        with self.assertRaises(SeedConfigSkip) as raised:
-            build_config_for_seed_item(build_seed_item(auth_mode="authenticated"))
+    def test_authenticated_ajax_seed_becomes_config_with_fixed_action(self):
+        slug, config = build_config_for_seed_item(
+            build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
+        )
 
-        self.assertEqual(raised.exception.reason, "auth_required")
+        self.assertEqual(slug, "wp_ajax_example_lookup-cb-public")
+        self.assertEqual(config["target"], "http://web/wp-admin/admin-ajax.php")
+        self.assertEqual(config["body_params"]["fixed"], ["action"])
+        self.assertEqual(config["body_params"]["fuzz"], ["item_id"])
+
+    def test_authenticated_admin_post_seed_becomes_config_with_fixed_action(self):
+        item = build_seed_item(hook_name="admin_post_export_orders", auth_mode="authenticated")
+        item["seed"].update(
+            {
+                "path": "/wp-admin/admin-post.php",
+                "body": {"action": "export_orders", "order_id": "FUZZ"},
+                "query_params": {},
+                "fuzzable_params": ["order_id"],
+            }
+        )
+
+        slug, config = build_config_for_seed_item(item)
+
+        self.assertEqual(slug, "admin_post_export_orders-cb-public")
+        self.assertEqual(config["target"], "http://web/wp-admin/admin-post.php")
+        self.assertEqual(config["body_params"]["fixed"], ["action"])
+        self.assertEqual(config["body_params"]["fuzz"], ["order_id"])
 
     def test_manual_or_malformed_seed_is_skipped_with_clear_reason(self):
         with self.assertRaises(SeedConfigSkip) as raised:
@@ -102,9 +124,10 @@ class SeedToConfigExporterTests(unittest.TestCase):
 
             config_path = output_dir / "wp_ajax_nopriv_example_lookup-cb-public.json"
             self.assertTrue(config_path.exists())
+            self.assertTrue((output_dir / "wp_ajax_example_lookup-cb-public.json").exists())
             self.assertEqual(summary["generated"][0]["config_slug"], "generated-hooks/wp_ajax_nopriv_example_lookup-cb-public")
-            self.assertEqual(summary["skipped"][0]["reason"], "auth_required")
-            self.assertEqual(summary["skipped"][1]["reason"], "missing_seed")
+            self.assertEqual(summary["generated"][1]["config_slug"], "generated-hooks/wp_ajax_example_lookup-cb-public")
+            self.assertEqual(summary["skipped"][0]["reason"], "missing_seed")
             self.assertEqual(json.loads(summary_path.read_text(encoding="utf-8")), summary)
 
     def test_cli_writes_config_and_summary_from_suggested_seeds_file(self):

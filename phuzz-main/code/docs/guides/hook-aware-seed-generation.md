@@ -111,13 +111,21 @@ Direct script mode also works:
 python hook_energy\seed_generation\export_cli.py --coverage-file output\total_coverage.json --output-dir output\seed_generation
 ```
 
-Convert unauth-capable seed suggestions into PHUZZ config JSON:
+Convert unauth-capable and authenticated seed suggestions into PHUZZ config JSON:
 
 ```powershell
 python hook_energy\seed_generation\seed_to_config_cli.py --suggested-seeds output\seed_generation\suggested_seeds.json --output-config-dir configs\generated-hooks --summary output\seed_generation\generated_config_summary.json
 ```
 
-Generated configs can be run later with `FUZZER_CONFIG=generated-hooks/<config-slug>`. The converter skips authenticated seeds with `auth_required`; it does not perform login automation or start fuzzing the generated configs.
+Generated configs can be run later with `FUZZER_CONFIG=generated-hooks/<config-slug>`. Authenticated configs rely on the existing WordPress UOPZ overrides for login, capability, and nonce checks. The converter does not perform login automation or start fuzzing the generated configs.
+
+### Authenticated Config Runtime Proof
+
+The authenticated path was verified against GamiPress using `wp_ajax_gamipress_get_logs`. Bootstrap completed all 10 probes and seed export produced 63 direct HTTP candidates. The generated config kept `action=gamipress_get_logs` fixed, fuzzed the 11 extracted request parameters, and PHUZZ produced a request artifact whose `executed_callbacks` contained callback ID `0c8eda78b0f602c896a900ec1cf560ba93691051` with `fired_hook=wp_ajax_gamipress_get_logs`.
+
+Akismet also produced an authenticated seed for `wp_ajax_comment_author_deurl`, with fixed `action` and fuzzable `id`. Its static class callback is currently reported under `blindspot_callbacks`, so it cannot be used as an `executed_callbacks` proof without extending the hook instrumentation. Function callbacks such as the GamiPress target provide the current end-to-end proof boundary.
+
+This verification runs one generated config explicitly through `FUZZER_CONFIG`; automatic config selection and batch fuzzing remain separate follow-up work.
 
 Example `suggested_seeds.json` entry:
 
@@ -384,7 +392,7 @@ python -m unittest `
 
 ## Validation Boundary
 
-The seed generator is valid when it writes deterministic discovery artifacts from `total_coverage.json`. The config converter is valid when it writes PHUZZ config JSON for unauth-capable seeds and records skipped seeds in `generated_config_summary.json`. Runtime validation is a separate stage: run a generated config and verify that the target callback id appears in request-level hook coverage.
+The seed generator is valid when it writes deterministic discovery artifacts from `total_coverage.json`. The config converter is valid when it writes PHUZZ config JSON for unauth-capable and authenticated seeds and records unsupported seeds in `generated_config_summary.json`. Runtime validation is a separate stage: run a generated config and verify that the target callback id appears in request-level hook coverage.
 
 If expected params are missing, first check whether `source_file` resolves on the host and whether `start_line`/`end_line` are present in the coverage artifact.
 

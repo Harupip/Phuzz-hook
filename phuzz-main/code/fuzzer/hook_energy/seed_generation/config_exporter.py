@@ -23,9 +23,7 @@ def build_config_for_seed_item(
         raise SeedConfigSkip("missing_seed")
 
     auth_mode = str(seed.get("auth_mode", "")).strip()
-    if auth_mode == "authenticated":
-        raise SeedConfigSkip("auth_required")
-    if auth_mode != "unauth-capable":
+    if auth_mode not in {"authenticated", "unauth-capable"}:
         raise SeedConfigSkip("unsupported_auth_mode")
 
     method = str(seed.get("method", "")).strip().upper()
