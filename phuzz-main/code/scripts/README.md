@@ -16,7 +16,7 @@ Run commands from `phuzz-main/code` unless a guide says otherwise. The root scri
 
 | File | What it does |
 | --- | --- |
-| `scripts/wordpress/run-wordpress-phuzz.ps1` | Host-side WordPress runner. Its default path exports live seed suggestions; opt-in batch mode also runs generated configs sequentially with a per-config timeout. |
+| `scripts/wordpress/run-wordpress-phuzz.ps1` | Host-side WordPress runner. Its default path exports live seed suggestions; opt-in batch mode runs generated configs in bounded windows and validates target callbacks from new hook artifacts. |
 | `scripts/wordpress/run-wordpress-phuzz.sh` | Bash helper for WSL-like shells. It stops the fuzzer service, clears `fuzzer/output`, then calls the PowerShell runner. |
 | `scripts/wordpress/run-wordpress-plugin-matrix.ps1` | Plugin matrix runner. It downloads missing plugin ZIPs, generates temporary Compose overrides, runs each selected plugin, and writes Markdown/JSON reports. |
 | `scripts/benchmarks/benchmark-wordpress-phuzz.ps1` | Benchmark runner. It switches scoring mode, runs repeated fuzz windows, copies artifacts, and calls the benchmark summarizer. |

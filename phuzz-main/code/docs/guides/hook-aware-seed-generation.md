@@ -125,7 +125,7 @@ The WordPress runner can execute every generated config sequentially after expor
 .\scripts\wordpress\run-wordpress-phuzz.ps1 -RunGeneratedConfigs -GeneratedConfigTimeoutSeconds 300 -NoFollowLogs
 ```
 
-Each config receives its own timeout. Failed and timed-out runs do not prevent later configs from running. Results are written to `fuzzer/output/seed_generation/generated_config_run_summary.json`; any failed or timed-out run makes the script fail after the summary is written.
+Each config receives its own bounded run window. Reaching the limit stops the long-running fuzzer intentionally; it is not itself a failure. The runner evaluates only request artifacts created during that window and reports `callback_reached`, `registered_not_executed`, `hook_fired_target_not_registered`, `no_artifact`, or `not_observed`. Results are written to `fuzzer/output/seed_generation/generated_config_run_summary.json`; the script fails when a process exits with an error or any target callback is not reached.
 
 ### Authenticated Config Runtime Proof
 

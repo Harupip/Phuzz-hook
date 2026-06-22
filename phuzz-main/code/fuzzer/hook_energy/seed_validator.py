@@ -265,6 +265,16 @@ def _normalize_http_template(candidate: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _collect_observed(hook_coverage_dir: str | Path, artifact_paths: list[str]) -> dict[str, set[str]]:
+    payloads = [_load_json(Path(hook_coverage_dir) / relative_path) for relative_path in artifact_paths]
+    return _collect_observed_payloads(payloads)
+
+
+def evaluate_artifact_payloads(candidate: dict[str, Any], payloads: list[Any]) -> dict[str, Any]:
+    observed = _collect_observed_payloads(payloads)
+    return _build_result(candidate, observed, artifact_count=len(payloads))
+
+
+def _collect_observed_payloads(payloads: list[Any]) -> dict[str, set[str]]:
     observed = {
         "executed_callback_ids": set(),
         "executed_callback_reprs": set(),
@@ -277,8 +287,7 @@ def _collect_observed(hook_coverage_dir: str | Path, artifact_paths: list[str]) 
         "newly_registered_child_hooks": {},
     }
 
-    for relative_path in artifact_paths:
-        payload = _load_json(Path(hook_coverage_dir) / relative_path)
+    for payload in payloads:
         if not isinstance(payload, Mapping):
             continue
 
@@ -349,25 +358,37 @@ def _build_result(candidate: dict[str, Any], observed: dict[str, set[str]], *, a
     else:
         expected_callback_reached = False
 
+    callback_registered = bool(callback_id and callback_id in observed["registered_callback_ids"])
+
     if expected_callback_reached:
+        status = "callback_reached"
         confidence = "high"
         if callback_id:
             reason = "Expected callback id was found in executed_callbacks"
         else:
             reason = "Expected callback repr was found in executed_callbacks"
+    elif callback_registered:
+        status = "registered_not_executed"
+        confidence = "low"
+        reason = "Expected callback was registered but was not executed"
     elif expected_hook_fired:
+        status = "hook_fired_target_not_registered"
         confidence = "medium"
         reason = "Expected hook was observed, but expected callback was not found in executed_callbacks"
+    elif artifact_count == 0:
+        status = "no_artifact"
+        confidence = "low"
+        reason = "No new hook coverage request artifacts were created"
     else:
+        status = "not_observed"
         confidence = "low"
         reason = _failure_reason(
-            artifact_count=artifact_count,
             callback_id=callback_id,
             callback_repr=callback_repr,
-            observed=observed,
         )
 
     return {
+        "status": status,
         "expected_hook_fired": expected_hook_fired,
         "expected_callback_reached": expected_callback_reached,
         "confidence": confidence,
@@ -385,17 +406,9 @@ def _hook_name_observed(hook_name: str, observed: dict[str, set[str]]) -> bool:
 
 def _failure_reason(
     *,
-    artifact_count: int,
     callback_id: str | None,
     callback_repr: str | None,
-    observed: dict[str, set[str]],
 ) -> str:
-    if artifact_count == 0:
-        return "No new hook coverage request artifacts were created"
-    if callback_id and callback_id in observed["registered_callback_ids"]:
-        return "Expected callback was registered but was not executed"
-    if callback_id and callback_id in observed["blindspot_callback_ids"]:
-        return "Expected callback was reported as a blindspot and was not executed"
     if not callback_id and not callback_repr:
         return "Candidate has no callback_id or callback_repr to match against executed_callbacks"
     return "Expected hook and callback were not observed in new hook coverage request artifacts"
