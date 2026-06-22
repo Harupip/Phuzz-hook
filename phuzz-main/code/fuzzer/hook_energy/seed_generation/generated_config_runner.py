@@ -59,8 +59,6 @@ def run_generated_configs(
                 command,
                 timeout=timeout_seconds,
                 check=False,
-                capture_output=True,
-                text=True,
             )
             status = "passed" if result.returncode == 0 else "failed"
             exit_code: int | None = result.returncode

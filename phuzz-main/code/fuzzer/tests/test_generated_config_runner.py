@@ -81,6 +81,8 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertEqual(report["counts"], {"total": 2, "passed": 1, "failed": 1, "timed_out": 0})
         self.assertEqual(report["runs"][0]["exit_code"], 3)
         self.assertIn("FUZZER_CONFIG=generated-hooks/two", runner.commands[1])
+        self.assertNotIn("capture_output", runner.calls[0][1])
+        self.assertNotIn("text", runner.calls[0][1])
 
     def test_timeout_cleans_named_container_and_continues(self):
         runner = FakeRunner([subprocess.TimeoutExpired(["docker"], 5), completed(0)])
