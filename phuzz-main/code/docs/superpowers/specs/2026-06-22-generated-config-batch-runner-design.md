@@ -2,7 +2,7 @@
 
 ## Goal
 
-Add an opt-in `-RunGeneratedConfigs` mode to the WordPress PHUZZ runner. The mode must execute generated hook configs sequentially with a per-config timeout and write a machine-readable run summary.
+Add an opt-in `-RunGeneratedConfigs` mode to the WordPress PHUZZ runner. The mode must execute generated hook configs sequentially within a bounded run window, validate target callbacks from new request artifacts, and write a machine-readable run summary.
 
 ## Scope
 
@@ -11,7 +11,7 @@ Add an opt-in `-RunGeneratedConfigs` mode to the WordPress PHUZZ runner. The mod
 - Export `suggested_seeds.json` and convert supported seeds into `configs/generated-hooks/*.json`.
 - Stop the default fuzzer before starting generated config runs.
 - Run every `generated[].config_slug` from `generated_config_summary.json` once.
-- Record `passed`, `failed`, or `timed_out` for every attempted config.
+- Record process outcome, new request count, and callback validation status for every attempted config.
 
 REST, shortcode, rewrite, XML-RPC setup, recursive child-hook generation, login automation, retries, and parallel runs remain out of scope.
 
@@ -41,8 +41,9 @@ After seed conversion, the PowerShell runner stops `fuzzer-wordpress-plugin` and
    `docker compose run --rm -T --name <unique-name> -e FUZZER_CONFIG=<slug> fuzzer-wordpress-plugin`
 
 4. Assigns an explicit container name so timeout cleanup can run `docker rm -f <name>`.
-5. Continues after failure or timeout.
-6. Writes `generated_config_run_summary.json` atomically after the batch finishes.
+5. Treats run-window expiry as intentional cleanup, not a fuzzing failure.
+6. Evaluates only request artifacts created during that config's run window.
+7. Writes `generated_config_run_summary.json` atomically after the batch finishes.
 
 Container names use the config index plus a sanitized slug to avoid invalid Docker names.
 
@@ -52,17 +53,25 @@ The run summary contains:
 
 - `generated_config_summary`: source summary path.
 - `timeout_seconds`: configured timeout.
-- `runs`: ordered rows with `config_slug`, `status`, `exit_code`, `duration_seconds`, and `container_name`.
-- `counts`: `total`, `passed`, `failed`, and `timed_out`.
+- `runs`: ordered rows with config identity, process outcome, validation status, request count, exit code, duration, and container name.
+- `counts`: totals grouped by validation status.
 
-Exit code is `0` when every run passes, `1` when any run fails or times out, and `2` for invalid CLI input or malformed summary data.
+Validation status precedence is:
+
+1. `callback_reached`: target exists in `executed_callbacks`.
+2. `registered_not_executed`: target exists in `registered_callbacks` but not `executed_callbacks`.
+3. `hook_fired_target_not_registered`: target hook fired but target callback was not registered.
+4. `no_artifact`: the run created no request artifact.
+5. `not_observed`: artifacts exist but neither target hook nor callback was observed.
+
+`blindspot_callbacks` remains metadata, not a separate status, because instrumentation derives it from active registered callbacks absent from `executed_callbacks`. Exit code is `0` only when every target is `callback_reached`, `1` for any other runtime result, and `2` for invalid input.
 
 ## Error Handling
 
 - Missing/malformed summary: fail before Docker execution.
 - Empty generated list: write an empty successful summary.
-- Non-zero Docker exit: record `failed`, continue.
-- Timeout: force-remove named container, record `timed_out`, continue.
+- Non-zero Docker exit before window end: record process failure, continue.
+- Run window elapsed: force-remove named container, validate new artifacts, continue.
 - Summary write failure: fail loudly.
 
 ## Tests
@@ -71,7 +80,8 @@ Python unit tests cover:
 
 - Ordered execution and successful summary counts.
 - Non-zero exit handling without stopping later configs.
-- Timeout cleanup and continued execution.
+- Run-window cleanup and continued execution.
+- Validation precedence from new request artifacts.
 - Missing or malformed generated config entries.
 - CLI output and exit codes.
 

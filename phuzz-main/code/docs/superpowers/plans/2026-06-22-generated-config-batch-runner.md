@@ -144,3 +144,18 @@ Expected: no parser errors and no whitespace errors.
 git add phuzz-main/code/fuzzer/hook_energy/seed_generation/generated_config_runner.py phuzz-main/code/fuzzer/tests/test_generated_config_runner.py phuzz-main/code/scripts/wordpress/run-wordpress-phuzz.ps1 phuzz-main/code/docs/guides/hook-aware-seed-generation.md phuzz-main/code/scripts/README.md phuzz-main/code/docs/superpowers/plans/2026-06-22-generated-config-batch-runner.md
 git commit -m "feat: run generated hook configs sequentially"
 ```
+
+### Task 4: Runtime artifact classification
+
+**Files:**
+- Modify: `phuzz-main/code/fuzzer/hook_energy/seed_validator.py`
+- Modify: `phuzz-main/code/fuzzer/hook_energy/seed_generation/generated_config_runner.py`
+- Modify: `phuzz-main/code/fuzzer/tests/test_seed_validator.py`
+- Modify: `phuzz-main/code/fuzzer/tests/test_generated_config_runner.py`
+
+- [ ] **Step 1: Write failing validator tests** for `callback_reached`, `registered_not_executed`, `hook_fired_target_not_registered`, `no_artifact`, and `not_observed`; assert no standalone blindspot status.
+- [ ] **Step 2: Run `python -m unittest tests.test_seed_validator -v`** and confirm status assertions fail.
+- [ ] **Step 3: Expose shared artifact-payload evaluation** in `seed_validator.py`, preserving existing booleans and reasons.
+- [ ] **Step 4: Write failing batch tests** asserting elapsed windows are intentional, only new artifacts are evaluated, request counts are recorded, and process failures remain separate.
+- [ ] **Step 5: Integrate the batch runner** with complete generated entries and `/shared-tmpfs/hook-coverage/requests` through the `web` service.
+- [ ] **Step 6: Run focused and full HookPhuzz suites**, PowerShell parser validation, and `git diff --check`.
