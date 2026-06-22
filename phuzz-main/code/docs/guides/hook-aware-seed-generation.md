@@ -119,13 +119,21 @@ python hook_energy\seed_generation\seed_to_config_cli.py --suggested-seeds outpu
 
 Generated configs can be run later with `FUZZER_CONFIG=generated-hooks/<config-slug>`. Authenticated configs rely on the existing WordPress UOPZ overrides for login, capability, and nonce checks. The converter does not perform login automation or start fuzzing the generated configs.
 
+The WordPress runner can execute every generated config sequentially after export:
+
+```powershell
+.\scripts\wordpress\run-wordpress-phuzz.ps1 -RunGeneratedConfigs -GeneratedConfigTimeoutSeconds 300 -NoFollowLogs
+```
+
+Each config receives its own bounded run window. Reaching the limit stops the long-running fuzzer intentionally; it is not itself a failure. The runner evaluates only request artifacts created during that window and reports `callback_reached`, `registered_not_executed`, `hook_fired_target_not_registered`, `no_artifact`, or `not_observed`. Results are written to `fuzzer/output/seed_generation/generated_config_run_summary.json`; the script fails when a process exits with an error or any target callback is not reached.
+
 ### Authenticated Config Runtime Proof
 
 The authenticated path was verified against GamiPress using `wp_ajax_gamipress_get_logs`. Bootstrap completed all 10 probes and seed export produced 63 direct HTTP candidates. The generated config kept `action=gamipress_get_logs` fixed, fuzzed the 11 extracted request parameters, and PHUZZ produced a request artifact whose `executed_callbacks` contained callback ID `0c8eda78b0f602c896a900ec1cf560ba93691051` with `fired_hook=wp_ajax_gamipress_get_logs`.
 
 Akismet also produced an authenticated seed for `wp_ajax_comment_author_deurl`, with fixed `action` and fuzzable `id`. Its static class callback is currently reported under `blindspot_callbacks`, so it cannot be used as an `executed_callbacks` proof without extending the hook instrumentation. Function callbacks such as the GamiPress target provide the current end-to-end proof boundary.
 
-This verification runs one generated config explicitly through `FUZZER_CONFIG`; automatic config selection and batch fuzzing remain separate follow-up work.
+This verification runs one generated config explicitly through `FUZZER_CONFIG`. The opt-in batch runner now automates sequential config selection; callback-level proof still comes from request hook coverage.
 
 Example `suggested_seeds.json` entry:
 

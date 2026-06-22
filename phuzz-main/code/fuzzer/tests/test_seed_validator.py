@@ -13,6 +13,7 @@ if str(FUZZER_DIR) not in sys.path:
 
 from hook_energy.seed_validator import (
     build_validation_request,
+    evaluate_artifact_payloads,
     load_candidate,
     validate_candidate,
 )
@@ -82,6 +83,56 @@ def build_request_artifact(*, executed: dict | list | None = None, registered: d
 
 
 class SeedValidatorTests(unittest.TestCase):
+    def test_artifact_status_is_callback_reached_when_target_executed(self) -> None:
+        result = evaluate_artifact_payloads(
+            build_candidate(),
+            [build_request_artifact(executed={"cb-public": {"callback_id": "cb-public"}})],
+        )
+
+        self.assertEqual(result["status"], "callback_reached")
+
+    def test_registered_not_executed_takes_precedence_over_hook_fired(self) -> None:
+        result = evaluate_artifact_payloads(
+            build_candidate(),
+            [
+                build_request_artifact(
+                    registered={"cb-public": {"callback_id": "cb-public"}},
+                    executed={
+                        "cb-other": {
+                            "callback_id": "cb-other",
+                            "fired_hook": "wp_ajax_nopriv_demo_lookup",
+                        }
+                    },
+                )
+            ],
+        )
+
+        self.assertEqual(result["status"], "registered_not_executed")
+
+    def test_hook_fired_status_requires_target_not_registered(self) -> None:
+        result = evaluate_artifact_payloads(
+            build_candidate(),
+            [
+                build_request_artifact(
+                    executed={
+                        "cb-other": {
+                            "callback_id": "cb-other",
+                            "fired_hook": "wp_ajax_nopriv_demo_lookup",
+                        }
+                    }
+                )
+            ],
+        )
+
+        self.assertEqual(result["status"], "hook_fired_target_not_registered")
+
+    def test_no_artifact_and_unrelated_artifact_are_distinct(self) -> None:
+        self.assertEqual(evaluate_artifact_payloads(build_candidate(), [])["status"], "no_artifact")
+        unrelated = build_request_artifact(
+            executed={"cb-other": {"callback_id": "cb-other", "fired_hook": "init"}}
+        )
+        self.assertEqual(evaluate_artifact_payloads(build_candidate(), [unrelated])["status"], "not_observed")
+
     def test_validates_true_when_callback_id_appears_in_new_artifact_executed_callbacks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             requests_dir = Path(tmp_dir) / "hook-coverage" / "requests"
