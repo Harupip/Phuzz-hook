@@ -1,8 +1,11 @@
 param(
     [switch]$ForcePlugins,
     [switch]$NoFollowLogs,
+    [switch]$RunGeneratedConfigs,
     [int]$WebTimeoutSeconds = 240,
-    [int]$SeedWaitSeconds = 45
+    [int]$SeedWaitSeconds = 45,
+    [ValidateRange(1, 86400)]
+    [int]$GeneratedConfigTimeoutSeconds = 300
 )
 
 $ErrorActionPreference = "Stop"
@@ -104,7 +107,7 @@ function Convert-LiveSeedSuggestionsToConfigs {
 
     Assert-PathExists -Path $suggestedSeeds -Hint "Run hook seed export before converting seeds into PHUZZ configs."
 
-    Write-Host "Converting unauth-capable suggested seeds into PHUZZ configs"
+    Write-Host "Converting supported suggested seeds into PHUZZ configs"
     python $configCli `
         --suggested-seeds $suggestedSeeds `
         --output-config-dir $outputConfigDir `
@@ -143,7 +146,27 @@ try {
     Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds
     Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot
 
-    if ($NoFollowLogs) {
+    if ($RunGeneratedConfigs) {
+        $seedOutputDir = Join-Path $scriptRoot "fuzzer\output\seed_generation"
+        $generatedConfigSummary = Join-Path $seedOutputDir "generated_config_summary.json"
+        $generatedRunSummary = Join-Path $seedOutputDir "generated_config_run_summary.json"
+        $generatedConfigRunner = Join-Path $scriptRoot "fuzzer\hook_energy\seed_generation\generated_config_runner.py"
+
+        Write-Host "Stopping default fuzzer before generated config batch"
+        docker compose stop --timeout 30 $fuzzerService | Out-Null
+
+        Write-Host "Running generated hook configs sequentially"
+        python $generatedConfigRunner `
+            --generated-config-summary $generatedConfigSummary `
+            --output-file $generatedRunSummary `
+            --timeout-seconds $GeneratedConfigTimeoutSeconds `
+            --service $fuzzerService
+        if ($LASTEXITCODE -ne 0) {
+            throw "Generated hook config batch failed. See $generatedRunSummary"
+        }
+
+        Write-Host "Generated config run summary: $generatedRunSummary"
+    } elseif ($NoFollowLogs) {
         Write-Host "PHUZZ started. To follow logs later, run:"
         Write-Host "  docker compose logs -f $fuzzerService"
         Write-Host "Suggested seed artifacts:"
