@@ -33,7 +33,7 @@ The exporter maps direct WordPress HTTP hooks such as `wp_ajax_*`, `wp_ajax_nopr
 
 These are discovery artifacts, not automatic inserts into PHUZZ's live `Candidate` queue. `seed_to_config_cli.py` converts unauth-capable and authenticated suggestions into `configs/generated-hooks/*.json`. Authenticated configs rely on the existing WordPress UOPZ overrides for login, capability, and nonce checks; the converter does not run login automation. See `../docs/guides/hook-aware-seed-generation.md` for commands, output shape, and validation boundary.
 
-The UOPZ hook registry also records multi-stage registration metadata when one callback registers another hook. These fields include `registered_inside_callback`, `parent_callback`, `hook_level`, `parent_hook_name`, and `parent_callback_id`. The classifier and validator preserve this metadata so replay can report child hooks discovered at runtime. This is metadata only: recursive seed generation for child hooks is not wired yet. See `../docs/guides/multistage-hook-discovery-metadata.md`.
+The UOPZ hook registry also records multi-stage registration metadata when one callback registers another hook. These fields include `registered_inside_callback`, `parent_callback`, `hook_level`, `parent_hook_name`, and `parent_callback_id`. The classifier and validator preserve this metadata so replay can report child hooks discovered at runtime. `hook_energy/recursive_child_hook_seeds.py` can turn replay-discovered direct HTTP child hooks into recursive seed/config artifacts, but it still does not insert them into PHUZZ's live `Candidate` queue. See `../docs/guides/multistage-hook-discovery-metadata.md`.
 
 ## VulnCheck
 

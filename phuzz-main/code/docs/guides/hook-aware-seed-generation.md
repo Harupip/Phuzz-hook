@@ -300,7 +300,35 @@ Compact candidate shape:
 
 For the detailed parent/child artifact contract, replay evidence, and current recursive-seed boundary, see `multistage-hook-discovery-metadata.md`.
 
-### 3. Replay One Candidate
+### 3. Generate Recursive Child Hook Seeds
+
+`recursive_child_hook_seeds.py` consumes hook registry or request artifact JSON that contains child hook registration metadata. It generates `recursive_child_hook_seeds.json`, `validation_result.json`, and PHUZZ config JSON files for child hooks that map to supported direct HTTP entrypoints.
+
+Generate child-hook seed/config artifacts without replay validation:
+
+```powershell
+python hook_energy\recursive_child_hook_seeds.py `
+  --input-file output\hook-coverage\requests\latest.json `
+  --output-dir output\recursive-child-hooks `
+  --max-hook-depth 3 `
+  --skip-validation
+```
+
+Run recursive replay validation when a WordPress target and hook coverage directory are available:
+
+```powershell
+python hook_energy\recursive_child_hook_seeds.py `
+  --input-file output\hook-coverage\requests\latest.json `
+  --output-dir output\recursive-child-hooks `
+  --base-url http://localhost:8080 `
+  --hook-coverage-dir output\hook-coverage `
+  --timeout 10 `
+  --max-hook-depth 3
+```
+
+This still writes artifacts and generated configs only. It does not insert recursive child seeds into PHUZZ's live `Candidate` queue.
+
+### 4. Replay One Candidate
 
 `seed_validator.py` replays one selected candidate or one single seed JSON and writes `validation_result.json`. It diffs the hook coverage request directory before and after replay, then inspects only the new artifacts created by that replay.
 

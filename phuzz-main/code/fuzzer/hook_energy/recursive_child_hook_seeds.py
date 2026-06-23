@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from .entry_classifier import _classify_callback, _normalize_callback
-from .seed_generation.config_exporter import export_seed_configs
-from .seed_generation.input_extractor import InputSignatureExtractor
-from .seed_validator import validate_candidate
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from hook_energy.entry_classifier import _classify_callback, _normalize_callback
+    from hook_energy.seed_generation.config_exporter import export_seed_configs
+    from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
+    from hook_energy.seed_validator import validate_candidate
+else:
+    from .entry_classifier import _classify_callback, _normalize_callback
+    from .seed_generation.config_exporter import export_seed_configs
+    from .seed_generation.input_extractor import InputSignatureExtractor
+    from .seed_validator import validate_candidate
 
 
 def build_recursive_seed_report(
