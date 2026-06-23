@@ -276,6 +276,23 @@ function Start-ArtifactSyncJob {
     } -ArgumentList $workDir, $requestsDir, $CoverageDir
 }
 
+function Clear-RecursiveContainerArtifacts {
+    $requestsDir = "/shared-tmpfs/hook-coverage/requests"
+
+    Write-Host "Cleaning recursive hook coverage artifacts"
+    Write-Host "  docker compose stop --timeout 30 fuzzer-wordpress-plugin"
+    docker compose stop --timeout 30 fuzzer-wordpress-plugin | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not stop fuzzer-wordpress-plugin before recursive artifact cleanup."
+        return
+    }
+
+    docker compose exec -T web sh -lc "find $requestsDir -maxdepth 1 -type f -delete" | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not clean recursive hook coverage artifacts from web:$requestsDir"
+    }
+}
+
 function Resolve-RecursiveHookCoverageDir {
     param([string[]]$InputFiles)
 
@@ -301,6 +318,7 @@ function Invoke-RecursiveChildHookMode {
     $inputFiles = @($RecursiveInputFile | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     $hookCoverageDir = $RecursiveHookCoverageDir
     $syncJob = $null
+    $copiedContainerArtifacts = $false
 
     Write-Host "Mode recursive step 1/4: preparing request artifacts"
     if ($inputFiles.Count -eq 0 -and -not $DryRun) {
@@ -308,6 +326,7 @@ function Invoke-RecursiveChildHookMode {
         $copyResult = Copy-ContainerRequestArtifacts -OutputDir $outputDir
         $inputFiles = @($copyResult.InputFiles)
         $hookCoverageDir = $copyResult.CoverageDir
+        $copiedContainerArtifacts = $true
     }
     if ($inputFiles.Count -eq 0) {
         $inputFiles = @("<copied request artifacts from web:/shared-tmpfs/hook-coverage/requests>")
@@ -363,6 +382,9 @@ function Invoke-RecursiveChildHookMode {
         if ($syncJob) {
             Stop-Job -Job $syncJob -ErrorAction SilentlyContinue
             Remove-Job -Job $syncJob -Force -ErrorAction SilentlyContinue
+        }
+        if ($copiedContainerArtifacts) {
+            Clear-RecursiveContainerArtifacts
         }
     }
     if ($recursiveExitCode -ne $null -and $recursiveExitCode -ne 0) {

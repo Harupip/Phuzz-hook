@@ -51,6 +51,14 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn("--hook-coverage-dir", script)
         self.assertIn("--max-hook-depth", script)
 
+    def test_guided_wrapper_cleans_recursive_container_artifacts_after_run(self):
+        script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")
+
+        self.assertIn("Clear-RecursiveContainerArtifacts", script)
+        self.assertIn("Cleaning recursive hook coverage artifacts", script)
+        self.assertIn("docker compose stop --timeout 30 fuzzer-wordpress-plugin", script)
+        self.assertIn("/shared-tmpfs/hook-coverage/requests", script)
+
     def test_guided_wrapper_recursive_dry_run_prints_helper_command(self):
         result = subprocess.run(
             [
