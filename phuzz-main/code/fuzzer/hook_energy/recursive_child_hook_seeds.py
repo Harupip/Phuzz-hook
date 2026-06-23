@@ -144,7 +144,7 @@ def run_recursive_child_hook_seeds(
                         report["summary"]["duplicates_skipped"] += 1
                         continue
                     seen.add(identity)
-                    child["recursive_depth"] = max(item["recursive_depth"] + 1, child["hook_level"])
+                    child["recursive_depth"] = item["recursive_depth"] + 1
                     if child["recursive_depth"] > max_hook_depth:
                         report["summary"]["depth_skipped"] += 1
                         continue
