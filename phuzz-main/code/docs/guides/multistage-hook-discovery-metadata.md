@@ -12,7 +12,7 @@ Implemented scope:
 
 Out of scope:
 
-- Recursive seed generation for child hooks.
+- Recursive seed generation for child hooks in the metadata instrumentation itself. Later seed/config artifact generation lives in `recursive_child_hook_seeds.py`.
 - PHUZZ scoring changes.
 - Hook-energy scheduling changes.
 - Baseline PHUZZ behavior changes.
@@ -120,7 +120,7 @@ and `hookphuzz_level1()` registers `wp_ajax_nopriv_hookphuzz_level2`, artifacts 
 
 ## Replay And Seed Boundary
 
-Multi-stage metadata is discovery context, not a recursive seed engine.
+Multi-stage metadata is discovery context. `recursive_child_hook_seeds.py` can consume that context later to build recursive child-hook seed/config artifacts.
 
 - `hook_level: 0` means the callback was registered during bootstrap or request setup.
 - `hook_level: 1` means the callback was registered while a level 0 callback was executing.
@@ -128,7 +128,7 @@ Multi-stage metadata is discovery context, not a recursive seed engine.
 
 The classifier keeps these levels and parent fields on every candidate row. Classification is still decided by entrypoint rules such as `wp_ajax_*`, `admin_post_*`, `admin_action_*`, `login_form_*`, and heartbeat hooks. A child hook at level 1 or level 2 does not automatically become a runnable PHUZZ config unless it also maps to a supported direct HTTP entrypoint.
 
-`phuzz_config_writer.py` only writes configs for `classification == "direct_http"`. Setup-required and non-entry child hooks remain audit artifacts until a later pipeline adds route-specific setup or recursive seed generation.
+`phuzz_config_writer.py` only writes configs for `classification == "direct_http"`. `recursive_child_hook_seeds.py` can replay supported direct HTTP child hooks and write generated configs from the discovered children. Setup-required and non-entry child hooks remain audit artifacts until a later pipeline adds route-specific setup.
 
 ## Verified Real Plugin Evidence
 

@@ -1,8 +1,12 @@
 param(
+    [ValidatePattern('^[a-zA-Z0-9_.-]+$')]
+    [string]$PluginSlug = "show-all-comments-in-one-page",
     [switch]$ForcePlugins,
     [switch]$NoFollowLogs,
     [switch]$RunGeneratedConfigs,
+    [ValidateRange(1, 86400)]
     [int]$WebTimeoutSeconds = 240,
+    [ValidateRange(1, 86400)]
     [int]$SeedWaitSeconds = 45,
     [ValidateRange(1, 86400)]
     [int]$GeneratedConfigTimeoutSeconds = 300
@@ -15,6 +19,42 @@ $scriptRoot = (Resolve-Path -LiteralPath (Join-Path $scriptDir "..\..")).Path
 $pluginScript = Join-Path $scriptRoot "web\applications\wordpress\_plugins\download-plugins.ps1"
 $fuzzerService = "fuzzer-wordpress-plugin"
 $webUrl = "http://localhost:8080/"
+
+function Get-ComposeArgs {
+    param([string]$OverridePath)
+
+    return @("docker", "compose", "-f", "docker-compose.yml", "-f", $OverridePath)
+}
+
+function Invoke-Compose {
+    param(
+        [string[]]$ComposeArgs,
+        [string[]]$AdditionalArgs
+    )
+
+    & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] @AdditionalArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "docker compose command failed: $($AdditionalArgs -join ' ')"
+    }
+}
+
+function New-PluginOverrideFile {
+    param([string]$PluginSlug)
+
+    $path = Join-Path $env:TEMP ("phuzz-{0}.override.yml" -f $PluginSlug)
+    $content = @(
+        "services:"
+        "  web:"
+        "    environment:"
+        "      FUZZER_COVERAGE_PATH: /var/www/html/wp-content/plugins/$PluginSlug/"
+        "      WP_TARGET_PLUGIN: $PluginSlug"
+        "  ${fuzzerService}:"
+        "    environment:"
+        "      FUZZER_CONFIG: wordpress/$PluginSlug"
+    )
+    Set-Content -LiteralPath $path -Value $content -Encoding ASCII
+    return $path
+}
 
 function Assert-PathExists {
     param(
@@ -56,10 +96,11 @@ function Wait-ForWebReady {
 function Export-LiveSeedSuggestions {
     param(
         [string]$ScriptRoot,
-        [int]$WaitSeconds
+        [int]$WaitSeconds,
+        [string[]]$ComposeArgs
     )
 
-    $webContainerId = (docker compose ps -q web).Trim()
+    $webContainerId = (& $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] ps -q web).Trim()
     if (-not $webContainerId) {
         throw "Could not resolve the running web container for seed export."
     }
@@ -115,35 +156,47 @@ function Convert-LiveSeedSuggestionsToConfigs {
 }
 
 Push-Location $scriptRoot
+$overridePath = $null
 try {
-    Write-Host "Checking Docker availability"
-    docker compose version | Out-Null
+    Write-Host "Using WordPress plugin: $PluginSlug"
+    $overridePath = New-PluginOverrideFile -PluginSlug $PluginSlug
+    $composeArgs = Get-ComposeArgs -OverridePath $overridePath
 
-    Write-Host "Downloading required plugin ZIPs"
-    if ($ForcePlugins) {
-        & $pluginScript -Force
+    Write-Host "Checking Docker availability"
+    Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("version")
+
+    if ($PluginSlug -eq "show-all-comments-in-one-page") {
+        Write-Host "Ensuring default plugin ZIP exists"
+        if ($ForcePlugins) {
+            & $pluginScript -Force
+        } else {
+            & $pluginScript
+        }
     } else {
-        & $pluginScript
+        Write-Host "Using local plugin ZIP for $PluginSlug"
+        if ($ForcePlugins) {
+            Write-Host "-ForcePlugins only applies to the default download script; selected plugin must exist locally."
+        }
     }
 
-    $requiredConfig = Join-Path $scriptRoot "fuzzer\configs\wordpress\show-all-comments-in-one-page.json"
-    $requiredPlugin = Join-Path $scriptRoot "web\applications\wordpress\_plugins\show-all-comments-in-one-page.zip"
+    $requiredConfig = Join-Path $scriptRoot "fuzzer\configs\wordpress\$PluginSlug.json"
+    $requiredPlugin = Join-Path $scriptRoot "web\applications\wordpress\_plugins\$PluginSlug.zip"
     $requiredWpCli = Join-Path $scriptRoot "web\applications\wordpress\wp-cli.phar"
 
-    Assert-PathExists -Path $requiredConfig -Hint "This working tree must already contain the PHUZZ config JSON."
-    Assert-PathExists -Path $requiredPlugin -Hint "Run the plugin download step again or check network access."
+    Assert-PathExists -Path $requiredConfig -Hint "Choose a plugin with a matching fuzzer\configs\wordpress\<slug>.json file."
+    Assert-PathExists -Path $requiredPlugin -Hint "Choose a plugin ZIP that exists in web\applications\wordpress\_plugins, or add $PluginSlug.zip there."
     Assert-PathExists -Path $requiredWpCli -Hint "The WordPress bootstrap artifact is missing from this checkout."
 
     Write-Host "Starting db and web containers"
-    docker compose up -d db web --build
+    Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", "db", "web", "--build")
 
     Write-Host "Waiting for WordPress to answer with HTTP 200"
     Wait-ForWebReady -Url $webUrl -TimeoutSeconds $WebTimeoutSeconds
 
     Write-Host "Starting fuzzer container"
-    docker compose up -d $fuzzerService --build
+    Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", $fuzzerService, "--build")
 
-    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds
+    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs
     Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot
 
     if ($RunGeneratedConfigs) {
@@ -153,7 +206,7 @@ try {
         $generatedConfigRunner = Join-Path $scriptRoot "fuzzer\hook_energy\seed_generation\generated_config_runner.py"
 
         Write-Host "Stopping default fuzzer before generated config batch"
-        docker compose stop --timeout 30 $fuzzerService | Out-Null
+        Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("stop", "--timeout", "30", $fuzzerService)
 
         Write-Host "Running generated hook configs sequentially"
         python $generatedConfigRunner `
@@ -175,8 +228,11 @@ try {
         Write-Host "  $scriptRoot\fuzzer\configs\generated-hooks"
     } else {
         Write-Host "Following fuzzer logs. Press Ctrl+C to stop following without stopping containers."
-        docker compose logs -f $fuzzerService
+        Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("logs", "-f", $fuzzerService)
     }
 } finally {
+    if ($overridePath -and (Test-Path -LiteralPath $overridePath)) {
+        Remove-Item -LiteralPath $overridePath -Force
+    }
     Pop-Location
 }

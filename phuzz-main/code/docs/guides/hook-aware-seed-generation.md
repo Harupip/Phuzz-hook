@@ -119,6 +119,82 @@ python hook_energy\seed_generation\seed_to_config_cli.py --suggested-seeds outpu
 
 Generated configs can be run later with `FUZZER_CONFIG=generated-hooks/<config-slug>`. Authenticated configs rely on the existing WordPress UOPZ overrides for login, capability, and nonce checks. The converter does not perform login automation or start fuzzing the generated configs.
 
+## Guided WordPress Runner Modes
+
+Use the guided wrapper from `code/` when you want one command with prompts:
+
+```powershell
+cd C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\phuzz-main\code
+.\phuzz.ps1
+```
+
+The wrapper only selects the workflow, plugin, and runner flags. It delegates to `scripts\wordpress\run-wordpress-phuzz.ps1`; PHUZZ speed is unchanged after startup.
+
+| Mode | What it does | Final artifact to read | What it does not do |
+| --- | --- | --- | --- |
+| `default` | Starts WordPress and the normal PHUZZ fuzzer for the selected plugin config. | Normal PHUZZ console output and `fuzzer/output/`. | Does not generate hook-aware configs first. |
+| `seed-config` | Starts WordPress, exports live hook coverage, writes `suggested_seeds.*`, then converts supported seeds into `configs/generated-hooks/*.json`. | `fuzzer/output/seed_generation/generated_config_summary.json` | Does not run the generated configs. |
+| `generated` | Does everything in `seed-config`, stops the default fuzzer, then runs each generated config sequentially with `FUZZER_CONFIG=generated-hooks/<slug>`. | `fuzzer/output/seed_generation/generated_config_run_summary.json` | Does not recursively queue newly discovered child hooks. |
+| `recursive` | Starts the selected plugin/config with the seed export flow, copies the new request artifacts, then runs `recursive_child_hook_seeds.py` with replay validation. If `-RecursiveInputFile` is passed, it skips the setup run and uses that artifact directly. | `fuzzer/output/recursive-child-hooks/recursive_child_hook_seeds.json`, `validation_result.json`, and `generated_config_summary.json` | Does not run PHUZZ against the recursive configs. |
+
+The plugin prompt lists only local plugins that have both:
+
+- `web/applications/wordpress/_plugins/<slug>.zip`
+- `fuzzer/configs/wordpress/<slug>.json`
+
+The default plugin is `show-all-comments-in-one-page`. To skip prompts:
+
+```powershell
+.\phuzz.ps1 -Mode generated -PluginSlug photo-gallery -GeneratedConfigTimeoutSeconds 300 -NoFollowLogs
+```
+
+To inspect the command without running Docker or PHUZZ:
+
+```powershell
+.\phuzz.ps1 -Mode generated -PluginSlug photo-gallery -GeneratedConfigTimeoutSeconds 300 -NoFollowLogs -DryRun
+```
+
+Run recursive child-hook seed generation from existing live request artifacts:
+
+```powershell
+.\phuzz.ps1 -Mode recursive
+```
+
+For mode `recursive`, the wrapper chooses the plugin/config first, runs the seed export setup for that plugin, then runs recursive child-hook generation. The console prints `Mode recursive target plugin: <slug>` before it consumes artifacts.
+
+Run recursive child-hook seed generation from one local artifact. The input file should be inside a `requests\` directory, or pass `-RecursiveHookCoverageDir` explicitly.
+
+```powershell
+.\phuzz.ps1 -Mode recursive -RecursiveInputFile fuzzer\output\recursive-child-hooks\coverage-YYYYMMDD-HHMMSS\requests\latest.json
+```
+
+Use a shorter replay timeout while testing:
+
+```powershell
+.\phuzz.ps1 -Mode recursive -RecursiveValidationTimeoutSeconds 3
+```
+
+The useful recursive outputs are:
+
+- `fuzzer/output/recursive-child-hooks/recursive_child_hook_seeds.json`
+- `fuzzer/output/recursive-child-hooks/validation_result.json`
+- `fuzzer/output/recursive-child-hooks/generated_config_summary.json`
+- `fuzzer/output/recursive-child-hooks/configs/*.json`
+
+The wrapper prints a recursive summary after the helper exits. If `generated`, `manual_analysis`, `duplicates_skipped`, and `depth_skipped` are all `0`, the copied request artifacts did not contain child-hook metadata, so there was nothing new to convert.
+
+Interpret `generated_config_run_summary.json` with these status meanings:
+
+| Status | Meaning |
+| --- | --- |
+| `callback_reached` | Target callback appeared in new request artifacts. This is the success state. |
+| `registered_not_executed` | Target callback was registered but did not execute in the run window. |
+| `hook_fired_target_not_registered` | Expected hook fired, but the target callback was not registered. |
+| `no_artifact` | The run produced no new request artifact for validation. |
+| `not_observed` | Artifacts existed, but they did not show the target hook/callback. |
+
+Recursive child-hook replay is separate from wrapper mode `generated`. Wrapper mode `recursive` turns already observed child hooks into seeds/configs and validates those child-hook seeds against `http://localhost:8080`. It mirrors request artifacts from the running `web` container so validation can compare before/after artifacts.
+
 The WordPress runner can execute every generated config sequentially after export:
 
 ```powershell
@@ -300,7 +376,31 @@ Compact candidate shape:
 
 For the detailed parent/child artifact contract, replay evidence, and current recursive-seed boundary, see `multistage-hook-discovery-metadata.md`.
 
-### 3. Replay One Candidate
+### 3. Generate Recursive Child Hook Seeds
+
+`recursive_child_hook_seeds.py` consumes hook registry or request artifact JSON that contains child hook registration metadata. It generates `recursive_child_hook_seeds.json`, `validation_result.json`, and PHUZZ config JSON files for child hooks that map to supported direct HTTP entrypoints.
+
+Generate child-hook seed/config artifacts with replay validation:
+
+```powershell
+python hook_energy\recursive_child_hook_seeds.py `
+  --input-file output\hook-coverage\requests\latest.json `
+  --output-dir output\recursive-child-hooks `
+  --base-url http://localhost:8080 `
+  --hook-coverage-dir output\hook-coverage `
+  --timeout 10 `
+  --max-hook-depth 3
+```
+
+Use wrapper mode `recursive` when you want it to copy request artifacts from the running `web` container first:
+
+```powershell
+.\phuzz.ps1 -Mode recursive
+```
+
+This still writes artifacts and generated configs only. It does not insert recursive child seeds into PHUZZ's live `Candidate` queue.
+
+### 4. Replay One Candidate
 
 `seed_validator.py` replays one selected candidate or one single seed JSON and writes `validation_result.json`. It diffs the hook coverage request directory before and after replay, then inspects only the new artifacts created by that replay.
 
