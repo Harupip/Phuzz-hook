@@ -1,7 +1,12 @@
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+FUZZER_DIR = Path(__file__).resolve().parents[1]
+if str(FUZZER_DIR) not in sys.path:
+    sys.path.insert(0, str(FUZZER_DIR))
 
 from hook_energy.recursive_child_hook_seeds import (
     build_recursive_seed_report,
@@ -174,11 +179,14 @@ class RecursiveChildHookSeedTests(unittest.TestCase):
         self.assertEqual(row["request"]["method"], "POST")
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            paths = write_recursive_artifacts(report, validation, Path(tmp_dir))
+            output_dir = Path(tmp_dir) / "recursive-child-hooks"
+            paths = write_recursive_artifacts(report, validation, output_dir)
             self.assertTrue(paths["seeds"].is_file())
             self.assertTrue(paths["validation"].is_file())
             self.assertTrue(paths["config_summary"].is_file())
             self.assertEqual(len(paths["configs"]), 1)
+            summary = json.loads(paths["config_summary"].read_text(encoding="utf-8"))
+            self.assertEqual(summary["generated"][0]["config_path"], str(paths["configs"][0]))
 
 
 if __name__ == "__main__":

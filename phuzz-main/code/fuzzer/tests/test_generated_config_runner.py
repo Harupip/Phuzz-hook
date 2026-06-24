@@ -13,6 +13,7 @@ if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
 from hook_energy.seed_generation.generated_config_runner import (
+    format_recursive_summary,
     load_generated_configs,
     list_request_artifacts,
     load_request_artifact,
@@ -104,6 +105,23 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                 ],
             )
 
+    def test_config_path_runs_relative_to_fuzzer_configs_dir(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "fuzzer" / "output" / "recursive-child-hooks" / "configs" / "child.json"
+            config_path.parent.mkdir(parents=True)
+            runner = FakeRunner([completed(0)])
+            artifacts = FakeArtifacts([set(), set()], {})
+
+            run_generated_configs(
+                [{**generated_config(), "config_path": str(config_path)}],
+                timeout_seconds=5,
+                run_command=runner,
+                list_artifacts=artifacts.list,
+                load_artifact=artifacts.load,
+            )
+
+        self.assertIn("FUZZER_CONFIG=../output/recursive-child-hooks/configs/child", runner.commands[0])
+
     def test_load_config_slugs_rejects_malformed_generated_item(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             summary_path = Path(tmp_dir) / "generated_config_summary.json"
@@ -155,6 +173,7 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertEqual(report["runs"][0]["validation_status"], "callback_reached")
         self.assertEqual(report["runs"][0]["requests_created"], 1)
         self.assertEqual(report["runs"][1]["validation_status"], "no_artifact")
+        self.assertEqual(report["runs"][0]["matched_artifact"], "request-one.json")
         self.assertEqual(artifacts.loaded, ["request-one.json"])
         container_name = report["runs"][0]["container_name"]
         cleanup_command = ["docker", "rm", "-f", container_name]
@@ -163,6 +182,65 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertEqual(cleanup_call[1]["timeout"], 30)
         self.assertEqual(report["counts"]["callback_reached"], 1)
         self.assertEqual(report["counts"]["no_artifact"], 1)
+
+    def test_runner_error_is_recorded_and_later_config_still_runs(self):
+        runner = FakeRunner([RuntimeError("boom"), completed(0)])
+        artifacts = FakeArtifacts([set(), set(), set()], {})
+
+        report = run_generated_configs(
+            [generated_config(), generated_config("generated-hooks/two", "hook-two", "cb-two")],
+            timeout_seconds=5,
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=artifacts.load,
+        )
+
+        self.assertEqual([row["process_status"] for row in report["runs"]], ["runner_error", "exited"])
+        self.assertEqual(report["runs"][0]["validation_reason"], "boom")
+        self.assertEqual(report["counts"]["runner_error"], 1)
+
+    def test_recursive_summary_statuses_and_matched_artifact(self):
+        reached = {
+            "config_slug": "generated-hooks/one",
+            "config_path": "fuzzer/output/recursive-child-hooks/configs/one.json",
+            "hook_name": "hook-one",
+            "callback_id": "cb-one",
+            "process_status": "window_elapsed",
+            "validation_status": "callback_reached",
+            "validation_reason": "hit",
+            "callback_reached": True,
+            "request_artifacts": ["hit.json"],
+            "matched_artifact": "hit.json",
+            "duration_seconds": 1.2,
+        }
+        timed_out = {
+            **reached,
+            "config_slug": "generated-hooks/two",
+            "hook_name": "hook-two",
+            "callback_id": "cb-two",
+            "process_status": "window_elapsed",
+            "validation_status": "no_artifact",
+            "validation_reason": "none",
+            "callback_reached": False,
+            "request_artifacts": [],
+            "matched_artifact": None,
+            "duration_seconds": 5.0,
+        }
+        failed = {**timed_out, "config_slug": "generated-hooks/three", "process_status": "failed"}
+        errored = {**timed_out, "config_slug": "generated-hooks/four", "process_status": "runner_error"}
+
+        summary = format_recursive_summary({"runs": [reached, timed_out, failed, errored]})
+
+        self.assertEqual(summary["total_configs"], 4)
+        self.assertEqual(summary["passed"], 1)
+        self.assertEqual(summary["timed_out"], 1)
+        self.assertEqual(summary["failed"], 2)
+        self.assertEqual(
+            [row["status"] for row in summary["results"]],
+            ["callback_reached", "timed_out", "failed", "runner_error"],
+        )
+        self.assertEqual(summary["results"][0]["matched_artifact"], "hit.json")
+        self.assertEqual(summary["results"][0]["config"], "fuzzer/output/recursive-child-hooks/configs/one.json")
 
     def test_main_writes_empty_success_summary(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

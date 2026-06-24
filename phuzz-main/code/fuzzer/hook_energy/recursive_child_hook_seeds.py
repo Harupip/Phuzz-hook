@@ -196,6 +196,13 @@ def write_recursive_artifacts(
         summary_path=config_summary_path,
         target_base=config_target_base,
     )
+    summary = json.loads(config_summary_path.read_text(encoding="utf-8"))
+    for item in summary.get("generated", []):
+        config_slug = str(item.get("config_slug") or "")
+        file_slug = Path(config_slug.replace("\\", "/")).name
+        if file_slug:
+            item["config_path"] = str(config_dir / f"{file_slug}.json")
+    config_summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return {
         "seeds": seeds_path,
         "validation": validation_path,
