@@ -119,6 +119,8 @@ python hook_energy\seed_generation\seed_to_config_cli.py --suggested-seeds outpu
 
 Generated configs can be run later with `FUZZER_CONFIG=generated-hooks/<config-slug>`. Authenticated configs rely on the existing WordPress UOPZ overrides for login, capability, and nonce checks. The converter does not perform login automation or start fuzzing the generated configs.
 
+REST routes registered with `register_rest_route($namespace, $route, $args)` are first-class direct HTTP seeds when runtime coverage resolves the route callback. The generated target is `http://web/wp-json/<namespace>/<route>`, methods come from the route args, and REST configs do not include an `action` parameter. The generator only extracts request parameters from the callback body; it does not parse REST schema args or recursively traverse helpers.
+
 ## Guided WordPress Runner Modes
 
 Use the guided wrapper from `code/` when you want one command with prompts:
@@ -202,6 +204,12 @@ The WordPress runner can execute every generated config sequentially after expor
 ```
 
 Each config receives its own bounded run window. Reaching the limit stops the long-running fuzzer intentionally; it is not itself a failure. The runner evaluates only request artifacts created during that window and reports `callback_reached`, `registered_not_executed`, `hook_fired_target_not_registered`, `no_artifact`, or `not_observed`. Results are written to `fuzzer/output/seed_generation/generated_config_run_summary.json`; the script fails when a process exits with an error or any target callback is not reached.
+
+### REST Route Runtime Proof
+
+The REST route path was verified against Contact Form 7 using `rest_route:contact-form-7/v1/contact-forms`. The generated config targeted `http://web/wp-json/contact-form-7/v1/contact-forms`, used `GET`, carried `entrypoint_type=rest_route`, and had no `action` parameter. PHUZZ produced a request artifact whose `executed_callbacks` contained callback ID `d6c9daf3190a957f90ff61889aac0887dff44a86` for `WPCF7_REST_Controller->get_contact_forms` from `contact-form-7/includes/rest-api.php:142`.
+
+Current REST support is intentionally conservative: route regex placeholders such as `(?P<id>\d+)` are exported literally, REST schema args are not converted into fuzz params yet, and success still requires the expected callback ID in `executed_callbacks`. HTTP 200 alone is not accepted as callback proof.
 
 ### Authenticated Config Runtime Proof
 
@@ -340,8 +348,9 @@ Direct HTTP candidates receive an `http_template` with method, path, and fixed p
 | `login_form_*` | `login_form` | `POST` | `/wp-login.php` | no |
 | `heartbeat_received` | `heartbeat_authenticated` | `POST` | `/wp-admin/admin-ajax.php` | yes |
 | `heartbeat_nopriv_received` | `heartbeat_unauthenticated` | `POST` | `/wp-admin/admin-ajax.php` | no |
+| `rest_route:<namespace>/<route>` | `rest_route` | registered methods | `/wp-json/<namespace>/<route>` | depends on permission callback |
 
-`setup_required` means the hook can be HTTP-relevant but needs extra setup before automatic PHUZZ config generation, for example shortcode pages, rewrite endpoints, REST route records, or XML-RPC method maps.
+`setup_required` means the hook can be HTTP-relevant but needs extra setup before automatic PHUZZ config generation, for example shortcode pages, rewrite endpoints, REST route records that were not resolved from `register_rest_route`, or XML-RPC method maps.
 
 `non_entry` means the hook is currently treated as non-replayable or manual-only, for example lifecycle, admin menu, enqueue, or unknown custom hooks.
 
@@ -500,7 +509,7 @@ python -m unittest `
 
 ## Validation Boundary
 
-The seed generator is valid when it writes deterministic discovery artifacts from `total_coverage.json`. The config converter is valid when it writes PHUZZ config JSON for unauth-capable and authenticated seeds and records unsupported seeds in `generated_config_summary.json`. Runtime validation is a separate stage: run a generated config and verify that the target callback id appears in request-level hook coverage.
+The seed generator is valid when it writes deterministic discovery artifacts from `total_coverage.json`. The config converter is valid when it writes PHUZZ config JSON for unauth-capable, authenticated, and REST route seeds and records unsupported seeds in `generated_config_summary.json`. Runtime validation is a separate stage: run a generated config and verify that the target callback id appears in request-level hook coverage.
 
 If expected params are missing, first check whether `source_file` resolves on the host and whether `start_line`/`end_line` are present in the coverage artifact.
 

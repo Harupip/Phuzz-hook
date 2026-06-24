@@ -43,8 +43,11 @@ def completed(returncode):
     return subprocess.CompletedProcess(["docker"], returncode, "", "")
 
 
-def generated_config(slug="generated-hooks/one", hook_name="wp_ajax_nopriv_demo", callback_id="cb-one"):
-    return {"config_slug": slug, "hook_name": hook_name, "callback_id": callback_id}
+def generated_config(slug="generated-hooks/one", hook_name="wp_ajax_nopriv_demo", callback_id="cb-one", entrypoint_type=None):
+    row = {"config_slug": slug, "hook_name": hook_name, "callback_id": callback_id}
+    if entrypoint_type:
+        row["entrypoint_type"] = entrypoint_type
+    return row
 
 
 class FakeArtifacts:
@@ -90,7 +93,12 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                     {
                         "generated": [
                             {"config_slug": "generated-hooks/one", "hook_name": "hook-one", "callback_id": "cb-one"},
-                            {"config_slug": "generated-hooks/two", "hook_name": "hook-two", "callback_id": "cb-two"},
+                            {
+                                "config_slug": "generated-hooks/two",
+                                "hook_name": "hook-two",
+                                "callback_id": "cb-two",
+                                "entrypoint_type": "rest_route",
+                            },
                         ]
                     }
                 ),
@@ -101,7 +109,12 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                 load_generated_configs(summary_path),
                 [
                     {"config_slug": "generated-hooks/one", "hook_name": "hook-one", "callback_id": "cb-one"},
-                    {"config_slug": "generated-hooks/two", "hook_name": "hook-two", "callback_id": "cb-two"},
+                    {
+                        "config_slug": "generated-hooks/two",
+                        "hook_name": "hook-two",
+                        "callback_id": "cb-two",
+                        "entrypoint_type": "rest_route",
+                    },
                 ],
             )
 
@@ -182,6 +195,34 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertEqual(cleanup_call[1]["timeout"], 30)
         self.assertEqual(report["counts"]["callback_reached"], 1)
         self.assertEqual(report["counts"]["no_artifact"], 1)
+
+    def test_rest_config_preserves_entrypoint_type_and_validates_callback_id(self):
+        runner = FakeRunner([completed(0)])
+        artifact = {
+            "hook_coverage": {
+                "registered_callbacks": {"cb-rest": {"callback_id": "cb-rest"}},
+                "executed_callbacks": {
+                    "cb-rest": {
+                        "callback_id": "cb-rest",
+                        "hook_name": "rest_route:demo/v1/items",
+                        "entrypoint_type": "rest_route",
+                    }
+                },
+                "blindspot_callbacks": {},
+            }
+        }
+        artifacts = FakeArtifacts([set(), {"request-rest.json"}], {"request-rest.json": artifact})
+
+        report = run_generated_configs(
+            [generated_config("generated-hooks/rest", "rest_route:demo/v1/items", "cb-rest", "rest_route")],
+            timeout_seconds=5,
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=artifacts.load,
+        )
+
+        self.assertEqual(report["runs"][0]["entrypoint_type"], "rest_route")
+        self.assertEqual(report["runs"][0]["validation_status"], "callback_reached")
 
     def test_runner_error_is_recorded_and_later_config_still_runs(self):
         runner = FakeRunner([RuntimeError("boom"), completed(0)])
@@ -302,6 +343,19 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("--generated-config-summary", script)
         self.assertIn("--output-file", script)
         self.assertIn("--timeout-seconds", script)
+
+    def test_wordpress_runner_maps_copied_plugin_source_into_seed_export(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("docker cp", script)
+        self.assertIn("--container-source-root", script)
+        self.assertIn("/var/www/html/wp-content/plugins/$PluginSlug", script)
+        self.assertIn("--host-source-root", script)
+        self.assertIn("--source-root", script)
+        self.assertIn("--unresolved-source-reason", script)
+        self.assertIn("source_copy_failed", script)
+        self.assertIn("no_php_files", script)
 
 
 if __name__ == "__main__":

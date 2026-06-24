@@ -17,11 +17,13 @@ class LiveHookSeedGenerator:
         container_source_root: str | Path | None = None,
         host_source_root: str | Path | None = None,
         source_root: str | Path | None = None,
+        unresolved_source_reason: str | None = None,
     ) -> None:
         resolver = SourcePathResolver(
             container_source_root=container_source_root,
             host_source_root=host_source_root,
             source_root=source_root,
+            unresolved_reason=unresolved_source_reason,
         )
         self.input_extractor = input_extractor or InputSignatureExtractor(source_resolver=resolver)
 
@@ -56,8 +58,13 @@ class LiveHookSeedGenerator:
                 "seed_priority": item["seed_priority"],
                 "generation_status": item["generation_status"],
             }
+            if item.get("entrypoint_type") == "rest_route":
+                compact_item["entrypoint_type"] = "rest_route"
             if item["seed"] is not None:
                 compact_item["seed"] = item["seed"]
+            for key in ("namespace", "route", "methods", "permission_callback"):
+                if item.get(key) is not None:
+                    compact_item[key] = item[key]
             compact_suggestions.append(compact_item)
 
         seed_report = {
@@ -122,43 +129,55 @@ class LiveHookSeedGenerator:
                     "resolved_source_file": None,
                 },
             )
-            seed, generation_status = self._generate_seed_template(hook_name, is_active, status, input_params)
-
-            rows.append(
-                {
-                    "callback_id": str(callback_id),
-                    "hook_name": hook_name,
-                    "callback_name": self._resolve_callback_name(str(callback_id), registered_entry),
-                    "callback_raw": str(registered_entry.get("callback_repr") or callback_id),
-                    "callback_type": str(registered_entry.get("type", registered_entry.get("callback_type", "unknown"))),
-                    "function_name": registered_entry.get("function_name"),
-                    "class_name": registered_entry.get("class_name"),
-                    "method_name": registered_entry.get("method_name"),
-                    "is_static": bool(registered_entry.get("is_static", False)),
-                    "is_closure": bool(registered_entry.get("is_closure", False)),
-                    "is_invokable": bool(registered_entry.get("is_invokable", False)),
-                    "formal_parameters": registered_entry.get("formal_parameters", []),
-                    "priority": self._safe_int(registered_entry.get("priority"), default=10),
-                    "accepted_args": self._safe_int(registered_entry.get("accepted_args"), default=1),
-                    "source_file": registered_entry.get("source_file"),
-                    "source_line": self._safe_int(registered_entry.get("source_line")),
-                    "start_line": self._safe_int(registered_entry.get("start_line")),
-                    "end_line": self._safe_int(registered_entry.get("end_line")),
-                    "source_resolution": source_resolution,
-                    "input_params": input_params,
-                    "is_active": is_active,
-                    "registration_status": str(registered_entry.get("status", "registered_only")),
-                    "register_count": 1,
-                    "execute_count": execute_count,
-                    "status": status,
-                    "seed_priority": seed_priority,
-                    "priority_rank": priority_rank,
-                    "target_family": target_family,
-                    "direct_http_supported": seed is not None,
-                    "generation_status": generation_status,
-                    "seed": seed,
-                }
+            entrypoint_type = str(registered_entry.get("entrypoint_type", "hook")).strip() or "hook"
+            seed, generation_status = self._generate_seed_template(
+                hook_name,
+                is_active,
+                status,
+                input_params,
+                registered_entry,
             )
+
+            row = {
+                "callback_id": str(callback_id),
+                "hook_name": hook_name,
+                "callback_name": self._resolve_callback_name(str(callback_id), registered_entry),
+                "callback_raw": str(registered_entry.get("callback_repr") or callback_id),
+                "callback_type": str(registered_entry.get("type", registered_entry.get("callback_type", "unknown"))),
+                "function_name": registered_entry.get("function_name"),
+                "class_name": registered_entry.get("class_name"),
+                "method_name": registered_entry.get("method_name"),
+                "is_static": bool(registered_entry.get("is_static", False)),
+                "is_closure": bool(registered_entry.get("is_closure", False)),
+                "is_invokable": bool(registered_entry.get("is_invokable", False)),
+                "formal_parameters": registered_entry.get("formal_parameters", []),
+                "priority": self._safe_int(registered_entry.get("priority"), default=10),
+                "accepted_args": self._safe_int(registered_entry.get("accepted_args"), default=1),
+                "source_file": registered_entry.get("source_file"),
+                "source_line": self._safe_int(registered_entry.get("source_line")),
+                "start_line": self._safe_int(registered_entry.get("start_line")),
+                "end_line": self._safe_int(registered_entry.get("end_line")),
+                "source_resolution": source_resolution,
+                "input_params": input_params,
+                "is_active": is_active,
+                "registration_status": str(registered_entry.get("status", "registered_only")),
+                "register_count": 1,
+                "execute_count": execute_count,
+                "status": status,
+                "seed_priority": seed_priority,
+                "priority_rank": priority_rank,
+                "target_family": target_family,
+                "direct_http_supported": seed is not None,
+                "generation_status": generation_status,
+                "seed": seed,
+            }
+            if entrypoint_type == "rest_route":
+                row["entrypoint_type"] = "rest_route"
+                row["namespace"] = registered_entry.get("namespace")
+                row["route"] = registered_entry.get("route")
+                row["methods"] = registered_entry.get("methods")
+                row["permission_callback"] = registered_entry.get("permission_callback")
+            rows.append(row)
 
         rows.sort(
             key=lambda item: (
@@ -185,11 +204,32 @@ class LiveHookSeedGenerator:
         is_active: bool,
         coverage_status: str,
         input_params: list[dict[str, Any]] | None = None,
+        callback_metadata: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, str]:
         if not is_active:
             return None, "inactive_callback"
         if coverage_status != "uncovered":
             return None, "already_covered"
+        if str((callback_metadata or {}).get("entrypoint_type", "")) == "rest_route":
+            namespace = str((callback_metadata or {}).get("namespace", "")).strip("/")
+            route = str((callback_metadata or {}).get("route", "")).strip("/")
+            if not namespace or not route:
+                return None, "manual_analysis_required"
+            methods = self._normalize_methods((callback_metadata or {}).get("methods"))
+            if not methods:
+                methods = ["GET"]
+            permission_callback = str((callback_metadata or {}).get("permission_callback", "")).strip()
+            auth_mode = "unauth-capable" if permission_callback in {"", "__return_true"} else "authenticated"
+            return self._attach_fuzzable_params({
+                "method": methods[0],
+                "methods": methods,
+                "path": f"/wp-json/{namespace}/{route}",
+                "content_type": "application/json",
+                "body": {},
+                "auth_mode": auth_mode,
+                "fixed_params": [],
+                "entrypoint_type": "rest_route",
+            }, input_params), "supported_http_seed"
         if hook_name.startswith("wp_ajax_nopriv_"):
             return self._attach_fuzzable_params({
                 "method": "POST",
@@ -229,9 +269,10 @@ class LiveHookSeedGenerator:
         seed: dict[str, Any],
         input_params: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
-        seed["fixed_params"] = ["action"]
+        seed["fixed_params"] = list(seed.get("fixed_params", ["action"]))
         seed["fuzzable_params"] = []
         seed["input_params"] = input_params or []
+        seed["discovered_file_params"] = []
 
         if "query_params" not in seed:
             seed["query_params"] = {}
@@ -244,7 +285,12 @@ class LiveHookSeedGenerator:
             if not name or name == "action":
                 continue
 
-            if source == "GET":
+            if source == "FILES":
+                seed["discovered_file_params"].append(item)
+                continue
+
+            request_method = str(seed.get("method", "")).upper()
+            if source == "GET" or (source == "REQUEST" and request_method == "GET"):
                 target = seed["query_params"]
             elif source == "COOKIE":
                 target = seed["cookies"]
@@ -269,6 +315,8 @@ class LiveHookSeedGenerator:
             return "highest", 400, "admin_post_nopriv"
         if hook_name.startswith("admin_post_"):
             return "high", 300, "admin_post"
+        if hook_name.startswith("rest_route:"):
+            return "high", 300, "rest_route"
         lowered = hook_name.lower()
         if lowered in {"init", "plugins_loaded", "wp_loaded"}:
             return "low", 100, "lifecycle"
@@ -303,3 +351,18 @@ class LiveHookSeedGenerator:
         if value in (None, ""):
             return default
         return int(value)
+
+    def _normalize_methods(self, value: Any) -> list[str]:
+        raw_items: list[Any]
+        if isinstance(value, list):
+            raw_items = value
+        else:
+            raw_items = [value]
+
+        methods: list[str] = []
+        for item in raw_items:
+            for part in str(item or "").replace("|", ",").split(","):
+                method = part.strip().upper()
+                if method and method not in methods:
+                    methods.append(method)
+        return methods

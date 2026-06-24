@@ -26,17 +26,20 @@ def build_config_for_seed_item(
     if auth_mode not in {"authenticated", "unauth-capable"}:
         raise SeedConfigSkip("unsupported_auth_mode")
 
-    method = str(seed.get("method", "")).strip().upper()
+    methods = _seed_methods(seed)
     path = str(seed.get("path", "")).strip()
     body = seed.get("body")
-    if not method or not path or not isinstance(body, Mapping):
+    if not methods or not path or not isinstance(body, Mapping):
         raise SeedConfigSkip("malformed_seed")
 
     config: dict[str, Any] = {
         "target": _join_target(target_base, path),
-        "methods": [method],
+        "methods": methods,
         "print_timestamps": True,
     }
+    entrypoint_type = str(seed.get("entrypoint_type") or seed_item.get("entrypoint_type") or "").strip()
+    if entrypoint_type:
+        config["entrypoint_type"] = entrypoint_type
 
     fixed_params = _string_set(seed.get("fixed_params", []))
     fuzzable_params = _string_set(seed.get("fuzzable_params", []))
@@ -47,16 +50,25 @@ def build_config_for_seed_item(
         ("headers", "headers"),
         ("cookies", "cookies"),
     )
+    fuzz_count = 0
     for seed_key, config_key in sections:
         values = seed.get(seed_key, {})
         if not isinstance(values, Mapping) or not values:
             continue
 
-        config[config_key] = _build_param_section(
+        section = _build_param_section(
             values,
             fixed_params=fixed_params,
             fuzzable_params=fuzzable_params,
         )
+        config[config_key] = section
+        if config_key in {"body_params", "query_params"}:
+            fuzz_count += len(section["fuzz"])
+
+    config["config_type"] = "fuzzing_ready" if fuzz_count else "replay_only"
+    discovered_file_params = seed.get("discovered_file_params", [])
+    if isinstance(discovered_file_params, list) and discovered_file_params:
+        config["metadata"] = {"discovered_file_params": discovered_file_params}
 
     return _build_file_slug(seed_item), config
 
@@ -93,13 +105,15 @@ def export_seed_configs(
 
         config_path = output_dir / f"{file_slug}.json"
         config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        summary["generated"].append(
-            {
-                "config_slug": _build_config_slug(output_dir, file_slug),
-                "hook_name": hook_name,
-                "callback_id": callback_id,
-            }
-        )
+        generated_row = {
+            "config_slug": _build_config_slug(output_dir, file_slug),
+            "hook_name": hook_name,
+            "callback_id": callback_id,
+        }
+        entrypoint_type = str(config.get("entrypoint_type", "")).strip()
+        if entrypoint_type:
+            generated_row["entrypoint_type"] = entrypoint_type
+        summary["generated"].append(generated_row)
 
     if summary_path is not None:
         Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
@@ -120,10 +134,11 @@ def _build_param_section(
 
     for name, value in values.items():
         param_name = str(name)
-        data.append({"name": param_name, "value": str(value)})
         if param_name in fuzzable_params and param_name not in fixed_params:
+            data.append({"name": param_name, "value": "fuzz"})
             fuzz.append(param_name)
         else:
+            data.append({"name": param_name, "value": str(value)})
             fixed.append(param_name)
 
     return {"data": data, "fixed": fixed, "fuzz": fuzz, "weight": 1}
@@ -147,6 +162,22 @@ def _build_config_slug(output_dir: Path, file_slug: str) -> str:
 
 def _join_target(target_base: str, path: str) -> str:
     return target_base.rstrip("/") + "/" + path.lstrip("/")
+
+
+def _seed_methods(seed: Mapping[str, Any]) -> list[str]:
+    raw_methods = seed.get("methods", seed.get("method", ""))
+    if isinstance(raw_methods, list):
+        items = raw_methods
+    else:
+        items = [raw_methods]
+
+    methods: list[str] = []
+    for item in items:
+        for part in str(item or "").replace("|", ",").split(","):
+            method = part.strip().upper()
+            if method and method not in methods:
+                methods.append(method)
+    return methods
 
 
 def _safe_slug(value: str) -> str:

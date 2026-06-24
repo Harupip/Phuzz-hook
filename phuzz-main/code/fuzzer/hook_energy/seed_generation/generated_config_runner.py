@@ -40,6 +40,11 @@ def load_generated_configs(path: Path) -> list[dict[str, str]]:
             if not isinstance(config_path, str) or not config_path.strip():
                 raise ValueError(f"generated[{index}].config_path must be a non-empty string")
             row["config_path"] = config_path.strip()
+        entrypoint_type = item.get("entrypoint_type")
+        if entrypoint_type is not None:
+            if not isinstance(entrypoint_type, str) or not entrypoint_type.strip():
+                raise ValueError(f"generated[{index}].entrypoint_type must be a non-empty string")
+            row["entrypoint_type"] = entrypoint_type.strip()
         configs.append(row)
     return configs
 
@@ -146,6 +151,7 @@ def run_generated_configs(
                 "config_path": config.get("config_path"),
                 "hook_name": config["hook_name"],
                 "callback_id": config["callback_id"],
+                "entrypoint_type": config.get("entrypoint_type"),
                 "process_status": process_status,
                 "validation_status": validation["status"],
                 "validation_reason": validation["reason"],
@@ -279,6 +285,7 @@ def _runner_error_row(
         "config_path": config.get("config_path"),
         "hook_name": str(config["hook_name"]),
         "callback_id": str(config["callback_id"]),
+        "entrypoint_type": config.get("entrypoint_type"),
         "process_status": "runner_error",
         "validation_status": "runner_error",
         "validation_reason": reason,
