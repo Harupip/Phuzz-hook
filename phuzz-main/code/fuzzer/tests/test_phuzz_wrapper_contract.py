@@ -1,3 +1,8 @@
+import json
+import os
+import shutil
+import sys
+import tempfile
 import unittest
 import subprocess
 from pathlib import Path
@@ -17,6 +22,7 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn("[string]$Mode", script)
         self.assertIn("[switch]$DryRun", script)
         self.assertIn("[switch]$Help", script)
+        self.assertIn("[switch]$RunRecursiveConfigs", script)
         self.assertIn("Read-Host", script)
 
     def test_guided_wrapper_delegates_to_existing_wordpress_runner(self):
@@ -131,6 +137,135 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn("-PluginSlug gamipress", result.stdout)
         self.assertIn("-NoFollowLogs", result.stdout)
         self.assertIn("recursive_child_hook_seeds.py", result.stdout)
+
+    def test_guided_wrapper_recursive_dry_run_prints_config_runner_when_enabled(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode",
+                "recursive",
+                "-RecursiveInputFile",
+                "sample.json",
+                "-RunRecursiveConfigs",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("generated_config_runner.py", result.stdout)
+        self.assertIn("recursive_config_run_summary.json", result.stdout)
+        self.assertIn("--output-format recursive", result.stdout)
+
+    def test_guided_wrapper_recursive_config_runner_is_not_blocked_by_seed_validation_failure(self):
+        script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")
+
+        self.assertIn("$recursiveExitCode -ne $null -and $recursiveExitCode -ne 0 -and -not $RunRecursiveConfigs", script)
+        self.assertIn("Recursive seed validation failed; continuing to recursive config runner", script)
+
+    def test_recursive_config_runner_skips_pre_runner_artifact_cleanup(self):
+        script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")
+
+        self.assertIn("if ($copiedContainerArtifacts -and -not $RunRecursiveConfigs)", script)
+        self.assertIn("Mode recursive step 4/4: running recursive generated configs", script)
+
+    def test_recursive_config_runner_summary_controls_exit_after_seed_validation_failure(self):
+        output_dir = CODE_DIR / "fuzzer" / "output" / "recursive-child-hooks"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            backup_dir = tmp_path / "recursive-child-hooks.backup"
+            if output_dir.exists():
+                shutil.move(str(output_dir), str(backup_dir))
+            try:
+                coverage_dir = tmp_path / "coverage"
+                requests_dir = coverage_dir / "requests"
+                requests_dir.mkdir(parents=True)
+                input_file = requests_dir / "sample.json"
+                input_file.write_text(json.dumps({"hook_coverage": {"registered_callbacks": {}}}), encoding="utf-8")
+
+                fake_bin = tmp_path / "bin"
+                fake_bin.mkdir()
+                calls_log = tmp_path / "calls.log"
+                fake_python = tmp_path / "fake_python.py"
+                fake_python.write_text(
+                    """
+import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+script = Path(args[0]).name if args else ""
+Path(os.environ["CALLS_LOG"]).open("a", encoding="utf-8").write(script + "\\n")
+
+def arg_value(name):
+    return args[args.index(name) + 1]
+
+if script == "recursive_child_hook_seeds.py":
+    out = Path(arg_value("--output-dir"))
+    (out / "configs").mkdir(parents=True, exist_ok=True)
+    (out / "recursive_child_hook_seeds.json").write_text(json.dumps({"summary": {"generated": 2, "manual_analysis": 0, "duplicates_skipped": 0, "depth_skipped": 0}}), encoding="utf-8")
+    (out / "validation_result.json").write_text(json.dumps({"summary": {"total": 2, "callback_reached": 0}, "validations": [{"status": "no_artifact"}, {"status": "no_artifact"}]}), encoding="utf-8")
+    (out / "generated_config_summary.json").write_text(json.dumps({"generated": [{"config_slug": "generated-hooks/one", "hook_name": "hook-one", "callback_id": "cb-one"}, {"config_slug": "generated-hooks/two", "hook_name": "hook-two", "callback_id": "cb-two"}]}), encoding="utf-8")
+    (out / "configs" / "one.json").write_text("{}", encoding="utf-8")
+    (out / "configs" / "two.json").write_text("{}", encoding="utf-8")
+    sys.exit(1)
+
+if script == "generated_config_runner.py":
+    output = Path(arg_value("--output-file"))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps({"total_configs": 2, "passed": 2, "failed": 0, "timed_out": 0, "results": [{"status": "callback_reached"}, {"status": "callback_reached"}]}), encoding="utf-8")
+    sys.exit(1)
+
+sys.exit(2)
+""",
+                    encoding="utf-8",
+                )
+                (fake_bin / "python.cmd").write_text(f'@"{sys.executable}" "{fake_python}" %*\n', encoding="utf-8")
+                (fake_bin / "docker.cmd").write_text("@exit /b 0\n", encoding="utf-8")
+                env = os.environ.copy()
+                env["PATH"] = str(fake_bin) + os.pathsep + env["PATH"]
+                env["CALLS_LOG"] = str(calls_log)
+
+                result = subprocess.run(
+                    [
+                        "powershell",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(CODE_DIR / "phuzz.ps1"),
+                        "-Mode",
+                        "recursive",
+                        "-RecursiveInputFile",
+                        str(input_file),
+                        "-RecursiveHookCoverageDir",
+                        str(coverage_dir),
+                        "-RunRecursiveConfigs",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=env,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(calls_log.read_text(encoding="utf-8").splitlines(), ["recursive_child_hook_seeds.py", "generated_config_runner.py"])
+                summary = json.loads((output_dir / "recursive_config_run_summary.json").read_text(encoding="utf-8-sig"))
+                self.assertEqual(summary["seed_validation_status"], "failed")
+                self.assertEqual(summary["seed_validation_failed_count"], 2)
+                self.assertEqual(summary["config_runner_status"], "passed")
+                self.assertIn(summary["overall_e2e_status"], {"passed_with_seed_validation_warning", "passed_config_runner"})
+            finally:
+                if output_dir.exists():
+                    shutil.rmtree(output_dir)
+                if backup_dir.exists():
+                    shutil.move(str(backup_dir), str(output_dir))
 
     def test_guided_wrapper_dry_run_does_not_prompt_when_mode_is_passed(self):
         result = subprocess.run(

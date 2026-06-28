@@ -45,11 +45,13 @@ class InputSignatureExtractor:
         container_source_root: str | Path | None = None,
         host_source_root: str | Path | None = None,
         source_root: str | Path | None = None,
+        unresolved_source_reason: str | None = None,
     ) -> None:
         self.source_resolver = source_resolver or SourcePathResolver(
             container_source_root=container_source_root,
             host_source_root=host_source_root,
             source_root=source_root,
+            unresolved_reason=unresolved_source_reason,
         )
 
     def extract(self, callback_metadata: dict[str, Any]) -> dict[str, Any]:

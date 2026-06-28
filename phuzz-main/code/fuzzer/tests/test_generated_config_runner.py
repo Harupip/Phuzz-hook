@@ -13,6 +13,7 @@ if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
 from hook_energy.seed_generation.generated_config_runner import (
+    format_recursive_summary,
     load_generated_configs,
     list_request_artifacts,
     load_request_artifact,
@@ -42,8 +43,11 @@ def completed(returncode):
     return subprocess.CompletedProcess(["docker"], returncode, "", "")
 
 
-def generated_config(slug="generated-hooks/one", hook_name="wp_ajax_nopriv_demo", callback_id="cb-one"):
-    return {"config_slug": slug, "hook_name": hook_name, "callback_id": callback_id}
+def generated_config(slug="generated-hooks/one", hook_name="wp_ajax_nopriv_demo", callback_id="cb-one", entrypoint_type=None):
+    row = {"config_slug": slug, "hook_name": hook_name, "callback_id": callback_id}
+    if entrypoint_type:
+        row["entrypoint_type"] = entrypoint_type
+    return row
 
 
 class FakeArtifacts:
@@ -89,7 +93,12 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                     {
                         "generated": [
                             {"config_slug": "generated-hooks/one", "hook_name": "hook-one", "callback_id": "cb-one"},
-                            {"config_slug": "generated-hooks/two", "hook_name": "hook-two", "callback_id": "cb-two"},
+                            {
+                                "config_slug": "generated-hooks/two",
+                                "hook_name": "hook-two",
+                                "callback_id": "cb-two",
+                                "entrypoint_type": "rest_route",
+                            },
                         ]
                     }
                 ),
@@ -100,9 +109,31 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                 load_generated_configs(summary_path),
                 [
                     {"config_slug": "generated-hooks/one", "hook_name": "hook-one", "callback_id": "cb-one"},
-                    {"config_slug": "generated-hooks/two", "hook_name": "hook-two", "callback_id": "cb-two"},
+                    {
+                        "config_slug": "generated-hooks/two",
+                        "hook_name": "hook-two",
+                        "callback_id": "cb-two",
+                        "entrypoint_type": "rest_route",
+                    },
                 ],
             )
+
+    def test_config_path_runs_relative_to_fuzzer_configs_dir(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "fuzzer" / "output" / "recursive-child-hooks" / "configs" / "child.json"
+            config_path.parent.mkdir(parents=True)
+            runner = FakeRunner([completed(0)])
+            artifacts = FakeArtifacts([set(), set()], {})
+
+            run_generated_configs(
+                [{**generated_config(), "config_path": str(config_path)}],
+                timeout_seconds=5,
+                run_command=runner,
+                list_artifacts=artifacts.list,
+                load_artifact=artifacts.load,
+            )
+
+        self.assertIn("FUZZER_CONFIG=../output/recursive-child-hooks/configs/child", runner.commands[0])
 
     def test_load_config_slugs_rejects_malformed_generated_item(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -155,6 +186,7 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertEqual(report["runs"][0]["validation_status"], "callback_reached")
         self.assertEqual(report["runs"][0]["requests_created"], 1)
         self.assertEqual(report["runs"][1]["validation_status"], "no_artifact")
+        self.assertEqual(report["runs"][0]["matched_artifact"], "request-one.json")
         self.assertEqual(artifacts.loaded, ["request-one.json"])
         container_name = report["runs"][0]["container_name"]
         cleanup_command = ["docker", "rm", "-f", container_name]
@@ -163,6 +195,93 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertEqual(cleanup_call[1]["timeout"], 30)
         self.assertEqual(report["counts"]["callback_reached"], 1)
         self.assertEqual(report["counts"]["no_artifact"], 1)
+
+    def test_rest_config_preserves_entrypoint_type_and_validates_callback_id(self):
+        runner = FakeRunner([completed(0)])
+        artifact = {
+            "hook_coverage": {
+                "registered_callbacks": {"cb-rest": {"callback_id": "cb-rest"}},
+                "executed_callbacks": {
+                    "cb-rest": {
+                        "callback_id": "cb-rest",
+                        "hook_name": "rest_route:demo/v1/items",
+                        "entrypoint_type": "rest_route",
+                    }
+                },
+                "blindspot_callbacks": {},
+            }
+        }
+        artifacts = FakeArtifacts([set(), {"request-rest.json"}], {"request-rest.json": artifact})
+
+        report = run_generated_configs(
+            [generated_config("generated-hooks/rest", "rest_route:demo/v1/items", "cb-rest", "rest_route")],
+            timeout_seconds=5,
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=artifacts.load,
+        )
+
+        self.assertEqual(report["runs"][0]["entrypoint_type"], "rest_route")
+        self.assertEqual(report["runs"][0]["validation_status"], "callback_reached")
+
+    def test_runner_error_is_recorded_and_later_config_still_runs(self):
+        runner = FakeRunner([RuntimeError("boom"), completed(0)])
+        artifacts = FakeArtifacts([set(), set(), set()], {})
+
+        report = run_generated_configs(
+            [generated_config(), generated_config("generated-hooks/two", "hook-two", "cb-two")],
+            timeout_seconds=5,
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=artifacts.load,
+        )
+
+        self.assertEqual([row["process_status"] for row in report["runs"]], ["runner_error", "exited"])
+        self.assertEqual(report["runs"][0]["validation_reason"], "boom")
+        self.assertEqual(report["counts"]["runner_error"], 1)
+
+    def test_recursive_summary_statuses_and_matched_artifact(self):
+        reached = {
+            "config_slug": "generated-hooks/one",
+            "config_path": "fuzzer/output/recursive-child-hooks/configs/one.json",
+            "hook_name": "hook-one",
+            "callback_id": "cb-one",
+            "process_status": "window_elapsed",
+            "validation_status": "callback_reached",
+            "validation_reason": "hit",
+            "callback_reached": True,
+            "request_artifacts": ["hit.json"],
+            "matched_artifact": "hit.json",
+            "duration_seconds": 1.2,
+        }
+        timed_out = {
+            **reached,
+            "config_slug": "generated-hooks/two",
+            "hook_name": "hook-two",
+            "callback_id": "cb-two",
+            "process_status": "window_elapsed",
+            "validation_status": "no_artifact",
+            "validation_reason": "none",
+            "callback_reached": False,
+            "request_artifacts": [],
+            "matched_artifact": None,
+            "duration_seconds": 5.0,
+        }
+        failed = {**timed_out, "config_slug": "generated-hooks/three", "process_status": "failed"}
+        errored = {**timed_out, "config_slug": "generated-hooks/four", "process_status": "runner_error"}
+
+        summary = format_recursive_summary({"runs": [reached, timed_out, failed, errored]})
+
+        self.assertEqual(summary["total_configs"], 4)
+        self.assertEqual(summary["passed"], 1)
+        self.assertEqual(summary["timed_out"], 1)
+        self.assertEqual(summary["failed"], 2)
+        self.assertEqual(
+            [row["status"] for row in summary["results"]],
+            ["callback_reached", "timed_out", "failed", "runner_error"],
+        )
+        self.assertEqual(summary["results"][0]["matched_artifact"], "hit.json")
+        self.assertEqual(summary["results"][0]["config"], "fuzzer/output/recursive-child-hooks/configs/one.json")
 
     def test_main_writes_empty_success_summary(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -224,6 +343,19 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("--generated-config-summary", script)
         self.assertIn("--output-file", script)
         self.assertIn("--timeout-seconds", script)
+
+    def test_wordpress_runner_maps_copied_plugin_source_into_seed_export(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("docker cp", script)
+        self.assertIn("--container-source-root", script)
+        self.assertIn("/var/www/html/wp-content/plugins/$PluginSlug", script)
+        self.assertIn("--host-source-root", script)
+        self.assertIn("--source-root", script)
+        self.assertIn("--unresolved-source-reason", script)
+        self.assertIn("source_copy_failed", script)
+        self.assertIn("no_php_files", script)
 
 
 if __name__ == "__main__":

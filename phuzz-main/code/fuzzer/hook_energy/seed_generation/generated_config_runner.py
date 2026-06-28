@@ -34,7 +34,18 @@ def load_generated_configs(path: Path) -> list[dict[str, str]]:
             value = item.get(field) if isinstance(item, Mapping) else None
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"generated[{index}].{field} must be a non-empty string")
-        configs.append({field: str(item[field]).strip() for field in ("config_slug", "hook_name", "callback_id")})
+        row = {field: str(item[field]).strip() for field in ("config_slug", "hook_name", "callback_id")}
+        config_path = item.get("config_path")
+        if config_path is not None:
+            if not isinstance(config_path, str) or not config_path.strip():
+                raise ValueError(f"generated[{index}].config_path must be a non-empty string")
+            row["config_path"] = config_path.strip()
+        entrypoint_type = item.get("entrypoint_type")
+        if entrypoint_type is not None:
+            if not isinstance(entrypoint_type, str) or not entrypoint_type.strip():
+                raise ValueError(f"generated[{index}].entrypoint_type must be a non-empty string")
+            row["entrypoint_type"] = entrypoint_type.strip()
+        configs.append(row)
     return configs
 
 
@@ -82,7 +93,12 @@ def run_generated_configs(
     for index, config in enumerate(generated_configs, start=1):
         slug = str(config["config_slug"])
         container_name = _container_name(index, slug)
-        artifacts_before = list_artifacts()
+        started_at = time.monotonic()
+        try:
+            artifacts_before = list_artifacts()
+        except Exception as exc:
+            runs.append(_runner_error_row(config, container_name, started_at, str(exc)))
+            continue
         command = [
             "docker",
             "compose",
@@ -92,10 +108,9 @@ def run_generated_configs(
             "--name",
             container_name,
             "-e",
-            f"FUZZER_CONFIG={slug}",
+            f"FUZZER_CONFIG={_runtime_config_slug(config)}",
             service,
         ]
-        started_at = time.monotonic()
         try:
             result = run_command(
                 command,
@@ -114,24 +129,36 @@ def run_generated_configs(
             )
             process_status = "window_elapsed"
             exit_code = None
+        except Exception as exc:
+            runs.append(_runner_error_row(config, container_name, started_at, str(exc)))
+            continue
 
-        new_artifacts = sorted(list_artifacts() - artifacts_before)
+        try:
+            new_artifacts = sorted(list_artifacts() - artifacts_before)
+            artifact_payloads = [(name, load_artifact(name)) for name in new_artifacts]
+        except Exception as exc:
+            runs.append(_runner_error_row(config, container_name, started_at, str(exc)))
+            continue
         validation = evaluate_artifact_payloads(
             {"hook_name": config["hook_name"], "callback_id": config["callback_id"]},
-            [load_artifact(name) for name in new_artifacts],
+            [payload for _, payload in artifact_payloads],
         )
+        matched_artifact = _matched_artifact(config, artifact_payloads)
 
         runs.append(
             {
                 "config_slug": slug,
+                "config_path": config.get("config_path"),
                 "hook_name": config["hook_name"],
                 "callback_id": config["callback_id"],
+                "entrypoint_type": config.get("entrypoint_type"),
                 "process_status": process_status,
                 "validation_status": validation["status"],
                 "validation_reason": validation["reason"],
                 "callback_reached": validation["expected_callback_reached"],
                 "requests_created": len(new_artifacts),
                 "request_artifacts": new_artifacts,
+                "matched_artifact": matched_artifact,
                 "exit_code": exit_code,
                 "duration_seconds": round(time.monotonic() - started_at, 3),
                 "container_name": container_name,
@@ -151,8 +178,20 @@ def run_generated_configs(
         "counts": {
             "total": len(runs),
             "process_failed": sum(row["process_status"] == "failed" for row in runs),
+            "runner_error": sum(row["process_status"] == "runner_error" for row in runs),
             **{status: sum(row["validation_status"] == status for row in runs) for status in statuses},
         },
+    }
+
+
+def format_recursive_summary(report: Mapping[str, Any]) -> dict[str, Any]:
+    results = [_format_recursive_result(row) for row in report.get("runs", [])]
+    return {
+        "total_configs": len(results),
+        "passed": sum(row["status"] == "callback_reached" for row in results),
+        "failed": sum(row["status"] in {"failed", "runner_error"} for row in results),
+        "timed_out": sum(row["status"] == "timed_out" for row in results),
+        "results": results,
     }
 
 
@@ -170,6 +209,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-file", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=300)
     parser.add_argument("--service", default="fuzzer-wordpress-plugin")
+    parser.add_argument("--output-format", choices=("default", "recursive"), default="default")
     return parser
 
 
@@ -184,10 +224,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             service=args.service,
         )
         report["generated_config_summary"] = str(source_path)
-        write_report(report, Path(args.output_file))
+        output_report = format_recursive_summary(report) if args.output_format == "recursive" else report
+        write_report(output_report, Path(args.output_file))
     except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+    if args.output_format == "recursive":
+        print(f"Recursive config run summary: output={args.output_file}")
+        summary = format_recursive_summary(report)
+        return 0 if summary["passed"] == summary["total_configs"] and summary["failed"] == 0 else 1
 
     counts = report["counts"]
     print(
@@ -195,12 +241,85 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"callback_reached={counts['callback_reached']} "
         f"process_failed={counts['process_failed']} output={args.output_file}"
     )
-    return 0 if counts["process_failed"] == 0 and counts["callback_reached"] == counts["total"] else 1
+    return 0 if counts["process_failed"] == 0 and counts["runner_error"] == 0 and counts["callback_reached"] == counts["total"] else 1
 
 
 def _container_name(index: int, slug: str) -> str:
     safe_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", slug).strip(".-") or "config"
     return f"hookphuzz-generated-{index}-{safe_slug}"[:120]
+
+
+def _runtime_config_slug(config: Mapping[str, str]) -> str:
+    config_path = config.get("config_path")
+    if not config_path:
+        return str(config["config_slug"])
+
+    normalized = str(config_path).replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part]
+    lowered = [part.lower() for part in parts]
+    if "fuzzer" in lowered:
+        index = len(lowered) - 1 - lowered[::-1].index("fuzzer")
+        slug = "/".join([".."] + parts[index + 1 :])
+    else:
+        slug = normalized
+    return slug[:-5] if slug.lower().endswith(".json") else slug
+
+
+def _matched_artifact(config: Mapping[str, str], artifacts: Sequence[tuple[str, Any]]) -> str | None:
+    candidate = {"hook_name": config["hook_name"], "callback_id": config["callback_id"]}
+    for name, payload in artifacts:
+        validation = evaluate_artifact_payloads(candidate, [payload])
+        if validation["expected_callback_reached"]:
+            return name
+    return None
+
+
+def _runner_error_row(
+    config: Mapping[str, str],
+    container_name: str,
+    started_at: float,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "config_slug": str(config["config_slug"]),
+        "config_path": config.get("config_path"),
+        "hook_name": str(config["hook_name"]),
+        "callback_id": str(config["callback_id"]),
+        "entrypoint_type": config.get("entrypoint_type"),
+        "process_status": "runner_error",
+        "validation_status": "runner_error",
+        "validation_reason": reason,
+        "callback_reached": False,
+        "requests_created": 0,
+        "request_artifacts": [],
+        "matched_artifact": None,
+        "exit_code": None,
+        "duration_seconds": round(time.monotonic() - started_at, 3),
+        "container_name": container_name,
+    }
+
+
+def _format_recursive_result(row: Mapping[str, Any]) -> dict[str, Any]:
+    status = _recursive_status(row)
+    return {
+        "config": str(row.get("config_path") or row.get("config_slug", "")),
+        "expected_hook": str(row.get("hook_name", "")),
+        "expected_callback": str(row.get("callback_id", "")),
+        "status": status,
+        "matched_artifact": row.get("matched_artifact"),
+        "reason": str(row.get("validation_reason", "")),
+        "duration_seconds": row.get("duration_seconds", 0),
+    }
+
+
+def _recursive_status(row: Mapping[str, Any]) -> str:
+    if row.get("callback_reached"):
+        return "callback_reached"
+    if row.get("process_status") == "runner_error":
+        return "runner_error"
+    if row.get("process_status") == "window_elapsed":
+        return "timed_out"
+    return "failed"
 
 
 if __name__ == "__main__":

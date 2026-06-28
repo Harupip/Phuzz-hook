@@ -115,6 +115,153 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
         self.assertIs(row["is_static"], True)
         self.assertEqual(row["formal_parameters"], [{"name": "request", "type": "array"}])
 
+    def test_files_are_discovered_but_not_fuzzed(self) -> None:
+        payload = {
+            "data": {
+                "registered_callbacks": {
+                    "cb-public": {
+                        "hook_name": "wp_ajax_nopriv_example_lookup",
+                        "callback_repr": "Example_Plugin::handle_lookup",
+                        "source_file": str(FIXTURE),
+                        "start_line": 2,
+                        "end_line": 9,
+                        "is_active": True,
+                    }
+                },
+                "executed_callbacks": {},
+            }
+        }
+
+        _, seed_report = LiveHookSeedGenerator().build_reports(payload)
+
+        seed = seed_report["suggested_seeds"][0]["seed"]
+        self.assertIn({"name": "avatar", "source": "FILES"}, [
+            {"name": item["name"], "source": item["source"]} for item in seed["discovered_file_params"]
+        ])
+        self.assertNotIn("avatar", seed["body"])
+        self.assertNotIn("avatar", seed["fuzzable_params"])
+
+    def test_request_params_follow_request_method_default(self) -> None:
+        generator = LiveHookSeedGenerator()
+
+        post_seed = generator._attach_fuzzable_params(
+            {
+                "method": "POST",
+                "path": "/wp-admin/admin-ajax.php",
+                "body": {"action": "demo"},
+                "auth_mode": "authenticated",
+            },
+            [{"name": "token", "source": "REQUEST"}],
+        )
+        get_seed = generator._attach_fuzzable_params(
+            {
+                "method": "GET",
+                "path": "/wp-admin/admin.php",
+                "body": {"action": "demo"},
+                "auth_mode": "authenticated",
+            },
+            [{"name": "token", "source": "REQUEST"}],
+        )
+
+        self.assertEqual(post_seed["body"]["token"], "FUZZ")
+        self.assertNotIn("token", post_seed["query_params"])
+        self.assertEqual(get_seed["query_params"]["token"], "FUZZ")
+        self.assertNotIn("token", get_seed["body"])
+
+    def test_get_rest_route_seed_uses_wp_json_target_and_query_params(self) -> None:
+        source = "<?php\nfunction rest_lookup() {\n    $term = $_GET['term'];\n}\n"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_file = Path(tmp_dir) / "rest.php"
+            source_file.write_text(source, encoding="utf-8")
+            payload = {
+                "data": {
+                    "registered_callbacks": {
+                        "cb-rest": {
+                            "entrypoint_type": "rest_route",
+                            "hook_name": "rest_route:demo/v1/items",
+                            "callback_repr": "rest_lookup",
+                            "namespace": "demo/v1",
+                            "route": "/items",
+                            "methods": ["GET"],
+                            "source_file": str(source_file),
+                            "start_line": 2,
+                            "end_line": 4,
+                            "is_active": True,
+                        }
+                    },
+                    "executed_callbacks": {},
+                }
+            }
+
+            _, seed_report = LiveHookSeedGenerator().build_reports(payload)
+
+        item = seed_report["suggested_seeds"][0]
+        seed = item["seed"]
+        self.assertEqual(item["entrypoint_type"], "rest_route")
+        self.assertEqual(seed["path"], "/wp-json/demo/v1/items")
+        self.assertEqual(seed["methods"], ["GET"])
+        self.assertEqual(seed["query_params"]["term"], "FUZZ")
+        self.assertNotIn("term", seed["body"])
+        self.assertNotIn("action", seed["body"])
+        self.assertEqual(seed["fixed_params"], [])
+
+    def test_post_rest_route_seed_uses_body_params_without_action(self) -> None:
+        source = "<?php\nfunction rest_save() {\n    $title = $_POST['title'];\n}\n"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_file = Path(tmp_dir) / "rest.php"
+            source_file.write_text(source, encoding="utf-8")
+            payload = {
+                "data": {
+                    "registered_callbacks": {
+                        "cb-rest": {
+                            "entrypoint_type": "rest_route",
+                            "hook_name": "rest_route:demo/v1/items",
+                            "callback_repr": "rest_save",
+                            "namespace": "demo/v1",
+                            "route": "items",
+                            "methods": ["POST"],
+                            "source_file": str(source_file),
+                            "start_line": 2,
+                            "end_line": 4,
+                            "is_active": True,
+                        }
+                    },
+                    "executed_callbacks": {},
+                }
+            }
+
+            _, seed_report = LiveHookSeedGenerator().build_reports(payload)
+
+        seed = seed_report["suggested_seeds"][0]["seed"]
+        self.assertEqual(seed["path"], "/wp-json/demo/v1/items")
+        self.assertEqual(seed["body"]["title"], "FUZZ")
+        self.assertNotIn("title", seed["query_params"])
+        self.assertNotIn("action", seed["body"])
+        self.assertEqual(seed["fixed_params"], [])
+
+    def test_unresolved_source_reason_is_reported(self) -> None:
+        payload = {
+            "data": {
+                "registered_callbacks": {
+                    "cb-public": {
+                        "hook_name": "wp_ajax_nopriv_example_lookup",
+                        "callback_repr": "example_lookup_handler",
+                        "source_file": "/var/www/html/wp-content/plugins/example-plugin/includes/ajax.php",
+                        "start_line": 2,
+                        "end_line": 4,
+                        "is_active": True,
+                    }
+                },
+                "executed_callbacks": {},
+            }
+        }
+
+        gap_report, seed_report = LiveHookSeedGenerator(unresolved_source_reason="source_copy_failed").build_reports(payload)
+
+        self.assertEqual(gap_report["callbacks"][0]["source_resolution"]["status"], "unresolved")
+        self.assertEqual(gap_report["callbacks"][0]["source_resolution"]["reason"], "source_copy_failed")
+        self.assertEqual(seed_report["suggested_seeds"][0]["source_resolution"]["reason"], "source_copy_failed")
+
     def test_export_cli_imports_as_package_module(self) -> None:
         from hook_energy.seed_generation.export_cli import build_argument_parser
 

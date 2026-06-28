@@ -37,6 +37,32 @@ def build_seed_item(*, hook_name="wp_ajax_nopriv_example_lookup", auth_mode="una
     }
 
 
+def build_rest_seed_item(*, method="GET", fuzzable_params=None):
+    fuzzable_params = ["term"] if fuzzable_params is None else fuzzable_params
+    seed = {
+        "methods": [method],
+        "path": "/wp-json/demo/v1/items",
+        "content_type": "application/json",
+        "body": {},
+        "query_params": {"term": "FUZZ"} if "term" in fuzzable_params else {},
+        "auth_mode": "unauth-capable",
+        "fixed_params": [],
+        "fuzzable_params": fuzzable_params,
+        "entrypoint_type": "rest_route",
+    }
+    if method != "GET":
+        seed["query_params"] = {}
+        seed["body"] = {"title": "FUZZ"} if "title" in fuzzable_params else {}
+    return {
+        "hook_name": "rest_route:demo/v1/items",
+        "callback_id": "cb-rest",
+        "callback_name": "rest_lookup",
+        "entrypoint_type": "rest_route",
+        "generation_status": "supported_http_seed",
+        "seed": seed,
+    }
+
+
 class SeedToConfigExporterTests(unittest.TestCase):
     def test_unauth_seed_becomes_phuzz_config_with_fixed_action_and_fuzzed_params(self):
         slug, config = build_config_for_seed_item(build_seed_item(), target_base="http://web")
@@ -44,12 +70,13 @@ class SeedToConfigExporterTests(unittest.TestCase):
         self.assertEqual(slug, "wp_ajax_nopriv_example_lookup-cb-public")
         self.assertEqual(config["target"], "http://web/wp-admin/admin-ajax.php")
         self.assertEqual(config["methods"], ["POST"])
+        self.assertEqual(config["config_type"], "fuzzing_ready")
         self.assertEqual(
             config["body_params"],
             {
                 "data": [
                     {"name": "action", "value": "example_lookup"},
-                    {"name": "item_id", "value": "FUZZ"},
+                    {"name": "item_id", "value": "fuzz"},
                 ],
                 "fixed": ["action"],
                 "fuzz": ["item_id"],
@@ -59,7 +86,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
         self.assertEqual(
             config["query_params"],
             {
-                "data": [{"name": "page", "value": "FUZZ"}],
+                "data": [{"name": "page", "value": "fuzz"}],
                 "fixed": [],
                 "fuzz": ["page"],
                 "weight": 1,
@@ -67,6 +94,34 @@ class SeedToConfigExporterTests(unittest.TestCase):
         )
         self.assertEqual(config["headers"]["fixed"], ["X-Seed"])
         self.assertEqual(config["cookies"]["fixed"], ["wordpress_test_cookie"])
+
+    def test_action_only_seed_becomes_replay_only_config(self):
+        item = build_seed_item()
+        item["seed"].update({"body": {"action": "example_lookup"}, "query_params": {}, "fuzzable_params": []})
+
+        _, config = build_config_for_seed_item(item, target_base="http://web")
+
+        self.assertEqual(config["config_type"], "replay_only")
+        self.assertEqual(config["body_params"]["fixed"], ["action"])
+        self.assertEqual(config["body_params"]["fuzz"], [])
+
+    def test_discovered_file_params_are_metadata_not_fuzz_params(self):
+        item = build_seed_item()
+        item["seed"].update(
+            {
+                "body": {"action": "example_lookup"},
+                "query_params": {},
+                "fuzzable_params": [],
+                "discovered_file_params": [{"name": "upload", "source": "FILES"}],
+            }
+        )
+
+        _, config = build_config_for_seed_item(item, target_base="http://web")
+
+        self.assertEqual(config["config_type"], "replay_only")
+        self.assertEqual(config["metadata"]["discovered_file_params"], [{"name": "upload", "source": "FILES"}])
+        self.assertNotIn("upload", config["body_params"]["fuzz"])
+        self.assertNotIn({"name": "upload", "value": "fuzz"}, config["body_params"]["data"])
 
     def test_authenticated_ajax_seed_becomes_config_with_fixed_action(self):
         slug, config = build_config_for_seed_item(
@@ -96,6 +151,32 @@ class SeedToConfigExporterTests(unittest.TestCase):
         self.assertEqual(config["body_params"]["fixed"], ["action"])
         self.assertEqual(config["body_params"]["fuzz"], ["order_id"])
 
+    def test_rest_seed_becomes_wp_json_config_without_action(self):
+        slug, config = build_config_for_seed_item(build_rest_seed_item(), target_base="http://web")
+
+        self.assertEqual(slug, "rest_route_demo_v1_items-cb-rest")
+        self.assertEqual(config["target"], "http://web/wp-json/demo/v1/items")
+        self.assertEqual(config["methods"], ["GET"])
+        self.assertEqual(config["entrypoint_type"], "rest_route")
+        self.assertEqual(config["config_type"], "fuzzing_ready")
+        self.assertEqual(config["query_params"]["fuzz"], ["term"])
+        self.assertNotIn("body_params", config)
+        self.assertNotIn("action", json.dumps(config))
+
+    def test_post_rest_seed_fuzzes_body_params(self):
+        _, config = build_config_for_seed_item(build_rest_seed_item(method="POST", fuzzable_params=["title"]))
+
+        self.assertEqual(config["methods"], ["POST"])
+        self.assertEqual(config["body_params"]["fuzz"], ["title"])
+        self.assertNotIn("query_params", config)
+        self.assertNotIn("action", json.dumps(config))
+
+    def test_rest_seed_without_fuzz_params_is_replay_only(self):
+        _, config = build_config_for_seed_item(build_rest_seed_item(fuzzable_params=[]))
+
+        self.assertEqual(config["config_type"], "replay_only")
+        self.assertEqual(config["entrypoint_type"], "rest_route")
+
     def test_manual_or_malformed_seed_is_skipped_with_clear_reason(self):
         with self.assertRaises(SeedConfigSkip) as raised:
             build_config_for_seed_item({"hook_name": "template_redirect", "callback_id": "cb-manual"})
@@ -110,6 +191,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
             seed_report = {
                 "suggested_seeds": [
                     build_seed_item(),
+                    build_rest_seed_item(),
                     build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated"),
                     {"hook_name": "template_redirect", "callback_id": "cb-manual"},
                 ]
@@ -124,9 +206,11 @@ class SeedToConfigExporterTests(unittest.TestCase):
 
             config_path = output_dir / "wp_ajax_nopriv_example_lookup-cb-public.json"
             self.assertTrue(config_path.exists())
+            self.assertTrue((output_dir / "rest_route_demo_v1_items-cb-rest.json").exists())
             self.assertTrue((output_dir / "wp_ajax_example_lookup-cb-public.json").exists())
             self.assertEqual(summary["generated"][0]["config_slug"], "generated-hooks/wp_ajax_nopriv_example_lookup-cb-public")
-            self.assertEqual(summary["generated"][1]["config_slug"], "generated-hooks/wp_ajax_example_lookup-cb-public")
+            self.assertEqual(summary["generated"][1]["entrypoint_type"], "rest_route")
+            self.assertEqual(summary["generated"][2]["config_slug"], "generated-hooks/wp_ajax_example_lookup-cb-public")
             self.assertEqual(summary["skipped"][0]["reason"], "missing_seed")
             self.assertEqual(json.loads(summary_path.read_text(encoding="utf-8")), summary)
 

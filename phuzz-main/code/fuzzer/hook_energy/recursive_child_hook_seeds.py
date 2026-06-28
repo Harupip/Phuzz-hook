@@ -10,11 +10,13 @@ from typing import Any
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from hook_energy.entry_classifier import _classify_callback, _normalize_callback
+    from hook_energy.entrypoints import rest_seed_template, seed_template_for_callback
     from hook_energy.seed_generation.config_exporter import export_seed_configs
     from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
     from hook_energy.seed_validator import validate_candidate
 else:
     from .entry_classifier import _classify_callback, _normalize_callback
+    from .entrypoints import rest_seed_template, seed_template_for_callback
     from .seed_generation.config_exporter import export_seed_configs
     from .seed_generation.input_extractor import InputSignatureExtractor
     from .seed_validator import validate_candidate
@@ -196,6 +198,13 @@ def write_recursive_artifacts(
         summary_path=config_summary_path,
         target_base=config_target_base,
     )
+    summary = json.loads(config_summary_path.read_text(encoding="utf-8"))
+    for item in summary.get("generated", []):
+        config_slug = str(item.get("config_slug") or "")
+        file_slug = Path(config_slug.replace("\\", "/")).name
+        if file_slug:
+            item["config_path"] = str(config_dir / f"{file_slug}.json")
+    config_summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return {
         "seeds": seeds_path,
         "validation": validation_path,
@@ -292,26 +301,20 @@ def _seed_for_callback(
     callback: Mapping[str, Any],
     extractor: InputSignatureExtractor,
 ) -> tuple[dict[str, Any] | None, str]:
-    rest_template = _rest_template(callback)
     classified = _classify_callback(_normalize_callback(dict(callback)), 1)
-    template = rest_template or classified.get("http_template")
-    if not isinstance(template, Mapping):
+    seed = seed_template_for_callback(str(callback.get("hook_name") or ""), callback)
+    if seed is None and str(callback.get("hook_name") or "") == "rest_api_init":
+        seed = rest_seed_template(callback)
+    if seed is None:
         return None, str(classified.get("reason") or "Unsupported child hook")
 
-    method = str(template.get("method") or "GET").upper()
-    seed = {
-        "method": method,
-        "path": str(template.get("path") or ""),
-        "content_type": "application/x-www-form-urlencoded",
-        "body": dict(template.get("body_params") or {}),
-        "query_params": dict(template.get("query_params") or {}),
-        "headers": dict(template.get("headers") or {}),
-        "cookies": {},
-        "auth_mode": "authenticated" if classified.get("auth_required") else "unauth-capable",
-        "fixed_params": ["action"] if classified.get("action") else [],
-        "fuzzable_params": [],
-    }
-    if classified.get("action") and "action" in seed["body"]:
+    method = str(seed.get("method") or "GET").upper()
+    seed.setdefault("headers", {})
+    seed.setdefault("query_params", {})
+    seed.setdefault("cookies", {})
+    seed.setdefault("fuzzable_params", [])
+    seed.setdefault("discovered_file_params", [])
+    if "action" in seed["body"]:
         seed["query_params"]["action"] = seed["body"].pop("action")
     input_params = extractor.extract(dict(callback)).get("input_params", [])
     seed["input_params"] = input_params
@@ -320,28 +323,19 @@ def _seed_for_callback(
         source = str(item.get("source") or "REQUEST").upper()
         if not name or name in seed["fixed_params"]:
             continue
-        target = seed["query_params"] if source == "GET" else seed["cookies"] if source == "COOKIE" else seed["body"]
+        if source == "FILES":
+            seed["discovered_file_params"].append(item)
+            continue
+        target = (
+            seed["query_params"]
+            if source == "GET" or (source == "REQUEST" and method == "GET")
+            else seed["cookies"]
+            if source == "COOKIE"
+            else seed["body"]
+        )
         target.setdefault(name, "FUZZ")
         seed["fuzzable_params"].append(name)
     return seed, "supported_http_seed"
-
-
-def _rest_template(callback: Mapping[str, Any]) -> dict[str, Any] | None:
-    if str(callback.get("hook_name") or "") != "rest_api_init":
-        return None
-    route = str(callback.get("rest_route") or callback.get("route") or "").strip("/")
-    namespace = str(callback.get("namespace") or "").strip("/")
-    if not route:
-        return None
-    if namespace and not route.startswith(f"{namespace}/"):
-        route = f"{namespace}/{route}"
-    methods = callback.get("methods", callback.get("method", "GET"))
-    if isinstance(methods, Sequence) and not isinstance(methods, str):
-        methods = next((method for method in methods if str(method).upper() in {"GET", "POST"}), "GET")
-    method = str(methods).upper()
-    if method not in {"GET", "POST"}:
-        return None
-    return {"method": method, "path": f"/wp-json/{route}", "query_params": {}, "body_params": {}}
 
 
 def _candidate_from_seed(item: Mapping[str, Any]) -> dict[str, Any]:

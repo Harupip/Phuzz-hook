@@ -51,6 +51,16 @@ def child_registered_callback() -> dict:
 
 
 class BootstrapEntryDiscoveryTests(unittest.TestCase):
+    def test_uopz_instrumentation_hooks_register_rest_route(self) -> None:
+        instrumentation = (
+            FUZZER_DIR.parent / "web" / "instrumentation" / "hook_coverage" / "uopz_hook_wp.php"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("__uopz_register_rest_route", instrumentation)
+        self.assertIn("__uopz_record_rest_callback_invocation", instrumentation)
+        self.assertIn("__uopz_try_hook_function('register_rest_route'", instrumentation)
+        self.assertIn("['entrypoint_type'] = 'rest_route'", instrumentation)
+
     def test_pipeline_runs_with_mocked_probe_classifier_and_validator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -226,6 +236,49 @@ class BootstrapEntryDiscoveryTests(unittest.TestCase):
             self.assertEqual(child["hook_level"], 1)
             self.assertEqual(child["parent_callback_id"], "cb-level1")
             self.assertEqual(child["parent_callback"]["hook_name"], "wp_ajax_nopriv_hookphuzz_level1")
+
+    def test_request_artifact_fallback_preserves_rest_route_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            requests_dir = root / "hook-coverage" / "requests"
+            requests_dir.mkdir(parents=True)
+            rest_entry = {
+                "callback_id": "cb-rest",
+                "hook_name": "rest_route:demo/v1/items",
+                "entrypoint_type": "rest_route",
+                "namespace": "demo/v1",
+                "route": "/items",
+                "methods": ["GET", "POST"],
+                "callback_repr": "Demo_Rest::items",
+                "permission_callback": "__return_true",
+                "source_file": "/var/www/html/wp-content/plugins/demo/rest.php",
+                "start_line": 12,
+            }
+            (requests_dir / "req-1.json").write_text(
+                json.dumps(
+                    {
+                        "hook_coverage": {
+                            "registered_callbacks": {"cb-rest": rest_entry},
+                            "executed_callbacks": {},
+                            "blindspot_callbacks": {},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            registry_path = bed.resolve_runtime_registry(None, root / "hook-coverage", root / "out", pretty=True)
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            rest = registry["data"]["registered_callbacks"]["cb-rest"]
+
+            self.assertEqual(rest["entrypoint_type"], "rest_route")
+            self.assertEqual(rest["namespace"], "demo/v1")
+            self.assertEqual(rest["route"], "/items")
+            self.assertEqual(rest["methods"], ["GET", "POST"])
+            self.assertEqual(rest["callback_repr"], "Demo_Rest::items")
+            self.assertEqual(rest["permission_callback"], "__return_true")
+            self.assertEqual(rest["source_file"], "/var/www/html/wp-content/plugins/demo/rest.php")
+            self.assertEqual(rest["start_line"], 12)
 
 
 if __name__ == "__main__":

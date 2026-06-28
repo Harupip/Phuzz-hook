@@ -97,7 +97,8 @@ function Export-LiveSeedSuggestions {
     param(
         [string]$ScriptRoot,
         [int]$WaitSeconds,
-        [string[]]$ComposeArgs
+        [string[]]$ComposeArgs,
+        [string]$PluginSlug
     )
 
     $webContainerId = (& $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] ps -q web).Trim()
@@ -111,28 +112,63 @@ function Export-LiveSeedSuggestions {
     $exportCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\export_cli.py"
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     $snapshotReady = $false
+    $pluginSourceTempRoot = $null
 
-    Write-Host "Waiting for live hook coverage snapshot to export suggested seeds"
-    while ((Get-Date) -lt $deadline) {
-        try {
-            $snapshot = docker exec $webContainerId sh -c "cat $coverageFileInContainer" 2>$null
-            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($snapshot)) {
-                $snapshot | Set-Content -Path $coverageSnapshot -Encoding UTF8
-                $snapshotReady = $true
-                break
+    try {
+        Write-Host "Waiting for live hook coverage snapshot to export suggested seeds"
+        while ((Get-Date) -lt $deadline) {
+            try {
+                $snapshot = docker exec $webContainerId sh -c "cat $coverageFileInContainer" 2>$null
+                if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($snapshot)) {
+                    $snapshot | Set-Content -Path $coverageSnapshot -Encoding UTF8
+                    $snapshotReady = $true
+                    break
+                }
+            } catch {
             }
-        } catch {
+
+            Start-Sleep -Seconds 5
         }
 
-        Start-Sleep -Seconds 5
-    }
+        if (-not $snapshotReady) {
+            throw "Timed out waiting for live hook coverage snapshot at $coverageFileInContainer."
+        }
 
-    if (-not $snapshotReady) {
-        throw "Timed out waiting for live hook coverage snapshot at $coverageFileInContainer."
-    }
+        $sourceArgs = @()
+        $pluginSourceTempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("phuzz-plugin-source-{0}" -f ([guid]::NewGuid().ToString("N")))
+        $hostSourceRoot = Join-Path $pluginSourceTempRoot $PluginSlug
+        New-Item -ItemType Directory -Path $hostSourceRoot -Force | Out-Null
+        $unresolvedSourceReason = $null
 
-    Write-Host "Exporting hook_gap_report.json and suggested_seeds.* to $outputDir"
-    python $exportCli --coverage-file $coverageSnapshot --output-dir $outputDir
+        try {
+            docker cp "${webContainerId}:/var/www/html/wp-content/plugins/$PluginSlug/." $hostSourceRoot
+            if ($LASTEXITCODE -ne 0) {
+                $unresolvedSourceReason = "source_copy_failed"
+            } elseif (-not (Get-ChildItem -LiteralPath $hostSourceRoot -Recurse -Filter *.php -File -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+                $unresolvedSourceReason = "no_php_files"
+            } else {
+                $sourceArgs = @(
+                    "--container-source-root", "/var/www/html/wp-content/plugins/$PluginSlug",
+                    "--host-source-root", $hostSourceRoot,
+                    "--source-root", $hostSourceRoot
+                )
+            }
+        } catch {
+            $unresolvedSourceReason = "source_copy_failed"
+        }
+
+        if ($unresolvedSourceReason) {
+            Write-Warning "Plugin source unavailable for seed extraction: $unresolvedSourceReason"
+            $sourceArgs = @("--unresolved-source-reason", $unresolvedSourceReason)
+        }
+
+        Write-Host "Exporting hook_gap_report.json and suggested_seeds.* to $outputDir"
+        python $exportCli --coverage-file $coverageSnapshot --output-dir $outputDir @sourceArgs
+    } finally {
+        if ($pluginSourceTempRoot -and (Test-Path -LiteralPath $pluginSourceTempRoot)) {
+            Remove-Item -LiteralPath $pluginSourceTempRoot -Recurse -Force
+        }
+    }
 }
 
 function Convert-LiveSeedSuggestionsToConfigs {
@@ -196,7 +232,7 @@ try {
     Write-Host "Starting fuzzer container"
     Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", $fuzzerService, "--build")
 
-    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs
+    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug
     Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot
 
     if ($RunGeneratedConfigs) {

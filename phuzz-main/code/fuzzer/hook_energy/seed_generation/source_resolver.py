@@ -10,13 +10,17 @@ class SourceResolution:
     source_file: str
     status: str
     resolved_source_file: str | None = None
+    reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "source_file": self.source_file,
             "status": self.status,
             "resolved_source_file": self.resolved_source_file,
         }
+        if self.reason:
+            result["reason"] = self.reason
+        return result
 
 
 class SourcePathResolver:
@@ -26,15 +30,17 @@ class SourcePathResolver:
         container_source_root: str | Path | None = None,
         host_source_root: str | Path | None = None,
         source_root: str | Path | None = None,
+        unresolved_reason: str | None = None,
     ) -> None:
         self.container_source_root = self._normalize_container_root(container_source_root)
         self.host_source_root = Path(host_source_root) if host_source_root else None
         self.source_root = Path(source_root) if source_root else self.host_source_root
+        self.unresolved_reason = str(unresolved_reason or "").strip() or None
 
     def resolve(self, source_file: str | Path | None) -> SourceResolution:
         raw_source = str(source_file or "").strip()
         if not raw_source:
-            return SourceResolution("", "unresolved", None)
+            return SourceResolution("", "unresolved", None, self.unresolved_reason)
 
         local_path = Path(raw_source)
         if local_path.exists() and local_path.is_file():
@@ -48,7 +54,7 @@ class SourcePathResolver:
         if mapped is not None:
             return SourceResolution(raw_source, "zip_mapped", str(mapped.resolve()))
 
-        return SourceResolution(raw_source, "unresolved", None)
+        return SourceResolution(raw_source, "unresolved", None, self.unresolved_reason)
 
     def _resolve_from_explicit_roots(self, raw_source: str) -> Path | None:
         if not self.container_source_root or self.host_source_root is None:

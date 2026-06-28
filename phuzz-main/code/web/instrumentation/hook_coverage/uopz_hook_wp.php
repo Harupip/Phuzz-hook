@@ -721,6 +721,79 @@ function __uopz_has_registered_callbacks(): bool
     return !empty($GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks']);
 }
 
+function __uopz_rest_hook_name(string $namespace, string $route): string
+{
+    return 'rest_route:' . trim($namespace, '/') . '/' . trim($route, '/');
+}
+
+function __uopz_normalize_rest_methods($methods): array
+{
+    $items = is_array($methods) ? $methods : [$methods ?: 'GET'];
+    $normalized = [];
+    foreach ($items as $item) {
+        foreach (explode(',', str_replace('|', ',', (string) $item)) as $part) {
+            $method = strtoupper(trim($part));
+            if ($method !== '' && !in_array($method, $normalized, true)) {
+                $normalized[] = $method;
+            }
+        }
+    }
+
+    return $normalized ?: ['GET'];
+}
+
+function __uopz_rest_endpoint_args($args): array
+{
+    if (!is_array($args)) {
+        return [];
+    }
+
+    if (array_key_exists('callback', $args)) {
+        return [$args];
+    }
+
+    $endpoints = [];
+    foreach ($args as $key => $entry) {
+        if (!is_int($key) || !is_array($entry) || !array_key_exists('callback', $entry)) {
+            continue;
+        }
+        if (!array_key_exists('permission_callback', $entry) && array_key_exists('permission_callback', $args)) {
+            $entry['permission_callback'] = $args['permission_callback'];
+        }
+        $endpoints[] = $entry;
+    }
+
+    return $endpoints;
+}
+
+function __uopz_register_rest_route(string $namespace, string $route, $args): void
+{
+    foreach (__uopz_rest_endpoint_args($args) as $entry) {
+        $callback = $entry['callback'] ?? null;
+        if ($callback === null || !__uopz_is_target_callback($callback)) {
+            continue;
+        }
+
+        $hookName = __uopz_rest_hook_name($namespace, $route);
+        $priority = 10;
+        __uopz_register_callback('rest_route', $hookName, $callback, $priority, 1, 'register_rest_route');
+
+        $callbackId = __uopz_callback_identity($callback, $hookName, $priority)['callback_id'];
+        if (!isset($GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId])) {
+            continue;
+        }
+
+        $permissionCallback = $entry['permission_callback'] ?? null;
+        $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['entrypoint_type'] = 'rest_route';
+        $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['namespace'] = trim($namespace, '/');
+        $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['route'] = '/' . trim($route, '/');
+        $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['methods'] =
+            __uopz_normalize_rest_methods($entry['methods'] ?? 'GET');
+        $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['permission_callback'] =
+            $permissionCallback === null ? null : __uopz_callback_repr($permissionCallback);
+    }
+}
+
 // Ghi nhan callback nam trong danh sach ma WP_Hook se dispatch cho hook hien tai.
 function __uopz_mark_callback_executed(
     string $type,
@@ -775,6 +848,104 @@ function __uopz_mark_callback_executed(
     $GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'][$callbackId]['source'] = $source;
 }
 
+function __uopz_current_rest_route_path(): ?string
+{
+    if (isset($_GET['rest_route'])) {
+        return trim((string) $_GET['rest_route'], '/');
+    }
+
+    $target = (string) ($GLOBALS['__uopz_request']['http_target'] ?? '');
+    $path = parse_url($target, PHP_URL_PATH) ?: '';
+    if (strpos($path, '/wp-json/') !== 0) {
+        return null;
+    }
+
+    return trim(rawurldecode(substr($path, strlen('/wp-json/'))), '/');
+}
+
+function __uopz_rest_request_matches_entry(array $entry): bool
+{
+    $current = __uopz_current_rest_route_path();
+    if ($current === null || $current === '') {
+        return false;
+    }
+
+    $expected = trim((string) ($entry['namespace'] ?? ''), '/') . '/' . trim((string) ($entry['route'] ?? ''), '/');
+    $expected = trim($expected, '/');
+    if ($expected === '') {
+        return false;
+    }
+    if ($current === $expected) {
+        return true;
+    }
+    if (strpos($expected, '(') === false) {
+        return false;
+    }
+
+    return @preg_match('#^' . str_replace('#', '\\#', $expected) . '$#', $current) === 1;
+}
+
+function __uopz_rest_callback_matches($callback, array $entry): bool
+{
+    $hookName = (string) ($entry['hook_name'] ?? '');
+    if ($hookName === '') {
+        return false;
+    }
+
+    $priority = (int) ($entry['priority'] ?? 10);
+    $identity = __uopz_callback_identity($callback, $hookName, $priority);
+    return $identity['callback_id'] === (string) ($entry['callback_id'] ?? '')
+        || $identity['stable_id'] === (string) ($entry['stable_id'] ?? '')
+        || $identity['runtime_id'] === (string) ($entry['runtime_id'] ?? '');
+}
+
+function __uopz_copy_rest_metadata_to_executed(string $callbackId, array $registered): void
+{
+    if (!isset($GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'][$callbackId])) {
+        return;
+    }
+
+    foreach (['entrypoint_type', 'namespace', 'route', 'methods', 'permission_callback'] as $key) {
+        if (array_key_exists($key, $registered)) {
+            $GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'][$callbackId][$key] = $registered[$key];
+        }
+    }
+}
+
+function __uopz_record_rest_callback_invocation($callback, int $actualArgCount, string $source): void
+{
+    foreach ($GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'] ?? [] as $callbackId => $registered) {
+        if (!is_array($registered) || ($registered['entrypoint_type'] ?? '') !== 'rest_route') {
+            continue;
+        }
+        if (!($registered['is_active'] ?? true)) {
+            continue;
+        }
+        if (!__uopz_rest_request_matches_entry($registered) || !__uopz_rest_callback_matches($callback, $registered)) {
+            continue;
+        }
+
+        $hookName = (string) $registered['hook_name'];
+        $priority = (int) ($registered['priority'] ?? 10);
+        __uopz_push_callback_stack($registered);
+        try {
+            __uopz_mark_callback_executed(
+                'rest_route',
+                $hookName,
+                $callback,
+                $priority,
+                (int) ($registered['accepted_args'] ?? $actualArgCount),
+                $source,
+                $hookName
+            );
+            $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['status'] = 'covered';
+            __uopz_copy_rest_metadata_to_executed((string) $callbackId, $registered);
+        } finally {
+            __uopz_pop_callback_stack();
+        }
+    }
+}
+
 function __uopz_get_current_priority_for_hook(string $hookName): int
 {
     if (!isset($GLOBALS['wp_filter'][$hookName]) || !is_object($GLOBALS['wp_filter'][$hookName])) {
@@ -798,6 +969,7 @@ function __uopz_record_actual_callback_invocation($callback, int $actualArgCount
 {
     $context = __uopz_get_runtime_hook_context();
     if ($context === null) {
+        __uopz_record_rest_callback_invocation($callback, $actualArgCount, $source);
         return;
     }
 
@@ -812,6 +984,7 @@ function __uopz_record_actual_callback_invocation($callback, int $actualArgCount
 
     // Chỉ tính execution coverage cho callback mục tiêu đã có trong registry.
     if ($registered === null) {
+        __uopz_record_rest_callback_invocation($callback, $actualArgCount, $source);
         return;
     }
 
@@ -948,6 +1121,17 @@ function __uopz_install_wp_hooks(): void
                 'add_action'
             );
         }
+    });
+
+    $installResults[] = __uopz_try_hook_function('register_rest_route', function (...$args) {
+        $namespace = (string) ($args[0] ?? '');
+        $route = (string) ($args[1] ?? '');
+        $routeArgs = $args[2] ?? [];
+        if ($namespace === '' || $route === '') {
+            return;
+        }
+
+        __uopz_register_rest_route($namespace, $route, $routeArgs);
     });
 
     $installResults[] = __uopz_try_hook_function('remove_filter', function (...$args) {
@@ -1300,6 +1484,9 @@ register_shutdown_function(function () {
 // bạn có thể gọi lại __uopz_install_wp_hooks() sau khi plugin.php đã được load.
 // Co the goi lai ham nay sau khi WordPress load xong neu auto_prepend chay qua som.
 __uopz_install_wp_hooks();
+if (function_exists('add_action')) {
+    add_action('rest_api_init', '__uopz_install_wp_hooks', 0);
+}
 
 // ============================================================================
 // CALLBACK OWNERSHIP HELPERS

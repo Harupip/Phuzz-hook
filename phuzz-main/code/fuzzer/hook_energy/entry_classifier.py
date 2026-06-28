@@ -3,89 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
-DIRECT_HTTP_RULES = (
-    {
-        "prefix": "wp_ajax_nopriv_",
-        "entry_type": "ajax_unauthenticated",
-        "path": "/wp-admin/admin-ajax.php",
-        "method": "POST",
-        "param_target": "body_params",
-        "auth_required": False,
-        "reason": "WordPress AJAX nopriv hook maps directly to admin-ajax.php?action=<action>",
-    },
-    {
-        "prefix": "wp_ajax_",
-        "entry_type": "ajax_authenticated",
-        "path": "/wp-admin/admin-ajax.php",
-        "method": "POST",
-        "param_target": "body_params",
-        "auth_required": True,
-        "reason": "WordPress AJAX hook maps directly to admin-ajax.php?action=<action>",
-    },
-    {
-        "prefix": "admin_post_nopriv_",
-        "entry_type": "admin_post_unauthenticated",
-        "path": "/wp-admin/admin-post.php",
-        "method": "POST",
-        "param_target": "body_params",
-        "auth_required": False,
-        "reason": "WordPress admin-post nopriv hook maps directly to admin-post.php?action=<action>",
-    },
-    {
-        "prefix": "admin_post_",
-        "entry_type": "admin_post_authenticated",
-        "path": "/wp-admin/admin-post.php",
-        "method": "POST",
-        "param_target": "body_params",
-        "auth_required": True,
-        "reason": "WordPress admin-post hook maps directly to admin-post.php?action=<action>",
-    },
-    {
-        "prefix": "admin_action_",
-        "entry_type": "admin_action",
-        "path": "/wp-admin/admin.php",
-        "method": "GET",
-        "param_target": "query_params",
-        "auth_required": True,
-        "reason": "WordPress admin action hook maps directly to admin.php?action=<action>",
-    },
-    {
-        "prefix": "login_form_",
-        "entry_type": "login_form",
-        "path": "/wp-login.php",
-        "method": "POST",
-        "param_target": "query_params",
-        "auth_required": False,
-        "reason": "WordPress login form hook maps directly to wp-login.php?action=<action>",
-    },
-)
-
-DIRECT_HTTP_EXACT_RULES = {
-    "heartbeat_received": {
-        "entry_type": "heartbeat_authenticated",
-        "path": "/wp-admin/admin-ajax.php",
-        "method": "POST",
-        "param_target": "body_params",
-        "action": "heartbeat",
-        "auth_required": True,
-        "reason": "WordPress authenticated heartbeat hook maps directly to admin-ajax.php?action=heartbeat",
-    },
-    "heartbeat_nopriv_received": {
-        "entry_type": "heartbeat_unauthenticated",
-        "path": "/wp-admin/admin-ajax.php",
-        "method": "POST",
-        "param_target": "body_params",
-        "action": "heartbeat",
-        "auth_required": False,
-        "reason": "WordPress unauthenticated heartbeat hook maps directly to admin-ajax.php?action=heartbeat",
-    },
-}
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from hook_energy.entrypoints import direct_http_details
+else:
+    from .entrypoints import direct_http_details
 
 SETUP_REQUIRED_HOOKS = {
     "rest_api_init": ("rest_route", "REST route records require route-to-config support before PHUZZ config generation"),
@@ -260,7 +188,7 @@ def _normalize_callback(row: dict[str, Any]) -> NormalizedCallback:
 
 
 def _classify_callback(callback: NormalizedCallback, index: int) -> dict[str, Any]:
-    direct = _direct_http_details(callback.hook_name)
+    direct = _direct_http_details(callback)
     if direct is not None:
         classification = "direct_http"
         details = direct
@@ -281,42 +209,8 @@ def _classify_callback(callback: NormalizedCallback, index: int) -> dict[str, An
     }
 
 
-def _direct_http_details(hook_name: str | None) -> dict[str, Any] | None:
-    if not hook_name:
-        return None
-
-    exact_rule = DIRECT_HTTP_EXACT_RULES.get(hook_name)
-    if exact_rule is not None:
-        return _build_direct_details(exact_rule, exact_rule["action"])
-
-    for rule in DIRECT_HTTP_RULES:
-        prefix = str(rule["prefix"])
-        if hook_name.startswith(prefix):
-            return _build_direct_details(rule, hook_name.removeprefix(prefix))
-    return None
-
-
-def _build_direct_details(rule: dict[str, Any], action: str) -> dict[str, Any]:
-    query_params: dict[str, str] = {}
-    body_params: dict[str, str] = {}
-    if rule["param_target"] == "query_params":
-        query_params["action"] = action
-    else:
-        body_params["action"] = action
-
-    return {
-        "entry_type": rule["entry_type"],
-        "action": action,
-        "http_template": {
-            "method": rule["method"],
-            "path": rule["path"],
-            "query_params": query_params,
-            "body_params": body_params,
-        },
-        "auth_required": rule["auth_required"],
-        "confidence": "high",
-        "reason": rule["reason"],
-    }
+def _direct_http_details(callback: NormalizedCallback) -> dict[str, Any] | None:
+    return direct_http_details(callback.hook_name, callback.raw)
 
 
 def _setup_required_details(callback: NormalizedCallback) -> dict[str, Any] | None:
