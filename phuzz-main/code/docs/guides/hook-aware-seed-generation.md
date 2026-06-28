@@ -45,6 +45,12 @@ The generator creates replayable seeds for these hook families:
 
 Other hooks stay manual-only unless later code adds a supported route mapping.
 
+## Entrypoint Rule Ownership
+
+Entrypoint mapping rules live in `code/fuzzer/hook_energy/entrypoints.py`. That file is grouped by entrypoint family (`WordPress AJAX`, `Admin Post`, `Admin Action`, `Login Form`, `Heartbeat`, and `REST route`) so new mappings have one obvious owner.
+
+When adding a new entrypoint family, update `entrypoints.py`, then cover the classifier, live seed generator, and recursive child seed path when that family should flow through those stages. Keep generated artifacts backward-compatible unless a separate migration is intentional.
+
 ## Input Signature Extraction
 
 The extractor lives at:

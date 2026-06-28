@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..entrypoints import seed_template_for_callback
 from .input_extractor import InputSignatureExtractor
 from .source_resolver import SourcePathResolver
 
@@ -210,59 +211,14 @@ class LiveHookSeedGenerator:
             return None, "inactive_callback"
         if coverage_status != "uncovered":
             return None, "already_covered"
-        if str((callback_metadata or {}).get("entrypoint_type", "")) == "rest_route":
-            namespace = str((callback_metadata or {}).get("namespace", "")).strip("/")
-            route = str((callback_metadata or {}).get("route", "")).strip("/")
-            if not namespace or not route:
-                return None, "manual_analysis_required"
-            methods = self._normalize_methods((callback_metadata or {}).get("methods"))
-            if not methods:
-                methods = ["GET"]
-            permission_callback = str((callback_metadata or {}).get("permission_callback", "")).strip()
-            auth_mode = "unauth-capable" if permission_callback in {"", "__return_true"} else "authenticated"
-            return self._attach_fuzzable_params({
-                "method": methods[0],
-                "methods": methods,
-                "path": f"/wp-json/{namespace}/{route}",
-                "content_type": "application/json",
-                "body": {},
-                "auth_mode": auth_mode,
-                "fixed_params": [],
-                "entrypoint_type": "rest_route",
-            }, input_params), "supported_http_seed"
-        if hook_name.startswith("wp_ajax_nopriv_"):
-            return self._attach_fuzzable_params({
-                "method": "POST",
-                "path": "/wp-admin/admin-ajax.php",
-                "content_type": "application/x-www-form-urlencoded",
-                "body": {"action": hook_name.removeprefix("wp_ajax_nopriv_")},
-                "auth_mode": "unauth-capable",
-            }, input_params), "supported_http_seed"
-        if hook_name.startswith("wp_ajax_"):
-            return self._attach_fuzzable_params({
-                "method": "POST",
-                "path": "/wp-admin/admin-ajax.php",
-                "content_type": "application/x-www-form-urlencoded",
-                "body": {"action": hook_name.removeprefix("wp_ajax_")},
-                "auth_mode": "authenticated",
-            }, input_params), "supported_http_seed"
-        if hook_name.startswith("admin_post_nopriv_"):
-            return self._attach_fuzzable_params({
-                "method": "POST",
-                "path": "/wp-admin/admin-post.php",
-                "content_type": "application/x-www-form-urlencoded",
-                "body": {"action": hook_name.removeprefix("admin_post_nopriv_")},
-                "auth_mode": "unauth-capable",
-            }, input_params), "supported_http_seed"
-        if hook_name.startswith("admin_post_"):
-            return self._attach_fuzzable_params({
-                "method": "POST",
-                "path": "/wp-admin/admin-post.php",
-                "content_type": "application/x-www-form-urlencoded",
-                "body": {"action": hook_name.removeprefix("admin_post_")},
-                "auth_mode": "authenticated",
-            }, input_params), "supported_http_seed"
-        return None, "manual_analysis_required"
+        is_rest_route = str((callback_metadata or {}).get("entrypoint_type", "")) == "rest_route"
+        is_seeded_hook = hook_name.startswith(("wp_ajax_nopriv_", "wp_ajax_", "admin_post_nopriv_", "admin_post_"))
+        if not is_rest_route and not is_seeded_hook:
+            return None, "manual_analysis_required"
+        seed = seed_template_for_callback(hook_name, callback_metadata)
+        if seed is None:
+            return None, "manual_analysis_required"
+        return self._attach_fuzzable_params(seed, input_params), "supported_http_seed"
 
     def _attach_fuzzable_params(
         self,

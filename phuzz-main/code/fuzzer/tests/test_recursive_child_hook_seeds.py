@@ -152,6 +152,29 @@ class RecursiveChildHookSeedTests(unittest.TestCase):
         self.assertEqual(seed["method"], "POST")
         self.assertEqual(seed["path"], "/wp-json/demo/v1/items")
 
+    def test_file_inputs_are_metadata_not_fuzz_params(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source = Path(tmp_dir) / "demo.php"
+            source.write_text(
+                "\n".join(
+                    [
+                        "<?php",
+                        "function child_upload() {",
+                        "    $upload = $_FILES['upload'];",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            report = build_recursive_seed_report(
+                [coverage(child(source_file=str(source), start_line=2, end_line=4))]
+            )
+
+        seed = report["suggested_seeds"][0]["seed"]
+        self.assertEqual(seed["discovered_file_params"][0]["name"], "upload")
+        self.assertNotIn("upload", seed["body"])
+        self.assertNotIn("upload", seed["fuzzable_params"])
+
     def test_writes_seed_configs_and_required_validation_fields(self):
         report = build_recursive_seed_report([coverage(child())])
 
