@@ -11,10 +11,17 @@ class InputSignatureExtractor:
     DEFAULT_WINDOW_LINES = 200
 
     SUPERGLOBAL_PATTERN = re.compile(
-        r"\$_(?P<source>GET|POST|REQUEST|COOKIE|FILES)\s*\[\s*(?P<quote>['\"])(?P<name>[A-Za-z0-9_\-]+)(?P=quote)\s*\]"
+        r"\$_(?P<source>GET|POST|REQUEST|COOKIE|FILES)\s*(?P<chain>(?:\[\s*['\"][A-Za-z0-9_\-]+['\"]\s*\])+)"
+    )
+    ARRAY_OFFSET_PATTERN = re.compile(
+        r"\[\s*(?P<quote>['\"])(?P<name>[A-Za-z0-9_\-]+)(?P=quote)\s*\]"
     )
     FILTER_INPUT_PATTERN = re.compile(
         r"filter_input\s*\(\s*INPUT_(?P<source>GET|POST|COOKIE)\s*,\s*(?P<quote>['\"])(?P<name>[A-Za-z0-9_\-]+)(?P=quote)",
+        re.IGNORECASE,
+    )
+    REFERER_HELPER_PATTERN = re.compile(
+        r"\b(?:check_ajax_referer|check_admin_referer)\s*\(\s*(['\"])[^'\"]+\1\s*,\s*(?P<quote>['\"])(?P<name>[A-Za-z0-9_\-]+)(?P=quote)",
         re.IGNORECASE,
     )
     JSON_BODY_ASSIGNMENT_PATTERN = re.compile(
@@ -95,9 +102,23 @@ class InputSignatureExtractor:
             for match in self.JSON_BODY_ASSIGNMENT_PATTERN.finditer(line):
                 json_body_vars.add(match.group("var"))
             for match in self.SUPERGLOBAL_PATTERN.finditer(line):
-                self._append_match(results, seen, match.group("source"), match.group("name"), match.group(0), line_number)
+                name = self._name_from_chain(match.group("chain"))
+                if name:
+                    self._append_match(results, seen, match.group("source"), name, match.group(0), line_number)
             for match in self.FILTER_INPUT_PATTERN.finditer(line):
                 self._append_match(results, seen, match.group("source").upper(), match.group("name"), match.group(0), line_number)
+            for match in self.REFERER_HELPER_PATTERN.finditer(line):
+                self._append_match(
+                    results,
+                    seen,
+                    "REQUEST",
+                    match.group("name"),
+                    match.group(0),
+                    line_number,
+                    confidence="wordpress_nonce_helper",
+                    role="security_nonce",
+                    fuzzable=False,
+                )
             for var_name in json_body_vars:
                 key_pattern = re.compile(self.ARRAY_KEY_PATTERN_TEMPLATE.format(var=re.escape(var_name)))
                 for match in key_pattern.finditer(line):
@@ -184,6 +205,12 @@ class InputSignatureExtractor:
                 return index + 1
         return None
 
+    def _name_from_chain(self, chain: str) -> str:
+        keys = [match.group("name") for match in self.ARRAY_OFFSET_PATTERN.finditer(chain)]
+        if not keys:
+            return ""
+        return keys[0] + "".join(f"[{key}]" for key in keys[1:])
+
     def _append_match(
         self,
         results: list[dict[str, Any]],
@@ -193,23 +220,34 @@ class InputSignatureExtractor:
         evidence: str,
         line_number: int,
         confidence: str = "static_regex",
+        role: str | None = None,
+        fuzzable: bool | None = None,
     ) -> None:
         if name == "action":
             return
         key = (source, name)
         if key in seen:
+            for item in results:
+                if item.get("source") == source and item.get("name") == name:
+                    if role is not None:
+                        item["role"] = role
+                    if fuzzable is not None:
+                        item["fuzzable"] = fuzzable
             return
         seen.add(key)
-        results.append(
-            {
-                "name": name,
-                "source": source,
-                "location": self.LOCATION_BY_SOURCE.get(source, "body_or_query"),
-                "confidence": confidence,
-                "evidence": evidence,
-                "line": line_number,
-            }
-        )
+        row = {
+            "name": name,
+            "source": source,
+            "location": self.LOCATION_BY_SOURCE.get(source, "body_or_query"),
+            "confidence": confidence,
+            "evidence": evidence,
+            "line": line_number,
+        }
+        if role is not None:
+            row["role"] = role
+        if fuzzable is not None:
+            row["fuzzable"] = fuzzable
+        results.append(row)
 
     def _callback_name(self, callback_metadata: dict[str, Any]) -> str:
         for key in ("callback_repr", "callback_name", "stable_id", "runtime_id"):

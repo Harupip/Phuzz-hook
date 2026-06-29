@@ -84,6 +84,40 @@ class InputSignatureExtractorTests(unittest.TestCase):
         self.assertIn(("GET", "preview"), extracted)
         self.assertIn(("COOKIE", "theme"), extracted)
 
+    def test_extracts_nested_post_param_and_ajax_nonce_helper(self) -> None:
+        source = textwrap.dedent(
+            """\
+            <?php
+            function save_api_settings() {
+                check_ajax_referer('vx_nonce','vx_nonce');
+                if (isset($_POST['cfx_settings'])) {
+                    if (!empty($_POST['cfx_settings']['alert_emails'])) {
+                        $info_form['alert_emails'] = $_POST['cfx_settings']['alert_emails'];
+                    }
+                }
+            }
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_file = Path(tmp_dir) / "plugin.php"
+            source_file.write_text(source, encoding="utf-8")
+
+            result = InputSignatureExtractor().extract(
+                {
+                    "source_file": str(source_file),
+                    "start_line": 2,
+                    "end_line": 9,
+                    "function_name": "save_api_settings",
+                }
+            )
+
+        by_name = {item["name"]: item for item in result["input_params"]}
+        self.assertEqual(by_name["vx_nonce"]["role"], "security_nonce")
+        self.assertIs(by_name["vx_nonce"]["fuzzable"], False)
+        self.assertIn("cfx_settings", by_name)
+        self.assertEqual(by_name["cfx_settings[alert_emails]"]["source"], "POST")
+
 
 if __name__ == "__main__":
     unittest.main()

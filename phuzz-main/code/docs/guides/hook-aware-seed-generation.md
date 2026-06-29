@@ -534,3 +534,16 @@ Broader regression set:
 ```powershell
 python -m unittest tests.test_seed_generation_live_export tests.test_seed_generation_importer tests.test_scoring_modes tests.test_hook_energy_integration tests.test_hook_energy_bridge tests.test_benchmark_summary -v
 ```
+
+## Nested WordPress Inputs
+
+Problem: generated configs for `crm-perks-forms` only extracted the parent `cfx_settings` request param, so `wp_ajax_vx_form_save_api_settings` missed the callback's actual request shape.
+
+Fix: the static extractor now keeps literal nested superglobal chains such as `cfx_settings[alert_emails]`, records literal WordPress nonce helper params as fixed `security_nonce` inputs, and the config exporters escape generated concrete param names only when writing PHUZZ regex selectors.
+
+Evidence:
+
+- Unit tests pass for nested params, nonce metadata, fixed/fuzz selector escaping, and legacy `.*` selector preservation.
+- Regression tests pass for input extraction, live seed export, seed-to-config export, bootstrap config writing, input-param seed generation, and recursive child seeds.
+- `crm-perks-forms` replay reached `wp_ajax_vx_form_save_api_settings` with `callback_reached=true`.
+- Generated config now includes fixed `vx_nonce` and fuzzed raw data name `cfx_settings[alert_emails]` with selector `cfx_settings\[alert_emails\]`.

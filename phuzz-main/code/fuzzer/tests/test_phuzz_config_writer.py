@@ -48,7 +48,7 @@ class PhuzzConfigWriterTests(unittest.TestCase):
             [{"name": "action", "value": "abc"}, {"name": "item_id", "value": "FUZZ"}],
         )
         self.assertEqual(config["query_params"]["fuzz"], ["page"])
-        self.assertEqual(config["headers"]["fixed"], ["X-Demo"])
+        self.assertEqual(config["headers"]["fixed"], ["X\\-Demo"])
         self.assertEqual(config["cookies"]["fixed"], ["wordpress_test_cookie"])
         self.assertEqual(
             config["metadata"],
@@ -76,6 +76,25 @@ class PhuzzConfigWriterTests(unittest.TestCase):
         self.assertEqual(config["body_params"]["fixed"], ["action"])
         self.assertIn("hookphuzz_probe", config["body_params"]["fuzz"])
         self.assertIn({"name": "hookphuzz_probe", "value": "fuzz"}, config["body_params"]["data"])
+
+    def test_bracket_param_selectors_are_escaped_but_legacy_regex_stays_raw(self) -> None:
+        candidate = build_candidate(
+            http_template={
+                "method": "POST",
+                "path": "/wp-admin/admin-ajax.php",
+                "body_params": {
+                    "action": "abc",
+                    "cfx_settings[alert_emails]": "FUZZ",
+                    ".*": "FUZZ",
+                },
+            }
+        )
+
+        _, config = build_config_for_candidate(candidate, target_base="http://web")
+
+        self.assertIn({"name": "cfx_settings[alert_emails]", "value": "FUZZ"}, config["body_params"]["data"])
+        self.assertEqual(config["body_params"]["fixed"], ["action"])
+        self.assertEqual(config["body_params"]["fuzz"], ["cfx_settings\\[alert_emails\\]", ".*"])
 
     def test_write_candidate_configs_only_writes_direct_http_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -229,6 +229,11 @@ class LiveHookSeedGenerator:
         seed["fuzzable_params"] = []
         seed["input_params"] = input_params or []
         seed["discovered_file_params"] = []
+        nested_parents = {
+            str(item.get("name", "")).split("[", 1)[0]
+            for item in input_params or []
+            if "[" in str(item.get("name", ""))
+        }
 
         if "query_params" not in seed:
             seed["query_params"] = {}
@@ -245,6 +250,10 @@ class LiveHookSeedGenerator:
                 seed["discovered_file_params"].append(item)
                 continue
 
+            is_fixed_input = item.get("fuzzable") is False or str(item.get("role", "")) == "security_nonce"
+            if name in nested_parents and not is_fixed_input:
+                continue
+
             request_method = str(seed.get("method", "")).upper()
             if source == "GET" or (source == "REQUEST" and request_method == "GET"):
                 target = seed["query_params"]
@@ -254,7 +263,11 @@ class LiveHookSeedGenerator:
                 target = seed["body"]
 
             if name not in target:
-                target[name] = "FUZZ"
+                target[name] = "fuzz" if is_fixed_input else "FUZZ"
+            if is_fixed_input:
+                if name not in seed["fixed_params"]:
+                    seed["fixed_params"].append(name)
+                continue
             if name not in seed["fuzzable_params"]:
                 seed["fuzzable_params"].append(name)
 
