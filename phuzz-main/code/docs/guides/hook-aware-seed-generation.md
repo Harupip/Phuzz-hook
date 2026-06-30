@@ -211,6 +211,23 @@ The WordPress runner can execute every generated config sequentially after expor
 
 Each config receives its own bounded run window. Reaching the limit stops the long-running fuzzer intentionally; it is not itself a failure. The runner evaluates only request artifacts created during that window and reports `callback_reached`, `registered_not_executed`, `hook_fired_target_not_registered`, `no_artifact`, or `not_observed`. Results are written to `fuzzer/output/seed_generation/generated_config_run_summary.json`; the script fails when a process exits with an error or any target callback is not reached.
 
+### Evaluation Report
+
+After bootstrap discovery, seed export, config conversion, validation, or fuzzing runs have already produced artifacts, build the offline evaluation report from `code/fuzzer`:
+
+```powershell
+python -m hook_energy.evaluation_report --output-root output --json-output output/evaluation/hookphuzz_evaluation_summary.json --markdown-output output/evaluation/hookphuzz_evaluation_summary.md
+```
+
+The report generator is an artifact summarizer only. It does not run Docker, bootstrap discovery, source parameter extraction, replay validation, generated config execution, or PHUZZ fuzzing. It reads existing files such as `seed_generation/generated_config_summary.json`, `seed_generation/suggested_seeds.json`, `seed_generation/hook_gap_report.json`, optional `validation_result.json`, optional `generated_config_run_summary.json`, historical `evaluations/*/evaluation-summary.json`, `evaluations/*/e2e-summary.json`, `evaluations/*/total_coverage.json`, and matching `vulnerable-candidates.json` files.
+
+It writes:
+
+- `fuzzer/output/evaluation/hookphuzz_evaluation_summary.json`
+- `fuzzer/output/evaluation/hookphuzz_evaluation_summary.md`
+
+Use the JSON when you need machine-readable totals for runtime hooks, direct HTTP candidates, generated configs, fuzzing-ready configs, callback reach, vulnerability findings, skipped reasons, observed target hooks, and extracted fuzz params. Use the Markdown when you need a readable summary with case notes and the current engineering recommendation.
+
 ### REST Route Runtime Proof
 
 The REST route path was verified against Contact Form 7 using `rest_route:contact-form-7/v1/contact-forms`. The generated config targeted `http://web/wp-json/contact-form-7/v1/contact-forms`, used `GET`, carried `entrypoint_type=rest_route`, and had no `action` parameter. PHUZZ produced a request artifact whose `executed_callbacks` contained callback ID `d6c9daf3190a957f90ff61889aac0887dff44a86` for `WPCF7_REST_Controller->get_contact_forms` from `contact-form-7/includes/rest-api.php:142`.
@@ -527,6 +544,7 @@ Relevant tests:
 cd C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\phuzz-main\code\fuzzer
 python -m unittest tests.test_seed_generation_input_extractor tests.test_input_signature_extractor tests.test_seed_generation_with_input_params -v
 python -m unittest tests.test_seed_to_config_exporter -v
+python -m unittest tests.test_hookphuzz_evaluation_report -v
 ```
 
 Broader regression set:
