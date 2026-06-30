@@ -11,6 +11,7 @@ if str(FUZZER_DIR) not in sys.path:
 
 from hook_energy.seed_generation.config_exporter import (
     SeedConfigSkip,
+    build_generated_param_summary,
     build_config_for_seed_item,
     export_seed_configs,
 )
@@ -21,6 +22,13 @@ def build_seed_item(*, hook_name="wp_ajax_nopriv_example_lookup", auth_mode="una
         "hook_name": hook_name,
         "callback_id": "cb-public",
         "callback_name": "example_lookup_handler",
+        "callback_repr": "example_lookup_handler",
+        "source_file": "/var/www/html/wp-content/plugins/demo/includes/ajax.php",
+        "source_resolution": {
+            "source_file": "/var/www/html/wp-content/plugins/demo/includes/ajax.php",
+            "status": "zip_mapped",
+            "resolved_source_file": "/tmp/demo/includes/ajax.php",
+        },
         "generation_status": "supported_http_seed",
         "seed": {
             "method": "POST",
@@ -33,6 +41,10 @@ def build_seed_item(*, hook_name="wp_ajax_nopriv_example_lookup", auth_mode="una
             "auth_mode": auth_mode,
             "fixed_params": ["action"],
             "fuzzable_params": ["item_id", "page"],
+            "input_params": [
+                {"name": "item_id", "source": "POST", "confidence": "static_regex"},
+                {"name": "page", "source": "GET", "confidence": "static_regex"},
+            ],
         },
     }
 
@@ -264,6 +276,49 @@ class SeedToConfigExporterTests(unittest.TestCase):
             self.assertEqual(summary["generated"][2]["config_slug"], "generated-hooks/wp_ajax_example_lookup-cb-public")
             self.assertEqual(summary["skipped"][0]["reason"], "missing_seed")
             self.assertEqual(json.loads(summary_path.read_text(encoding="utf-8")), summary)
+            self.assertTrue((root / "generated_param_summary.json").exists())
+
+    def test_builds_param_summary_for_generated_configs(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            output_dir = root / "configs" / "generated-hooks"
+            seed_item = build_seed_item()
+            action_only = build_seed_item(hook_name="wp_ajax_example_action_only")
+            action_only["source_resolution"] = {"status": "zip_mapped", "resolved_source_file": "/tmp/demo/ajax.php"}
+            action_only["seed"].update(
+                {"body": {"action": "example_action_only"}, "query_params": {}, "fuzzable_params": [], "input_params": []}
+            )
+            unresolved = build_seed_item(hook_name="wp_ajax_example_unresolved")
+            unresolved["source_resolution"] = {"status": "unresolved", "resolved_source_file": None}
+            unresolved["seed"].update(
+                {"body": {"action": "example_unresolved"}, "query_params": {}, "fuzzable_params": [], "input_params": []}
+            )
+            seed_report = {"suggested_seeds": [seed_item, action_only, unresolved]}
+            summary = export_seed_configs(seed_report, output_config_dir=output_dir)
+
+            param_summary = build_generated_param_summary(
+                seed_report,
+                summary,
+                output_config_dir=output_dir,
+            )
+
+            self.assertEqual(
+                param_summary["summary"],
+                {"total": 3, "fuzzing_ready": 1, "entrypoint_only": 1, "manual_analysis": 1},
+            )
+            ready = param_summary["configs"][0]
+            self.assertEqual(ready["hook_name"], "wp_ajax_nopriv_example_lookup")
+            self.assertEqual(ready["callback_repr"], "example_lookup_handler")
+            self.assertTrue(ready["config_path"].endswith("wp_ajax_nopriv_example_lookup-cb-public.json"))
+            self.assertEqual(ready["endpoint_type"], "ajax")
+            self.assertEqual(ready["callback_source_file"], "/var/www/html/wp-content/plugins/demo/includes/ajax.php")
+            self.assertTrue(ready["callback_source_found"])
+            self.assertEqual(ready["extracted_params"], ["item_id", "page"])
+            self.assertEqual(ready["param_sources"], ["$_POST", "$_GET"])
+            self.assertTrue(ready["has_fuzz_params"])
+            self.assertEqual(ready["status"], "fuzzing_ready")
+            self.assertEqual(param_summary["configs"][1]["status"], "entrypoint_only")
+            self.assertEqual(param_summary["configs"][2]["status"], "manual_analysis")
 
     def test_cli_writes_config_and_summary_from_suggested_seeds_file(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
