@@ -326,6 +326,17 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
 
 
 class GeneratedConfigPowerShellContractTests(unittest.TestCase):
+    def test_wordpress_bootstrap_installs_country_state_city_dependency_before_target(self):
+        script_path = FUZZER_DIR.parent / "web" / "applications" / "wordpress" / "init.sh"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("${WP_TARGET_PLUGIN} == 'country-state-city-auto-dropdown'", script)
+        self.assertIn("./wp-cli.phar plugin install ./_plugins/contact-form-7.zip --activate", script)
+        self.assertLess(
+            script.index("./wp-cli.phar plugin install ./_plugins/contact-form-7.zip --activate"),
+            script.index("./wp-cli.phar plugin install ./_plugins/${WP_TARGET_PLUGIN}.zip --activate"),
+        )
+
     def test_wordpress_runner_exposes_and_wires_opt_in_batch_mode(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
         script = script_path.read_text(encoding="utf-8-sig")

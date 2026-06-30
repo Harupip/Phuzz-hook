@@ -118,8 +118,65 @@ def export_seed_configs(
     if summary_path is not None:
         Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
         Path(summary_path).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        param_summary_path = Path(summary_path).with_name("generated_param_summary.json")
+        param_summary = build_generated_param_summary(
+            seed_report,
+            summary,
+            output_config_dir=output_dir,
+        )
+        param_summary_path.write_text(json.dumps(param_summary, indent=2), encoding="utf-8")
 
     return summary
+
+
+def build_generated_param_summary(
+    seed_report: Mapping[str, Any],
+    config_summary: Mapping[str, Any],
+    *,
+    output_config_dir: str | Path,
+) -> dict[str, Any]:
+    output_dir = Path(output_config_dir)
+    suggestions = [item for item in seed_report.get("suggested_seeds", []) if isinstance(item, Mapping)]
+    by_key = {(str(item.get("hook_name", "")), str(item.get("callback_id", ""))): item for item in suggestions}
+
+    rows: list[dict[str, Any]] = []
+    for generated in config_summary.get("generated", []):
+        if not isinstance(generated, Mapping):
+            continue
+        hook_name = str(generated.get("hook_name", ""))
+        callback_id = str(generated.get("callback_id", ""))
+        seed_item = by_key.get((hook_name, callback_id), {})
+        config_path = output_dir / f"{_build_file_slug(seed_item)}.json"
+        config = _read_json_object(config_path)
+        fuzz_params = _config_fuzz_params(config)
+        source_found = _callback_source_found(seed_item)
+        status = "fuzzing_ready" if fuzz_params else "entrypoint_only"
+        if not source_found:
+            status = "manual_analysis"
+        rows.append(
+            {
+                "hook_name": hook_name,
+                "callback_repr": _callback_repr(seed_item, callback_id),
+                "config_path": str(config_path),
+                "endpoint_type": _endpoint_type(hook_name, seed_item, config),
+                "callback_source_file": _callback_source_file(seed_item),
+                "callback_source_found": source_found,
+                "extracted_params": fuzz_params,
+                "param_sources": _param_sources(seed_item, fuzz_params, source_found=source_found),
+                "has_fuzz_params": bool(fuzz_params),
+                "status": status,
+            }
+        )
+
+    return {
+        "summary": {
+            "total": len(rows),
+            "fuzzing_ready": len([item for item in rows if item["status"] == "fuzzing_ready"]),
+            "entrypoint_only": len([item for item in rows if item["status"] == "entrypoint_only"]),
+            "manual_analysis": len([item for item in rows if item["status"] == "manual_analysis"]),
+        },
+        "configs": rows,
+    }
 
 
 def _build_param_section(
@@ -189,3 +246,94 @@ def _string_set(value: Any) -> set[str]:
     if not isinstance(value, list):
         return set()
     return {str(item) for item in value if str(item)}
+
+
+def _read_json_object(path: Path) -> Mapping[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, Mapping) else {}
+
+
+def _config_fuzz_params(config: Mapping[str, Any]) -> list[str]:
+    params: list[str] = []
+    for key in ("body_params", "query_params"):
+        section = config.get(key)
+        if not isinstance(section, Mapping):
+            continue
+        for name in section.get("fuzz", []):
+            param_name = str(name)
+            if param_name and param_name not in params:
+                params.append(param_name)
+    return params
+
+
+def _callback_repr(seed_item: Mapping[str, Any], callback_id: str) -> str:
+    for key in ("callback_repr", "callback_name", "callback_raw"):
+        value = str(seed_item.get(key, "")).strip()
+        if value:
+            return value
+    return callback_id
+
+
+def _callback_source_file(seed_item: Mapping[str, Any]) -> str:
+    resolution = seed_item.get("source_resolution")
+    if isinstance(resolution, Mapping):
+        value = str(resolution.get("source_file") or resolution.get("resolved_source_file") or "").strip()
+        if value:
+            return value
+    return str(seed_item.get("source_file") or "").strip()
+
+
+def _callback_source_found(seed_item: Mapping[str, Any]) -> bool:
+    resolution = seed_item.get("source_resolution")
+    if not isinstance(resolution, Mapping):
+        return False
+    status = str(resolution.get("status", "")).strip()
+    return bool(status and status != "unresolved" and resolution.get("resolved_source_file"))
+
+
+def _endpoint_type(hook_name: str, seed_item: Mapping[str, Any], config: Mapping[str, Any]) -> str:
+    entrypoint_type = str(config.get("entrypoint_type") or seed_item.get("entrypoint_type") or "").strip()
+    target = str(config.get("target", ""))
+    if hook_name.startswith("rest_route:") or entrypoint_type == "rest_route" or "/wp-json/" in target:
+        return "rest"
+    if hook_name.startswith(("wp_ajax_", "wp_ajax_nopriv_")) or "admin-ajax.php" in target:
+        return "ajax"
+    if hook_name.startswith(("admin_post_", "admin_post_nopriv_")) or "admin-post.php" in target:
+        return "admin_post"
+    return "unknown"
+
+
+def _param_sources(seed_item: Mapping[str, Any], params: list[str], *, source_found: bool) -> list[str]:
+    seed = seed_item.get("seed")
+    input_params = seed.get("input_params", []) if isinstance(seed, Mapping) else []
+    source_by_name: dict[str, str] = {}
+    if isinstance(input_params, list):
+        for item in input_params:
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name", "")).strip()
+            if name and name not in source_by_name:
+                source_by_name[name] = _param_source_label(item)
+
+    labels: list[str] = []
+    for name in params:
+        label = source_by_name.get(name) or ("default" if source_found else "manual")
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _param_source_label(item: Mapping[str, Any]) -> str:
+    confidence = str(item.get("confidence", ""))
+    if confidence.startswith("shallow_helper"):
+        return "helper"
+    source = str(item.get("source", "")).upper()
+    return {
+        "GET": "$_GET",
+        "POST": "$_POST",
+        "REQUEST": "$_REQUEST",
+        "COOKIE": "$_COOKIE",
+    }.get(source, "manual")
