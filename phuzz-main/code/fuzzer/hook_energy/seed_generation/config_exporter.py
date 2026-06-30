@@ -136,12 +136,18 @@ def _build_param_section(
         param_name = str(name)
         if param_name in fuzzable_params and param_name not in fixed_params:
             data.append({"name": param_name, "value": "fuzz"})
-            fuzz.append(param_name)
+            fuzz.append(_selector_for_generated_param(param_name))
         else:
             data.append({"name": param_name, "value": str(value)})
-            fixed.append(param_name)
+            fixed.append(_selector_for_generated_param(param_name))
 
     return {"data": data, "fixed": fixed, "fuzz": fuzz, "weight": 1}
+
+
+def _selector_for_generated_param(param_name: str) -> str:
+    if param_name == ".*":
+        return param_name
+    return re.escape(param_name)
 
 
 def _build_file_slug(seed_item: Mapping[str, Any]) -> str:

@@ -92,7 +92,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
                 "weight": 1,
             },
         )
-        self.assertEqual(config["headers"]["fixed"], ["X-Seed"])
+        self.assertEqual(config["headers"]["fixed"], ["X\\-Seed"])
         self.assertEqual(config["cookies"]["fixed"], ["wordpress_test_cookie"])
 
     def test_action_only_seed_becomes_replay_only_config(self):
@@ -150,6 +150,57 @@ class SeedToConfigExporterTests(unittest.TestCase):
         self.assertEqual(config["target"], "http://web/wp-admin/admin-post.php")
         self.assertEqual(config["body_params"]["fixed"], ["action"])
         self.assertEqual(config["body_params"]["fuzz"], ["order_id"])
+
+    def test_bracket_param_data_name_stays_raw_and_fuzz_selector_is_escaped(self):
+        item = build_seed_item(hook_name="wp_ajax_vx_form_save_api_settings", auth_mode="authenticated")
+        item["seed"].update(
+            {
+                "body": {
+                    "action": "vx_form_save_api_settings",
+                    "vx_nonce": "fuzz",
+                    "cfx_settings[alert_emails]": "FUZZ",
+                },
+                "query_params": {},
+                "fixed_params": ["action", "vx_nonce"],
+                "fuzzable_params": ["cfx_settings[alert_emails]"],
+            }
+        )
+
+        _, config = build_config_for_seed_item(item)
+
+        self.assertIn({"name": "cfx_settings[alert_emails]", "value": "fuzz"}, config["body_params"]["data"])
+        self.assertEqual(config["body_params"]["fixed"], ["action", "vx_nonce"])
+        self.assertEqual(config["body_params"]["fuzz"], ["cfx_settings\\[alert_emails\\]"])
+
+    def test_fixed_bracket_selector_is_escaped(self):
+        item = build_seed_item()
+        item["seed"].update(
+            {
+                "body": {"action": "example_lookup", "token[field]": "fuzz"},
+                "query_params": {},
+                "fixed_params": ["action", "token[field]"],
+                "fuzzable_params": [],
+            }
+        )
+
+        _, config = build_config_for_seed_item(item)
+
+        self.assertEqual(config["body_params"]["fixed"], ["action", "token\\[field\\]"])
+
+    def test_legacy_regex_selector_is_not_escaped(self):
+        item = build_seed_item()
+        item["seed"].update(
+            {
+                "body": {"action": "example_lookup", ".*": "FUZZ"},
+                "query_params": {},
+                "fixed_params": ["action"],
+                "fuzzable_params": [".*"],
+            }
+        )
+
+        _, config = build_config_for_seed_item(item)
+
+        self.assertEqual(config["body_params"]["fuzz"], [".*"])
 
     def test_rest_seed_becomes_wp_json_config_without_action(self):
         slug, config = build_config_for_seed_item(build_rest_seed_item(), target_base="http://web")

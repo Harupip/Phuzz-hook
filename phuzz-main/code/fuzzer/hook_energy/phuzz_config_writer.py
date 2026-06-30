@@ -102,11 +102,18 @@ def _build_param_section(values: Mapping[str, str], *, allow_fuzz: bool) -> tupl
     fuzz: list[str] = []
     for name in values:
         param_name = str(name)
+        selector = _selector_for_generated_param(param_name)
         if allow_fuzz and param_name != "action":
-            fuzz.append(param_name)
+            fuzz.append(selector)
         else:
-            fixed.append(param_name)
+            fixed.append(selector)
     return {"data": data, "fixed": fixed, "fuzz": fuzz, "weight": 1 if fuzz else 0}, len(fuzz)
+
+
+def _selector_for_generated_param(param_name: str) -> str:
+    if param_name == ".*":
+        return param_name
+    return re.escape(param_name)
 
 
 def _section_values(section: Any) -> dict[str, str]:

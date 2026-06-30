@@ -187,6 +187,56 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
         self.assertIn("page", direct_seed["fuzzable_params"])
         self.assertNotIn("action", direct_seed["fuzzable_params"])
 
+    def test_generator_keeps_nonce_fixed_and_prunes_nested_parent_param(self) -> None:
+        source = "\n".join(
+            [
+                "<?php",
+                "function save_api_settings() {",
+                "    check_ajax_referer('vx_nonce','vx_nonce');",
+                "    if (isset($_POST['cfx_settings'])) {",
+                "        if (!empty($_POST['cfx_settings']['alert_emails'])) {",
+                "            $info_form['alert_emails'] = $_POST['cfx_settings']['alert_emails'];",
+                "        }",
+                "    }",
+                "}",
+                "",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_file = Path(tmp_dir) / "crm.php"
+            source_file.write_text(source, encoding="utf-8")
+
+            payload = {
+                "data": {
+                    "registered_callbacks": {
+                        "cb-crm": {
+                            "callback_id": "cb-crm",
+                            "hook_name": "wp_ajax_vx_form_save_api_settings",
+                            "callback_repr": "cfx_form_admin_pages->save_api_settings",
+                            "source_file": str(source_file),
+                            "source_line": 2,
+                            "start_line": 2,
+                            "end_line": 9,
+                            "is_active": True,
+                            "status": "registered_only",
+                        }
+                    },
+                    "executed_callbacks": {},
+                }
+            }
+
+            _, seed_report = LiveHookSeedGenerator().build_reports(payload)
+
+        seed = seed_report["suggested_seeds"][0]["seed"]
+        self.assertEqual(seed["body"]["action"], "vx_form_save_api_settings")
+        self.assertEqual(seed["body"]["vx_nonce"], "fuzz")
+        self.assertEqual(seed["body"]["cfx_settings[alert_emails]"], "FUZZ")
+        self.assertNotIn("cfx_settings", seed["body"])
+        self.assertIn("vx_nonce", seed["fixed_params"])
+        self.assertNotIn("vx_nonce", seed["fuzzable_params"])
+        self.assertEqual(seed["fuzzable_params"], ["cfx_settings[alert_emails]"])
+
     def test_generator_prioritizes_nopriv_over_authenticated_hooks(self) -> None:
         generator = LiveHookSeedGenerator()
 
