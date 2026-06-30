@@ -10,3 +10,4 @@ __pycache__
 !*/output/.gitkeep
 cookies.json
 params.json
+fuzzer/configs/generated-hooks*/
