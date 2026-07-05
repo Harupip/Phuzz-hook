@@ -141,6 +141,7 @@ def seed_template_for_callback(
         return None
 
     http_template = details["http_template"]
+    entrypoint_type = "heartbeat" if hook_name in DIRECT_HTTP_EXACT_RULES else details["entry_type"]
     return {
         "method": http_template["method"],
         "path": http_template["path"],
@@ -149,6 +150,7 @@ def seed_template_for_callback(
         "query_params": dict(http_template.get("query_params") or {}),
         "auth_mode": "authenticated" if details["auth_required"] else "unauth-capable",
         "fixed_params": ["action"] if details.get("action") else [],
+        "entrypoint_type": entrypoint_type,
     }
 
 

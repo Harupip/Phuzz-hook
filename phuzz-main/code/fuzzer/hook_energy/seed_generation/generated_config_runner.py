@@ -150,6 +150,7 @@ def run_generated_configs(
             [payload for _, payload in artifact_payloads],
         )
         matched_artifact = _matched_artifact(config, artifact_payloads)
+        failure_category = _failure_category(process_status, validation["status"])
 
         runs.append(
             {
@@ -162,6 +163,7 @@ def run_generated_configs(
                 "validation_status": validation["status"],
                 "validation_reason": validation["reason"],
                 "callback_reached": validation["expected_callback_reached"],
+                "failure_category": failure_category,
                 "requests_created": len(new_artifacts),
                 "request_artifacts": new_artifacts,
                 "matched_artifact": matched_artifact,
@@ -190,6 +192,30 @@ def run_generated_configs(
         },
     }
 
+
+def format_validation_result(report: Mapping[str, Any]) -> dict[str, Any]:
+    validations = []
+    for row in report.get('runs', []):
+        validations.append(
+            {
+                'config_slug': row.get('config_slug'),
+                'hook_name': row.get('hook_name'),
+                'callback_id': row.get('callback_id'),
+                'entrypoint_type': row.get('entrypoint_type'),
+                'status': row.get('validation_status'),
+                'callback_reached': bool(row.get('callback_reached')),
+                'failure_category': row.get('failure_category'),
+                'reason': row.get('validation_reason'),
+                'matched_artifact': row.get('matched_artifact'),
+            }
+        )
+    return {
+        'summary': {
+            'total': len(validations),
+            'callback_reached': sum(row['callback_reached'] for row in validations),
+        },
+        'validations': validations,
+    }
 
 def format_recursive_summary(report: Mapping[str, Any]) -> dict[str, Any]:
     results = [_format_recursive_result(row) for row in report.get("runs", [])]
@@ -232,7 +258,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         report["generated_config_summary"] = str(source_path)
         output_report = format_recursive_summary(report) if args.output_format == "recursive" else report
-        write_report(output_report, Path(args.output_file))
+        output_path = Path(args.output_file)
+        write_report(output_report, output_path)
+        if args.output_format == 'default':
+            write_report(format_validation_result(report), output_path.with_name('validation_result.json'))
     except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -273,6 +302,21 @@ def _runtime_config_slug(config: Mapping[str, str]) -> str:
     return slug[:-5] if slug.lower().endswith(".json") else slug
 
 
+def _failure_category(process_status: str, validation_status: str) -> str | None:
+    if validation_status == 'callback_reached':
+        return None
+    if process_status == 'runner_error' or validation_status == 'runner_error':
+        return 'F. instrumentation/generation bug'
+    if validation_status in {'no_artifact', 'hook_fired_target_not_registered'}:
+        return 'C. request mapping wrong'
+    if validation_status == 'registered_not_executed':
+        return 'E. callback registered but not HTTP reachable'
+    if validation_status == 'not_observed':
+        return 'B. auth/login branch mismatch'
+    if process_status == 'failed':
+        return 'A. plugin dependency/context missing'
+    return 'F. instrumentation/generation bug'
+
 def _matched_artifact(config: Mapping[str, str], artifacts: Sequence[tuple[str, Any]]) -> str | None:
     candidate = {"hook_name": config["hook_name"], "callback_id": config["callback_id"]}
     for name, payload in artifacts:
@@ -298,6 +342,7 @@ def _runner_error_row(
         "validation_status": "runner_error",
         "validation_reason": reason,
         "callback_reached": False,
+        "failure_category": "F. instrumentation/generation bug",
         "requests_created": 0,
         "request_artifacts": [],
         "matched_artifact": None,

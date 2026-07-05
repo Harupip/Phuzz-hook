@@ -37,7 +37,7 @@ def build_config_for_seed_item(
         "methods": methods,
         "print_timestamps": True,
     }
-    entrypoint_type = str(seed.get("entrypoint_type") or seed_item.get("entrypoint_type") or "").strip()
+    entrypoint_type = _entrypoint_type_for_seed(seed_item, seed, path)
     if entrypoint_type:
         config["entrypoint_type"] = entrypoint_type
 
@@ -65,11 +65,17 @@ def build_config_for_seed_item(
         if config_key in {"body_params", "query_params"}:
             fuzz_count += len(section["fuzz"])
 
-    config["config_type"] = "fuzzing_ready" if fuzz_count else "replay_only"
-    discovered_file_params = seed.get("discovered_file_params", [])
-    if isinstance(discovered_file_params, list) and discovered_file_params:
-        config["metadata"] = {"discovered_file_params": discovered_file_params}
-
+    config['config_type'] = 'fuzzing_ready' if fuzz_count else 'replay_only'
+    discovered_file_params = seed.get('discovered_file_params', [])
+    if not isinstance(discovered_file_params, list):
+        discovered_file_params = []
+    config['metadata'] = _metadata_for_seed_item(
+        seed_item,
+        seed,
+        entrypoint_type=entrypoint_type,
+        fuzzing_ready=bool(fuzz_count),
+        discovered_file_params=discovered_file_params,
+    )
     return _build_file_slug(seed_item), config
 
 
@@ -98,9 +104,7 @@ def export_seed_configs(
         try:
             file_slug, config = build_config_for_seed_item(item, target_base=target_base)
         except SeedConfigSkip as exc:
-            summary["skipped"].append(
-                {"hook_name": hook_name, "callback_id": callback_id, "reason": exc.reason}
-            )
+            summary["skipped"].append(_skipped_row(item, hook_name, callback_id, exc.reason))
             continue
 
         config_path = output_dir / f"{file_slug}.json"
@@ -113,6 +117,7 @@ def export_seed_configs(
         entrypoint_type = str(config.get("entrypoint_type", "")).strip()
         if entrypoint_type:
             generated_row["entrypoint_type"] = entrypoint_type
+        generated_row.update(_summary_metadata(item, config))
         summary["generated"].append(generated_row)
 
     if summary_path is not None:
@@ -159,6 +164,14 @@ def build_generated_param_summary(
                 "callback_repr": _callback_repr(seed_item, callback_id),
                 "config_path": str(config_path),
                 "endpoint_type": _endpoint_type(hook_name, seed_item, config),
+                "entrypoint_type": config.get("entrypoint_type") or seed_item.get("entrypoint_type"),
+                "callback_start_line": _callback_start_line(seed_item),
+                "auth_mode": _config_metadata_value(config, "auth_mode"),
+                "generated_reason": _config_metadata_value(config, "generated_reason"),
+                "fuzzing_ready": bool(_config_metadata_value(config, "fuzzing_ready")),
+                "setup_required": bool(_config_metadata_value(config, "setup_required")),
+                "manual_analysis": bool(_config_metadata_value(config, "manual_analysis")),
+                "missing_requirements": _config_metadata_value(config, "missing_requirements") or [],
                 "callback_source_file": _callback_source_file(seed_item),
                 "callback_source_found": source_found,
                 "extracted_params": fuzz_params,
@@ -254,6 +267,120 @@ def _string_set(value: Any) -> set[str]:
     return {str(item) for item in value if str(item)}
 
 
+def _entrypoint_type_for_seed(seed_item: Mapping[str, Any], seed: Mapping[str, Any], path: str) -> str:
+    explicit = str(seed.get('entrypoint_type') or seed_item.get('entrypoint_type') or '').strip()
+    if explicit:
+        return explicit
+    hook_name = str(seed_item.get('hook_name', '')).strip()
+    if hook_name.startswith('wp_ajax_nopriv_'):
+        return 'ajax_unauthenticated'
+    if hook_name.startswith('wp_ajax_'):
+        return 'ajax_authenticated'
+    if hook_name.startswith('admin_post_nopriv_'):
+        return 'admin_post_unauthenticated'
+    if hook_name.startswith('admin_post_'):
+        return 'admin_post_authenticated'
+    if hook_name.startswith('login_form_'):
+        return 'login_form'
+    if hook_name in {'heartbeat_received', 'heartbeat_nopriv_received'}:
+        return 'heartbeat'
+    if '/wp-json/' in path:
+        return 'rest_route'
+    return ''
+
+
+def _metadata_for_seed_item(
+    seed_item: Mapping[str, Any],
+    seed: Mapping[str, Any],
+    *,
+    entrypoint_type: str,
+    fuzzing_ready: bool,
+    discovered_file_params: list[Any],
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        'entrypoint_type': entrypoint_type,
+        'hook_name': str(seed_item.get('hook_name', '')),
+        'callback_repr': _callback_repr(seed_item, str(seed_item.get('callback_id', ''))),
+        'callback_source_file': _callback_source_file(seed_item),
+        'callback_start_line': _callback_start_line(seed_item),
+        'auth_mode': str(seed.get('auth_mode') or ''),
+        'generated_reason': str(seed_item.get('generated_reason') or seed_item.get('generation_status') or ''),
+        'fuzzing_ready': fuzzing_ready,
+        'setup_required': bool(seed_item.get('setup_required', False)),
+        'manual_analysis': bool(seed_item.get('manual_analysis', False)),
+    }
+    route = seed_item.get('route') or seed_item.get('rest_route')
+    if route:
+        metadata['route'] = route
+    if discovered_file_params:
+        metadata['discovered_file_params'] = discovered_file_params
+    missing = _missing_requirements(seed_item, fuzzing_ready=fuzzing_ready)
+    if missing:
+        metadata['missing_requirements'] = missing
+    return metadata
+
+
+def _summary_metadata(seed_item: Mapping[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = config.get('metadata')
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    keys = (
+        'entrypoint_type',
+        'hook_name',
+        'route',
+        'callback_repr',
+        'callback_source_file',
+        'callback_start_line',
+        'auth_mode',
+        'generated_reason',
+        'fuzzing_ready',
+        'setup_required',
+        'manual_analysis',
+        'missing_requirements',
+    )
+    return {key: metadata[key] for key in keys if key in metadata}
+
+
+def _skipped_row(seed_item: Mapping[str, Any], hook_name: str, callback_id: str, reason: str) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        'hook_name': hook_name,
+        'callback_id': callback_id,
+        'reason': reason,
+        'callback_repr': _callback_repr(seed_item, callback_id),
+        'callback_source_file': _callback_source_file(seed_item),
+        'callback_start_line': _callback_start_line(seed_item),
+        'auth_mode': str(seed_item.get('auth_mode') or ''),
+        'generated_reason': str(seed_item.get('generated_reason') or seed_item.get('generation_status') or reason),
+        'fuzzing_ready': False,
+        'setup_required': bool(seed_item.get('setup_required', False)),
+        'manual_analysis': bool(seed_item.get('manual_analysis', reason == 'missing_seed')),
+        'missing_requirements': _missing_requirements(seed_item, fuzzing_ready=False),
+    }
+    entrypoint_type = str(seed_item.get('entrypoint_type') or '').strip()
+    if entrypoint_type:
+        row['entrypoint_type'] = entrypoint_type
+    route = seed_item.get('route') or seed_item.get('rest_route')
+    if route:
+        row['route'] = route
+    return row
+
+
+def _callback_start_line(seed_item: Mapping[str, Any]) -> int | None:
+    for key in ('callback_start_line', 'start_line', 'source_line'):
+        value = seed_item.get(key)
+        if value not in (None, ''):
+            return int(value)
+    return None
+
+
+def _missing_requirements(seed_item: Mapping[str, Any], *, fuzzing_ready: bool) -> list[str]:
+    if fuzzing_ready:
+        return []
+    existing = seed_item.get('missing_requirements')
+    if isinstance(existing, list):
+        return [str(item) for item in existing if str(item)]
+    return ['fuzzable_params']
+
 def _read_json_object(path: Path) -> Mapping[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -274,6 +401,12 @@ def _config_fuzz_params(config: Mapping[str, Any]) -> list[str]:
                 params.append(param_name)
     return params
 
+
+def _config_metadata_value(config: Mapping[str, Any], key: str) -> Any:
+    metadata = config.get('metadata')
+    if isinstance(metadata, Mapping):
+        return metadata.get(key)
+    return None
 
 def _callback_repr(seed_item: Mapping[str, Any], callback_id: str) -> str:
     for key in ("callback_repr", "callback_name", "callback_raw"):

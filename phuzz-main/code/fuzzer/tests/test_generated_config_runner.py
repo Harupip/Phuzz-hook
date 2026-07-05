@@ -157,6 +157,7 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
 
         self.assertEqual([row["process_status"] for row in report["runs"]], ["failed", "exited"])
         self.assertEqual([row["validation_status"] for row in report["runs"]], ["no_artifact", "no_artifact"])
+        self.assertEqual(report['runs'][0]['failure_category'], 'C. request mapping wrong')
         self.assertEqual(report["counts"]["process_failed"], 1)
         self.assertEqual(report["runs"][0]["exit_code"], 3)
         self.assertIn("FUZZER_CONFIG=generated-hooks/two", runner.commands[1])
@@ -331,6 +332,11 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
             report = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(report["generated_config_summary"], str(source))
             self.assertEqual(report["counts"]["total"], 0)
+            validation_result = root / 'validation_result.json'
+            self.assertTrue(validation_result.exists())
+            validation = json.loads(validation_result.read_text(encoding='utf-8'))
+            self.assertEqual(validation['summary']['total'], 0)
+            self.assertEqual(validation['validations'], [])
 
     def test_main_returns_two_for_malformed_summary(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

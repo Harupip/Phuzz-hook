@@ -24,6 +24,8 @@ def build_seed_item(*, hook_name="wp_ajax_nopriv_example_lookup", auth_mode="una
         "callback_name": "example_lookup_handler",
         "callback_repr": "example_lookup_handler",
         "source_file": "/var/www/html/wp-content/plugins/demo/includes/ajax.php",
+        "source_line": 42,
+        "start_line": 42,
         "source_resolution": {
             "source_file": "/var/www/html/wp-content/plugins/demo/includes/ajax.php",
             "status": "zip_mapped",
@@ -107,6 +109,26 @@ class SeedToConfigExporterTests(unittest.TestCase):
         self.assertEqual(config["headers"]["fixed"], ["X\\-Seed"])
         self.assertEqual(config["cookies"]["fixed"], ["wordpress_test_cookie"])
 
+    def test_generated_config_includes_entrypoint_metadata(self):
+        _, config = build_config_for_seed_item(build_seed_item(), target_base='http://web')
+
+        self.assertEqual(config['entrypoint_type'], 'ajax_unauthenticated')
+        self.assertEqual(
+            config['metadata'],
+            {
+                'entrypoint_type': 'ajax_unauthenticated',
+                'hook_name': 'wp_ajax_nopriv_example_lookup',
+                'callback_repr': 'example_lookup_handler',
+                'callback_source_file': '/var/www/html/wp-content/plugins/demo/includes/ajax.php',
+                'callback_start_line': 42,
+                'auth_mode': 'unauth-capable',
+                'generated_reason': 'supported_http_seed',
+                'fuzzing_ready': True,
+                'setup_required': False,
+                'manual_analysis': False,
+            },
+        )
+
     def test_action_only_seed_becomes_replay_only_config(self):
         item = build_seed_item()
         item["seed"].update({"body": {"action": "example_lookup"}, "query_params": {}, "fuzzable_params": []})
@@ -162,6 +184,48 @@ class SeedToConfigExporterTests(unittest.TestCase):
         self.assertEqual(config["target"], "http://web/wp-admin/admin-post.php")
         self.assertEqual(config["body_params"]["fixed"], ["action"])
         self.assertEqual(config["body_params"]["fuzz"], ["order_id"])
+
+    def test_login_form_seed_becomes_config_with_fixed_query_action(self):
+        item = build_seed_item(hook_name="login_form_lostpassword")
+        item["seed"].update(
+            {
+                "path": "/wp-login.php",
+                "body": {},
+                "query_params": {"action": "lostpassword"},
+                "auth_mode": "unauth-capable",
+                "fuzzable_params": [],
+            }
+        )
+
+        _, config = build_config_for_seed_item(item)
+
+        self.assertEqual(config["target"], "http://web/wp-login.php")
+        self.assertEqual(config["entrypoint_type"], "login_form")
+        self.assertEqual(config["metadata"]["auth_mode"], "unauth-capable")
+        self.assertEqual(config["query_params"]["fixed"], ["action"])
+        self.assertEqual(config["query_params"]["data"], [{"name": "action", "value": "lostpassword"}])
+
+    def test_heartbeat_seed_becomes_config_with_common_entrypoint_type(self):
+        item = build_seed_item(hook_name="heartbeat_nopriv_received")
+        item["seed"].update(
+            {
+                "path": "/wp-admin/admin-ajax.php",
+                "body": {"action": "heartbeat"},
+                "query_params": {},
+                "auth_mode": "unauth-capable",
+                "fuzzable_params": [],
+            }
+        )
+
+        _, config = build_config_for_seed_item(item)
+
+        self.assertEqual(config["target"], "http://web/wp-admin/admin-ajax.php")
+        self.assertEqual(config["entrypoint_type"], "heartbeat")
+        self.assertEqual(config["metadata"]["auth_mode"], "unauth-capable")
+        self.assertFalse(config["metadata"]["setup_required"])
+        self.assertFalse(config["metadata"]["manual_analysis"])
+        self.assertEqual(config["body_params"]["fixed"], ["action"])
+        self.assertEqual(config["body_params"]["data"], [{"name": "action", "value": "heartbeat"}])
 
     def test_bracket_param_data_name_stays_raw_and_fuzz_selector_is_escaped(self):
         item = build_seed_item(hook_name="wp_ajax_vx_form_save_api_settings", auth_mode="authenticated")
@@ -272,6 +336,8 @@ class SeedToConfigExporterTests(unittest.TestCase):
             self.assertTrue((output_dir / "rest_route_demo_v1_items-cb-rest.json").exists())
             self.assertTrue((output_dir / "wp_ajax_example_lookup-cb-public.json").exists())
             self.assertEqual(summary["generated"][0]["config_slug"], "generated-hooks/wp_ajax_nopriv_example_lookup-cb-public")
+            self.assertTrue(summary['generated'][0]['fuzzing_ready'])
+            self.assertEqual(summary['generated'][0]['generated_reason'], 'supported_http_seed')
             self.assertEqual(summary["generated"][1]["entrypoint_type"], "rest_route")
             self.assertEqual(summary["generated"][2]["config_slug"], "generated-hooks/wp_ajax_example_lookup-cb-public")
             self.assertEqual(summary["skipped"][0]["reason"], "missing_seed")

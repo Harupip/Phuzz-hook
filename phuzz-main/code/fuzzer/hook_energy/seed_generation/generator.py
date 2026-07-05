@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..entrypoints import seed_template_for_callback
+from ..entrypoints import direct_http_details, seed_template_for_callback
 from .input_extractor import InputSignatureExtractor
 from .source_resolver import SourcePathResolver
 
@@ -58,9 +58,18 @@ class LiveHookSeedGenerator:
                 "source_resolution": item["source_resolution"],
                 "seed_priority": item["seed_priority"],
                 "generation_status": item["generation_status"],
+                "callback_repr": item["callback_raw"],
+                "callback_source_file": item["source_file"],
+                "callback_start_line": item["start_line"] or item["source_line"],
+                "auth_mode": item.get("auth_mode"),
+                "generated_reason": item["generation_status"],
+                "fuzzing_ready": item["fuzzing_ready"],
+                "setup_required": item["setup_required"],
+                "manual_analysis": item["manual_analysis"],
+                "missing_requirements": item["missing_requirements"],
             }
-            if item.get("entrypoint_type") == "rest_route":
-                compact_item["entrypoint_type"] = "rest_route"
+            if item.get('entrypoint_type'):
+                compact_item['entrypoint_type'] = item['entrypoint_type']
             if item["seed"] is not None:
                 compact_item["seed"] = item["seed"]
             for key in ("namespace", "route", "methods", "permission_callback"):
@@ -130,7 +139,7 @@ class LiveHookSeedGenerator:
                     "resolved_source_file": None,
                 },
             )
-            entrypoint_type = str(registered_entry.get("entrypoint_type", "hook")).strip() or "hook"
+            entrypoint_type = self._entrypoint_type_for_callback(hook_name, registered_entry)
             seed, generation_status = self._generate_seed_template(
                 hook_name,
                 is_active,
@@ -138,6 +147,13 @@ class LiveHookSeedGenerator:
                 input_params,
                 registered_entry,
             )
+            if seed is not None:
+                entrypoint_type = str(seed.get('entrypoint_type') or entrypoint_type)
+            auth_mode = str(seed.get('auth_mode')) if isinstance(seed, dict) else None
+            fuzzing_ready = bool(seed and seed.get('fuzzable_params'))
+            missing_requirements = self._missing_requirements(entrypoint_type, seed, source_resolution)
+            manual_analysis = generation_status == "manual_analysis_required"
+            setup_required = self._setup_required(entrypoint_type, manual_analysis)
 
             row = {
                 "callback_id": str(callback_id),
@@ -170,6 +186,13 @@ class LiveHookSeedGenerator:
                 "target_family": target_family,
                 "direct_http_supported": seed is not None,
                 "generation_status": generation_status,
+                "entrypoint_type": entrypoint_type,
+                "auth_mode": auth_mode,
+                "generated_reason": generation_status,
+                "fuzzing_ready": fuzzing_ready,
+                "setup_required": setup_required,
+                "manual_analysis": manual_analysis,
+                "missing_requirements": missing_requirements,
                 "seed": seed,
             }
             if entrypoint_type == "rest_route":
@@ -199,6 +222,38 @@ class LiveHookSeedGenerator:
                 return value
         return callback_id
 
+    def _entrypoint_type_for_callback(self, hook_name: str, metadata: dict[str, Any]) -> str:
+        direct = direct_http_details(hook_name, metadata)
+        if direct is not None:
+            return str(direct['entry_type'])
+        raw_type = str(metadata.get('entrypoint_type') or '').strip()
+        if raw_type:
+            return raw_type
+        if hook_name == 'xmlrpc_methods' and any(key in metadata for key in ('method_map', 'xmlrpc_method', 'methods')):
+            return 'xmlrpc_method_map'
+        if 'shortcode' in hook_name.lower() or any(key in metadata for key in ('shortcode', 'shortcode_tag')):
+            return 'shortcode'
+        return 'hook'
+
+    def _missing_requirements(
+        self,
+        entrypoint_type: str,
+        seed: dict[str, Any] | None,
+        source_resolution: dict[str, Any],
+    ) -> list[str]:
+        if seed is not None:
+            return [] if seed.get('fuzzable_params') else ['fuzzable_params']
+        if entrypoint_type == 'xmlrpc_method_map':
+            return ['xmlrpc_method_name', 'xmlrpc_body_template']
+        if entrypoint_type == 'shortcode':
+            return ['content_setup']
+        if source_resolution.get('status') == 'unresolved':
+            return ['callback_source_file']
+        return ['direct_http_mapping']
+
+    def _setup_required(self, entrypoint_type: str, manual_analysis: bool) -> bool:
+        return manual_analysis and entrypoint_type in {"xmlrpc_method_map", "shortcode"}
+
     def _generate_seed_template(
         self,
         hook_name: str,
@@ -212,7 +267,10 @@ class LiveHookSeedGenerator:
         if coverage_status != "uncovered":
             return None, "already_covered"
         is_rest_route = str((callback_metadata or {}).get("entrypoint_type", "")) == "rest_route"
-        is_seeded_hook = hook_name.startswith(("wp_ajax_nopriv_", "wp_ajax_", "admin_post_nopriv_", "admin_post_"))
+        is_seeded_hook = hook_name.startswith(
+            ('wp_ajax_nopriv_', 'wp_ajax_', 'admin_post_nopriv_', 'admin_post_', 'login_form_')
+        )
+        is_seeded_hook = is_seeded_hook or hook_name in {'heartbeat_received', 'heartbeat_nopriv_received'}
         if not is_rest_route and not is_seeded_hook:
             return None, "manual_analysis_required"
         seed = seed_template_for_callback(hook_name, callback_metadata)
@@ -286,6 +344,10 @@ class LiveHookSeedGenerator:
             return "high", 300, "admin_post"
         if hook_name.startswith("rest_route:"):
             return "high", 300, "rest_route"
+        if hook_name.startswith('login_form_'):
+            return "medium", 220, "login_form"
+        if hook_name in {'heartbeat_received', 'heartbeat_nopriv_received'}:
+            return "medium", 220, "heartbeat"
         lowered = hook_name.lower()
         if lowered in {"init", "plugins_loaded", "wp_loaded"}:
             return "low", 100, "lifecycle"
