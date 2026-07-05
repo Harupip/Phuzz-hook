@@ -314,6 +314,33 @@ sys.exit(2)
         self.assertNotIn("Force plugin download", result.stdout)
         self.assertIn("-RunGeneratedConfigs", result.stdout)
 
+    def test_guided_wrapper_generated_mode_lists_plugins_without_manual_config(self):
+        plugin_zip = CODE_DIR / "web" / "applications" / "wordpress" / "_plugins" / "zzzz-generated-only.zip"
+        config_file = CODE_DIR / "fuzzer" / "configs" / "wordpress" / "zzzz-generated-only.json"
+        self.assertFalse(config_file.exists())
+        try:
+            plugin_zip.write_bytes(b"")
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(CODE_DIR / "phuzz.ps1"),
+                    "-DryRun",
+                ],
+                input="3\n\nn\n",
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            if plugin_zip.exists():
+                plugin_zip.unlink()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("zzzz-generated-only", result.stdout)
+
     def test_guided_wrapper_rejects_invalid_timeout_before_delegating(self):
         result = subprocess.run(
             [

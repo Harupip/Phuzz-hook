@@ -70,6 +70,8 @@ Useful options:
 }
 
 function Get-LocalPluginSlugs {
+    param([bool]$RequireConfig = $true)
+
     if (-not (Test-Path -LiteralPath $pluginDir)) {
         return @()
     }
@@ -77,7 +79,7 @@ function Get-LocalPluginSlugs {
     return @(
         Get-ChildItem -LiteralPath $pluginDir -Filter "*.zip" |
             ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) } |
-            Where-Object { Test-Path -LiteralPath (Join-Path $configDir "$_.json") } |
+            Where-Object { (-not $RequireConfig) -or (Test-Path -LiteralPath (Join-Path $configDir "$_.json")) } |
             Sort-Object -Unique
     )
 }
@@ -101,14 +103,20 @@ function Read-MenuMode {
 }
 
 function Read-PluginSlug {
-    $slugs = @(Get-LocalPluginSlugs)
+    param([bool]$RequireConfig = $true)
+
+    $slugs = @(Get-LocalPluginSlugs -RequireConfig $RequireConfig)
     if ($slugs.Count -eq 0) {
-        Write-Host "No local plugin ZIP with matching PHUZZ config found. Using default: show-all-comments-in-one-page"
+        Write-Host "No local plugin ZIP found. Using default: show-all-comments-in-one-page"
         return "show-all-comments-in-one-page"
     }
 
     Write-Host ""
-    Write-Host "Choose local WordPress plugin with matching PHUZZ config:"
+    if ($RequireConfig) {
+        Write-Host "Choose local WordPress plugin with matching PHUZZ config:"
+    } else {
+        Write-Host "Choose local WordPress plugin:"
+    }
     for ($index = 0; $index -lt $slugs.Count; $index++) {
         Write-Host ("  {0}) {1}" -f ($index + 1), $slugs[$index])
     }
@@ -640,7 +648,7 @@ if ($interactive) {
 
 if (-not $PSBoundParameters.ContainsKey("PluginSlug")) {
     if ($interactive) {
-        $PluginSlug = Read-PluginSlug
+        $PluginSlug = Read-PluginSlug -RequireConfig ($Mode -ne "generated")
     } else {
         $PluginSlug = "show-all-comments-in-one-page"
     }

@@ -344,16 +344,33 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("[switch]$RunGeneratedConfigs", script)
         self.assertIn("[string]$PluginSlug = \"show-all-comments-in-one-page\"", script)
         self.assertIn("$GeneratedConfigTimeoutSeconds", script)
-        self.assertIn("fuzzer\\configs\\wordpress\\$PluginSlug.json", script)
+        self.assertIn("fuzzer\\configs\\{0}.json", script)
+        self.assertIn("wordpress/$PluginSlug", script)
+        self.assertIn("wordpress/bootstrap-generated", script)
         self.assertIn("web\\applications\\wordpress\\_plugins\\$PluginSlug.zip", script)
         self.assertIn("WP_TARGET_PLUGIN: $PluginSlug", script)
-        self.assertIn("FUZZER_CONFIG: wordpress/$PluginSlug", script)
+        self.assertIn("FUZZER_CONFIG: $BootstrapConfigSlug", script)
         self.assertIn("if ($RunGeneratedConfigs)", script)
         self.assertIn("Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @(\"stop\", \"--timeout\", \"30\", $fuzzerService)", script)
         self.assertIn("generated_config_runner.py", script)
         self.assertIn("--generated-config-summary", script)
         self.assertIn("--output-file", script)
         self.assertIn("--timeout-seconds", script)
+
+    def test_wordpress_runner_uses_shared_bootstrap_config_for_generated_mode(self):
+        runner_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        runner = runner_path.read_text(encoding="utf-8-sig")
+        config_path = FUZZER_DIR / "configs" / "wordpress" / "bootstrap-generated.json"
+        self.assertTrue(config_path.exists())
+        config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+
+        self.assertIn('"wordpress/bootstrap-generated"', runner)
+        self.assertIn("$BootstrapConfigSlug", runner)
+        self.assertIn("fuzzer\\configs\\{0}.json", runner)
+        self.assertIn('$BootstrapConfigSlug.Replace("/", [System.IO.Path]::DirectorySeparatorChar)', runner)
+        self.assertEqual(config["target"], "http://web/")
+        self.assertEqual(config["methods"], ["GET"])
+        self.assertEqual(config["query_params"]["fuzz"], ["hookphuzz_probe"])
 
     def test_wordpress_runner_maps_copied_plugin_source_into_seed_export(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
