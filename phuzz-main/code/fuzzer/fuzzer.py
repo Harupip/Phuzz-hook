@@ -822,9 +822,9 @@ class Fuzzer:
                         stop = int(time.time())
                         diff = stop - self.start_time
                         print(f"\n\n\n\n\n\nFound {vuln_type}! in {diff}s\n\n\n\n\n\n")
-                        #with open("/sync-tmpfs/vuln_found", "w") as f:
-                        #    f.write(f"Found by {self.fuzzer_id} in {diff}s")
-                        #sys.exit(1337) #TODO: comment me out!
+                        with open("/sync-tmpfs/vuln_found", "w") as f:
+                            f.write(f"Found by {self.fuzzer_id} in {diff}s")
+                        sys.exit(1337) #TODO: comment me out!
 
                 if self.ff_is_interesting(mutated_candidate):
                     #print("TP priority / score:", mutated_candidate.priority, mutated_candidate.score)

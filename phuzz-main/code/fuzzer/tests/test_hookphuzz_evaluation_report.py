@@ -97,6 +97,54 @@ class HookPhuzzEvaluationReportTests(unittest.TestCase):
             self.assertEqual(demo["classification"], "config_generated_not_fuzzed")
             self.assertEqual(demo["extracted_fuzz_params"][0]["params"], ["item_id"])
 
+    def test_generated_config_vuln_found_counts_as_e2e_success(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            seed_dir = root / "output" / "seed_generation"
+            write_json(
+                seed_dir / "hook_gap_report.json",
+                {
+                    "summary": {"registered_callbacks": 1, "direct_http_seed_candidates": 1},
+                    "callbacks": [
+                        {
+                            "hook_name": "wp_ajax_demo_lookup",
+                            "callback_id": "cb-ready",
+                            "source_file": "/var/www/html/wp-content/plugins/demo/includes/ajax.php",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                seed_dir / "generated_config_summary.json",
+                {
+                    "generated": [
+                        {"hook_name": "wp_ajax_demo_lookup", "callback_id": "cb-ready", "config_slug": "generated/demo"}
+                    ],
+                    "skipped": [],
+                },
+            )
+            write_json(
+                seed_dir / "generated_config_run_summary.json",
+                {
+                    "counts": {"callback_reached": 1, "vuln_found": 0},
+                    "runs": [
+                        {
+                            "hook_name": "wp_ajax_demo_lookup",
+                            "callback_reached": True,
+                            "process_status": "failed",
+                            "exit_code": 57,
+                        }
+                    ],
+                },
+            )
+
+            report = build_evaluation_report(root / "output")
+            demo = report["plugins"][0]
+
+            self.assertEqual(demo["vulnerability_found_count"], 1)
+            self.assertEqual(demo["callback_reached_count"], 1)
+            self.assertEqual(demo["classification"], "e2e_success")
+
     def test_aggregates_legacy_evaluation_summary_rows_as_e2e_success(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             output = Path(tmp_dir) / "output"

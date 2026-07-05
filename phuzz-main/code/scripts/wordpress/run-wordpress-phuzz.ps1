@@ -4,12 +4,14 @@ param(
     [switch]$ForcePlugins,
     [switch]$NoFollowLogs,
     [switch]$RunGeneratedConfigs,
+    [ValidatePattern('^[a-zA-Z0-9_./-]+$')]
+    [string]$BootstrapConfigSlug = "",
     [ValidateRange(1, 86400)]
     [int]$WebTimeoutSeconds = 240,
     [ValidateRange(1, 86400)]
     [int]$SeedWaitSeconds = 45,
-    [ValidateRange(1, 86400)]
-    [int]$GeneratedConfigTimeoutSeconds = 300
+    [ValidateRange(1, 30)]
+    [int]$GeneratedConfigTimeoutSeconds = 30
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,6 +21,14 @@ $scriptRoot = (Resolve-Path -LiteralPath (Join-Path $scriptDir "..\..")).Path
 $pluginScript = Join-Path $scriptRoot "web\applications\wordpress\_plugins\download-plugins.ps1"
 $fuzzerService = "fuzzer-wordpress-plugin"
 $webUrl = "http://localhost:8080/"
+
+if (-not $BootstrapConfigSlug) {
+    if ($RunGeneratedConfigs) {
+        $BootstrapConfigSlug = "wordpress/bootstrap-generated"
+    } else {
+        $BootstrapConfigSlug = "wordpress/$PluginSlug"
+    }
+}
 
 function Get-ComposeArgs {
     param([string]$OverridePath)
@@ -39,7 +49,10 @@ function Invoke-Compose {
 }
 
 function New-PluginOverrideFile {
-    param([string]$PluginSlug)
+    param(
+        [string]$PluginSlug,
+        [string]$BootstrapConfigSlug
+    )
 
     $path = Join-Path $env:TEMP ("phuzz-{0}.override.yml" -f $PluginSlug)
     $content = @(
@@ -50,7 +63,7 @@ function New-PluginOverrideFile {
         "      WP_TARGET_PLUGIN: $PluginSlug"
         "  ${fuzzerService}:"
         "    environment:"
-        "      FUZZER_CONFIG: wordpress/$PluginSlug"
+        "      FUZZER_CONFIG: $BootstrapConfigSlug"
     )
     Set-Content -LiteralPath $path -Value $content -Encoding ASCII
     return $path
@@ -195,7 +208,7 @@ Push-Location $scriptRoot
 $overridePath = $null
 try {
     Write-Host "Using WordPress plugin: $PluginSlug"
-    $overridePath = New-PluginOverrideFile -PluginSlug $PluginSlug
+    $overridePath = New-PluginOverrideFile -PluginSlug $PluginSlug -BootstrapConfigSlug $BootstrapConfigSlug
     $composeArgs = Get-ComposeArgs -OverridePath $overridePath
 
     Write-Host "Checking Docker availability"
@@ -215,11 +228,11 @@ try {
         }
     }
 
-    $requiredConfig = Join-Path $scriptRoot "fuzzer\configs\wordpress\$PluginSlug.json"
+    $requiredConfig = Join-Path $scriptRoot ("fuzzer\configs\{0}.json" -f $BootstrapConfigSlug.Replace("/", [System.IO.Path]::DirectorySeparatorChar))
     $requiredPlugin = Join-Path $scriptRoot "web\applications\wordpress\_plugins\$PluginSlug.zip"
     $requiredWpCli = Join-Path $scriptRoot "web\applications\wordpress\wp-cli.phar"
 
-    Assert-PathExists -Path $requiredConfig -Hint "Choose a plugin with a matching fuzzer\configs\wordpress\<slug>.json file."
+    Assert-PathExists -Path $requiredConfig -Hint "Choose an existing bootstrap config slug."
     Assert-PathExists -Path $requiredPlugin -Hint "Choose a plugin ZIP that exists in web\applications\wordpress\_plugins, or add $PluginSlug.zip there."
     Assert-PathExists -Path $requiredWpCli -Hint "The WordPress bootstrap artifact is missing from this checkout."
 

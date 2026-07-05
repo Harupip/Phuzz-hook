@@ -12,8 +12,8 @@ param(
     [int]$WebTimeoutSeconds = 240,
     [ValidateRange(1, 86400)]
     [int]$SeedWaitSeconds = 45,
-    [ValidateRange(1, 86400)]
-    [int]$GeneratedConfigTimeoutSeconds = 300,
+    [ValidateRange(1, 30)]
+    [int]$GeneratedConfigTimeoutSeconds = 30,
     [ValidateRange(1, 20)]
     [int]$MaxHookDepth = 3,
     [ValidateRange(1, 300)]
@@ -40,11 +40,11 @@ Usage:
   .\phuzz.ps1
   .\phuzz.ps1 -Mode default
   .\phuzz.ps1 -Mode seed-config -NoFollowLogs
-  .\phuzz.ps1 -Mode generated -PluginSlug gamipress -GeneratedConfigTimeoutSeconds 300 -NoFollowLogs
+  .\phuzz.ps1 -Mode generated -PluginSlug gamipress -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs
   .\phuzz.ps1 -Mode recursive
   .\phuzz.ps1 -Mode recursive -RunRecursiveConfigs
   .\phuzz.ps1 -Mode recursive -RecursiveInputFile fuzzer\output\hook-coverage\requests\latest.json
-  .\phuzz.ps1 -Mode generated -GeneratedConfigTimeoutSeconds 300 -NoFollowLogs -DryRun
+  .\phuzz.ps1 -Mode generated -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs -DryRun
 
 Modes:
   default      Start WordPress PHUZZ with existing behavior.
@@ -58,7 +58,7 @@ Useful options:
   -NoFollowLogs                    Return after startup instead of following fuzzer logs.
   -WebTimeoutSeconds <seconds>     Wait window for WordPress HTTP 200. Default: 240.
   -SeedWaitSeconds <seconds>       Wait window for live hook coverage snapshot. Default: 45.
-  -GeneratedConfigTimeoutSeconds   Per generated-config run window. Default: 300.
+  -GeneratedConfigTimeoutSeconds   Per generated-config run window. Default/max: 30.
   -RecursiveInputFile <path>       Child-hook input artifact. Repeat for multiple files.
   -RecursiveHookCoverageDir <path> Hook coverage dir with requests/ for recursive validation.
   -RecursiveBaseUrl <url>          WordPress base URL for recursive validation. Default: http://localhost:8080.
@@ -70,6 +70,8 @@ Useful options:
 }
 
 function Get-LocalPluginSlugs {
+    param([bool]$RequireConfig = $true)
+
     if (-not (Test-Path -LiteralPath $pluginDir)) {
         return @()
     }
@@ -77,7 +79,7 @@ function Get-LocalPluginSlugs {
     return @(
         Get-ChildItem -LiteralPath $pluginDir -Filter "*.zip" |
             ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) } |
-            Where-Object { Test-Path -LiteralPath (Join-Path $configDir "$_.json") } |
+            Where-Object { (-not $RequireConfig) -or (Test-Path -LiteralPath (Join-Path $configDir "$_.json")) } |
             Sort-Object -Unique
     )
 }
@@ -101,14 +103,20 @@ function Read-MenuMode {
 }
 
 function Read-PluginSlug {
-    $slugs = @(Get-LocalPluginSlugs)
+    param([bool]$RequireConfig = $true)
+
+    $slugs = @(Get-LocalPluginSlugs -RequireConfig $RequireConfig)
     if ($slugs.Count -eq 0) {
-        Write-Host "No local plugin ZIP with matching PHUZZ config found. Using default: show-all-comments-in-one-page"
+        Write-Host "No local plugin ZIP found. Using default: show-all-comments-in-one-page"
         return "show-all-comments-in-one-page"
     }
 
     Write-Host ""
-    Write-Host "Choose local WordPress plugin with matching PHUZZ config:"
+    if ($RequireConfig) {
+        Write-Host "Choose local WordPress plugin with matching PHUZZ config:"
+    } else {
+        Write-Host "Choose local WordPress plugin:"
+    }
     for ($index = 0; $index -lt $slugs.Count; $index++) {
         Write-Host ("  {0}) {1}" -f ($index + 1), $slugs[$index])
     }
@@ -640,7 +648,7 @@ if ($interactive) {
 
 if (-not $PSBoundParameters.ContainsKey("PluginSlug")) {
     if ($interactive) {
-        $PluginSlug = Read-PluginSlug
+        $PluginSlug = Read-PluginSlug -RequireConfig ($Mode -ne "generated")
     } else {
         $PluginSlug = "show-all-comments-in-one-page"
     }

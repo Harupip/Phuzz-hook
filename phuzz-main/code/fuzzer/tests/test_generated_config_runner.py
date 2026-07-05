@@ -163,6 +163,31 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertNotIn("capture_output", runner.calls[0][1])
         self.assertNotIn("text", runner.calls[0][1])
 
+    def test_stop_on_vuln_exit_is_recorded_as_vuln_found_not_failed(self):
+        runner = FakeRunner([completed(57)])
+        artifact = {
+            "hook_coverage": {
+                "registered_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                "executed_callbacks": {"cb-one": {"callback_id": "cb-one", "fired_hook": "wp_ajax_nopriv_demo"}},
+                "blindspot_callbacks": {},
+            }
+        }
+        artifacts = FakeArtifacts([set(), {"request-one.json"}], {"request-one.json": artifact})
+
+        report = run_generated_configs(
+            [generated_config()],
+            timeout_seconds=5,
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=artifacts.load,
+        )
+
+        self.assertEqual(report["runs"][0]["process_status"], "vuln_found")
+        self.assertEqual(report["runs"][0]["exit_code"], 57)
+        self.assertEqual(report["runs"][0]["validation_status"], "callback_reached")
+        self.assertEqual(report["counts"]["vuln_found"], 1)
+        self.assertEqual(report["counts"]["process_failed"], 0)
+
     def test_timeout_cleans_named_container_and_continues(self):
         runner = FakeRunner([subprocess.TimeoutExpired(["docker"], 5), completed(0)])
         artifact = {
@@ -343,17 +368,36 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
 
         self.assertIn("[switch]$RunGeneratedConfigs", script)
         self.assertIn("[string]$PluginSlug = \"show-all-comments-in-one-page\"", script)
+        self.assertIn("[ValidateRange(1, 30)]", script)
+        self.assertIn("[int]$GeneratedConfigTimeoutSeconds = 30", script)
         self.assertIn("$GeneratedConfigTimeoutSeconds", script)
-        self.assertIn("fuzzer\\configs\\wordpress\\$PluginSlug.json", script)
+        self.assertIn("fuzzer\\configs\\{0}.json", script)
+        self.assertIn("wordpress/$PluginSlug", script)
+        self.assertIn("wordpress/bootstrap-generated", script)
         self.assertIn("web\\applications\\wordpress\\_plugins\\$PluginSlug.zip", script)
         self.assertIn("WP_TARGET_PLUGIN: $PluginSlug", script)
-        self.assertIn("FUZZER_CONFIG: wordpress/$PluginSlug", script)
+        self.assertIn("FUZZER_CONFIG: $BootstrapConfigSlug", script)
         self.assertIn("if ($RunGeneratedConfigs)", script)
         self.assertIn("Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @(\"stop\", \"--timeout\", \"30\", $fuzzerService)", script)
         self.assertIn("generated_config_runner.py", script)
         self.assertIn("--generated-config-summary", script)
         self.assertIn("--output-file", script)
         self.assertIn("--timeout-seconds", script)
+
+    def test_wordpress_runner_uses_shared_bootstrap_config_for_generated_mode(self):
+        runner_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        runner = runner_path.read_text(encoding="utf-8-sig")
+        config_path = FUZZER_DIR / "configs" / "wordpress" / "bootstrap-generated.json"
+        self.assertTrue(config_path.exists())
+        config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+
+        self.assertIn('"wordpress/bootstrap-generated"', runner)
+        self.assertIn("$BootstrapConfigSlug", runner)
+        self.assertIn("fuzzer\\configs\\{0}.json", runner)
+        self.assertIn('$BootstrapConfigSlug.Replace("/", [System.IO.Path]::DirectorySeparatorChar)', runner)
+        self.assertEqual(config["target"], "http://web/")
+        self.assertEqual(config["methods"], ["GET"])
+        self.assertEqual(config["query_params"]["fuzz"], ["hookphuzz_probe"])
 
     def test_wordpress_runner_maps_copied_plugin_source_into_seed_export(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
