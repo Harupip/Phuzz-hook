@@ -153,13 +153,13 @@ The plugin prompt lists only local plugins that have both:
 The default plugin is `show-all-comments-in-one-page`. To skip prompts:
 
 ```powershell
-.\phuzz.ps1 -Mode generated -PluginSlug photo-gallery -GeneratedConfigTimeoutSeconds 300 -NoFollowLogs
+.\phuzz.ps1 -Mode generated -PluginSlug photo-gallery -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs
 ```
 
 To inspect the command without running Docker or PHUZZ:
 
 ```powershell
-.\phuzz.ps1 -Mode generated -PluginSlug photo-gallery -GeneratedConfigTimeoutSeconds 300 -NoFollowLogs -DryRun
+.\phuzz.ps1 -Mode generated -PluginSlug photo-gallery -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs -DryRun
 ```
 
 Run recursive child-hook seed generation from existing live request artifacts:
@@ -206,7 +206,7 @@ Recursive child-hook replay is separate from wrapper mode `generated`. Wrapper m
 The WordPress runner can execute every generated config sequentially after export:
 
 ```powershell
-.\scripts\wordpress\run-wordpress-phuzz.ps1 -RunGeneratedConfigs -GeneratedConfigTimeoutSeconds 300 -NoFollowLogs
+.\scripts\wordpress\run-wordpress-phuzz.ps1 -RunGeneratedConfigs -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs
 ```
 
 Each config receives its own bounded run window. Reaching the limit stops the long-running fuzzer intentionally; it is not itself a failure. The runner evaluates only request artifacts created during that window and reports `callback_reached`, `registered_not_executed`, `hook_fired_target_not_registered`, `no_artifact`, or `not_observed`. Results are written to `fuzzer/output/seed_generation/generated_config_run_summary.json`; the script fails when a process exits with an error or any target callback is not reached.

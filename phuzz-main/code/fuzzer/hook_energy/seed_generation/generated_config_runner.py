@@ -21,6 +21,7 @@ CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
 REQUESTS_DIR = "/shared-tmpfs/hook-coverage/requests"
+STOP_ON_VULN_EXIT_CODE = 1337 % 256
 
 
 def load_generated_configs(path: Path) -> list[dict[str, str]]:
@@ -117,8 +118,13 @@ def run_generated_configs(
                 timeout=timeout_seconds,
                 check=False,
             )
-            process_status = "exited" if result.returncode == 0 else "failed"
             exit_code: int | None = result.returncode
+            if result.returncode == 0:
+                process_status = "exited"
+            elif result.returncode == STOP_ON_VULN_EXIT_CODE:
+                process_status = "vuln_found"
+            else:
+                process_status = "failed"
         except subprocess.TimeoutExpired:
             run_command(
                 ["docker", "rm", "-f", container_name],
@@ -178,6 +184,7 @@ def run_generated_configs(
         "counts": {
             "total": len(runs),
             "process_failed": sum(row["process_status"] == "failed" for row in runs),
+            "vuln_found": sum(row["process_status"] == "vuln_found" for row in runs),
             "runner_error": sum(row["process_status"] == "runner_error" for row in runs),
             **{status: sum(row["validation_status"] == status for row in runs) for status in statuses},
         },
@@ -239,6 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         "Generated config run summary: "
         f"callback_reached={counts['callback_reached']} "
+        f"vuln_found={counts['vuln_found']} "
         f"process_failed={counts['process_failed']} output={args.output_file}"
     )
     return 0 if counts["process_failed"] == 0 and counts["runner_error"] == 0 and counts["callback_reached"] == counts["total"] else 1

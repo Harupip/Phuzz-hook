@@ -278,7 +278,7 @@ sys.exit(2)
                 "-Mode",
                 "generated",
                 "-GeneratedConfigTimeoutSeconds",
-                "300",
+                "30",
                 "-PluginSlug",
                 "gamipress",
                 "-NoFollowLogs",
@@ -291,8 +291,56 @@ sys.exit(2)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-RunGeneratedConfigs", result.stdout)
-        self.assertIn("-GeneratedConfigTimeoutSeconds 300", result.stdout)
+        self.assertIn("-GeneratedConfigTimeoutSeconds 30", result.stdout)
         self.assertIn("-PluginSlug gamipress", result.stdout)
+
+    def test_guided_wrapper_generated_mode_defaults_to_30_second_config_runs(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode",
+                "generated",
+                "-PluginSlug",
+                "gamipress",
+                "-NoFollowLogs",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-GeneratedConfigTimeoutSeconds 30", result.stdout)
+
+    def test_guided_wrapper_rejects_generated_config_timeout_above_30(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode",
+                "generated",
+                "-GeneratedConfigTimeoutSeconds",
+                "31",
+                "-PluginSlug",
+                "gamipress",
+                "-NoFollowLogs",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GeneratedConfigTimeoutSeconds", result.stderr)
 
     def test_guided_wrapper_interactive_dry_run_does_not_ask_force_download(self):
         result = subprocess.run(

@@ -7,7 +7,7 @@ Run commands from `phuzz-main/code` unless a guide says otherwise. The root scri
 | Command | Purpose | Output |
 | --- | --- | --- |
 | `.\run-wordpress-phuzz.ps1 -NoFollowLogs` | Start the default WordPress PHUZZ target and export live seed suggestions. | `fuzzer/output/` and `fuzzer/output/seed_generation/` |
-| `.\run-wordpress-phuzz.ps1 -RunGeneratedConfigs -GeneratedConfigTimeoutSeconds 300 -NoFollowLogs` | Export hook seeds, convert supported configs, then run each generated config sequentially. | `fuzzer/output/seed_generation/generated_config_run_summary.json` |
+| `.\run-wordpress-phuzz.ps1 -RunGeneratedConfigs -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs` | Export hook seeds, convert supported configs, then run each generated config sequentially. | `fuzzer/output/seed_generation/generated_config_run_summary.json` |
 | `.\run-wordpress-plugin-matrix.ps1 -DownloadMissing` | Validate one or more WordPress plugin targets. | `docs/reports/plugin-matrix/` |
 | `.\benchmark-wordpress-phuzz.ps1 -RunsPerMode 5 -RunMinutes 30` | Compare baseline PHUZZ scoring with hook-aware scoring. | `fuzzer/output/benchmarks/` |
 | `bash ./run-wordpress-phuzz.sh -NoFollowLogs` | Bash/WSL wrapper that clears old fuzzer output before delegating to PowerShell. | `fuzzer/output/` |

@@ -12,8 +12,8 @@ param(
     [int]$WebTimeoutSeconds = 240,
     [ValidateRange(1, 86400)]
     [int]$SeedWaitSeconds = 45,
-    [ValidateRange(1, 86400)]
-    [int]$GeneratedConfigTimeoutSeconds = 300,
+    [ValidateRange(1, 30)]
+    [int]$GeneratedConfigTimeoutSeconds = 30,
     [ValidateRange(1, 20)]
     [int]$MaxHookDepth = 3,
     [ValidateRange(1, 300)]
@@ -40,11 +40,11 @@ Usage:
   .\phuzz.ps1
   .\phuzz.ps1 -Mode default
   .\phuzz.ps1 -Mode seed-config -NoFollowLogs
-  .\phuzz.ps1 -Mode generated -PluginSlug gamipress -GeneratedConfigTimeoutSeconds 300 -NoFollowLogs
+  .\phuzz.ps1 -Mode generated -PluginSlug gamipress -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs
   .\phuzz.ps1 -Mode recursive
   .\phuzz.ps1 -Mode recursive -RunRecursiveConfigs
   .\phuzz.ps1 -Mode recursive -RecursiveInputFile fuzzer\output\hook-coverage\requests\latest.json
-  .\phuzz.ps1 -Mode generated -GeneratedConfigTimeoutSeconds 300 -NoFollowLogs -DryRun
+  .\phuzz.ps1 -Mode generated -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs -DryRun
 
 Modes:
   default      Start WordPress PHUZZ with existing behavior.
@@ -58,7 +58,7 @@ Useful options:
   -NoFollowLogs                    Return after startup instead of following fuzzer logs.
   -WebTimeoutSeconds <seconds>     Wait window for WordPress HTTP 200. Default: 240.
   -SeedWaitSeconds <seconds>       Wait window for live hook coverage snapshot. Default: 45.
-  -GeneratedConfigTimeoutSeconds   Per generated-config run window. Default: 300.
+  -GeneratedConfigTimeoutSeconds   Per generated-config run window. Default/max: 30.
   -RecursiveInputFile <path>       Child-hook input artifact. Repeat for multiple files.
   -RecursiveHookCoverageDir <path> Hook coverage dir with requests/ for recursive validation.
   -RecursiveBaseUrl <url>          WordPress base URL for recursive validation. Default: http://localhost:8080.

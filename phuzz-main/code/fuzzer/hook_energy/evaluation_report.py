@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+STOP_ON_VULN_EXIT_CODE = 1337 % 256
+
 
 CLASSIFICATIONS = (
     "e2e_success",
@@ -450,14 +452,22 @@ def _merge_validation_result(builder: _PluginBuilder, payload: Any) -> None:
 def _merge_generated_config_run_summary(builder: _PluginBuilder, payload: Any) -> None:
     if not isinstance(payload, dict):
         return
+    counted_vulns = 0
     counts = payload.get("counts")
     if isinstance(counts, dict):
         builder.callback_reached_count = max(builder.callback_reached_count, _int_or_zero(counts.get("callback_reached")))
+        counted_vulns = _int_or_zero(counts.get("vuln_found"))
+    row_vulns = 0
     runs = payload.get("runs")
     if isinstance(runs, list):
         for row in runs:
-            if isinstance(row, dict) and row.get("hook_name"):
+            if not isinstance(row, dict):
+                continue
+            if row.get("hook_name"):
                 builder.observed_target_hooks.add(str(row["hook_name"]))
+            if row.get("process_status") == "vuln_found" or row.get("exit_code") == STOP_ON_VULN_EXIT_CODE:
+                row_vulns += 1
+    builder.vulnerability_found_count = max(builder.vulnerability_found_count, counted_vulns, row_vulns)
 
 
 def _merge_e2e_summary(builder: _PluginBuilder, payload: Any) -> None:

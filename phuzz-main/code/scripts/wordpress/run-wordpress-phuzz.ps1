@@ -10,8 +10,8 @@ param(
     [int]$WebTimeoutSeconds = 240,
     [ValidateRange(1, 86400)]
     [int]$SeedWaitSeconds = 45,
-    [ValidateRange(1, 86400)]
-    [int]$GeneratedConfigTimeoutSeconds = 300
+    [ValidateRange(1, 30)]
+    [int]$GeneratedConfigTimeoutSeconds = 30
 )
 
 $ErrorActionPreference = "Stop"

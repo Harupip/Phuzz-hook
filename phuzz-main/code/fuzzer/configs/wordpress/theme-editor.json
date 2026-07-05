@@ -1,0 +1,19 @@
+{
+  "target": "http://web/",
+  "methods": [
+    "GET"
+  ],
+  "query_params": {
+    "data": [
+      {
+        "name": "hookphuzz_probe",
+        "value": "fuzz"
+      }
+    ],
+    "fixed": [],
+    "fuzz": [
+      "hookphuzz_probe"
+    ],
+    "weight": 1
+  }
+}

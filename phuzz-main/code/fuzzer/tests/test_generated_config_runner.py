@@ -163,6 +163,31 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertNotIn("capture_output", runner.calls[0][1])
         self.assertNotIn("text", runner.calls[0][1])
 
+    def test_stop_on_vuln_exit_is_recorded_as_vuln_found_not_failed(self):
+        runner = FakeRunner([completed(57)])
+        artifact = {
+            "hook_coverage": {
+                "registered_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                "executed_callbacks": {"cb-one": {"callback_id": "cb-one", "fired_hook": "wp_ajax_nopriv_demo"}},
+                "blindspot_callbacks": {},
+            }
+        }
+        artifacts = FakeArtifacts([set(), {"request-one.json"}], {"request-one.json": artifact})
+
+        report = run_generated_configs(
+            [generated_config()],
+            timeout_seconds=5,
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=artifacts.load,
+        )
+
+        self.assertEqual(report["runs"][0]["process_status"], "vuln_found")
+        self.assertEqual(report["runs"][0]["exit_code"], 57)
+        self.assertEqual(report["runs"][0]["validation_status"], "callback_reached")
+        self.assertEqual(report["counts"]["vuln_found"], 1)
+        self.assertEqual(report["counts"]["process_failed"], 0)
+
     def test_timeout_cleans_named_container_and_continues(self):
         runner = FakeRunner([subprocess.TimeoutExpired(["docker"], 5), completed(0)])
         artifact = {
@@ -343,6 +368,8 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
 
         self.assertIn("[switch]$RunGeneratedConfigs", script)
         self.assertIn("[string]$PluginSlug = \"show-all-comments-in-one-page\"", script)
+        self.assertIn("[ValidateRange(1, 30)]", script)
+        self.assertIn("[int]$GeneratedConfigTimeoutSeconds = 30", script)
         self.assertIn("$GeneratedConfigTimeoutSeconds", script)
         self.assertIn("fuzzer\\configs\\{0}.json", script)
         self.assertIn("wordpress/$PluginSlug", script)
