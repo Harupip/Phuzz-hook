@@ -8,10 +8,17 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.entrypoints import direct_http_details, rest_http_template
+from hook_energy.entrypoints import direct_http_details, rest_http_template, seed_template_for_callback
 
 
 class EntrypointRuleTests(unittest.TestCase):
+    HEARTBEAT_BODY = {
+        "action": "heartbeat",
+        "_nonce": "hookphuzz",
+        "screen_id": "front",
+        "data[hookphuzz_probe]": "1",
+    }
+
     def test_longer_public_ajax_prefix_wins_before_authenticated_ajax_prefix(self) -> None:
         details = direct_http_details("wp_ajax_nopriv_demo_lookup")
 
@@ -26,7 +33,12 @@ class EntrypointRuleTests(unittest.TestCase):
         self.assertIsNotNone(details)
         self.assertEqual(details["entry_type"], "heartbeat_authenticated")
         self.assertEqual(details["http_template"]["path"], "/wp-admin/admin-ajax.php")
-        self.assertEqual(details["http_template"]["body_params"], {"action": "heartbeat"})
+        self.assertEqual(details["http_template"]["body_params"], self.HEARTBEAT_BODY)
+
+        seed = seed_template_for_callback("heartbeat_received")
+        self.assertEqual(seed["auth_mode"], "authenticated")
+        self.assertEqual(seed["body"], self.HEARTBEAT_BODY)
+        self.assertEqual(seed["fixed_params"], list(self.HEARTBEAT_BODY))
 
     def test_admin_post_nopriv_maps_to_admin_post_with_fixed_action(self) -> None:
         details = direct_http_details('admin_post_nopriv_export_orders')
@@ -55,7 +67,12 @@ class EntrypointRuleTests(unittest.TestCase):
         self.assertEqual(details['entry_type'], 'heartbeat_unauthenticated')
         self.assertFalse(details['auth_required'])
         self.assertEqual(details['http_template']['path'], '/wp-admin/admin-ajax.php')
-        self.assertEqual(details['http_template']['body_params'], {'action': 'heartbeat'})
+        self.assertEqual(details['http_template']['body_params'], self.HEARTBEAT_BODY)
+
+        seed = seed_template_for_callback('heartbeat_nopriv_received')
+        self.assertEqual(seed['auth_mode'], 'unauth-capable')
+        self.assertEqual(seed['body'], self.HEARTBEAT_BODY)
+        self.assertEqual(seed['fixed_params'], list(self.HEARTBEAT_BODY))
 
     def test_rest_template_uses_wp_json_path_without_action(self) -> None:
         template = rest_http_template(

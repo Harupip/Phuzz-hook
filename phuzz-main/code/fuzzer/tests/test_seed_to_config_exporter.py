@@ -9,6 +9,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
+from hook_energy.entrypoints import seed_template_for_callback
 from hook_energy.seed_generation.config_exporter import (
     SeedConfigSkip,
     build_generated_param_summary,
@@ -205,27 +206,42 @@ class SeedToConfigExporterTests(unittest.TestCase):
         self.assertEqual(config["query_params"]["fixed"], ["action"])
         self.assertEqual(config["query_params"]["data"], [{"name": "action", "value": "lostpassword"}])
 
-    def test_heartbeat_seed_becomes_config_with_common_entrypoint_type(self):
-        item = build_seed_item(hook_name="heartbeat_nopriv_received")
-        item["seed"].update(
-            {
-                "path": "/wp-admin/admin-ajax.php",
-                "body": {"action": "heartbeat"},
-                "query_params": {},
-                "auth_mode": "unauth-capable",
-                "fuzzable_params": [],
-            }
-        )
+    def test_exported_heartbeat_template_stays_replay_only_with_fixed_probe_body(self):
+        heartbeat_body = {
+            "action": "heartbeat",
+            "_nonce": "hookphuzz",
+            "screen_id": "front",
+            "data[hookphuzz_probe]": "1",
+        }
+        for hook_name, auth_mode in (
+            ("heartbeat_received", "authenticated"),
+            ("heartbeat_nopriv_received", "unauth-capable"),
+        ):
+            with self.subTest(hook_name=hook_name):
+                item = build_seed_item(hook_name=hook_name, auth_mode=auth_mode)
+                item["seed"] = seed_template_for_callback(hook_name)
 
-        _, config = build_config_for_seed_item(item)
+                _, config = build_config_for_seed_item(item)
 
-        self.assertEqual(config["target"], "http://web/wp-admin/admin-ajax.php")
-        self.assertEqual(config["entrypoint_type"], "heartbeat")
-        self.assertEqual(config["metadata"]["auth_mode"], "unauth-capable")
-        self.assertFalse(config["metadata"]["setup_required"])
-        self.assertFalse(config["metadata"]["manual_analysis"])
-        self.assertEqual(config["body_params"]["fixed"], ["action"])
-        self.assertEqual(config["body_params"]["data"], [{"name": "action", "value": "heartbeat"}])
+                self.assertEqual(config["target"], "http://web/wp-admin/admin-ajax.php")
+                self.assertEqual(config["entrypoint_type"], "heartbeat")
+                self.assertEqual(config["config_type"], "replay_only")
+                self.assertEqual(config["metadata"]["auth_mode"], auth_mode)
+                self.assertFalse(config["metadata"]["fuzzing_ready"])
+                self.assertFalse(config["metadata"]["setup_required"])
+                self.assertFalse(config["metadata"]["manual_analysis"])
+                self.assertEqual(config["body_params"]["fixed"], ["action", "_nonce", "screen_id", "data\\[hookphuzz_probe\\]"])
+                self.assertEqual(config["body_params"]["fuzz"], [])
+                self.assertEqual(
+                    config["body_params"]["data"],
+                    [
+                        {"name": "action", "value": "heartbeat"},
+                        {"name": "_nonce", "value": "hookphuzz"},
+                        {"name": "screen_id", "value": "front"},
+                        {"name": "data[hookphuzz_probe]", "value": "1"},
+                    ],
+                )
+                self.assertEqual(item["seed"]["body"], heartbeat_body)
 
     def test_bracket_param_data_name_stays_raw_and_fuzz_selector_is_escaped(self):
         item = build_seed_item(hook_name="wp_ajax_vx_form_save_api_settings", auth_mode="authenticated")

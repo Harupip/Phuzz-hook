@@ -179,7 +179,11 @@ function Export-LiveSeedSuggestions {
         python $exportCli --coverage-file $coverageSnapshot --output-dir $outputDir @sourceArgs
     } finally {
         if ($pluginSourceTempRoot -and (Test-Path -LiteralPath $pluginSourceTempRoot)) {
-            Remove-Item -LiteralPath $pluginSourceTempRoot -Recurse -Force
+            try {
+                Remove-Item -LiteralPath $pluginSourceTempRoot -Recurse -Force -ErrorAction Stop
+            } catch {
+                Write-Warning "Plugin source temp cleanup failed: $($_.Exception.Message)"
+            }
         }
     }
 }

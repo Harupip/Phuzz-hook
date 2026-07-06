@@ -77,6 +77,13 @@ _LOGIN_FORM_RULES = (
 DIRECT_HTTP_RULES = _AJAX_RULES + _ADMIN_POST_RULES + _ADMIN_ACTION_RULES + _LOGIN_FORM_RULES
 
 # Heartbeat: exact hook names map to admin-ajax.php?action=heartbeat.
+_HEARTBEAT_BODY_PARAMS = {
+    "action": "heartbeat",
+    "_nonce": "hookphuzz",
+    "screen_id": "front",
+    "data[hookphuzz_probe]": "1",
+}
+
 DIRECT_HTTP_EXACT_RULES = {
     "heartbeat_received": {
         "entry_type": "heartbeat_authenticated",
@@ -84,6 +91,7 @@ DIRECT_HTTP_EXACT_RULES = {
         "method": "POST",
         "param_target": "body_params",
         "action": "heartbeat",
+        "body_params": _HEARTBEAT_BODY_PARAMS,
         "auth_required": True,
         "reason": "WordPress authenticated heartbeat hook maps directly to admin-ajax.php?action=heartbeat",
     },
@@ -93,6 +101,7 @@ DIRECT_HTTP_EXACT_RULES = {
         "method": "POST",
         "param_target": "body_params",
         "action": "heartbeat",
+        "body_params": _HEARTBEAT_BODY_PARAMS,
         "auth_required": False,
         "reason": "WordPress unauthenticated heartbeat hook maps directly to admin-ajax.php?action=heartbeat",
     },
@@ -149,7 +158,7 @@ def seed_template_for_callback(
         "body": dict(http_template.get("body_params") or {}),
         "query_params": dict(http_template.get("query_params") or {}),
         "auth_mode": "authenticated" if details["auth_required"] else "unauth-capable",
-        "fixed_params": ["action"] if details.get("action") else [],
+        "fixed_params": list(http_template.get("body_params") or {}) + list(http_template.get("query_params") or {}),
         "entrypoint_type": entrypoint_type,
     }
 
@@ -195,8 +204,8 @@ def rest_http_template(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def _build_direct_details(rule: Mapping[str, Any], action: str) -> dict[str, Any]:
-    query_params: dict[str, str] = {}
-    body_params: dict[str, str] = {}
+    query_params = dict(rule.get("query_params") or {})
+    body_params = dict(rule.get("body_params") or {})
     if rule["param_target"] == "query_params":
         query_params["action"] = action
     else:

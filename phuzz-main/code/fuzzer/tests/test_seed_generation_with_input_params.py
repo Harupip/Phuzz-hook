@@ -307,7 +307,20 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
         self.assertFalse(by_hook['heartbeat_nopriv_received']['manual_analysis'])
         self.assertEqual(by_hook['heartbeat_nopriv_received']['seed']['path'], '/wp-admin/admin-ajax.php')
         self.assertEqual(by_hook['heartbeat_nopriv_received']['seed']['method'], 'POST')
-        self.assertEqual(by_hook['heartbeat_nopriv_received']['seed']['body']['action'], 'heartbeat')
+        heartbeat_body = {
+            'action': 'heartbeat',
+            '_nonce': 'hookphuzz',
+            'screen_id': 'front',
+            'data[hookphuzz_probe]': '1',
+        }
+        for hook_name in ('heartbeat_received', 'heartbeat_nopriv_received'):
+            seed = by_hook[hook_name]['seed']
+            for name, value in heartbeat_body.items():
+                self.assertEqual(seed['body'][name], value)
+            self.assertEqual(seed['fixed_params'], list(heartbeat_body))
+            self.assertNotIn('_nonce', seed['fuzzable_params'])
+            self.assertNotIn('screen_id', seed['fuzzable_params'])
+            self.assertNotIn('data[hookphuzz_probe]', seed['fuzzable_params'])
 
     def test_xmlrpc_and_shortcode_stay_manual_analysis_without_seed(self) -> None:
         payload = {

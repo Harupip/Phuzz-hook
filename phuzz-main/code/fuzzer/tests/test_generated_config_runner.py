@@ -418,6 +418,14 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("source_copy_failed", script)
         self.assertIn("no_php_files", script)
 
+    def test_wordpress_runner_source_temp_cleanup_is_best_effort(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("Plugin source temp cleanup failed", script)
+        self.assertIn("Remove-Item -LiteralPath $pluginSourceTempRoot -Recurse -Force -ErrorAction Stop", script)
+
+
 
 if __name__ == "__main__":
     unittest.main()
