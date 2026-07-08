@@ -239,6 +239,127 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
         self.assertNotIn("action", seed["body"])
         self.assertEqual(seed["fixed_params"], [])
 
+    def test_login_form_seed_uses_login_action_query(self) -> None:
+        payload = {
+            'data': {
+                'registered_callbacks': {
+                    'cb-login': {
+                        'hook_name': 'login_form_resetpass',
+                        'callback_repr': 'login_resetpass',
+                        'source_file': str(FIXTURE),
+                        'start_line': 2,
+                        'end_line': 9,
+                        'is_active': True,
+                    }
+                },
+                'executed_callbacks': {},
+            }
+        }
+
+        _, seed_report = LiveHookSeedGenerator().build_reports(payload)
+
+        item = seed_report['suggested_seeds'][0]
+        seed = item['seed']
+        self.assertEqual(item['entrypoint_type'], 'login_form')
+        self.assertEqual(seed['path'], '/wp-login.php')
+        self.assertEqual(seed['method'], 'POST')
+        self.assertEqual(seed['query_params']['action'], 'resetpass')
+        self.assertEqual(seed['auth_mode'], 'unauth-capable')
+        self.assertEqual(seed['fixed_params'], ['action'])
+        self.assertFalse(item['setup_required'])
+        self.assertFalse(item['manual_analysis'])
+
+    def test_heartbeat_seed_uses_admin_ajax_heartbeat_action(self) -> None:
+        payload = {
+            'data': {
+                'registered_callbacks': {
+                    'cb-heartbeat': {
+                        'hook_name': 'heartbeat_received',
+                        'callback_repr': 'private_heartbeat',
+                        'source_file': str(FIXTURE),
+                        'start_line': 2,
+                        'end_line': 9,
+                        'is_active': True,
+                    },
+                    'cb-heartbeat-nopriv': {
+                        'hook_name': 'heartbeat_nopriv_received',
+                        'callback_repr': 'public_heartbeat',
+                        'source_file': str(FIXTURE),
+                        'start_line': 2,
+                        'end_line': 9,
+                        'is_active': True,
+                    }
+                },
+                'executed_callbacks': {},
+            }
+        }
+
+        _, seed_report = LiveHookSeedGenerator().build_reports(payload)
+
+        by_hook = {item['hook_name']: item for item in seed_report['suggested_seeds']}
+        self.assertEqual(by_hook['heartbeat_received']['entrypoint_type'], 'heartbeat')
+        self.assertEqual(by_hook['heartbeat_received']['seed']['auth_mode'], 'authenticated')
+        self.assertFalse(by_hook['heartbeat_received']['setup_required'])
+        self.assertFalse(by_hook['heartbeat_received']['manual_analysis'])
+        self.assertEqual(by_hook['heartbeat_nopriv_received']['entrypoint_type'], 'heartbeat')
+        self.assertEqual(by_hook['heartbeat_nopriv_received']['seed']['auth_mode'], 'unauth-capable')
+        self.assertFalse(by_hook['heartbeat_nopriv_received']['setup_required'])
+        self.assertFalse(by_hook['heartbeat_nopriv_received']['manual_analysis'])
+        self.assertEqual(by_hook['heartbeat_nopriv_received']['seed']['path'], '/wp-admin/admin-ajax.php')
+        self.assertEqual(by_hook['heartbeat_nopriv_received']['seed']['method'], 'POST')
+        heartbeat_body = {
+            'action': 'heartbeat',
+            '_nonce': 'hookphuzz',
+            'screen_id': 'front',
+            'data[hookphuzz_probe]': '1',
+        }
+        for hook_name in ('heartbeat_received', 'heartbeat_nopriv_received'):
+            seed = by_hook[hook_name]['seed']
+            for name, value in heartbeat_body.items():
+                self.assertEqual(seed['body'][name], value)
+            self.assertEqual(seed['fixed_params'], list(heartbeat_body))
+            self.assertNotIn('_nonce', seed['fuzzable_params'])
+            self.assertNotIn('screen_id', seed['fuzzable_params'])
+            self.assertNotIn('data[hookphuzz_probe]', seed['fuzzable_params'])
+
+    def test_xmlrpc_and_shortcode_stay_manual_analysis_without_seed(self) -> None:
+        payload = {
+            'data': {
+                'registered_callbacks': {
+                    'cb-xmlrpc': {
+                        'hook_name': 'xmlrpc_methods',
+                        'callback_repr': 'register_xmlrpc_methods',
+                        'method_map': True,
+                        'is_active': True,
+                    },
+                    'cb-shortcode': {
+                        'hook_name': 'shortcode_demo',
+                        'callback_repr': 'render_demo_shortcode',
+                        'shortcode_tag': 'demo',
+                        'is_active': True,
+                    },
+                },
+                'executed_callbacks': {},
+            }
+        }
+
+        _, seed_report = LiveHookSeedGenerator().build_reports(payload)
+        by_hook = {item['hook_name']: item for item in seed_report['suggested_seeds']}
+
+        self.assertEqual(by_hook['xmlrpc_methods']['entrypoint_type'], 'xmlrpc_method_map')
+        self.assertEqual(by_hook['xmlrpc_methods']['generation_status'], 'manual_analysis_required')
+        self.assertFalse(by_hook['xmlrpc_methods']['fuzzing_ready'])
+        self.assertTrue(by_hook['xmlrpc_methods']['setup_required'])
+        self.assertTrue(by_hook['xmlrpc_methods']['manual_analysis'])
+        self.assertIn('xmlrpc_method_name', by_hook['xmlrpc_methods']['missing_requirements'])
+        self.assertNotIn('seed', by_hook['xmlrpc_methods'])
+        self.assertEqual(by_hook['shortcode_demo']['entrypoint_type'], 'shortcode')
+        self.assertFalse(by_hook['shortcode_demo']['fuzzing_ready'])
+        self.assertTrue(by_hook['shortcode_demo']['setup_required'])
+        self.assertTrue(by_hook['shortcode_demo']['manual_analysis'])
+        self.assertIn('content_setup', by_hook['shortcode_demo']['missing_requirements'])
+        self.assertNotIn('seed', by_hook['shortcode_demo'])
+
     def test_unresolved_source_reason_is_reported(self) -> None:
         payload = {
             "data": {

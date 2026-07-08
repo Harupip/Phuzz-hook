@@ -125,7 +125,15 @@ class EntryClassifierTests(unittest.TestCase):
         self.assertEqual(by_hook["login_form_lostpassword"]["http_template"]["path"], "/wp-login.php")
         self.assertFalse(by_hook["login_form_lostpassword"]["auth_required"])
         self.assertEqual(by_hook["heartbeat_received"]["entry_type"], "heartbeat_authenticated")
-        self.assertEqual(by_hook["heartbeat_received"]["http_template"]["body_params"], {"action": "heartbeat"})
+        self.assertEqual(
+            by_hook["heartbeat_received"]["http_template"]["body_params"],
+            {
+                "action": "heartbeat",
+                "_nonce": "hookphuzz",
+                "screen_id": "front",
+                "data[hookphuzz_probe]": "1",
+            },
+        )
         self.assertEqual(by_hook["heartbeat_nopriv_received"]["entry_type"], "heartbeat_unauthenticated")
         self.assertFalse(by_hook["heartbeat_nopriv_received"]["auth_required"])
 

@@ -157,6 +157,7 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
 
         self.assertEqual([row["process_status"] for row in report["runs"]], ["failed", "exited"])
         self.assertEqual([row["validation_status"] for row in report["runs"]], ["no_artifact", "no_artifact"])
+        self.assertEqual(report['runs'][0]['failure_category'], 'C. request mapping wrong')
         self.assertEqual(report["counts"]["process_failed"], 1)
         self.assertEqual(report["runs"][0]["exit_code"], 3)
         self.assertIn("FUZZER_CONFIG=generated-hooks/two", runner.commands[1])
@@ -331,6 +332,11 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
             report = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(report["generated_config_summary"], str(source))
             self.assertEqual(report["counts"]["total"], 0)
+            validation_result = root / 'validation_result.json'
+            self.assertTrue(validation_result.exists())
+            validation = json.loads(validation_result.read_text(encoding='utf-8'))
+            self.assertEqual(validation['summary']['total'], 0)
+            self.assertEqual(validation['validations'], [])
 
     def test_main_returns_two_for_malformed_summary(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -411,6 +417,14 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("--unresolved-source-reason", script)
         self.assertIn("source_copy_failed", script)
         self.assertIn("no_php_files", script)
+
+    def test_wordpress_runner_source_temp_cleanup_is_best_effort(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("Plugin source temp cleanup failed", script)
+        self.assertIn("Remove-Item -LiteralPath $pluginSourceTempRoot -Recurse -Force -ErrorAction Stop", script)
+
 
 
 if __name__ == "__main__":
