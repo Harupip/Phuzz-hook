@@ -190,12 +190,13 @@ function Export-LiveSeedSuggestions {
 
 function Convert-LiveSeedSuggestionsToConfigs {
     param(
-        [string]$ScriptRoot
+        [string]$ScriptRoot,
+        [string]$PluginSlug
     )
 
     $seedOutputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
     $suggestedSeeds = Join-Path $seedOutputDir "suggested_seeds.json"
-    $outputConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-hooks"
+    $outputConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-config\$PluginSlug"
     $summaryPath = Join-Path $seedOutputDir "generated_config_summary.json"
     $configCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\seed_to_config_cli.py"
 
@@ -250,7 +251,7 @@ try {
     Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", $fuzzerService, "--build")
 
     Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug
-    Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot
+    Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug
 
     if ($RunGeneratedConfigs) {
         $seedOutputDir = Join-Path $scriptRoot "fuzzer\output\seed_generation"
@@ -278,7 +279,7 @@ try {
         Write-Host "Suggested seed artifacts:"
         Write-Host "  $scriptRoot\fuzzer\output\seed_generation"
         Write-Host "Generated hook config artifacts:"
-        Write-Host "  $scriptRoot\fuzzer\configs\generated-hooks"
+        Write-Host "  $scriptRoot\fuzzer\configs\generated-config\$PluginSlug"
     } else {
         Write-Host "Following fuzzer logs. Press Ctrl+C to stop following without stopping containers."
         Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("logs", "-f", $fuzzerService)

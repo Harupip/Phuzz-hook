@@ -31,7 +31,7 @@ Runtime hook seed generation lives under `hook_energy/seed_generation/`. It expo
 
 The exporter maps direct WordPress HTTP hooks such as `wp_ajax_*`, `wp_ajax_nopriv_*`, `admin_post_*`, and `admin_post_nopriv_*` to replayable PHUZZ seed templates. It also scans callback source for request-controlled inputs and injects discovered params as `FUZZ`, while keeping `action` fixed.
 
-These are discovery artifacts, not automatic inserts into PHUZZ's live `Candidate` queue. `seed_to_config_cli.py` converts unauth-capable and authenticated suggestions into `configs/generated-hooks/*.json`. Authenticated configs rely on the existing WordPress UOPZ overrides for login, capability, and nonce checks; the converter does not run login automation. See `../docs/guides/hook-aware-seed-generation.md` for commands, output shape, and validation boundary.
+These are discovery artifacts, not automatic inserts into PHUZZ's live `Candidate` queue. `seed_to_config_cli.py` converts unauth-capable and authenticated suggestions into `configs/generated-config/<plugin>/*.json`. Authenticated configs rely on the existing WordPress UOPZ overrides for login, capability, and nonce checks; the converter does not run login automation. See `../docs/guides/hook-aware-seed-generation.md` for commands, output shape, and validation boundary.
 
 `hook_energy/evaluation_report.py` builds an offline JSON and Markdown summary from existing generated-config, validation, and fuzzing artifacts. It does not rerun discovery or fuzzing; it writes `output/evaluation/hookphuzz_evaluation_summary.json` and `.md` for review.
 
