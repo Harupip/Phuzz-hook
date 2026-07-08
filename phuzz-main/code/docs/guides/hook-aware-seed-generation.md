@@ -120,10 +120,10 @@ python hook_energy\seed_generation\export_cli.py --coverage-file output\total_co
 Convert unauth-capable and authenticated seed suggestions into PHUZZ config JSON:
 
 ```powershell
-python hook_energy\seed_generation\seed_to_config_cli.py --suggested-seeds output\seed_generation\suggested_seeds.json --output-config-dir configs\generated-hooks --summary output\seed_generation\generated_config_summary.json
+python hook_energy\seed_generation\seed_to_config_cli.py --suggested-seeds output\seed_generation\suggested_seeds.json --output-config-dir configs\generated-config\<plugin> --summary output\seed_generation\generated_config_summary.json
 ```
 
-Generated configs can be run later with `FUZZER_CONFIG=generated-hooks/<config-slug>`. Authenticated configs rely on the existing WordPress UOPZ overrides for login, capability, and nonce checks. The converter does not perform login automation or start fuzzing the generated configs.
+Generated configs can be run later with `FUZZER_CONFIG=generated-config/<plugin>/<config-slug>`. Authenticated configs rely on the existing WordPress UOPZ overrides for login, capability, and nonce checks. The converter does not perform login automation or start fuzzing the generated configs.
 
 REST routes registered with `register_rest_route($namespace, $route, $args)` are first-class direct HTTP seeds when runtime coverage resolves the route callback. The generated target is `http://web/wp-json/<namespace>/<route>`, methods come from the route args, and REST configs do not include an `action` parameter. The generator only extracts request parameters from the callback body; it does not parse REST schema args or recursively traverse helpers.
 
@@ -141,8 +141,8 @@ The wrapper only selects the workflow, plugin, and runner flags. It delegates to
 | Mode | What it does | Final artifact to read | What it does not do |
 | --- | --- | --- | --- |
 | `default` | Starts WordPress and the normal PHUZZ fuzzer for the selected plugin config. | Normal PHUZZ console output and `fuzzer/output/`. | Does not generate hook-aware configs first. |
-| `seed-config` | Starts WordPress, exports live hook coverage, writes `suggested_seeds.*`, then converts supported seeds into `configs/generated-hooks/*.json`. | `fuzzer/output/seed_generation/generated_config_summary.json` | Does not run the generated configs. |
-| `generated` | Does everything in `seed-config`, stops the default fuzzer, then runs each generated config sequentially with `FUZZER_CONFIG=generated-hooks/<slug>`. | `fuzzer/output/seed_generation/generated_config_run_summary.json` | Does not recursively queue newly discovered child hooks. |
+| `seed-config` | Starts WordPress, exports live hook coverage, writes `suggested_seeds.*`, then converts supported seeds into `configs/generated-config/<plugin>/*.json`. | `fuzzer/output/seed_generation/generated_config_summary.json` | Does not run the generated configs. |
+| `generated` | Does everything in `seed-config`, stops the default fuzzer, then runs each generated config sequentially with `FUZZER_CONFIG=generated-config/<plugin>/<slug>`. | `fuzzer/output/seed_generation/generated_config_run_summary.json` | Does not recursively queue newly discovered child hooks. |
 | `recursive` | Starts the selected plugin/config with the seed export flow, copies the new request artifacts, then runs `recursive_child_hook_seeds.py` with replay validation. If `-RecursiveInputFile` is passed, it skips the setup run and uses that artifact directly. | `fuzzer/output/recursive-child-hooks/recursive_child_hook_seeds.json`, `validation_result.json`, and `generated_config_summary.json` | Does not run PHUZZ against the recursive configs. |
 
 The plugin prompt lists only local plugins that have both:

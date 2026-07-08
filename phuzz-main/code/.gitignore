@@ -11,3 +11,4 @@ __pycache__
 cookies.json
 params.json
 fuzzer/configs/generated-hooks*/
+fuzzer/configs/generated-config*/

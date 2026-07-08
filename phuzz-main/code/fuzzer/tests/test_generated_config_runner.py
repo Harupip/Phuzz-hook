@@ -378,6 +378,8 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("[int]$GeneratedConfigTimeoutSeconds = 30", script)
         self.assertIn("$GeneratedConfigTimeoutSeconds", script)
         self.assertIn("fuzzer\\configs\\{0}.json", script)
+        self.assertIn("fuzzer\\configs\\generated-config\\$PluginSlug", script)
+        self.assertIn("Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug", script)
         self.assertIn("wordpress/$PluginSlug", script)
         self.assertIn("wordpress/bootstrap-generated", script)
         self.assertIn("web\\applications\\wordpress\\_plugins\\$PluginSlug.zip", script)

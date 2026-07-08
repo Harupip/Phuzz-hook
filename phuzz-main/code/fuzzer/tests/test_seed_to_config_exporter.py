@@ -329,7 +329,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
     def test_export_writes_config_file_and_summary(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            output_dir = root / "configs" / "generated-hooks"
+            output_dir = root / "configs" / "generated-config" / "demo-plugin"
             summary_path = root / "generated_config_summary.json"
             seed_report = {
                 "suggested_seeds": [
@@ -351,11 +351,11 @@ class SeedToConfigExporterTests(unittest.TestCase):
             self.assertTrue(config_path.exists())
             self.assertTrue((output_dir / "rest_route_demo_v1_items-cb-rest.json").exists())
             self.assertTrue((output_dir / "wp_ajax_example_lookup-cb-public.json").exists())
-            self.assertEqual(summary["generated"][0]["config_slug"], "generated-hooks/wp_ajax_nopriv_example_lookup-cb-public")
+            self.assertEqual(summary["generated"][0]["config_slug"], "generated-config/demo-plugin/wp_ajax_nopriv_example_lookup-cb-public")
             self.assertTrue(summary['generated'][0]['fuzzing_ready'])
             self.assertEqual(summary['generated'][0]['generated_reason'], 'supported_http_seed')
             self.assertEqual(summary["generated"][1]["entrypoint_type"], "rest_route")
-            self.assertEqual(summary["generated"][2]["config_slug"], "generated-hooks/wp_ajax_example_lookup-cb-public")
+            self.assertEqual(summary["generated"][2]["config_slug"], "generated-config/demo-plugin/wp_ajax_example_lookup-cb-public")
             self.assertEqual(summary["skipped"][0]["reason"], "missing_seed")
             self.assertEqual(json.loads(summary_path.read_text(encoding="utf-8")), summary)
             self.assertTrue((root / "generated_param_summary.json").exists())
