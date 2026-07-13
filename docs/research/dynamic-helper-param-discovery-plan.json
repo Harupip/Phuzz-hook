@@ -1,0 +1,262 @@
+{
+    "status":  "planning_only",
+    "current_pipeline":  [
+                             {
+                                 "stage":  "bootstrap",
+                                 "file":  "phuzz-main/code/web/instrumentation/__fuzzer__startcov.php",
+                                 "lines":  "3-5",
+                                 "output":  "loads hook coverage"
+                             },
+                             {
+                                 "stage":  "uopz",
+                                 "file":  "phuzz-main/code/web/instrumentation/hook_coverage/uopz_hook_wp.php",
+                                 "lines":  "1063-1241",
+                                 "output":  "registered/executed callback state"
+                             },
+                             {
+                                 "stage":  "artifact",
+                                 "file":  "phuzz-main/code/web/instrumentation/hook_coverage/uopz_hook_wp.php",
+                                 "lines":  "1275-1474",
+                                 "output":  "requests/\u003crequest_id\u003e.json,total_coverage.json"
+                             },
+                             {
+                                 "stage":  "static_extract",
+                                 "file":  "phuzz-main/code/fuzzer/hook_energy/seed_generation/input_extractor.py",
+                                 "lines":  "64-192",
+                                 "output":  "input_params"
+                             },
+                             {
+                                 "stage":  "seed",
+                                 "file":  "phuzz-main/code/fuzzer/hook_energy/seed_generation/generator.py",
+                                 "lines":  "31-178",
+                                 "output":  "suggested_seeds.json"
+                             },
+                             {
+                                 "stage":  "export",
+                                 "file":  "phuzz-main/code/fuzzer/hook_energy/seed_generation/config_exporter.py",
+                                 "lines":  "82-192",
+                                 "output":  "generated config and parameter summaries"
+                             },
+                             {
+                                 "stage":  "replay",
+                                 "file":  "phuzz-main/code/fuzzer/hook_energy/seed_generation/generated_config_runner.py",
+                                 "lines":  "81-281",
+                                 "output":  "run summary,validation_result.json"
+                             }
+                         ],
+    "uopz_capabilities":  {
+                              "current_scope":  "fixed WordPress allowlist",
+                              "function_hook":  "yes_named_only",
+                              "method_hook":  "yes_named_only",
+                              "argument_capture":  "yes_entry_hook",
+                              "return_capture_without_behavior_change":  "no",
+                              "generic_helper_observer":  "no",
+                              "request_correlation":  "existing request_id plus callback stack",
+                              "runtime_experiment":  "not_run_no_containers"
+                          },
+    "supported_input_patterns":  [
+                                     {
+                                         "pattern":  "literal superglobals",
+                                         "static":  "yes",
+                                         "dynamic":  "no"
+                                     },
+                                     {
+                                         "pattern":  "filter_input",
+                                         "static":  "yes",
+                                         "dynamic":  "new function hook"
+                                     },
+                                     {
+                                         "pattern":  "json_decode php://input",
+                                         "static":  "yes",
+                                         "dynamic":  "source assisted"
+                                     },
+                                     {
+                                         "pattern":  "REST get_param",
+                                         "static":  "no",
+                                         "dynamic":  "new method hook"
+                                     },
+                                     {
+                                         "pattern":  "custom helper",
+                                         "static":  "shortcode special case only",
+                                         "dynamic":  "target symbol hooks plus source assist"
+                                     }
+                                 ],
+    "recommended_strategy":  {
+                                 "name":  "source-assisted runtime-guided helper discovery",
+                                 "why":  "Only source-proven request_reader symbols may convert evaluated arguments into parameter evidence.",
+                                 "not_sufficient_for":  "raw superglobal array offsets or comparisons",
+                                 "prototype_scope":  {
+                                                         "max_iterations":  2,
+                                                         "max_symbols":  64,
+                                                         "max_discoveries":  32,
+                                                         "max_configs":  8,
+                                                         "timeout_seconds":  30
+                                                     }
+                             },
+    "artifact_schema":  {
+                            "location":  "request artifact field runtime_param_discoveries; aggregate experimental output",
+                            "key_fields":  [
+                                               "request_id",
+                                               "correlation_id",
+                                               "callback_id",
+                                               "parameter_name",
+                                               "parameter_path",
+                                               "http_source",
+                                               "reader_function",
+                                               "reader_file",
+                                               "reader_line",
+                                               "call_chain",
+                                               "confidence",
+                                               "discovery_mode"
+                                           ],
+                            "values":  "omitted by default; presence/type/redacted only",
+                            "dedupe_key":  "callback_id,http_source,parameter_path,reader_file,reader_line"
+                        },
+    "integration_points":  [
+                               {
+                                   "file":  "web/instrumentation/hook_coverage/uopz_hook_wp.php",
+                                   "lines":  "41-74,968-1006,1031-1060,1446-1474",
+                                   "change":  "modify",
+                                   "responsibility":  "mode gate, symbol hooks, request extension"
+                               },
+                               {
+                                   "file":  "web/instrumentation/hook_coverage/runtime_param_collector.php",
+                                   "change":  "new",
+                                   "responsibility":  "RuntimeParamCollector"
+                               },
+                               {
+                                   "file":  "fuzzer/hook_energy/seed_generation/dynamic_param_artifacts.py",
+                                   "change":  "new",
+                                   "responsibility":  "artifact parser"
+                               },
+                               {
+                                   "file":  "fuzzer/hook_energy/seed_generation/dynamic_param_merger.py",
+                                   "change":  "new",
+                                   "responsibility":  "merge rules"
+                               },
+                               {
+                                   "file":  "fuzzer/hook_energy/seed_generation/dynamic_config_replay.py",
+                                   "change":  "new",
+                                   "responsibility":  "iterative coordinator"
+                               },
+                               {
+                                   "file":  "scripts/wordpress/run-wordpress-phuzz.ps1",
+                                   "lines":  "1-15,51-70,109-210,256-275",
+                                   "change":  "modify",
+                                   "responsibility":  "flag/env/experimental roots"
+                               }
+                           ],
+    "mode_design":  {
+                        "powershell_parameter":  "ParamDiscoveryMode",
+                        "values":  [
+                                       "static",
+                                       "dynamic-helper",
+                                       "hybrid"
+                                   ],
+                        "default":  "static",
+                        "environment":  "HOOKPHUZZ_PARAM_DISCOVERY_MODE",
+                        "invalid":  "PowerShell ValidateSet; PHP unknown falls back static",
+                        "output_root":  "fuzzer/output/param-discovery/\u003cplugin\u003e/\u003cmode\u003e",
+                        "config_root":  "fuzzer/configs/generated-param-discovery/\u003cplugin\u003e/\u003cmode\u003e",
+                        "v1_dynamic_behavior":  "independent experimental config set",
+                        "dynamic-helper_semantics":  "Only parameters proven through request_reader helpers; arbitrary helper strings and direct reads are excluded."
+                    },
+    "test_plan":  [
+                      "direct superglobal",
+                      "one-level helper",
+                      "multi-level helper",
+                      "REST get_param",
+                      "dynamic helper argument",
+                      "static+dynamic duplicate",
+                      "GET+POST duplicate",
+                      "nested parameter",
+                      "fixed point",
+                      "limit",
+                      "disabled baseline unchanged",
+                      "callback not reached"
+                  ],
+    "validation_target":  {
+                              "plugin":  "crm-perks-forms",
+                              "entrypoint":  "wp_ajax_vx_form_save_api_settings",
+                              "chain":  "includes/admin-pages.php:18 -\u003e save_api_settings:723 -\u003e cfx_form::post(\u0027cfx_settings\u0027):731 -\u003e crm-perks-forms.php:887-892 $_REQUEST[$key]",
+                              "condition":  "fresh callback_reached replay required"
+                          },
+    "risks":  [
+                  "UOPZ named symbol edge cases untested in container",
+                  "superglobal offsets are not hook events",
+                  "overhead/timing effects",
+                  "request precedence and nested JSON selector semantics",
+                  "secret leakage"
+              ],
+    "open_questions":  [
+                           "UOPZ namespaced/closure/inherited method behavior on pinned image",
+                           "PHUZZ JSON/nested selector support",
+                           "REST source precedence",
+                           "whether CRM target reaches without authentication/setup"
+                       ],
+    "helper_reader_analyzer":  {
+                                   "supported_patterns":  [
+                                                              "$_GET[$arg]",
+                                                              "$_POST[$arg]",
+                                                              "$_REQUEST[$arg]",
+                                                              "$_COOKIE[$arg]",
+                                                              "filter_input(INPUT_*,$arg)",
+                                                              "WP_REST_Request::get_param($arg)"
+                                                          ],
+                                   "mapping_contract":  {
+                                                            "role":  "request_reader",
+                                                            "parameter_argument_index":  0,
+                                                            "formal_parameter":  "key",
+                                                            "http_source":  "REQUEST",
+                                                            "evidence":  "expression,file,line",
+                                                            "confidence":  "high",
+                                                            "runtime_rule":  "only request_reader arguments become runtime parameter evidence"
+                                                        },
+                                   "unsupported_patterns":  [
+                                                                "arbitrary dataflow",
+                                                                "computed keys",
+                                                                "filter_input_array",
+                                                                "bulk REST getters",
+                                                                "ArrayAccess",
+                                                                "closures",
+                                                                "magic __call",
+                                                                "late-defined symbols after inventory",
+                                                                "direct opcode-level reads"
+                                                            ],
+                                   "implementation_location":  "Phase 2: fuzzer/hook_energy/seed_generation/helper_request_reader_analyzer.php bridge plus Python parser adapter"
+                               },
+    "implementation_phases":  [
+                                  {
+                                      "phase":  0,
+                                      "name":  "UOPZ capability smoke tests",
+                                      "scope":  "experimental smoke script only",
+                                      "status":  "completed",
+                                      "result":  "all required checks passed"
+                                  },
+                                  {
+                                      "phase":  1,
+                                      "name":  "Manual cfx_form reader",
+                                      "scope":  "cfx_form::post arg 0 REQUEST; runtime evidence only",
+                                      "status":  "planned",
+                                      "no_config_expansion":  true
+                                  },
+                                  {
+                                      "phase":  2,
+                                      "name":  "Automatic analyzer",
+                                      "scope":  "HelperRequestReaderAnalyzer exact supported patterns",
+                                      "status":  "planned"
+                                  },
+                                  {
+                                      "phase":  3,
+                                      "name":  "One experimental config",
+                                      "scope":  "one trusted discovery, one replay",
+                                      "status":  "planned"
+                                  },
+                                  {
+                                      "phase":  4,
+                                      "name":  "Bounded iteration",
+                                      "scope":  "fixed-point, hashes, limits, timeouts",
+                                      "status":  "planned"
+                                  }
+                              ]
+}
