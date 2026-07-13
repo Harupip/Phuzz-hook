@@ -15,6 +15,8 @@ from hook_energy.seed_generation.config_exporter import (
     build_generated_param_summary,
     build_config_for_seed_item,
     export_seed_configs,
+    merge_runtime_param_discoveries,
+    normalized_parameter_path,
 )
 
 
@@ -78,7 +80,131 @@ def build_rest_seed_item(*, method="GET", fuzzable_params=None):
     }
 
 
+def build_runtime_discovery(item, **overrides):
+    discovery = {
+        "schema_version": "hookphuzz-runtime-param-v1",
+        "entrypoint_type": "wp_ajax",
+        "entrypoint_name": item["hook_name"],
+        "callback_id": item["callback_id"],
+        "parameter_name": "cfx_settings",
+        "parameter_path": ["cfx_settings"],
+        "http_source": "REQUEST",
+        "reader_function": "cfx_form::post",
+        "confidence": "high",
+        "discovery_mode": "dynamic-helper",
+    }
+    discovery.update(overrides)
+    return discovery
 class SeedToConfigExporterTests(unittest.TestCase):
+    def test_runtime_discovery_adds_wp_ajax_request_param_to_body(self):
+        item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
+        item["seed"].update({"body": {"action": "example_lookup"}, "query_params": {}, "fuzzable_params": []})
+        _, config = build_config_for_seed_item(item)
+
+        results = merge_runtime_param_discoveries(config, item, [build_runtime_discovery(item)])
+
+        self.assertIn({"name": "cfx_settings", "value": "fuzz"}, config["body_params"]["data"])
+        self.assertIn("cfx_settings", config["body_params"]["fuzz"])
+        self.assertEqual(results[0]["merge_action"], "added")
+        self.assertTrue(results[0]["placement_inferred_from_entrypoint_template"])
+
+    def test_static_nested_parameter_wins_over_runtime_root(self):
+        item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
+        item["seed"].update({
+            "body": {"action": "example_lookup", "cfx_settings[alert_emails]": "FUZZ"},
+            "query_params": {},
+            "fuzzable_params": ["cfx_settings[alert_emails]"],
+        })
+        _, config = build_config_for_seed_item(item)
+
+        results = merge_runtime_param_discoveries(config, item, [build_runtime_discovery(item)])
+
+        self.assertEqual(config["body_params"]["fuzz"], ["cfx_settings\\[alert_emails\\]"])
+        self.assertEqual(results[0]["merge_action"], "matched_existing")
+
+    def test_repeated_runtime_discovery_deduplicates(self):
+        item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
+        _, config = build_config_for_seed_item(item)
+        discovery = build_runtime_discovery(item, parameter_name="new_param", parameter_path=["new_param"])
+
+        results = merge_runtime_param_discoveries(config, item, [discovery, discovery])
+
+        self.assertEqual(config["body_params"]["fuzz"].count("new_param"), 1)
+        self.assertEqual([row["merge_action"] for row in results], ["added"])
+        self.assertEqual(results[0]["observation_count"], 2)
+
+    def test_runtime_fixed_parameter_is_not_fuzzed(self):
+        item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
+        _, config = build_config_for_seed_item(item)
+
+        results = merge_runtime_param_discoveries(
+            config, item, [build_runtime_discovery(item, parameter_name="action", parameter_path=["action"])]
+        )
+
+        self.assertNotIn("action", config["body_params"]["fuzz"])
+        self.assertEqual(results[0]["reason"], "runtime_discovery_ignored_fixed_parameter")
+
+    def test_runtime_callback_and_entrypoint_mismatches_reject(self):
+        item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
+        _, config = build_config_for_seed_item(item)
+        callback_results = merge_runtime_param_discoveries(config, item, [build_runtime_discovery(item, callback_id="other")])
+        entrypoint_results = merge_runtime_param_discoveries(config, item, [build_runtime_discovery(item, entrypoint_name="wp_ajax_other")])
+
+        self.assertEqual(callback_results[0]["reason"], "runtime_discovery_callback_mismatch")
+        self.assertEqual(entrypoint_results[0]["reason"], "runtime_discovery_entrypoint_mismatch")
+
+    def test_runtime_malformed_and_unsupported_sources_reject_safely(self):
+        item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
+        _, config = build_config_for_seed_item(item)
+        results = merge_runtime_param_discoveries(config, item, [
+            build_runtime_discovery(item, parameter_path=[]),
+            build_runtime_discovery(item, parameter_name="", parameter_path=["bad"]),
+            build_runtime_discovery(item, parameter_path=["bad", 1]),
+            build_runtime_discovery(item, http_source="FILES"),
+        ])
+
+        self.assertEqual([row["reason"] for row in results], [
+            "runtime_discovery_malformed_parameter",
+            "runtime_discovery_malformed_parameter",
+            "runtime_discovery_malformed_parameter",
+            "runtime_discovery_unsupported_source",
+        ])
+
+    def test_runtime_absence_keeps_static_config_unchanged(self):
+        item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
+        _, baseline = build_config_for_seed_item(item)
+        _, unchanged = build_config_for_seed_item(item)
+
+        self.assertEqual(unchanged, baseline)
+        self.assertNotIn("runtime_param_provenance", unchanged["metadata"])
+        self.assertEqual(normalized_parameter_path("cfx_settings[alert_emails]"), ("cfx_settings", "alert_emails"))
+
+    def test_runtime_export_writes_machine_readable_provenance(self):
+        item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
+        item["seed"].update({"body": {"action": "example_lookup"}, "query_params": {}, "fuzzable_params": []})
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            summary = export_seed_configs(
+                {"suggested_seeds": [item]},
+                output_config_dir=root / "configs",
+                summary_path=root / "generated_config_summary.json",
+                runtime_param_discoveries=[build_runtime_discovery(item)],
+            )
+            param_summary = json.loads((root / "generated_param_summary.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(summary["generated"][0]["fuzzing_ready"])
+        self.assertEqual(param_summary["configs"][0]["runtime_param_provenance"][0]["origin"], "runtime_helper")
+
+    def test_unrelated_runtime_discovery_is_rejected_in_summary(self):
+        item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            summary = export_seed_configs(
+                {"suggested_seeds": [item]},
+                output_config_dir=Path(tmp_dir) / "configs",
+                runtime_param_discoveries=[build_runtime_discovery(item, callback_id="other")],
+            )
+
+        self.assertEqual(summary["runtime_param_discoveries"][0]["reason"], "runtime_discovery_unmatched_config")
     def test_unauth_seed_becomes_phuzz_config_with_fixed_action_and_fuzzed_params(self):
         slug, config = build_config_for_seed_item(build_seed_item(), target_base="http://web")
 

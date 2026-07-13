@@ -26,6 +26,15 @@ $GLOBALS['__uopz_runtime_hook_contexts'] = [];
 $GLOBALS['__uopz_callback_origin_cache'] = [];
 $GLOBALS['__hookphuzz_callback_stack'] = [];
 
+$__hookphuzz_param_discovery_mode = (string) getenv('HOOKPHUZZ_PARAM_DISCOVERY_MODE');
+if (
+    ($__hookphuzz_param_discovery_mode === 'dynamic-helper' || $__hookphuzz_param_discovery_mode === 'hybrid')
+    && file_exists(__DIR__ . '/runtime_param_collector.php')
+) {
+    require_once __DIR__ . '/runtime_param_collector.php';
+    hookphuzz_runtime_param_collector_init();
+}
+
 // Tạo request_id thân thiện: <Giờ-Phút-Giây>_<Method>_<Path>_<Random>
 $__uopz_method = $_SERVER['REQUEST_METHOD'] ?? 'CLI';
 $__uopz_uri = $_SERVER['REQUEST_URI'] ?? '';
@@ -1063,6 +1072,9 @@ function __uopz_try_hook_method(string $className, string $methodName, Closure $
 function __uopz_install_wp_hooks(): void
 {
     if ($GLOBALS['__uopz_hooks_installed'] === true) {
+        if (function_exists('hookphuzz_runtime_param_install_readers')) {
+            hookphuzz_runtime_param_install_readers('__uopz_current_parent_callback_metadata');
+        }
         return;
     }
 
@@ -1238,6 +1250,10 @@ function __uopz_install_wp_hooks(): void
     // auto_prepend co the chay truoc khi WordPress load xong plugin API.
     // Neu danh dau "installed" qua som thi MU plugin se khong retry duoc nua.
     $GLOBALS['__uopz_hooks_installed'] = !in_array(false, $installResults, true);
+
+    if (function_exists('hookphuzz_runtime_param_install_readers')) {
+        hookphuzz_runtime_param_install_readers('__uopz_current_parent_callback_metadata');
+    }
 }
 
 // ============================================================================
@@ -1312,6 +1328,10 @@ function __uopz_build_request_export(): array
     $requestExport['new_hook_names'] = $executedHookNames;
     $requestExport['coverage_delta'] = 0;
     $requestExport['score'] = 1;
+    if (function_exists('hookphuzz_runtime_param_enabled') && hookphuzz_runtime_param_enabled()) {
+        $requestExport['runtime_param_discoveries'] = hookphuzz_runtime_param_get_discoveries();
+        $requestExport['debug']['runtime_param_discovery'] = hookphuzz_runtime_param_get_debug_metadata();
+    }
     return $requestExport;
 }
 
@@ -1486,6 +1506,8 @@ register_shutdown_function(function () {
 __uopz_install_wp_hooks();
 if (function_exists('add_action')) {
     add_action('rest_api_init', '__uopz_install_wp_hooks', 0);
+    add_action('plugins_loaded', '__uopz_install_wp_hooks', 0);
+    add_action('init', '__uopz_install_wp_hooks', 0);
 }
 
 // ============================================================================

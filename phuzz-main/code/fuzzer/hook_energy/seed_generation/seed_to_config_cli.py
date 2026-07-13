@@ -18,6 +18,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-config-dir", required=True, help="Directory for generated PHUZZ config JSON files.")
     parser.add_argument("--summary", required=True, help="Path to write generated/skipped summary JSON.")
     parser.add_argument("--target-base", default="http://web", help="Base URL used for generated PHUZZ targets.")
+    parser.add_argument(
+        "--runtime-discovery-artifact",
+        action="append",
+        default=[],
+        help="Request artifact containing runtime_param_discoveries; may be repeated.",
+    )
     return parser
 
 
@@ -26,11 +32,24 @@ def main() -> int:
     suggested_path = Path(args.suggested_seeds)
     payload = json.loads(suggested_path.read_text(encoding="utf-8-sig"))
 
+    discoveries = []
+    for artifact_path in args.runtime_discovery_artifact:
+        try:
+            artifact = json.loads(Path(artifact_path).read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            discoveries.append({"artifact_path": str(artifact_path)})
+            continue
+        if isinstance(artifact, dict) and isinstance(artifact.get("runtime_param_discoveries"), list):
+            discoveries.extend(item for item in artifact["runtime_param_discoveries"] if isinstance(item, dict))
+        else:
+            discoveries.append({"artifact_path": str(artifact_path)})
+
     summary = export_seed_configs(
         payload,
         output_config_dir=Path(args.output_config_dir),
         summary_path=Path(args.summary),
         target_base=args.target_base,
+        runtime_param_discoveries=discoveries,
     )
     print(f"Seed config export summary: generated={len(summary['generated'])} skipped={len(summary['skipped'])}")
     for item in summary["generated"]:

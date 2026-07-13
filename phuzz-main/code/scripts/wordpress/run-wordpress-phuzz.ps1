@@ -10,6 +10,8 @@ param(
     [int]$WebTimeoutSeconds = 240,
     [ValidateRange(1, 86400)]
     [int]$SeedWaitSeconds = 45,
+    [ValidateSet('static', 'dynamic-helper')]
+    [string]$ParamDiscoveryMode = 'static',
     [ValidateRange(1, 30)]
     [int]$GeneratedConfigTimeoutSeconds = 30
 )
@@ -51,7 +53,8 @@ function Invoke-Compose {
 function New-PluginOverrideFile {
     param(
         [string]$PluginSlug,
-        [string]$BootstrapConfigSlug
+        [string]$BootstrapConfigSlug,
+        [string]$ParamDiscoveryMode
     )
 
     $path = Join-Path $env:TEMP ("phuzz-{0}.override.yml" -f $PluginSlug)
@@ -61,12 +64,55 @@ function New-PluginOverrideFile {
         "    environment:"
         "      FUZZER_COVERAGE_PATH: /var/www/html/wp-content/plugins/$PluginSlug/"
         "      WP_TARGET_PLUGIN: $PluginSlug"
+        "      HOOKPHUZZ_PARAM_DISCOVERY_MODE: $ParamDiscoveryMode"
+        "      HOOKPHUZZ_HELPER_READER_REGISTRY: /shared-tmpfs/hook-coverage/helper_reader_registry.json"
         "  ${fuzzerService}:"
         "    environment:"
         "      FUZZER_CONFIG: $BootstrapConfigSlug"
     )
     Set-Content -LiteralPath $path -Value $content -Encoding ASCII
     return $path
+}
+
+function Publish-HelperReaderRegistry {
+    param(
+        [string]$ScriptRoot,
+        [string[]]$ComposeArgs,
+        [string]$PluginSlug
+    )
+
+    $webContainerId = (& $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] ps -q web).Trim()
+    if (-not $webContainerId) {
+        throw "Could not resolve the running web container for helper reader analysis."
+    }
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("phuzz-helper-reader-{0}" -f [guid]::NewGuid().ToString("N"))
+    $sourceRoot = Join-Path $tempRoot $PluginSlug
+    $registry = Join-Path $ScriptRoot "fuzzer\output\seed_generation\helper_reader_registry.json"
+    $analyzer = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\helper_request_reader_cli.py"
+    try {
+        New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
+        docker cp "${webContainerId}:/var/www/html/wp-content/plugins/$PluginSlug/." $sourceRoot
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not copy plugin source for helper reader analysis."
+        }
+        New-Item -ItemType Directory -Path (Split-Path -Parent $registry) -Force | Out-Null
+        python $analyzer --source-root $sourceRoot --display-root "/var/www/html/wp-content/plugins/$PluginSlug" --output $registry
+        if ($LASTEXITCODE -ne 0) {
+            throw "Helper reader analysis failed."
+        }
+        docker exec $webContainerId mkdir -p /shared-tmpfs/hook-coverage
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not create the shared helper reader registry directory."
+        }
+        docker cp $registry "${webContainerId}:/shared-tmpfs/hook-coverage/helper_reader_registry.json"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not publish helper reader registry to the web container."
+        }
+    } finally {
+        if (Test-Path -LiteralPath $tempRoot) {
+            Remove-Item -LiteralPath $tempRoot -Recurse -Force
+        }
+    }
 }
 
 function Assert-PathExists {
@@ -191,7 +237,8 @@ function Export-LiveSeedSuggestions {
 function Convert-LiveSeedSuggestionsToConfigs {
     param(
         [string]$ScriptRoot,
-        [string]$PluginSlug
+        [string]$PluginSlug,
+        [string[]]$ComposeArgs
     )
 
     $seedOutputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
@@ -199,21 +246,38 @@ function Convert-LiveSeedSuggestionsToConfigs {
     $outputConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-config\$PluginSlug"
     $summaryPath = Join-Path $seedOutputDir "generated_config_summary.json"
     $configCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\seed_to_config_cli.py"
+    $runtimeArtifactRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("phuzz-runtime-artifacts-{0}" -f [guid]::NewGuid().ToString("N"))
 
     Assert-PathExists -Path $suggestedSeeds -Hint "Run hook seed export before converting seeds into PHUZZ configs."
 
-    Write-Host "Converting supported suggested seeds into PHUZZ configs"
-    python $configCli `
-        --suggested-seeds $suggestedSeeds `
-        --output-config-dir $outputConfigDir `
-        --summary $summaryPath
+    try {
+        $webContainerId = (& $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] ps -q web).Trim()
+        if ($webContainerId) {
+            New-Item -ItemType Directory -Path $runtimeArtifactRoot -Force | Out-Null
+            docker cp "${webContainerId}:/shared-tmpfs/hook-coverage/requests/." $runtimeArtifactRoot 2>$null
+        }
+        $runtimeArtifactArgs = @(Get-ChildItem -LiteralPath $runtimeArtifactRoot -Filter *.json -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            "--runtime-discovery-artifact"
+            $_.FullName
+        })
+        Write-Host "Converting supported suggested seeds into PHUZZ configs"
+        python $configCli `
+            --suggested-seeds $suggestedSeeds `
+            --output-config-dir $outputConfigDir `
+            --summary $summaryPath `
+            @runtimeArtifactArgs
+    } finally {
+        if (Test-Path -LiteralPath $runtimeArtifactRoot) {
+            Remove-Item -LiteralPath $runtimeArtifactRoot -Recurse -Force
+        }
+    }
 }
 
 Push-Location $scriptRoot
 $overridePath = $null
 try {
     Write-Host "Using WordPress plugin: $PluginSlug"
-    $overridePath = New-PluginOverrideFile -PluginSlug $PluginSlug -BootstrapConfigSlug $BootstrapConfigSlug
+    $overridePath = New-PluginOverrideFile -PluginSlug $PluginSlug -BootstrapConfigSlug $BootstrapConfigSlug -ParamDiscoveryMode $ParamDiscoveryMode
     $composeArgs = Get-ComposeArgs -OverridePath $overridePath
 
     Write-Host "Checking Docker availability"
@@ -247,11 +311,15 @@ try {
     Write-Host "Waiting for WordPress to answer with HTTP 200"
     Wait-ForWebReady -Url $webUrl -TimeoutSeconds $WebTimeoutSeconds
 
+    if ($ParamDiscoveryMode -eq 'dynamic-helper') {
+        Publish-HelperReaderRegistry -ScriptRoot $scriptRoot -ComposeArgs $composeArgs -PluginSlug $PluginSlug
+    }
+
     Write-Host "Starting fuzzer container"
     Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", $fuzzerService, "--build")
 
     Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug
-    Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug
+    Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug -ComposeArgs $composeArgs
 
     if ($RunGeneratedConfigs) {
         $seedOutputDir = Join-Path $scriptRoot "fuzzer\output\seed_generation"

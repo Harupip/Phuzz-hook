@@ -16,6 +16,8 @@ namespace {
 
     function smoke_function(string $value): string { return "fn:$value"; }
     function smoke_duplicate(): string { return 'duplicate'; }
+    function some_service(string $value): string { return $value; }
+    function get_option(string $value): string { return $value; }
 
     class SmokeParent { public function inherited(string $value): string { return "parent:$value"; } }
     class SmokeChild extends SmokeParent {}
@@ -77,12 +79,53 @@ namespace {
     $check('duplicate_install', $firstInstall === true && $secondInstall === true, ['effect_count' => $duplicate]);
     $check('duplicate_install_behavior', $duplicateReturn === 'duplicate' && $duplicate === 10, ['effect_count' => $duplicate]);
 
+    putenv('HOOKPHUZZ_PARAM_DISCOVERY_MODE=dynamic-helper');
+    $registryPath = tempnam(sys_get_temp_dir(), 'hookphuzz-reader-');
+    file_put_contents($registryPath, json_encode(['readers' => [[
+        'schema_version' => 'hookphuzz-helper-reader-v1',
+        'symbol_type' => 'static_method',
+        'declaring_class' => 'cfx_form',
+        'method_name' => 'post',
+        'formal_key_argument_index' => 0,
+        'formal_key_argument_name' => 'key',
+        'http_source' => 'REQUEST',
+        'reader_kind' => 'custom_helper',
+        'confidence' => 'high',
+        'analysis_mode' => 'source-assisted',
+    ]]]));
+    putenv('HOOKPHUZZ_HELPER_READER_REGISTRY=' . $registryPath);
+    register_shutdown_function(static function () use ($registryPath): void { @unlink($registryPath); });
+    $collectorPath = getenv('HOOKPHUZZ_RUNTIME_PARAM_COLLECTOR')
+        ?: __DIR__ . '/../../../web/instrumentation/hook_coverage/runtime_param_collector.php';
+    if (!file_exists($collectorPath) && file_exists('/var/www/fuzzer/hook_coverage/runtime_param_collector.php')) {
+        $collectorPath = '/var/www/fuzzer/hook_coverage/runtime_param_collector.php';
+    }
+    require_once $collectorPath;
+    hookphuzz_runtime_param_collector_init();
+    $activeCallback = [
+        'callback_id' => 'cfx-save-api-settings',
+        'callback_repr' => 'cfx_admin::save_api_settings',
+        'hook_name' => 'wp_ajax_vx_form_save_api_settings',
+    ];
+    hookphuzz_runtime_param_install_readers(static function () use (&$activeCallback): ?array { return $activeCallback; });
+    $check('missing_late_reader', (hookphuzz_runtime_param_get_debug_metadata()['reader_hooks']['cfx_form::post']['status'] ?? null) === 'not_defined');
+
     require_once '/var/www/html/wp-content/plugins/crm-perks-forms/crm-perks-forms.php';
     $_REQUEST['cfx_settings'] = 'settings-value';
-    $cfxArgs = [];
-    $cfxInstall = uopz_set_hook('cfx_form', 'post', static function (...$args) use (&$cfxArgs): void { $cfxArgs = $args; });
+    hookphuzz_runtime_param_install_readers(static function () use (&$activeCallback): ?array { return $activeCallback; });
+    hookphuzz_runtime_param_install_readers(static function () use (&$activeCallback): ?array { return $activeCallback; });
     $cfxReturn = cfx_form::post('cfx_settings');
-    $check('cfx_form_post_arguments_without_return_override', $cfxInstall === true && $cfxArgs === ['cfx_settings'] && $cfxReturn === 'settings-value', ['args' => $cfxArgs, 'return' => $cfxReturn]);
+    cfx_form::post('cfx_settings');
+    cfx_form::post('vx_nonce');
+    some_service('mode');
+    get_option('mode');
+    $discoveries = hookphuzz_runtime_param_get_discoveries();
+    $debug = hookphuzz_runtime_param_get_debug_metadata();
+    $check('cfx_form_post_runtime_discovery_and_return', $cfxReturn === 'settings-value' && count($discoveries) === 2 && ($discoveries[0]['parameter_name'] ?? null) === 'cfx_settings' && array_key_exists('observed_value', $discoveries[0]) && $discoveries[0]['observed_value'] === null, ['return' => $cfxReturn, 'discoveries' => $discoveries]);
+    $check('runtime_reader_duplicate_hook_protection', ($debug['reader_hooks']['cfx_form::post']['status'] ?? null) === 'already_installed', ['reader_hooks' => $debug['reader_hooks']]);
+    $activeCallback = null;
+    cfx_form::post('outside');
+    $check('runtime_reader_excludes_untrusted_calls', count(hookphuzz_runtime_param_get_discoveries()) === 2);
 
     $check('debug_backtrace_inside_hook', !empty($seen['namespaced']['backtrace_has_hook']));
     $results['passed'] = !in_array(false, array_column($results['tests'], 'passed'), true);

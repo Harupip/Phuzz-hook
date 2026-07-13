@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -85,11 +85,14 @@ def export_seed_configs(
     output_config_dir: str | Path,
     summary_path: str | Path | None = None,
     target_base: str = "http://web",
+    runtime_param_discoveries: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, str]]]:
     output_dir = Path(output_config_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    summary: dict[str, list[dict[str, str]]] = {"generated": [], "skipped": []}
+    summary: dict[str, Any] = {"generated": [], "skipped": []}
+    discoveries = list(runtime_param_discoveries or [])
+    consumed_discoveries: set[int] = set()
     suggestions = seed_report.get("suggested_seeds", [])
     if not isinstance(suggestions, list):
         raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
@@ -107,6 +110,14 @@ def export_seed_configs(
             summary["skipped"].append(_skipped_row(item, hook_name, callback_id, exc.reason))
             continue
 
+        matching_discoveries = [
+            discovery
+            for index, discovery in enumerate(discoveries)
+            if _runtime_discovery_matches_seed(discovery, item)
+            and not consumed_discoveries.add(index)
+        ]
+        merge_runtime_param_discoveries(config, item, matching_discoveries)
+
         config_path = output_dir / f"{file_slug}.json"
         config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         generated_row = {
@@ -120,6 +131,14 @@ def export_seed_configs(
         generated_row.update(_summary_metadata(item, config))
         summary["generated"].append(generated_row)
 
+    unmatched = [
+        _runtime_result(discovery, "rejected", "runtime_discovery_unmatched_config")
+        for index, discovery in enumerate(discoveries)
+        if index not in consumed_discoveries
+    ]
+    if unmatched:
+        summary["runtime_param_discoveries"] = unmatched
+
     if summary_path is not None:
         Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
         Path(summary_path).write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -129,9 +148,210 @@ def export_seed_configs(
             summary,
             output_config_dir=output_dir,
         )
+        if unmatched:
+            param_summary["runtime_param_discoveries"] = unmatched
         param_summary_path.write_text(json.dumps(param_summary, indent=2), encoding="utf-8")
 
     return summary
+
+
+def merge_runtime_param_discoveries(
+    config: dict[str, Any],
+    seed_item: Mapping[str, Any],
+    discoveries: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge validated helper observations without changing the PHUZZ schema."""
+    results: list[dict[str, Any]] = []
+    for discovery in discoveries:
+        reason = _runtime_discovery_rejection(discovery, seed_item)
+        if reason:
+            results.append(_runtime_result(discovery, "rejected", reason))
+            continue
+
+        path = _normalized_parameter_path(discovery["parameter_path"])
+        location, inferred = _runtime_config_location(config, seed_item, discovery["http_source"], path)
+        if path in _config_fixed_paths(config):
+            results.append(_runtime_result(discovery, "ignored_fixed", "runtime_discovery_ignored_fixed_parameter", location))
+            continue
+        section = config.setdefault(f"{location}_params", {"data": [], "fixed": [], "fuzz": [], "weight": 1})
+        existing = _section_parameter_paths(section)
+        fixed_paths = _section_fixed_paths(section)
+        if path in fixed_paths:
+            results.append(_runtime_result(discovery, "ignored_fixed", "runtime_discovery_ignored_fixed_parameter", location))
+            continue
+        if path in existing:
+            prior = next(
+                (
+                    row
+                    for row in results
+                    if row.get("config_location") == location
+                    and normalized_parameter_path(row.get("parameter_path")) == path
+                    and row.get("merge_action") in {"added", "matched_existing"}
+                ),
+                None,
+            )
+            if prior is not None:
+                prior["observation_count"] = int(prior.get("observation_count", 1)) + 1
+            else:
+                results.append(_runtime_result(discovery, "ignored_duplicate", None, location, inferred=inferred))
+            continue
+        if any(existing_path[: len(path)] == path for existing_path in existing):
+            results.append(_runtime_result(discovery, "matched_existing", None, location, inferred=inferred))
+            continue
+
+        name = _parameter_name_from_path(path)
+        section["data"].append({"name": name, "value": "fuzz"})
+        section["fuzz"].append(_selector_for_generated_param(name))
+        results.append(_runtime_result(discovery, "added", None, location, inferred=inferred))
+
+    if results:
+        metadata = config.setdefault("metadata", {})
+        metadata["runtime_param_provenance"] = results
+        fuzzing_ready = bool(_config_fuzz_params(config))
+        metadata["fuzzing_ready"] = fuzzing_ready
+        config["config_type"] = "fuzzing_ready" if fuzzing_ready else "replay_only"
+    return results
+
+
+def normalized_parameter_path(value: Any) -> tuple[str, ...] | None:
+    if isinstance(value, str):
+        parts = [part for part in re.findall(r"[^\[\]]+", value) if part]
+    elif isinstance(value, list) and all(isinstance(part, str) and part for part in value):
+        parts = value
+    else:
+        return None
+    return tuple(parts) or None
+
+
+def _normalized_parameter_path(value: Any) -> tuple[str, ...]:
+    path = normalized_parameter_path(value)
+    if path is None:
+        raise ValueError("invalid parameter path")
+    return path
+
+
+def _runtime_discovery_matches_seed(discovery: Mapping[str, Any], seed_item: Mapping[str, Any]) -> bool:
+    return (
+        isinstance(discovery, Mapping)
+        and str(discovery.get("callback_id", "")) == str(seed_item.get("callback_id", ""))
+        and str(discovery.get("entrypoint_name", "")) == str(seed_item.get("hook_name", ""))
+    )
+
+
+def _runtime_discovery_rejection(discovery: Mapping[str, Any], seed_item: Mapping[str, Any]) -> str | None:
+    if not isinstance(discovery, Mapping):
+        return "runtime_discovery_malformed"
+    if discovery.get("schema_version") != "hookphuzz-runtime-param-v1":
+        return "runtime_discovery_unsupported_schema"
+    name = discovery.get("parameter_name")
+    path = normalized_parameter_path(discovery.get("parameter_path"))
+    if not isinstance(name, str) or not name.strip() or path is None:
+        return "runtime_discovery_malformed_parameter"
+    if str(discovery.get("callback_id", "")) != str(seed_item.get("callback_id", "")):
+        return "runtime_discovery_callback_mismatch"
+    if str(discovery.get("entrypoint_name", "")) != str(seed_item.get("hook_name", "")):
+        return "runtime_discovery_entrypoint_mismatch"
+    expected_type = "wp_ajax" if str(seed_item.get("hook_name", "")).startswith("wp_ajax_") else ""
+    if not expected_type or discovery.get("entrypoint_type") != expected_type:
+        return "runtime_discovery_entrypoint_type_mismatch"
+    if str(discovery.get("http_source", "")).upper() not in {"GET", "POST", "REQUEST", "COOKIE"}:
+        return "runtime_discovery_unsupported_source"
+    if not isinstance(discovery.get("reader_function"), str) or not discovery["reader_function"].strip():
+        return "runtime_discovery_missing_reader_function"
+    if discovery.get("confidence") != "high" or discovery.get("discovery_mode") != "dynamic-helper":
+        return "runtime_discovery_untrusted"
+    if _is_trace_only_parameter(name):
+        return "runtime_discovery_trace_or_debug_parameter"
+    return None
+
+
+def _is_trace_only_parameter(name: str) -> bool:
+    return name.lower() in {"trace", "debug", "request_id", "coverage_id"} or name.lower().startswith("hookphuzz_")
+
+
+def _runtime_config_location(
+    config: Mapping[str, Any], seed_item: Mapping[str, Any], source: str, path: tuple[str, ...]
+) -> tuple[str, bool]:
+    source = source.upper()
+    if source == "POST":
+        return "body", False
+    if source == "GET":
+        return "query", False
+    if source == "COOKIE":
+        return "cookies", False
+    for location in ("body", "query"):
+        if any(existing[:1] == path[:1] for existing in _section_parameter_paths(config.get(f"{location}_params", {}))):
+            return location, False
+    is_ajax = str(seed_item.get("hook_name", "")).startswith("wp_ajax_")
+    return ("body" if is_ajax else "query"), True
+
+
+def _section_parameter_paths(section: Any) -> set[tuple[str, ...]]:
+    if not isinstance(section, Mapping):
+        return set()
+    values = section.get("data", [])
+    if not isinstance(values, list):
+        return set()
+    return {
+        path
+        for item in values
+        if isinstance(item, Mapping)
+        for path in [normalized_parameter_path(item.get("name"))]
+        if path is not None
+    }
+
+
+def _section_fixed_paths(section: Any) -> set[tuple[str, ...]]:
+    if not isinstance(section, Mapping):
+        return set()
+    fixed = section.get("fixed", [])
+    values = section.get("data", [])
+    if not isinstance(fixed, list) or not isinstance(values, list):
+        return set()
+    fixed_selectors = {str(value) for value in fixed}
+    return {
+        path
+        for item in values
+        if isinstance(item, Mapping)
+        and _selector_for_generated_param(str(item.get("name", ""))) in fixed_selectors
+        for path in [normalized_parameter_path(item.get("name"))]
+        if path is not None
+    }
+
+
+def _config_fixed_paths(config: Mapping[str, Any]) -> set[tuple[str, ...]]:
+    return set().union(*(_section_fixed_paths(config.get(f"{location}_params", {})) for location in ("body", "query", "cookies")))
+
+
+def _parameter_name_from_path(path: tuple[str, ...]) -> str:
+    return path[0] + "".join(f"[{part}]" for part in path[1:])
+
+
+def _runtime_result(
+    discovery: Mapping[str, Any],
+    merge_action: str,
+    reason: str | None = None,
+    config_location: str | None = None,
+    *,
+    inferred: bool = False,
+) -> dict[str, Any]:
+    row = {
+        "parameter": discovery.get("parameter_name") if isinstance(discovery, Mapping) else None,
+        "parameter_path": discovery.get("parameter_path") if isinstance(discovery, Mapping) else None,
+        "source": discovery.get("http_source") if isinstance(discovery, Mapping) else None,
+        "config_location": config_location,
+        "origin": "runtime_helper",
+        "reader_function": discovery.get("reader_function") if isinstance(discovery, Mapping) else None,
+        "callback_id": discovery.get("callback_id") if isinstance(discovery, Mapping) else None,
+        "entrypoint_name": discovery.get("entrypoint_name") if isinstance(discovery, Mapping) else None,
+        "confidence": discovery.get("confidence") if isinstance(discovery, Mapping) else None,
+        "merge_action": merge_action,
+    }
+    if reason:
+        row["reason"] = reason
+    if inferred:
+        row["placement_inferred_from_entrypoint_template"] = True
+    return row
 
 
 def build_generated_param_summary(
@@ -176,6 +396,7 @@ def build_generated_param_summary(
                 "callback_source_found": source_found,
                 "extracted_params": fuzz_params,
                 "param_sources": _param_sources(seed_item, fuzz_params, source_found=source_found),
+                "runtime_param_provenance": _config_metadata_value(config, "runtime_param_provenance") or [],
                 "has_fuzz_params": bool(fuzz_params),
                 "status": status,
             }

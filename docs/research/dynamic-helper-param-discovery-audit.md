@@ -1,6 +1,6 @@
 # Dynamic helper parameter discovery audit
 
-Status: planning only. No production code changed. Evidence paths are relative to `phuzz-main/code` unless stated.
+Status: Phase 1–3 implemented and validated on `crm-perks-forms` (2026-07-14). Historical planning notes remain below; the implementation status at the end is authoritative. Evidence paths are relative to `phuzz-main/code` unless stated.
 
 ## 1. Executive conclusion
 
@@ -249,3 +249,17 @@ V1 classification: named functions/methods after inventory including namespace/i
 All required checks passed. Duplicate `uopz_set_hook` replaced the earlier hook (`effect_count=10`); original return stayed `duplicate`. `cfx_form::post('cfx_settings')` hook captured `["cfx_settings"]` and returned `settings-value`; no `uopz_set_return` used.
 
 Phase 1 only changes: new `web/instrumentation/hook_coverage/runtime_param_collector.php`; minimal gated calls/config in `uopz_hook_wp.php`; new `fuzzer/tests/experimental` runtime fixture/test; no `InputSignatureExtractor`, generator, exporter, config, or PowerShell change. Phase 1 tests: disabled mode emits no discovery; active callback plus `cfx_form::post` emits REQUEST/key/callback/request/call chain; arbitrary trace-only string argument emits none; return unchanged; callback-not-reached evidence discarded; dedupe repeated helper reads.
+
+## Phase 1 historical status (2026-07-13)
+
+Implemented only the manual `cfx_form::post` mapping in `runtime_param_collector.php` and its opt-in UOPZ installation in `uopz_hook_wp.php`. `static` (including missing/unknown values) leaves the collector unloaded from artifacts and installs no reader hook; `dynamic-helper` and `hybrid` collect independent per-request evidence only. The manual hook has a three-attempt bootstrap bound, records `not_defined`, `installed`, `already_installed`, or `failed` in experimental debug metadata, and never changes helper returns.
+
+The focused collector fixture and real-container UOPZ smoke pass disabled mode, trusted collection, untrusted exclusion, deduplication, invalid inputs, distinct parameters, no value capture, late symbols, and return preservation. Fresh `crm-perks-forms` validation on 2026-07-13 reached `cfx_form_admin_pages->save_api_settings` through `wp_ajax_vx_form_save_api_settings` and emitted one deduplicated `cfx_settings` discovery from `cfx_form::post` in a timestamped per-request artifact. This was the Phase 1 checkpoint; later implementation supersedes the manual mapping.
+
+## Phase 2–3 implementation status (2026-07-14)
+
+`HelperRequestReaderAnalyzer` now scans plugin PHP source for a static method whose formal parameter is used directly as a supported `$_GET`, `$_POST`, `$_REQUEST`, or `$_COOKIE` key in a return expression. It writes `hookphuzz-helper-reader-registry-v1`; the runtime collector loads only high-confidence `source-assisted` entries from `HOOKPHUZZ_HELPER_READER_REGISTRY`. There is no name-based registration, arbitrary dataflow, runtime value collection, branch-seed extraction, or scoring/mutation/detector change.
+
+For `crm-perks-forms`, the generated registry proves `cfx_form::post`, key argument `0` (`$key`), source `REQUEST`, expression `$_REQUEST[$key]`, and definition lines `887-892`. `run-wordpress-phuzz.ps1 -PluginSlug crm-perks-forms -ParamDiscoveryMode dynamic-helper -RunGeneratedConfigs` copies plugin source from the running web container, publishes the registry to shared tmpfs before fuzzing, and passes copied request artifacts to `seed_to_config_cli.py`.
+
+Fresh runtime evidence installed the `cfx_form::post` hook, recorded `cfx_settings` under `wp_ajax_vx_form_save_api_settings`, and associated it with `cfx_form_admin_pages->save_api_settings`. Phase 2 merge retained the existing static leaf `cfx_settings[alert_emails]` and recorded the runtime parent as `runtime_helper` provenance with `merge_action=matched_existing`; `action` and `vx_nonce` stayed fixed. The post-merge replay artifact again executed callback id `492e8bc85e85bc8bc1e8db221aa688198925a218`. The generated-runner report hit a timeout while reading that artifact through `docker compose exec`, but the copied artifact itself contains the installed hook, discovery, and executed callback, so the Phase 3 gate is satisfied.
