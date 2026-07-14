@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -20,6 +21,7 @@ from hook_energy.seed_validator import evaluate_artifact_payloads
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
+ArtifactRecovery = Callable[[], list[tuple[str, Any]]]
 REQUESTS_DIR = "/shared-tmpfs/hook-coverage/requests"
 STOP_ON_VULN_EXIT_CODE = 1337 % 256
 
@@ -78,6 +80,24 @@ def load_request_artifact(name: str) -> Any:
     return json.loads(result.stdout)
 
 
+def recover_request_artifacts_direct_copy() -> list[tuple[str, Any]]:
+    with tempfile.TemporaryDirectory(prefix="hookphuzz-artifacts-") as temp_dir:
+        destination = Path(temp_dir)
+        result = subprocess.run(
+            ["docker", "compose", "cp", f"web:{REQUESTS_DIR}/.", str(destination)],
+            timeout=30,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "Could not directly copy request artifacts")
+        return [
+            (path.name, json.loads(path.read_text(encoding="utf-8-sig")))
+            for path in sorted(destination.glob("*.json"))
+        ]
+
+
 def run_generated_configs(
     generated_configs: Sequence[Mapping[str, str]],
     *,
@@ -86,6 +106,8 @@ def run_generated_configs(
     run_command: CommandRunner = subprocess.run,
     list_artifacts: ArtifactLister = list_request_artifacts,
     load_artifact: ArtifactLoader = load_request_artifact,
+    recover_artifacts: ArtifactRecovery = recover_request_artifacts_direct_copy,
+    force_primary_artifact_read_failure: bool = False,
 ) -> dict[str, Any]:
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
@@ -139,12 +161,27 @@ def run_generated_configs(
             runs.append(_runner_error_row(config, container_name, started_at, str(exc)))
             continue
 
+        artifact_status = "loaded"
+        artifact_retrieval_method = "compose_exec"
+        reporting_status = "ok"
+        reporting_error = None
         try:
             new_artifacts = sorted(list_artifacts() - artifacts_before)
+            if force_primary_artifact_read_failure:
+                raise subprocess.TimeoutExpired("docker compose exec artifact read", 30)
             artifact_payloads = [(name, load_artifact(name)) for name in new_artifacts]
         except Exception as exc:
-            runs.append(_runner_error_row(config, container_name, started_at, str(exc)))
-            continue
+            reporting_error = _reporting_error_code(exc)
+            artifact_status = "failed"
+            reporting_status = "degraded"
+            try:
+                artifact_payloads = recover_artifacts()
+                new_artifacts = [name for name, _ in artifact_payloads]
+                artifact_status = "recovered"
+                artifact_retrieval_method = "direct_copy"
+            except Exception:
+                new_artifacts = []
+                artifact_payloads = []
         validation = evaluate_artifact_payloads(
             {"hook_name": config["hook_name"], "callback_id": config["callback_id"]},
             [payload for _, payload in artifact_payloads],
@@ -160,9 +197,14 @@ def run_generated_configs(
                 "callback_id": config["callback_id"],
                 "entrypoint_type": config.get("entrypoint_type"),
                 "process_status": process_status,
+                "execution_status": _execution_status(process_status, validation["expected_callback_reached"]),
                 "validation_status": validation["status"],
                 "validation_reason": validation["reason"],
                 "callback_reached": validation["expected_callback_reached"],
+                "artifact_status": artifact_status,
+                "artifact_retrieval_method": artifact_retrieval_method,
+                "reporting_status": reporting_status,
+                "reporting_error": reporting_error,
                 "failure_category": failure_category,
                 "requests_created": len(new_artifacts),
                 "request_artifacts": new_artifacts,
@@ -243,6 +285,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-seconds", type=int, default=300)
     parser.add_argument("--service", default="fuzzer-wordpress-plugin")
     parser.add_argument("--output-format", choices=("default", "recursive"), default="default")
+    parser.add_argument("--force-primary-artifact-read-failure", action="store_true", help="Validation-only: force primary artifact read failure and exercise direct-copy recovery.")
     return parser
 
 
@@ -255,6 +298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             generated_configs,
             timeout_seconds=args.timeout_seconds,
             service=args.service,
+            force_primary_artifact_read_failure=args.force_primary_artifact_read_failure,
         )
         report["generated_config_summary"] = str(source_path)
         output_report = format_recursive_summary(report) if args.output_format == "recursive" else report
@@ -302,6 +346,19 @@ def _runtime_config_slug(config: Mapping[str, str]) -> str:
     return slug[:-5] if slug.lower().endswith(".json") else slug
 
 
+def _execution_status(process_status: str, callback_reached: bool) -> str:
+    if callback_reached:
+        return "callback_reached"
+    return process_status
+
+
+def _reporting_error_code(exc: Exception) -> str:
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    if "timeoutexpired" in name or "timed out" in text or "timeout" in text:
+        return "compose_exec_timeout"
+    return name or "artifact_transport_error"
+
 def _failure_category(process_status: str, validation_status: str) -> str | None:
     if validation_status == 'callback_reached':
         return None
@@ -339,9 +396,14 @@ def _runner_error_row(
         "callback_id": str(config["callback_id"]),
         "entrypoint_type": config.get("entrypoint_type"),
         "process_status": "runner_error",
+        "execution_status": "runner_error",
         "validation_status": "runner_error",
         "validation_reason": reason,
         "callback_reached": False,
+        "artifact_status": "not_attempted",
+        "artifact_retrieval_method": None,
+        "reporting_status": "failed",
+        "reporting_error": reason,
         "failure_category": "F. instrumentation/generation bug",
         "requests_created": 0,
         "request_artifacts": [],
@@ -377,3 +439,8 @@ def _recursive_status(row: Mapping[str, Any]) -> str:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+

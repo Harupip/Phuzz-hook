@@ -19,6 +19,7 @@ class LiveHookSeedGenerator:
         host_source_root: str | Path | None = None,
         source_root: str | Path | None = None,
         unresolved_source_reason: str | None = None,
+        include_observed_entrypoints: bool = False,
     ) -> None:
         resolver = SourcePathResolver(
             container_source_root=container_source_root,
@@ -27,10 +28,14 @@ class LiveHookSeedGenerator:
             unresolved_reason=unresolved_source_reason,
         )
         self.input_extractor = input_extractor or InputSignatureExtractor(source_resolver=resolver)
+        self.include_observed_entrypoints = include_observed_entrypoints
 
     def build_reports(self, coverage_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         callback_rows = self._build_callback_rows(coverage_payload)
-        suggested_rows = [item for item in callback_rows if item["status"] == "uncovered" and item["is_active"]]
+        suggested_rows = [
+            item for item in callback_rows
+            if item["is_active"] and (item["status"] == "uncovered" or item["validation_export"])
+        ]
 
         gap_report = {
             "schema_version": "hook-gap-report-v1",
@@ -146,6 +151,7 @@ class LiveHookSeedGenerator:
                 status,
                 input_params,
                 registered_entry,
+                self.include_observed_entrypoints,
             )
             if seed is not None:
                 entrypoint_type = str(seed.get('entrypoint_type') or entrypoint_type)
@@ -194,6 +200,7 @@ class LiveHookSeedGenerator:
                 "manual_analysis": manual_analysis,
                 "missing_requirements": missing_requirements,
                 "seed": seed,
+                "validation_export": self.include_observed_entrypoints and status == "covered" and seed is not None,
             }
             if entrypoint_type == "rest_route":
                 row["entrypoint_type"] = "rest_route"
@@ -261,10 +268,11 @@ class LiveHookSeedGenerator:
         coverage_status: str,
         input_params: list[dict[str, Any]] | None = None,
         callback_metadata: dict[str, Any] | None = None,
+        include_observed_entrypoints: bool = False,
     ) -> tuple[dict[str, Any] | None, str]:
         if not is_active:
             return None, "inactive_callback"
-        if coverage_status != "uncovered":
+        if coverage_status != "uncovered" and not include_observed_entrypoints:
             return None, "already_covered"
         is_rest_route = str((callback_metadata or {}).get("entrypoint_type", "")) == "rest_route"
         is_seeded_hook = hook_name.startswith(

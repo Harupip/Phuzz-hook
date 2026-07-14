@@ -20,6 +20,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host-source-root", help="Host source root mapped from --container-source-root.")
     parser.add_argument("--source-root", help="Host plugin source root or extracted ZIP root for suffix-based mapping.")
     parser.add_argument("--unresolved-source-reason", help="Reason to record when callback source cannot be resolved.")
+    parser.add_argument("--include-observed-entrypoints", action="store_true", help="Include mapped direct HTTP callbacks already observed, for replay validation.")
     return parser
 
 
@@ -34,6 +35,7 @@ def main() -> int:
         host_source_root=args.host_source_root,
         source_root=args.source_root,
         unresolved_source_reason=args.unresolved_source_reason,
+        include_observed_entrypoints=args.include_observed_entrypoints,
     )
     gap_report, seed_report = generator.write_artifacts(payload, output_dir)
 

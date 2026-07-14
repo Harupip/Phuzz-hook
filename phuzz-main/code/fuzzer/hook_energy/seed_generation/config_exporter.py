@@ -122,6 +122,7 @@ def export_seed_configs(
         config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         generated_row = {
             "config_slug": _build_config_slug(output_dir, file_slug),
+            "config_path": str(config_path),
             "hook_name": hook_name,
             "callback_id": callback_id,
         }
@@ -254,7 +255,7 @@ def _runtime_discovery_rejection(discovery: Mapping[str, Any], seed_item: Mappin
     expected_type = "wp_ajax" if str(seed_item.get("hook_name", "")).startswith("wp_ajax_") else ""
     if not expected_type or discovery.get("entrypoint_type") != expected_type:
         return "runtime_discovery_entrypoint_type_mismatch"
-    if str(discovery.get("http_source", "")).upper() not in {"GET", "POST", "REQUEST", "COOKIE"}:
+    if str(discovery.get("http_source", "")).upper() not in {"GET", "POST", "REQUEST", "COOKIE", "FILTER_INPUT_GET", "FILTER_INPUT_POST", "REST_GET_PARAM"}:
         return "runtime_discovery_unsupported_source"
     if not isinstance(discovery.get("reader_function"), str) or not discovery["reader_function"].strip():
         return "runtime_discovery_missing_reader_function"
@@ -273,9 +274,13 @@ def _runtime_config_location(
     config: Mapping[str, Any], seed_item: Mapping[str, Any], source: str, path: tuple[str, ...]
 ) -> tuple[str, bool]:
     source = source.upper()
-    if source == "POST":
+    if source in {"POST", "FILTER_INPUT_POST"}:
         return "body", False
-    if source == "GET":
+    if source in {"GET", "FILTER_INPUT_GET"}:
+        return "query", False
+    if source == "REST_GET_PARAM":
+        if "body_params" in config and "query_params" not in config:
+            return "body", False
         return "query", False
     if source == "COOKIE":
         return "cookies", False
@@ -346,6 +351,7 @@ def _runtime_result(
         "entrypoint_name": discovery.get("entrypoint_name") if isinstance(discovery, Mapping) else None,
         "confidence": discovery.get("confidence") if isinstance(discovery, Mapping) else None,
         "merge_action": merge_action,
+        "observation_count": int(discovery.get("observation_count", 1)) if isinstance(discovery, Mapping) else 1,
     }
     if reason:
         row["reason"] = reason
@@ -612,7 +618,7 @@ def _read_json_object(path: Path) -> Mapping[str, Any]:
 
 def _config_fuzz_params(config: Mapping[str, Any]) -> list[str]:
     params: list[str] = []
-    for key in ("body_params", "query_params"):
+    for key in ("body_params", "query_params", "cookies"):
         section = config.get(key)
         if not isinstance(section, Mapping):
             continue
@@ -697,3 +703,9 @@ def _param_source_label(item: Mapping[str, Any]) -> str:
         "REQUEST": "$_REQUEST",
         "COOKIE": "$_COOKIE",
     }.get(source, "manual")
+
+
+
+
+
+

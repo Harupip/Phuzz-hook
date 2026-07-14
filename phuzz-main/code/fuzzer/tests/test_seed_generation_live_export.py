@@ -143,6 +143,13 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
             suggested = json.loads((output_dir / "suggested_seeds.json").read_text(encoding="utf-8"))
             self.assertEqual(suggested["summary"]["direct_http_seed_candidates"], 1)
 
+    def test_validation_export_includes_covered_ajax_but_not_internal_hook(self) -> None:
+        _, seed_report = LiveHookSeedGenerator(include_observed_entrypoints=True).build_reports(build_live_coverage_payload())
+
+        hooks = {item["hook_name"] for item in seed_report["suggested_seeds"]}
+        self.assertIn("wp_ajax_sac_post_type_call", hooks)
+        self.assertNotIn("wp_enqueue_scripts", hooks)
+
     def test_generator_adds_extracted_fuzzable_params_to_direct_seed(self) -> None:
         source = "\n".join(
             [

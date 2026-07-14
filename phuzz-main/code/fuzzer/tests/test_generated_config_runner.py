@@ -266,6 +266,32 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertEqual(report["runs"][0]["validation_reason"], "boom")
         self.assertEqual(report["counts"]["runner_error"], 1)
 
+    def test_primary_artifact_failure_recovers_callback_from_direct_copy(self):
+        runner = FakeRunner([completed(0)])
+        artifact = {
+            "hook_coverage": {
+                "registered_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                "executed_callbacks": {"cb-one": {"callback_id": "cb-one", "fired_hook": "wp_ajax_nopriv_demo"}},
+                "blindspot_callbacks": {},
+            }
+        }
+        artifacts = FakeArtifacts([set(), {"request-one.json"}], {"request-one.json": artifact})
+
+        report = run_generated_configs(
+            [generated_config()], timeout_seconds=5, run_command=runner,
+            list_artifacts=artifacts.list, load_artifact=artifacts.load,
+            recover_artifacts=lambda: [("request-one.json", artifact)],
+            force_primary_artifact_read_failure=True,
+        )
+
+        row = report["runs"][0]
+        self.assertEqual(row["execution_status"], "callback_reached")
+        self.assertTrue(row["callback_reached"])
+        self.assertEqual(row["artifact_status"], "recovered")
+        self.assertEqual(row["artifact_retrieval_method"], "direct_copy")
+        self.assertEqual(row["reporting_status"], "degraded")
+        self.assertEqual(row["reporting_error"], "compose_exec_timeout")
+
     def test_recursive_summary_statuses_and_matched_artifact(self):
         reached = {
             "config_slug": "generated-hooks/one",

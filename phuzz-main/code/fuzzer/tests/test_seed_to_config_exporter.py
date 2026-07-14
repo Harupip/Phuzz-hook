@@ -478,6 +478,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
             self.assertTrue((output_dir / "rest_route_demo_v1_items-cb-rest.json").exists())
             self.assertTrue((output_dir / "wp_ajax_example_lookup-cb-public.json").exists())
             self.assertEqual(summary["generated"][0]["config_slug"], "generated-config/demo-plugin/wp_ajax_nopriv_example_lookup-cb-public")
+            self.assertEqual(summary["generated"][0]["config_path"], str(output_dir / "wp_ajax_nopriv_example_lookup-cb-public.json"))
             self.assertTrue(summary['generated'][0]['fuzzing_ready'])
             self.assertEqual(summary['generated'][0]['generated_reason'], 'supported_http_seed')
             self.assertEqual(summary["generated"][1]["entrypoint_type"], "rest_route")
