@@ -406,6 +406,8 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("fuzzer\\configs\\{0}.json", script)
         self.assertIn("fuzzer\\configs\\generated-config\\$PluginSlug", script)
         self.assertIn("Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug", script)
+        self.assertIn("--runtime-discovery-manifest $manifestPath", script)
+        self.assertIn("RequestArtifactsBefore", script)
         self.assertIn("wordpress/$PluginSlug", script)
         self.assertIn("wordpress/bootstrap-generated", script)
         self.assertIn("web\\applications\\wordpress\\_plugins\\$PluginSlug.zip", script)
@@ -432,6 +434,14 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertEqual(config["target"], "http://web/")
         self.assertEqual(config["methods"], ["GET"])
         self.assertEqual(config["query_params"]["fuzz"], ["hookphuzz_probe"])
+
+    def test_wordpress_runner_probes_rest_index_before_seed_export(self):
+        script = (FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1").read_text(encoding="utf-8-sig")
+
+        self.assertIn("function Invoke-RestRegistrationProbe", script)
+        self.assertIn("/wp-json/", script)
+        self.assertIn("/?rest_route=/", script)
+        self.assertLess(script.index("Invoke-RestRegistrationProbe -BaseUrl $webUrl"), script.rindex("Export-LiveSeedSuggestions"))
 
     def test_wordpress_runner_maps_copied_plugin_source_into_seed_export(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"

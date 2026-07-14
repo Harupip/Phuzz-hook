@@ -194,11 +194,16 @@ function hookphuzz_runtime_param_record(array $reader, array $args, ?array $acti
         $state['seen'][$key] = count($state['discoveries']);
         [$readerFile, $readerLine] = hookphuzz_runtime_param_reader_location($reader);
         $hookName = (string) ($activeCallback['hook_name'] ?? '');
-        $entrypointType = strpos($hookName, 'wp_ajax') === 0 ? 'wp_ajax' : null;
+        $entrypointType = strpos($hookName, 'wp_ajax') === 0
+            ? 'wp_ajax'
+            : (($activeCallback['entrypoint_type'] ?? '') === 'rest_route' ? 'rest_route' : null);
         $state['discoveries'][] = [
             'schema_version' => 'hookphuzz-runtime-param-v1',
             'entrypoint_type' => $entrypointType,
             'entrypoint_name' => $hookName !== '' ? $hookName : null,
+            'namespace' => $activeCallback['namespace'] ?? null,
+            'route' => $activeCallback['route'] ?? null,
+            'method' => $activeCallback['method'] ?? null,
             'callback_id' => $activeCallback['callback_id'],
             'callback_repr' => $activeCallback['callback_repr'] ?? null,
             'callback_source' => $activeCallback['source_file'] ?? null,
@@ -226,10 +231,76 @@ function hookphuzz_runtime_param_record(array $reader, array $args, ?array $acti
     }
 }
 
+function hookphuzz_runtime_param_active_rest_callback(): ?array
+{
+    $callbacks = $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'] ?? [];
+    if (!is_array($callbacks) || !function_exists('__uopz_rest_request_matches_entry')) {
+        return null;
+    }
+    $trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS);
+    foreach ($callbacks as $entry) {
+        if (!is_array($entry) || ($entry['entrypoint_type'] ?? '') !== 'rest_route'
+            || !__uopz_rest_request_matches_entry($entry)) {
+            continue;
+        }
+        $repr = (string) ($entry['callback_repr'] ?? '');
+        if (!preg_match('/^([^->:]+)(?:->|::)([^->:]+)$/', $repr, $parts)) {
+            continue;
+        }
+        foreach ($trace as $frame) {
+            if (($frame['class'] ?? '') === $parts[1] && ($frame['function'] ?? '') === $parts[2]) {
+                $entry['method'] = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+                return $entry;
+            }
+        }
+    }
+    return null;
+}
+
+function hookphuzz_runtime_param_install_rest_reader(): void
+{
+    $state =& $GLOBALS['__hookphuzz_runtime_param'];
+    $symbol = 'WP_REST_Request::get_param';
+    if (empty($state['enabled']) || !extension_loaded('uopz') || ($state['reader_hooks'][$symbol]['status'] ?? '') === 'installed') {
+        return;
+    }
+    if (!class_exists('WP_REST_Request', false) || !method_exists('WP_REST_Request', 'get_param')) {
+        $state['reader_hooks'][$symbol] = ['status' => 'pending', 'reason' => 'runtime_symbol_not_defined'];
+        return;
+    }
+    $reader = [
+        'symbol' => $symbol,
+        'symbol_type' => 'instance_method',
+        'class' => 'WP_REST_Request',
+        'method' => 'get_param',
+        'reader_type' => 'REST_GET_PARAM',
+        'parameter_argument_index' => 0,
+        'formal_parameter' => 'key',
+        'http_source' => 'REST_GET_PARAM',
+        'confidence' => 'high',
+        'definition_file' => '',
+        'definition_start_line' => 0,
+        'definition_end_line' => 0,
+        'evidence' => ['source_expression' => 'WP_REST_Request::get_param', 'source_line' => 0],
+    ];
+    try {
+        $ok = uopz_set_hook('WP_REST_Request', 'get_param', static function (...$args) use ($reader): void {
+            hookphuzz_runtime_param_record($reader, $args, hookphuzz_runtime_param_active_rest_callback());
+        });
+        $state['reader_hooks'][$symbol] = ['status' => $ok ? 'installed' : 'failed', 'reason' => $ok ? null : 'uopz_set_hook_failed'];
+    } catch (Throwable $e) {
+        $state['reader_hooks'][$symbol] = ['status' => 'failed', 'reason' => 'uopz_set_hook_exception'];
+    }
+}
+
 function hookphuzz_runtime_param_install_readers(callable $activeCallbackProvider): void
 {
     $state =& $GLOBALS['__hookphuzz_runtime_param'];
-    if (empty($state['enabled']) || !extension_loaded('uopz') || $state['install_attempts'] >= 3) {
+    if (empty($state['enabled']) || !extension_loaded('uopz')) {
+        return;
+    }
+    hookphuzz_runtime_param_install_rest_reader();
+    if ($state['install_attempts'] >= 3) {
         return;
     }
     $state['install_attempts']++;

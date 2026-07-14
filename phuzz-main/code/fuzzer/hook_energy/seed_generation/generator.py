@@ -321,7 +321,7 @@ class LiveHookSeedGenerator:
                 continue
 
             request_method = str(seed.get("method", "")).upper()
-            if source == "GET" or (source == "REQUEST" and request_method == "GET"):
+            if source in {"GET", "REST_GET_PARAM"} or (source == "REQUEST" and request_method == "GET"):
                 target = seed["query_params"]
             elif source == "COOKIE":
                 target = seed["cookies"]

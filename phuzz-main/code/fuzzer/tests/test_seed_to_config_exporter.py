@@ -18,6 +18,7 @@ from hook_energy.seed_generation.config_exporter import (
     merge_runtime_param_discoveries,
     normalized_parameter_path,
 )
+from hook_energy.seed_generation.seed_to_config_cli import load_runtime_discovery_manifest
 
 
 def build_seed_item(*, hook_name="wp_ajax_nopriv_example_lookup", auth_mode="unauth-capable"):
@@ -96,6 +97,31 @@ def build_runtime_discovery(item, **overrides):
     discovery.update(overrides)
     return discovery
 class SeedToConfigExporterTests(unittest.TestCase):
+    def test_runtime_manifest_deduplicates_many_paths(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            artifact = root / "request with space.json"
+            artifact.write_text('{"runtime_param_discoveries": []}', encoding="utf-8")
+            manifest = root / "runtime_discovery_manifest.json"
+            manifest.write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "phase5e",
+                "artifacts": [{"path": str(artifact), "required": True}] * 1000,
+            }), encoding="utf-8")
+            paths = load_runtime_discovery_manifest(str(manifest))
+
+        self.assertEqual(paths, [str(artifact.resolve())])
+
+    def test_runtime_manifest_requires_present_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            manifest = Path(tmp_dir) / "runtime_discovery_manifest.json"
+            manifest.write_text(json.dumps({
+                "schema_version": 1, "run_id": "phase5e",
+                "artifacts": [{"path": str(Path(tmp_dir) / "missing.json"), "required": True}],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "required artifact is missing"):
+                load_runtime_discovery_manifest(str(manifest))
+
     def test_runtime_discovery_adds_wp_ajax_request_param_to_body(self):
         item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
         item["seed"].update({"body": {"action": "example_lookup"}, "query_params": {}, "fuzzable_params": []})
@@ -152,6 +178,30 @@ class SeedToConfigExporterTests(unittest.TestCase):
 
         self.assertEqual(callback_results[0]["reason"], "runtime_discovery_callback_mismatch")
         self.assertEqual(entrypoint_results[0]["reason"], "runtime_discovery_entrypoint_mismatch")
+
+    def test_rest_runtime_get_param_uses_query_and_rejects_wrong_entrypoint_type(self):
+        item = build_rest_seed_item(method="GET", fuzzable_params=[])
+        _, config = build_config_for_seed_item(item)
+        discovery = build_runtime_discovery(
+            item,
+            entrypoint_type="rest_route",
+            parameter_name="search",
+            parameter_path=["search"],
+            http_source="REST_GET_PARAM",
+            reader_function="WP_REST_Request::get_param",
+        )
+
+        results = merge_runtime_param_discoveries(config, item, [discovery])
+
+        self.assertEqual(config["target"], "http://web/wp-json/demo/v1/items")
+        self.assertEqual(config["methods"], ["GET"])
+        self.assertIn({"name": "search", "value": "fuzz"}, config["query_params"]["data"])
+        self.assertEqual(results[0]["merge_action"], "added")
+
+        mismatch = merge_runtime_param_discoveries(
+            config, item, [{**discovery, "entrypoint_type": "wp_ajax"}]
+        )
+        self.assertEqual(mismatch[0]["reason"], "runtime_discovery_entrypoint_type_mismatch")
 
     def test_runtime_malformed_and_unsupported_sources_reject_safely(self):
         item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")

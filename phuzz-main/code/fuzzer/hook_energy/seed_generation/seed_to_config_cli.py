@@ -24,16 +24,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=[],
         help="Request artifact containing runtime_param_discoveries; may be repeated.",
     )
+    parser.add_argument(
+        "--runtime-discovery-manifest",
+        help="JSON manifest listing the bounded runtime discovery artifacts for this run.",
+    )
     return parser
 
 
-def main() -> int:
-    args = build_argument_parser().parse_args()
-    suggested_path = Path(args.suggested_seeds)
-    payload = json.loads(suggested_path.read_text(encoding="utf-8-sig"))
-
+def load_runtime_discovery_artifacts(paths: list[str]) -> list[dict]:
     discoveries = []
-    for artifact_path in args.runtime_discovery_artifact:
+    for artifact_path in paths:
         try:
             artifact = json.loads(Path(artifact_path).read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError):
@@ -43,6 +43,42 @@ def main() -> int:
             discoveries.extend(item for item in artifact["runtime_param_discoveries"] if isinstance(item, dict))
         else:
             discoveries.append({"artifact_path": str(artifact_path)})
+    return discoveries
+
+
+def load_runtime_discovery_manifest(path: str) -> list[str]:
+    try:
+        manifest = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"runtime discovery manifest is unreadable: {path}") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1 or not isinstance(manifest.get("run_id"), str):
+        raise ValueError("runtime discovery manifest has unsupported schema")
+    paths: list[str] = []
+    seen: set[str] = set()
+    for entry in manifest.get("artifacts", []):
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or not entry["path"].strip():
+            raise ValueError("runtime discovery manifest has malformed artifact entry")
+        normalized = str(Path(entry["path"]).resolve())
+        if normalized in seen:
+            continue
+        if not Path(normalized).is_file():
+            if entry.get("required", True):
+                raise ValueError(f"runtime discovery manifest required artifact is missing: {entry['path']}")
+            continue
+        seen.add(normalized)
+        paths.append(normalized)
+    return paths
+
+
+def main() -> int:
+    args = build_argument_parser().parse_args()
+    suggested_path = Path(args.suggested_seeds)
+    payload = json.loads(suggested_path.read_text(encoding="utf-8-sig"))
+
+    paths = list(args.runtime_discovery_artifact)
+    if args.runtime_discovery_manifest:
+        paths.extend(load_runtime_discovery_manifest(args.runtime_discovery_manifest))
+    discoveries = load_runtime_discovery_artifacts(list(dict.fromkeys(paths)))
 
     summary = export_seed_configs(
         payload,

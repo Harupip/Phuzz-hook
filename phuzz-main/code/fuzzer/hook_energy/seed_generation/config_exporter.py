@@ -252,7 +252,13 @@ def _runtime_discovery_rejection(discovery: Mapping[str, Any], seed_item: Mappin
         return "runtime_discovery_callback_mismatch"
     if str(discovery.get("entrypoint_name", "")) != str(seed_item.get("hook_name", "")):
         return "runtime_discovery_entrypoint_mismatch"
-    expected_type = "wp_ajax" if str(seed_item.get("hook_name", "")).startswith("wp_ajax_") else ""
+    hook_name = str(seed_item.get("hook_name", ""))
+    if hook_name.startswith("wp_ajax_"):
+        expected_type = "wp_ajax"
+    elif hook_name.startswith("rest_route:") or seed_item.get("entrypoint_type") == "rest_route":
+        expected_type = "rest_route"
+    else:
+        expected_type = ""
     if not expected_type or discovery.get("entrypoint_type") != expected_type:
         return "runtime_discovery_entrypoint_type_mismatch"
     if str(discovery.get("http_source", "")).upper() not in {"GET", "POST", "REQUEST", "COOKIE", "FILTER_INPUT_GET", "FILTER_INPUT_POST", "REST_GET_PARAM"}:

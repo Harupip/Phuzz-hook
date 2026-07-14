@@ -923,6 +923,9 @@ function __uopz_copy_rest_metadata_to_executed(string $callbackId, array $regist
 
 function __uopz_record_rest_callback_invocation($callback, int $actualArgCount, string $source): void
 {
+    if (function_exists('hookphuzz_runtime_param_install_readers')) {
+        hookphuzz_runtime_param_install_readers('__uopz_current_parent_callback_metadata');
+    }
     foreach ($GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'] ?? [] as $callbackId => $registered) {
         if (!is_array($registered) || ($registered['entrypoint_type'] ?? '') !== 'rest_route') {
             continue;

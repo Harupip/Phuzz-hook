@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlsplit, urlunsplit
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -112,6 +113,7 @@ def run_generated_configs(
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
 
+    rest_transport = _rest_transport_mode()
     runs: list[dict[str, Any]] = []
     for index, config in enumerate(generated_configs, start=1):
         slug = str(config["config_slug"])
@@ -122,6 +124,7 @@ def run_generated_configs(
         except Exception as exc:
             runs.append(_runner_error_row(config, container_name, started_at, str(exc)))
             continue
+        runtime_slug, requested_url, effective_url, fallback_used = _runtime_config_for_rest(config, rest_transport)
         command = [
             "docker",
             "compose",
@@ -131,7 +134,7 @@ def run_generated_configs(
             "--name",
             container_name,
             "-e",
-            f"FUZZER_CONFIG={_runtime_config_slug(config)}",
+            f"FUZZER_CONFIG={runtime_slug}",
             service,
         ]
         try:
@@ -196,6 +199,9 @@ def run_generated_configs(
                 "hook_name": config["hook_name"],
                 "callback_id": config["callback_id"],
                 "entrypoint_type": config.get("entrypoint_type"),
+                "requested_url": requested_url,
+                "effective_url": effective_url,
+                "rest_fallback_used": fallback_used,
                 "process_status": process_status,
                 "execution_status": _execution_status(process_status, validation["expected_callback_reached"]),
                 "validation_status": validation["status"],
@@ -344,6 +350,39 @@ def _runtime_config_slug(config: Mapping[str, str]) -> str:
     else:
         slug = normalized
     return slug[:-5] if slug.lower().endswith(".json") else slug
+
+
+def _rest_transport_mode() -> str:
+    try:
+        result = subprocess.run(
+        ["docker", "compose", "exec", "-T", "web", "sh", "-lc", "curl -fsS -o /dev/null -w '%{http_code}' http://localhost/wp-json/"],
+        timeout=30, check=False, capture_output=True, text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "rest_route"
+    return "canonical" if result.returncode == 0 and result.stdout.strip() == "200" else "rest_route"
+
+
+def _runtime_config_for_rest(config: Mapping[str, str], transport: str) -> tuple[str, str | None, str | None, bool]:
+    config_path = config.get("config_path")
+    if config.get("entrypoint_type") != "rest_route" or not config_path:
+        return _runtime_config_slug(config), None, None, False
+    path = Path(config_path)
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    requested = str(payload.get("target", ""))
+    if transport != "rest_route" or not requested:
+        return _runtime_config_slug(config), requested, requested, False
+    target = urlsplit(requested)
+    prefix = "/wp-json/"
+    if not target.path.startswith(prefix):
+        return _runtime_config_slug(config), requested, requested, False
+    route = target.path[len(prefix) - 1 :]
+    effective = urlunsplit((target.scheme, target.netloc, "/", f"rest_route={route}", ""))
+    replay_path = path.with_name(f"{path.stem}__rest_route_replay.json")
+    payload["target"] = effective
+    replay_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    replay_config = {**config, "config_path": str(replay_path)}
+    return _runtime_config_slug(replay_config), requested, effective, True
 
 
 def _execution_status(process_status: str, callback_reached: bool) -> str:

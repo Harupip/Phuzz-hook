@@ -152,6 +152,23 @@ function Wait-ForWebReady {
     throw "Timed out waiting for $Url to return HTTP 200 within $TimeoutSeconds seconds."
 }
 
+function Invoke-RestRegistrationProbe {
+    param([string]$BaseUrl)
+
+    # A real REST index request fires rest_api_init, allowing plugins to register routes.
+    foreach ($path in @('/wp-json/', '/?rest_route=/')) {
+        try {
+            $response = Invoke-WebRequest -Uri ($BaseUrl.TrimEnd('/') + $path) -UseBasicParsing -TimeoutSec 10
+            if ($response.StatusCode -eq 200) {
+                return
+            }
+        } catch {
+            continue
+        }
+    }
+    throw 'REST registration probe failed for both canonical and rest_route index URLs.'
+}
+
 function Export-LiveSeedSuggestions {
     param(
         [string]$ScriptRoot,
@@ -238,7 +255,8 @@ function Convert-LiveSeedSuggestionsToConfigs {
     param(
         [string]$ScriptRoot,
         [string]$PluginSlug,
-        [string[]]$ComposeArgs
+        [string[]]$ComposeArgs,
+        [string[]]$RequestArtifactsBefore
     )
 
     $seedOutputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
@@ -256,16 +274,18 @@ function Convert-LiveSeedSuggestionsToConfigs {
             New-Item -ItemType Directory -Path $runtimeArtifactRoot -Force | Out-Null
             docker cp "${webContainerId}:/shared-tmpfs/hook-coverage/requests/." $runtimeArtifactRoot 2>$null
         }
-        $runtimeArtifactArgs = @(Get-ChildItem -LiteralPath $runtimeArtifactRoot -Filter *.json -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-            "--runtime-discovery-artifact"
-            $_.FullName
-        })
+        $artifacts = @(Get-ChildItem -LiteralPath $runtimeArtifactRoot -Filter *.json -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $RequestArtifactsBefore -notcontains $_.Name } |
+            ForEach-Object { [ordered]@{ path = $_.FullName; request_id = $_.BaseName; context = 'bootstrap_or_probe'; expected_callback_id = ''; required = $true } })
+        $manifestPath = Join-Path $runtimeArtifactRoot 'runtime_discovery_manifest.json'
+        [ordered]@{ schema_version = 1; run_id = [guid]::NewGuid().ToString('N'); created_at = (Get-Date).ToUniversalTime().ToString('o'); plugin_slug = $PluginSlug; artifacts = $artifacts } |
+            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
         Write-Host "Converting supported suggested seeds into PHUZZ configs"
         python $configCli `
             --suggested-seeds $suggestedSeeds `
             --output-config-dir $outputConfigDir `
             --summary $summaryPath `
-            @runtimeArtifactArgs
+            --runtime-discovery-manifest $manifestPath
     } finally {
         if (Test-Path -LiteralPath $runtimeArtifactRoot) {
             Remove-Item -LiteralPath $runtimeArtifactRoot -Recurse -Force
@@ -308,8 +328,10 @@ try {
     Write-Host "Starting db and web containers"
     Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", "db", "web", "--build")
 
+    $requestArtifactsBefore = @(Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("exec", "-T", "web", "sh", "-c", "find /shared-tmpfs/hook-coverage/requests -maxdepth 1 -type f -printf '%f\\n'") | Where-Object { $_ })
     Write-Host "Waiting for WordPress to answer with HTTP 200"
     Wait-ForWebReady -Url $webUrl -TimeoutSeconds $WebTimeoutSeconds
+    Invoke-RestRegistrationProbe -BaseUrl $webUrl
 
     if ($ParamDiscoveryMode -eq 'dynamic-helper') {
         Publish-HelperReaderRegistry -ScriptRoot $scriptRoot -ComposeArgs $composeArgs -PluginSlug $PluginSlug
@@ -319,7 +341,7 @@ try {
     Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", $fuzzerService, "--build")
 
     Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug
-    Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug -ComposeArgs $composeArgs
+    Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug -ComposeArgs $composeArgs -RequestArtifactsBefore $requestArtifactsBefore
 
     if ($RunGeneratedConfigs) {
         $seedOutputDir = Join-Path $scriptRoot "fuzzer\output\seed_generation"

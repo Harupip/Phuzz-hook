@@ -20,6 +20,7 @@ class InputSignatureExtractor:
         r"filter_input\s*\(\s*INPUT_(?P<source>GET|POST|COOKIE)\s*,\s*(?P<quote>['\"])(?P<name>[A-Za-z0-9_\-]+)(?P=quote)",
         re.IGNORECASE,
     )
+    REST_GET_PARAM_PATTERN = re.compile(r"\$(?P<receiver>[A-Za-z_]\w*)\s*->\s*get_param\s*\(\s*(?P<quote>['\"])(?P<name>[A-Za-z0-9_-]+)(?P=quote)\s*\)")
     REFERER_HELPER_PATTERN = re.compile(
         r"\b(?:check_ajax_referer|check_admin_referer)\s*\(\s*(['\"])[^'\"]+\1\s*,\s*(?P<quote>['\"])(?P<name>[A-Za-z0-9_\-]+)(?P=quote)",
         re.IGNORECASE,
@@ -43,6 +44,7 @@ class InputSignatureExtractor:
         "COOKIE": "cookie",
         "FILES": "body",
         "BODY_JSON": "body",
+        "REST_GET_PARAM": "query",
     }
 
     def __init__(
@@ -84,7 +86,10 @@ class InputSignatureExtractor:
 
         start_index = max(start_line - 1, 0)
         end_index = min(max(end_line, start_line), len(lines))
-        input_params = self._extract_from_lines(lines[start_index:end_index], start_index + 1)
+        callback_lines = lines[start_index:end_index]
+        input_params = self._extract_from_lines(callback_lines, start_index + 1)
+        if callback_metadata.get("entrypoint_type") == "rest_route":
+            self._extend_rest_literals(input_params, callback_lines, start_index + 1, callback_metadata)
         self._extend_from_shallow_helpers(input_params, lines[start_index:end_index], path, start_index + 1)
         return {
             "callback": callback_name,
@@ -248,6 +253,14 @@ class InputSignatureExtractor:
         if fuzzable is not None:
             row["fuzzable"] = fuzzable
         results.append(row)
+
+    def _extend_rest_literals(self, results, lines, first_line_number, metadata) -> None:
+        formal = {str(item.get("name")) for item in metadata.get("formal_parameters", []) if isinstance(item, dict)}
+        seen = {(str(item.get("source", "")), str(item.get("name", ""))) for item in results}
+        for offset, line in enumerate(lines):
+            for match in self.REST_GET_PARAM_PATTERN.finditer(line):
+                if match.group("receiver") in formal:
+                    self._append_match(results, seen, "REST_GET_PARAM", match.group("name"), match.group(0), first_line_number + offset, confidence="rest_literal")
 
     def _callback_name(self, callback_metadata: dict[str, Any]) -> str:
         for key in ("callback_repr", "callback_name", "stable_id", "runtime_id"):
