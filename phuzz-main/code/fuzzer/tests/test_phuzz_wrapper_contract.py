@@ -18,7 +18,7 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertTrue(script_path.exists(), "Expected phuzz-main/code/phuzz.ps1 to exist")
         script = script_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"recursive\")]", script)
+        self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"dynamic\", \"recursive\")]", script)
         self.assertIn("[string]$Mode", script)
         self.assertIn("[switch]$DryRun", script)
         self.assertIn("[switch]$Help", script)
@@ -315,6 +315,31 @@ sys.exit(2)
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-GeneratedConfigTimeoutSeconds 30", result.stdout)
+
+    def test_guided_wrapper_dynamic_mode_delegates_to_source_assisted_batch(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode",
+                "dynamic",
+                "-PluginSlug",
+                "crm-perks-forms",
+                "-NoFollowLogs",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-ParamDiscoveryMode dynamic-helper", result.stdout)
+        self.assertIn("-RunGeneratedConfigs", result.stdout)
         self.assertIn("-GeneratedConfigTimeoutSeconds 30", result.stdout)
 
     def test_guided_wrapper_rejects_generated_config_timeout_above_30(self):

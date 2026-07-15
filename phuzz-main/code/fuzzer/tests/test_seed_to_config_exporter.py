@@ -203,6 +203,22 @@ class SeedToConfigExporterTests(unittest.TestCase):
         )
         self.assertEqual(mismatch[0]["reason"], "runtime_discovery_entrypoint_type_mismatch")
 
+    def test_repeated_runtime_parent_path_observations_coalesce(self):
+        item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
+        item["seed"].update({
+            "body": {"action": "example_lookup", "cfx_settings[alert_emails]": "FUZZ"},
+            "query_params": {},
+            "fuzzable_params": ["cfx_settings[alert_emails]"],
+        })
+        _, config = build_config_for_seed_item(item)
+        discovery = build_runtime_discovery(item, parameter_name="cfx_settings", parameter_path=["cfx_settings"])
+
+        results = merge_runtime_param_discoveries(config, item, [discovery, discovery])
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["merge_action"], "matched_existing")
+        self.assertEqual(results[0]["observation_count"], 2)
+
     def test_runtime_malformed_and_unsupported_sources_reject_safely(self):
         item = build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
         _, config = build_config_for_seed_item(item)

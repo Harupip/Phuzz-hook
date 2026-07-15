@@ -17,6 +17,7 @@ function hookphuzz_runtime_param_collector_init(): bool
         'reader_hooks' => [],
         'registry_rejections' => [],
         'install_attempts' => 0,
+        'callback_install_attempted' => false,
         'discarded' => 0,
         'recording' => false,
     ];
@@ -293,17 +294,22 @@ function hookphuzz_runtime_param_install_rest_reader(): void
     }
 }
 
-function hookphuzz_runtime_param_install_readers(callable $activeCallbackProvider): void
+function hookphuzz_runtime_param_install_readers(callable $activeCallbackProvider, bool $retryUnavailableAtCallback = false): void
 {
     $state =& $GLOBALS['__hookphuzz_runtime_param'];
     if (empty($state['enabled']) || !extension_loaded('uopz')) {
         return;
     }
     hookphuzz_runtime_param_install_rest_reader();
-    if ($state['install_attempts'] >= 3) {
+    $retryAtCallback = $retryUnavailableAtCallback && empty($state['callback_install_attempted']);
+    if ($state['install_attempts'] >= 3 && !$retryAtCallback) {
         return;
     }
-    $state['install_attempts']++;
+    if ($retryAtCallback) {
+        $state['callback_install_attempted'] = true;
+    } else {
+        $state['install_attempts']++;
+    }
     foreach (hookphuzz_runtime_param_reader_registry() as $reader) {
         $symbol = $reader['symbol'];
         if (($state['reader_hooks'][$symbol]['status'] ?? '') === 'installed') {
@@ -344,6 +350,7 @@ function hookphuzz_runtime_param_get_debug_metadata(): array
         'reader_hooks' => $state['reader_hooks'] ?? [],
         'registry_rejections' => $state['registry_rejections'] ?? [],
         'install_attempts' => $state['install_attempts'] ?? 0,
+        'callback_install_attempted' => $state['callback_install_attempted'] ?? false,
         'discarded' => $state['discarded'] ?? 0,
     ];
 }

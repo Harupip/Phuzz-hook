@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("default", "seed-config", "generated", "recursive")]
+    [ValidateSet("default", "seed-config", "generated", "dynamic", "recursive")]
     [string]$Mode,
     [ValidatePattern('^[a-zA-Z0-9_.-]+$')]
     [string]$PluginSlug,
@@ -41,6 +41,7 @@ Usage:
   .\phuzz.ps1 -Mode default
   .\phuzz.ps1 -Mode seed-config -NoFollowLogs
   .\phuzz.ps1 -Mode generated -PluginSlug gamipress -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs
+  .\phuzz.ps1 -Mode dynamic -PluginSlug crm-perks-forms -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs
   .\phuzz.ps1 -Mode recursive
   .\phuzz.ps1 -Mode recursive -RunRecursiveConfigs
   .\phuzz.ps1 -Mode recursive -RecursiveInputFile fuzzer\output\hook-coverage\requests\latest.json
@@ -50,6 +51,7 @@ Modes:
   default      Start WordPress PHUZZ with existing behavior.
   seed-config  Start WordPress, export hook seeds, generate PHUZZ configs, do not follow logs.
   generated    Export seeds/configs, then run generated hook configs sequentially.
+  dynamic      Run source-assisted runtime parameter discovery, then replay its configs.
   recursive    Generate recursive child-hook seeds/configs from request artifacts.
 
 Useful options:
@@ -90,15 +92,17 @@ function Read-MenuMode {
     Write-Host "  1) default     - Start WordPress PHUZZ with existing behavior"
     Write-Host "  2) seed-config - Start web, export hook seeds, generate PHUZZ configs"
     Write-Host "  3) generated   - Generate configs, then run them sequentially"
-    Write-Host "  4) recursive   - Generate recursive child-hook seeds/configs from request artifacts"
+    Write-Host "  4) dynamic     - Discover source-proven helper parameters, then replay configs"
+    Write-Host "  5) recursive   - Generate recursive child-hook seeds/configs from request artifacts"
 
-    $choice = (Read-Host "Select [1-4]").Trim()
+    $choice = (Read-Host "Select [1-5]").Trim()
     switch ($choice) {
         "1" { return "default" }
         "2" { return "seed-config" }
         "3" { return "generated" }
-        "4" { return "recursive" }
-        default { throw "Invalid selection '$choice'. Choose 1, 2, 3, or 4." }
+        "4" { return "dynamic" }
+        "5" { return "recursive" }
+        default { throw "Invalid selection '$choice'. Choose 1, 2, 3, 4, or 5." }
     }
 }
 
@@ -648,7 +652,7 @@ if ($interactive) {
 
 if (-not $PSBoundParameters.ContainsKey("PluginSlug")) {
     if ($interactive) {
-        $PluginSlug = Read-PluginSlug -RequireConfig ($Mode -ne "generated")
+        $PluginSlug = Read-PluginSlug -RequireConfig ($Mode -notin @("generated", "dynamic"))
     } else {
         $PluginSlug = "show-all-comments-in-one-page"
     }
@@ -689,6 +693,11 @@ switch ($Mode) {
         $runnerParams["NoFollowLogs"] = $true
     }
     "generated" {
+        $runnerParams["RunGeneratedConfigs"] = $true
+        $runnerParams["GeneratedConfigTimeoutSeconds"] = $GeneratedConfigTimeoutSeconds
+    }
+    "dynamic" {
+        $runnerParams["ParamDiscoveryMode"] = "dynamic-helper"
         $runnerParams["RunGeneratedConfigs"] = $true
         $runnerParams["GeneratedConfigTimeoutSeconds"] = $GeneratedConfigTimeoutSeconds
     }

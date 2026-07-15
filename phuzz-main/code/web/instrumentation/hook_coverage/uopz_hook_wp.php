@@ -1000,6 +1000,10 @@ function __uopz_record_actual_callback_invocation($callback, int $actualArgCount
         return;
     }
 
+    if (function_exists('hookphuzz_runtime_param_install_readers')) {
+        hookphuzz_runtime_param_install_readers('__uopz_current_parent_callback_metadata', true);
+    }
+
     __uopz_push_callback_stack($registered);
     try {
         __uopz_mark_callback_executed(

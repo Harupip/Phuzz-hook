@@ -197,7 +197,20 @@ def merge_runtime_param_discoveries(
                 results.append(_runtime_result(discovery, "ignored_duplicate", None, location, inferred=inferred))
             continue
         if any(existing_path[: len(path)] == path for existing_path in existing):
-            results.append(_runtime_result(discovery, "matched_existing", None, location, inferred=inferred))
+            prior = next(
+                (
+                    row
+                    for row in results
+                    if row.get("config_location") == location
+                    and normalized_parameter_path(row.get("parameter_path")) == path
+                    and row.get("merge_action") == "matched_existing"
+                ),
+                None,
+            )
+            if prior is not None:
+                prior["observation_count"] = int(prior.get("observation_count", 1)) + 1
+            else:
+                results.append(_runtime_result(discovery, "matched_existing", None, location, inferred=inferred))
             continue
 
         name = _parameter_name_from_path(path)

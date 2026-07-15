@@ -419,6 +419,21 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("--generated-config-summary", script)
         self.assertIn("--output-file", script)
         self.assertIn("--timeout-seconds", script)
+        self.assertIn("fuzzer\\output\\param-discovery\\$PluginSlug\\dynamic-helper", script)
+        self.assertIn("fuzzer\\configs\\generated-param-discovery\\$PluginSlug\\dynamic-helper", script)
+        self.assertIn("runtime_discovery_summary.json", script)
+        self.assertIn("Write-DynamicReplaySummary", script)
+        self.assertIn("dynamic_discovery_run_summary.json", script)
+        self.assertIn("Running dynamic discovery replay before config merge", script)
+        self.assertIn("$env:COMPOSE_FILE = \"docker-compose.yml", script)
+
+    def test_runtime_reader_retries_once_when_target_callback_loads_the_symbol(self):
+        collector = (FUZZER_DIR.parent / "web" / "instrumentation" / "hook_coverage" / "runtime_param_collector.php").read_text(encoding="utf-8-sig")
+        instrumentation = (FUZZER_DIR.parent / "web" / "instrumentation" / "hook_coverage" / "uopz_hook_wp.php").read_text(encoding="utf-8-sig")
+
+        self.assertIn("bool $retryUnavailableAtCallback = false", collector)
+        self.assertIn("callback_install_attempted", collector)
+        self.assertIn("hookphuzz_runtime_param_install_readers('__uopz_current_parent_callback_metadata', true)", instrumentation)
 
     def test_wordpress_runner_uses_shared_bootstrap_config_for_generated_mode(self):
         runner_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
