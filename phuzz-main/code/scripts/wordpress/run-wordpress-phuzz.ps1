@@ -274,7 +274,18 @@ function Convert-LiveSeedSuggestionsToConfigs {
         $webContainerId = (& $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] ps -q web).Trim()
         if ($webContainerId) {
             New-Item -ItemType Directory -Path $runtimeArtifactRoot -Force | Out-Null
-            docker cp "${webContainerId}:/shared-tmpfs/hook-coverage/requests/." $runtimeArtifactRoot 2>$null
+            $previousErrorActionPreference = $ErrorActionPreference
+            $copyExitCode = 1
+            try {
+                $ErrorActionPreference = 'Continue'
+                docker cp "${webContainerId}:/shared-tmpfs/hook-coverage/requests/." $runtimeArtifactRoot 2>$null
+                $copyExitCode = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+            if ($copyExitCode -ne 0) {
+                throw "Could not copy runtime request artifacts from web container."
+            }
         }
         $artifacts = @(Get-ChildItem -LiteralPath $runtimeArtifactRoot -Filter *.json -File -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $RequestArtifactsBefore -notcontains $_.Name } |
