@@ -1,0 +1,154 @@
+services:
+  db-enabled:
+    image: mariadb:10.11.8
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+      MARIADB_ROOT_PASSWORD: root-password
+    volumes:
+      - phase9-db-enabled:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h localhost -uroot -proot-password --silent"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  db-disabled:
+    image: mariadb:10.11.8
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+      MARIADB_ROOT_PASSWORD: root-password
+    volumes:
+      - phase9-db-disabled:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h localhost -uroot -proot-password --silent"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  enabled:
+    build:
+      context: .
+      target: enabled
+      args:
+        WORDPRESS_VERSION: 6.5.5
+    depends_on:
+      db-enabled:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db-enabled
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_TABLE_PREFIX: phase9_enabled_
+      WORDPRESS_URL: http://enabled
+      HOOKPHUZZ_PHASE9_DISCOVERY_ROOT: /var/www/html/wp-content/plugins/hookphuzz-phase9-fixture/
+    command: ["/usr/local/bin/wordpress-entrypoint"]
+    volumes:
+      - phase9-wp-enabled:/var/www/html
+      - ./fixture/hookphuzz-phase9-fixture:/opt/phase9-plugin:ro
+      - phase9-enabled-artifacts:/shared
+      - phase9-enabled-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/wp-login.php >/dev/null"]
+      interval: 1s
+      timeout: 3s
+      retries: 90
+      start_period: 5s
+
+  disabled:
+    build:
+      context: .
+      target: disabled
+      args:
+        WORDPRESS_VERSION: 6.5.5
+    depends_on:
+      db-disabled:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db-disabled
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_TABLE_PREFIX: phase9_disabled_
+      WORDPRESS_URL: http://disabled
+      HOOKPHUZZ_PHASE9_DISCOVERY_ROOT: /var/www/html/wp-content/plugins/hookphuzz-phase9-fixture/
+    command: ["/usr/local/bin/wordpress-entrypoint"]
+    volumes:
+      - phase9-wp-disabled:/var/www/html
+      - ./fixture/hookphuzz-phase9-fixture:/opt/phase9-plugin:ro
+      - phase9-disabled-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/wp-login.php >/dev/null"]
+      interval: 1s
+      timeout: 3s
+      retries: 90
+      start_period: 5s
+
+  enabled-static:
+    build:
+      context: .
+      target: enabled-static
+      args:
+        WORDPRESS_VERSION: 6.5.5
+    depends_on:
+      db-enabled:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db-enabled
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_TABLE_PREFIX: phase9_static_
+      WORDPRESS_URL: http://enabled-static
+      HOOKPHUZZ_PHASE9_DISCOVERY_ROOT: /var/www/html/wp-content/plugins/hookphuzz-phase9-fixture/
+    command: ["/usr/local/bin/wordpress-entrypoint"]
+    volumes:
+      - phase9-wp-static:/var/www/html
+      - ./fixture/hookphuzz-phase9-fixture:/opt/phase9-plugin:ro
+      - phase9-static-artifacts:/shared
+      - phase9-static-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/wp-login.php >/dev/null"]
+      interval: 1s
+      timeout: 3s
+      retries: 90
+      start_period: 5s
+
+  verifier:
+    build:
+      context: .
+      target: verifier
+      args:
+        WORDPRESS_VERSION: 6.5.5
+    depends_on:
+      enabled:
+        condition: service_healthy
+      enabled-static:
+        condition: service_healthy
+      disabled:
+        condition: service_healthy
+    environment:
+      PHASE9_RUN_ID: ${PHASE9_RUN_ID:?run id required}
+    volumes:
+      - .:/workspace
+      - phase9-enabled-artifacts:/shared
+      - phase9-static-artifacts:/static-shared
+      - phase9-enabled-logs:/logs/enabled:ro
+      - phase9-disabled-logs:/logs/disabled:ro
+    entrypoint: ["bash", "/workspace/tests/run.sh"]
+
+volumes:
+  phase9-db-enabled:
+  phase9-db-disabled:
+  phase9-wp-enabled:
+  phase9-wp-disabled:
+  phase9-wp-static:
+  phase9-enabled-artifacts:
+  phase9-static-artifacts:
+  phase9-static-logs:
+  phase9-enabled-logs:
+  phase9-disabled-logs:
