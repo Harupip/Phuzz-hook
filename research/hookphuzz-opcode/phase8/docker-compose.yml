@@ -1,0 +1,152 @@
+services:
+  db-enabled:
+    image: mariadb:10.11.8
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+      MARIADB_ROOT_PASSWORD: root-password
+    volumes:
+      - phase8-db-enabled:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h localhost -uroot -proot-password --silent"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  db-disabled:
+    image: mariadb:10.11.8
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+      MARIADB_ROOT_PASSWORD: root-password
+    volumes:
+      - phase8-db-disabled:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h localhost -uroot -proot-password --silent"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  enabled:
+    build:
+      context: .
+      target: enabled
+      args:
+        WORDPRESS_VERSION: 6.5.5
+    depends_on:
+      db-enabled:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db-enabled
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_TABLE_PREFIX: phase8_enabled_
+      WORDPRESS_URL: http://enabled
+      HOOKPHUZZ_PHASE8_DISCOVERY_ROOT: /var/www/html/wp-content/plugins/hookphuzz-phase8-fixture/
+    command: ["/usr/local/bin/wordpress-entrypoint"]
+    volumes:
+      - phase8-wp-enabled:/var/www/html
+      - ./fixture/hookphuzz-phase8-fixture:/opt/phase8-plugin:ro
+      - phase8-enabled-artifacts:/shared
+      - phase8-enabled-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/wp-login.php >/dev/null"]
+      interval: 1s
+      timeout: 3s
+      retries: 90
+      start_period: 5s
+
+  disabled:
+    build:
+      context: .
+      target: disabled
+      args:
+        WORDPRESS_VERSION: 6.5.5
+    depends_on:
+      db-disabled:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db-disabled
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_TABLE_PREFIX: phase8_disabled_
+      WORDPRESS_URL: http://disabled
+      HOOKPHUZZ_PHASE8_DISCOVERY_ROOT: /var/www/html/wp-content/plugins/hookphuzz-phase8-fixture/
+    command: ["/usr/local/bin/wordpress-entrypoint"]
+    volumes:
+      - phase8-wp-disabled:/var/www/html
+      - ./fixture/hookphuzz-phase8-fixture:/opt/phase8-plugin:ro
+      - phase8-disabled-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/wp-login.php >/dev/null"]
+      interval: 1s
+      timeout: 3s
+      retries: 90
+      start_period: 5s
+
+  enabled-static:
+    build:
+      context: .
+      target: enabled-static
+      args:
+        WORDPRESS_VERSION: 6.5.5
+    depends_on:
+      db-enabled:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db-enabled
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_TABLE_PREFIX: phase8_static_
+      WORDPRESS_URL: http://enabled-static
+      HOOKPHUZZ_PHASE8_DISCOVERY_ROOT: /var/www/html/wp-content/plugins/hookphuzz-phase8-fixture/
+    command: ["/usr/local/bin/wordpress-entrypoint"]
+    volumes:
+      - phase8-wp-static:/var/www/html
+      - ./fixture/hookphuzz-phase8-fixture:/opt/phase8-plugin:ro
+      - phase8-static-artifacts:/shared
+      - phase8-static-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/wp-login.php >/dev/null"]
+      interval: 1s
+      timeout: 3s
+      retries: 90
+      start_period: 5s
+
+  verifier:
+    build:
+      context: .
+      target: verifier
+      args:
+        WORDPRESS_VERSION: 6.5.5
+    depends_on:
+      enabled:
+        condition: service_healthy
+      enabled-static:
+        condition: service_healthy
+      disabled:
+        condition: service_healthy
+    volumes:
+      - .:/workspace
+      - phase8-enabled-artifacts:/shared
+      - phase8-static-artifacts:/static-shared
+      - phase8-enabled-logs:/logs/enabled:ro
+      - phase8-disabled-logs:/logs/disabled:ro
+    entrypoint: ["bash", "/workspace/tests/run.sh"]
+
+volumes:
+  phase8-db-enabled:
+  phase8-db-disabled:
+  phase8-wp-enabled:
+  phase8-wp-disabled:
+  phase8-wp-static:
+  phase8-enabled-artifacts:
+  phase8-static-artifacts:
+  phase8-static-logs:
+  phase8-enabled-logs:
+  phase8-disabled-logs:

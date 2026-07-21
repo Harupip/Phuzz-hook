@@ -1,0 +1,1 @@
+{"schema_version":1,"registrations":[{"hook_name":"selected","callback":"hookphuzz_phase8_function_probe","canonical_callback":"hookphuzz_phase8_function_probe","callback_type":"function","priority":10,"accepted_args":1}]}
