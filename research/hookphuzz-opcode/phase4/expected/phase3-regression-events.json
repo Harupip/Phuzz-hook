@@ -1,0 +1,9 @@
+[
+  {"source":"GET","key_type":"string","key":"id","path":["id"],"depth":1,"opcode":"ZEND_FETCH_DIM_R","access_context":"read"},
+  {"source":"POST","key_type":"string","key":"username","path":["username"],"depth":1,"opcode":"ZEND_FETCH_DIM_R","access_context":"read"},
+  {"source":"REQUEST","key_type":"string","key":"email","path":["email"],"depth":1,"opcode":"ZEND_FETCH_DIM_R","access_context":"read"},
+  {"source":"COOKIE","key_type":"string","key":"session","path":["session"],"depth":1,"opcode":"ZEND_FETCH_DIM_R","access_context":"read"},
+  {"source":"POST","key_type":"int","key":10,"path":[10],"depth":1,"opcode":"ZEND_FETCH_DIM_R","access_context":"read"},
+  {"source":"POST","key_type":"string","key":"user","path":["user"],"depth":1,"opcode":"ZEND_FETCH_DIM_R","access_context":"read"},
+  {"source":"POST","key_type":"string","key":"name","path":["user","name"],"depth":2,"opcode":"ZEND_FETCH_DIM_R","access_context":"read"}
+]

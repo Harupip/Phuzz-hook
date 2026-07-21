@@ -1,0 +1,9 @@
+[
+  {"source":"POST","key_type":"string","key":"literal","path":["literal"],"depth":1,"opcode":"ZEND_FETCH_DIM_IS","access_context":"silent_read"},
+  {"source":"POST","key_type":"string","key":"runtime","path":["runtime"],"depth":1,"opcode":"ZEND_FETCH_DIM_IS","access_context":"silent_read"},
+  {"source":"POST","key_type":"string","key":"present","path":["present"],"depth":1,"opcode":"ZEND_ISSET_ISEMPTY_DIM_OBJ","access_context":"isset"},
+  {"source":"POST","key_type":"string","key":"present","path":["present"],"depth":1,"opcode":"ZEND_ISSET_ISEMPTY_DIM_OBJ","access_context":"isset"},
+  {"source":"POST","key_type":"string","key":"empty","path":["empty"],"depth":1,"opcode":"ZEND_ISSET_ISEMPTY_DIM_OBJ","access_context":"empty"},
+  {"source":"POST","key_type":"string","key":"empty","path":["empty"],"depth":1,"opcode":"ZEND_ISSET_ISEMPTY_DIM_OBJ","access_context":"empty"},
+  {"source":"POST","key_type":"int","key":10,"path":[10],"depth":1,"opcode":"ZEND_FETCH_DIM_IS","access_context":"silent_read","parameter_candidate":false}
+]
