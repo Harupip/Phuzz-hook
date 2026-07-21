@@ -1,0 +1,37 @@
+services:
+  db:
+    image: mariadb:10.11.8
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+      MARIADB_ROOT_PASSWORD: root-password
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h localhost -uroot -proot-password --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+  web:
+    build:
+      context: ..
+      dockerfile: phase10/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_URL: http://web
+    command: ["/usr/local/bin/phase10-entrypoint"]
+    volumes:
+      - ./results:/results
+      - ../../../phuzz-main/code/web/applications/wordpress/_plugins/crm-perks-forms/crm-perks-forms:/opt/crm-perks-forms:ro
+      - ./targets/contact-form-7.5.7.7.zip:/opt/contact-form-7.zip:ro
+  verifier:
+    image: curlimages/curl:8.8.0
+    depends_on:
+      web:
+        condition: service_started
+    command: ["sh", "-c", "for i in $(seq 1 90); do curl -fsS http://web/wp-login.php >/dev/null && exit 0; sleep 2; done; exit 1"]
