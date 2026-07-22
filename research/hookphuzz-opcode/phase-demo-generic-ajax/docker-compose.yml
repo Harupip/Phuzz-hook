@@ -1,0 +1,69 @@
+services:
+  db:
+    image: mariadb:10.11.8
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+      MARIADB_ROOT_PASSWORD: root-password
+    volumes:
+      - demo-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h localhost -uroot -proot-password --silent"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  wordpress:
+    build:
+      context: ..
+      dockerfile: phase-demo-generic-ajax/Dockerfile
+      args:
+        WORDPRESS_VERSION: 6.5.5
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_TABLE_PREFIX: hookphuzz_demo_
+      WORDPRESS_URL: http://wordpress
+      HOOKPHUZZ_DEMO_DISCOVERY_ROOT: /var/www/html/wp-content/plugins/hookphuzz-demo-target/
+    command: ["/usr/local/bin/wordpress-entrypoint"]
+    volumes:
+      - demo-wp:/var/www/html
+      - ./wordpress/wp-content/plugins/hookphuzz-demo-target:/opt/hookphuzz-demo-target:ro
+      - demo-artifacts:/shared
+      - demo-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/wp-login.php >/dev/null"]
+      interval: 1s
+      timeout: 3s
+      retries: 90
+      start_period: 5s
+
+  verifier:
+    build:
+      context: ..
+      dockerfile: phase-demo-generic-ajax/Dockerfile
+      args:
+        WORDPRESS_VERSION: 6.5.5
+    depends_on:
+      wordpress:
+        condition: service_healthy
+    environment:
+      HOOKPHUZZ_DEMO_RUN_ID: ${HOOKPHUZZ_DEMO_RUN_ID:?run id required}
+      HOOKPHUZZ_DEMO_HOOK: ${HOOKPHUZZ_DEMO_HOOK:-}
+    volumes:
+      - .:/workspace
+      - demo-artifacts:/shared
+    entrypoint: ["php", "/workspace/verifier/run.php"]
+
+volumes:
+  demo-db:
+  demo-wp:
+  demo-artifacts:
+  demo-logs:
+
