@@ -1,0 +1,25 @@
+    {
+        "target": "http://web/wp-admin/admin-ajax.php",
+        "methods": [
+            "POST"
+        ],
+        "body_params": {
+            "data": [
+                {
+                    "name": "action",
+                    "value": "hookphuzz_bootstrap_probe"
+                },
+                {
+                    "name": "hookphuzz_probe",
+                    "value": "fuzz"
+                }
+            ],
+            "fixed": [
+                "action"
+            ],
+            "fuzz": [
+                "hookphuzz_probe"
+            ],
+            "weight": 1
+        }
+    }
