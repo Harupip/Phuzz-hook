@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import time
+import copy
+from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -47,42 +50,52 @@ class LiveHookSeedGenerator:
 
         compact_suggestions: list[dict[str, Any]] = []
         for item in suggested_rows:
-            compact_item = {
-                "hook_name": item["hook_name"],
-                "callback_id": item["callback_id"],
-                "callback_name": item["callback_name"],
-                "source_file": item["source_file"],
-                "source_line": item["source_line"],
-                "start_line": item["start_line"],
-                "end_line": item["end_line"],
-                "source_resolution": item["source_resolution"],
-                "seed_priority": item["seed_priority"],
-                "generation_status": item["generation_status"],
-                "callback_repr": item["callback_raw"],
-                "callback_source_file": item["source_file"],
-                "callback_start_line": item["start_line"] or item["source_line"],
-                "auth_mode": item.get("auth_mode"),
-                "generated_reason": item["generation_status"],
-                "fuzzing_ready": item["fuzzing_ready"],
-                "setup_required": item["setup_required"],
-                "manual_analysis": item["manual_analysis"],
-                "missing_requirements": item["missing_requirements"],
-            }
-            if item.get('entrypoint_type'):
-                compact_item['entrypoint_type'] = item['entrypoint_type']
-            if item["seed"] is not None:
-                compact_item["seed"] = item["seed"]
-            for key in ("namespace", "route", "methods", "permission_callback"):
-                if item.get(key) is not None:
-                    compact_item[key] = item[key]
-            compact_suggestions.append(compact_item)
+            variants = item.get("seed_variants") or [item.get("seed")]
+            for seed in variants:
+                compact_item = {
+                    "hook_name": item["hook_name"],
+                    "callback_id": item["callback_id"],
+                    "callback_name": item["callback_name"],
+                    "source_file": item["source_file"],
+                    "source_line": item["source_line"],
+                    "start_line": item["start_line"],
+                    "end_line": item["end_line"],
+                    "source_resolution": item["source_resolution"],
+                    "seed_priority": item["seed_priority"],
+                    "target_family": item["target_family"],
+                    "status": item["status"],
+                    "is_active": item["is_active"],
+                    "direct_http_supported": item["direct_http_supported"],
+                    "priority": item["priority"],
+                    "accepted_args": item["accepted_args"],
+                    "generation_status": item["generation_status"],
+                    "callback_repr": item["callback_raw"],
+                    "callback_source_file": item["source_file"],
+                    "callback_start_line": item["start_line"] or item["source_line"],
+                    "auth_mode": item.get("auth_mode"),
+                    "generated_reason": item["generation_status"],
+                    "fuzzing_ready": bool(seed and seed.get("fuzzable_params")),
+                    "setup_required": item["setup_required"],
+                    "manual_analysis": item["manual_analysis"],
+                    "missing_requirements": item["missing_requirements"],
+                }
+                if item.get("entrypoint_type"):
+                    compact_item["entrypoint_type"] = item["entrypoint_type"]
+                if seed is not None:
+                    compact_item["seed"] = seed
+                for key in ("namespace", "route", "methods", "permission_callback"):
+                    if item.get(key) is not None:
+                        compact_item[key] = item[key]
+                compact_suggestions.append(compact_item)
 
+        compact_suggestions = self._deduplicate_suggestions(compact_suggestions)
         seed_report = {
-            "schema_version": "hook-seed-suggestions-v1",
+            "schema_version": "hook-seed-suggestions-v2",
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "summary": {
                 "suggested_entries": len(compact_suggestions),
                 "direct_http_seed_candidates": len([item for item in suggested_rows if item["direct_http_supported"]]),
+                "generated_seed_variants": len([item for item in compact_suggestions if item.get("seed")]),
                 "manual_only_entries": len([item for item in suggested_rows if not item["direct_http_supported"]]),
             },
             "suggested_seeds": compact_suggestions,
@@ -105,6 +118,10 @@ class LiveHookSeedGenerator:
         )
         (output_path / "suggested_seeds.md").write_text(
             self._build_seed_markdown(seed_report),
+            encoding="utf-8",
+        )
+        (output_path / "method_inference_report.json").write_text(
+            json.dumps(self._method_report(seed_report), indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
         return gap_report, seed_report
@@ -140,13 +157,18 @@ class LiveHookSeedGenerator:
                 },
             )
             entrypoint_type = self._entrypoint_type_for_callback(hook_name, registered_entry)
-            seed, generation_status = self._generate_seed_template(
+            seeds, generation_status = self._generate_seed_templates(
                 hook_name,
                 is_active,
                 status,
                 input_params,
-                registered_entry,
+                {
+                    **registered_entry,
+                    "callback_id": str(callback_id),
+                    "_executed_callback": executed_callbacks.get(callback_id, {}),
+                },
             )
+            seed = seeds[0] if seeds else None
             if seed is not None:
                 entrypoint_type = str(seed.get('entrypoint_type') or entrypoint_type)
             auth_mode = str(seed.get('auth_mode')) if isinstance(seed, dict) else None
@@ -194,6 +216,7 @@ class LiveHookSeedGenerator:
                 "manual_analysis": manual_analysis,
                 "missing_requirements": missing_requirements,
                 "seed": seed,
+                "seed_variants": seeds,
             }
             if entrypoint_type == "rest_route":
                 row["entrypoint_type"] = "rest_route"
@@ -254,29 +277,129 @@ class LiveHookSeedGenerator:
     def _setup_required(self, entrypoint_type: str, manual_analysis: bool) -> bool:
         return manual_analysis and entrypoint_type in {"xmlrpc_method_map", "shortcode"}
 
-    def _generate_seed_template(
+    def _generate_seed_templates(
         self,
         hook_name: str,
         is_active: bool,
         coverage_status: str,
         input_params: list[dict[str, Any]] | None = None,
         callback_metadata: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, Any] | None, str]:
+    ) -> tuple[list[dict[str, Any]], str]:
         if not is_active:
-            return None, "inactive_callback"
+            return [], "inactive_callback"
         if coverage_status != "uncovered":
-            return None, "already_covered"
+            return [], "already_covered"
         is_rest_route = str((callback_metadata or {}).get("entrypoint_type", "")) == "rest_route"
         is_seeded_hook = hook_name.startswith(
             ('wp_ajax_nopriv_', 'wp_ajax_', 'admin_post_nopriv_', 'admin_post_', 'login_form_')
         )
         is_seeded_hook = is_seeded_hook or hook_name in {'heartbeat_received', 'heartbeat_nopriv_received'}
         if not is_rest_route and not is_seeded_hook:
-            return None, "manual_analysis_required"
+            return [], "manual_analysis_required"
         seed = seed_template_for_callback(hook_name, callback_metadata)
         if seed is None:
-            return None, "manual_analysis_required"
-        return self._attach_fuzzable_params(seed, input_params), "supported_http_seed"
+            return [], "manual_analysis_required"
+
+        variants = []
+        for decision in self._method_decisions(hook_name, callback_metadata or {}, input_params or []):
+            variant = copy.deepcopy(seed)
+            variant.pop("methods", None)
+            variant.update(decision)
+            self._place_action_for_method(variant)
+            variants.append(self._attach_fuzzable_params(variant, input_params))
+        return variants, "supported_http_seed" if variants else "unresolved_http_method"
+
+    def _method_decisions(
+        self,
+        hook_name: str,
+        metadata: Mapping[str, Any],
+        input_params: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if str(metadata.get("entrypoint_type", "")) == "rest_route":
+            methods = self._normalize_methods(metadata.get("methods", metadata.get("method", "")))
+            if methods:
+                return [
+                    self._decision(method, "rest_declaration", "high", {"methods": methods})
+                    for method in methods
+                ]
+
+        observed = self._runtime_method(metadata)
+        if observed:
+            return [
+                self._decision(
+                    observed["method"],
+                    "runtime_observed",
+                    "high",
+                    {
+                        "request_method": observed["method"],
+                        "request_id": observed["request_id"],
+                        "target_plugin": observed["target_plugin"],
+                    },
+                )
+            ]
+
+        sources = {
+            str(item.get("source", "")).upper()
+            for item in input_params
+            if str(item.get("source", "")).upper() in {"GET", "POST", "REQUEST"}
+        }
+        if "REQUEST" in sources:
+            evidence = {"sources": sorted(sources), "alternative_methods": ["GET", "POST"]}
+            return [
+                self._decision(method, "ambiguous_request_expansion", "low", evidence)
+                for method in ("GET", "POST")
+            ]
+        if sources == {"GET", "POST"}:
+            return [
+                self._decision(method, "parameter_source", "medium", {"sources": ["GET", "POST"]})
+                for method in ("GET", "POST")
+            ]
+        if sources == {"GET"}:
+            return [self._decision("GET", "parameter_source", "medium", {"sources": ["GET"]})]
+        if sources == {"POST"}:
+            return [self._decision("POST", "parameter_source", "medium", {"sources": ["POST"]})]
+        return [self._decision(str(seed_template_for_callback(hook_name, metadata)["method"]), "fallback", "low", None)]
+
+    @staticmethod
+    def _decision(method: str, source: str, confidence: str, evidence: Any) -> dict[str, Any]:
+        normalized = str(method).upper()
+        return {
+            "method": normalized,
+            "method_source": source,
+            "method_confidence": confidence,
+            "method_evidence": evidence,
+            "seed_variant_id": normalized.lower(),
+        }
+
+    @staticmethod
+    def _runtime_method(metadata: Mapping[str, Any]) -> dict[str, str] | None:
+        observed = metadata.get("_executed_callback")
+        if not isinstance(observed, Mapping):
+            return None
+        required = ("callback_id", "hook_name", "callback_repr")
+        if any(str(observed.get(key, "")) != str(metadata.get(key, "")) for key in required):
+            return None
+        request_id = str(observed.get("request_id", "")).strip()
+        method = str(observed.get("http_method", "")).strip().upper()
+        target_plugin = str(observed.get("target_plugin", "")).strip()
+        if not request_id or not method or not target_plugin:
+            return None
+        return {"method": method, "request_id": request_id, "target_plugin": target_plugin}
+
+    @staticmethod
+    def _place_action_for_method(seed: dict[str, Any]) -> None:
+        body = seed.setdefault("body", {})
+        query = seed.setdefault("query_params", {})
+        action = body.pop("action", query.pop("action", None))
+        if action is None:
+            return
+        target = (
+            query
+            if seed.get("entrypoint_type") == "login_form"
+            or seed["method"] in {"GET", "DELETE", "OPTIONS", "HEAD"}
+            else body
+        )
+        target["action"] = action
 
     def _attach_fuzzable_params(
         self,
@@ -330,6 +453,75 @@ class LiveHookSeedGenerator:
                 seed["fuzzable_params"].append(name)
 
         return seed
+
+    def _method_report(self, seed_report: dict[str, Any]) -> dict[str, Any]:
+        rows = [
+            item
+            for item in seed_report.get("suggested_seeds", [])
+            if isinstance(item, dict) and isinstance(item.get("seed"), dict)
+        ]
+        methods = Counter(str(item["seed"].get("method") or "UNKNOWN") for item in rows)
+        sources = Counter(str(item["seed"].get("method_source") or "legacy_unclassified") for item in rows)
+        grouped = Counter((str(item.get("hook_name")), str(item.get("callback_id"))) for item in rows)
+        method_counts = {
+            method: methods.get(method, 0)
+            for method in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "UNKNOWN")
+        }
+        source_counts = {
+            source: sources.get(source, 0)
+            for source in (
+                "rest_declaration",
+                "runtime_observed",
+                "parameter_source",
+                "ambiguous_request_expansion",
+                "fallback",
+                "unresolved",
+                "legacy_artifact",
+            )
+        }
+        return {
+            "total_seeds": len(rows),
+            "methods": method_counts,
+            "method_sources": source_counts,
+            "fallback": sources.get("fallback", 0),
+            "unresolved": sources.get("unresolved", 0),
+            "expanded_variants": sum(1 for count in grouped.values() if count > 1),
+            "representative_seeds": [
+                {
+                    "hook_name": item.get("hook_name"),
+                    "callback_id": item.get("callback_id"),
+                    "method": item["seed"].get("method"),
+                    "method_source": item["seed"].get("method_source"),
+                }
+                for item in rows
+            ],
+        }
+
+    @staticmethod
+    def _deduplicate_suggestions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduplicated = []
+        seen = set()
+        for row in rows:
+            seed = row.get("seed")
+            if not isinstance(seed, Mapping):
+                deduplicated.append(row)
+                continue
+            identity = (
+                str(seed.get("path", "")),
+                str(seed.get("method", "")),
+                str(row.get("hook_name", "")),
+                str(row.get("route", "")),
+                str(row.get("callback_id", "")),
+                str(seed.get("auth_mode", "")),
+                tuple(sorted(str(key) for key in (seed.get("query_params") or {}))),
+                tuple(sorted(str(key) for key in (seed.get("body") or {}))),
+                tuple(sorted(str(key) for key in (seed.get("cookies") or {}))),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            deduplicated.append(row)
+        return deduplicated
 
     def _classify_seed_priority(self, hook_name: str, is_active: bool) -> tuple[str, int, str]:
         if not is_active:

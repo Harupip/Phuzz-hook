@@ -46,7 +46,7 @@ def build_validation_request(candidate: dict[str, Any], *, base_url: str, valida
         raise ValueError("candidate must contain an http_template")
 
     method = str(http_template.get("method", "")).strip().upper()
-    if method not in {"GET", "POST"}:
+    if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}:
         raise ValueError(f"Unsupported validation request method: {method or '<missing>'}")
 
     path = str(http_template.get("path", "")).strip()
@@ -68,7 +68,7 @@ def build_validation_request(candidate: dict[str, Any], *, base_url: str, valida
         "method": method,
         "url": _build_url(base_url, path, query_params),
         "params": {},
-        "data": body_params if method == "POST" else {},
+        "data": body_params if method in {"POST", "PUT", "PATCH", "DELETE"} else {},
         "headers": headers,
         "timeout": None,
         "query_params": query_params,

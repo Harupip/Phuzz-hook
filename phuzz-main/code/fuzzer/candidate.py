@@ -135,9 +135,11 @@ class Candidate:
         for k in self.fixed_params.keys():
             if k in ['cookies']: # May contain session values, so do not use it for the hash
                 continue 
+            s += f"__{k}:"
             s += '__'.join(['{}:{}'.format(*kv)
                 for kv in sorted(self.fixed_params[k].items())])
         for k in self.fuzz_params.keys():
+            s += f"__{k}:"
             s += '__'.join(['{}:{}'.format(*kv)
                 for kv in sorted(self.fuzz_params[k].items())])
         self.hash = hashlib.md5(s.encode()).hexdigest()

@@ -44,7 +44,7 @@ def build_config_for_candidate(candidate: Mapping[str, Any], *, target_base: str
         fuzz_count += section_fuzz_count
 
     if fuzz_count == 0:
-        placeholder_section = "body_params" if method == "POST" else "query_params"
+        placeholder_section = "body_params" if method in {"POST", "PUT", "PATCH", "DELETE"} else "query_params"
         values = _section_values(config.get(placeholder_section, {}))
         values["hookphuzz_probe"] = "fuzz"
         config[placeholder_section], _ = _build_param_section(values, allow_fuzz=True)
@@ -56,6 +56,9 @@ def build_config_for_candidate(candidate: Mapping[str, Any], *, target_base: str
         "callback_repr": _optional_string(candidate.get("callback_repr")),
         "entry_type": _optional_string(candidate.get("entry_type")),
         "generated_by": GENERATED_BY,
+        "method_source": _optional_string(candidate.get("method_source")) or "legacy_artifact",
+        "method_confidence": _optional_string(candidate.get("method_confidence")) or "low",
+        "method_evidence": candidate.get("method_evidence"),
     }
 
     return _safe_slug(_optional_string(candidate.get("candidate_id")) or _optional_string(candidate.get("callback_id")) or "candidate"), config

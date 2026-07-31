@@ -43,6 +43,7 @@ $GLOBALS['__uopz_request'] = [
     'request_id' => date('His') . "_{$__uopz_method}_{$__uopz_slug}_" . bin2hex(random_bytes(2)),
     'timestamp' => date('Y-m-d H:i:s'),
     'http_method' => $__uopz_method,
+    'target_plugin' => (string) (getenv('WP_TARGET_PLUGIN') ?: ''),
     'http_target' => $__uopz_uri,
     'endpoint' => __uopz_detect_endpoint(),
     'input_signature' => __uopz_build_input_signature(),
@@ -843,6 +844,8 @@ function __uopz_mark_callback_executed(
     $GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'][$callbackId]['source_file'] = $identity['source_file'];
     $GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'][$callbackId]['source_line'] = $identity['source_line'];
     $GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'][$callbackId]['request_id'] = $GLOBALS['__uopz_request']['request_id'];
+    $GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'][$callbackId]['http_method'] = $GLOBALS['__uopz_request']['http_method'];
+    $GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'][$callbackId]['target_plugin'] = $GLOBALS['__uopz_request']['target_plugin'];
     $GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'][$callbackId]['endpoint'] = $GLOBALS['__uopz_request']['endpoint'];
     $GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'][$callbackId]['input_signature'] = $GLOBALS['__uopz_request']['input_signature'];
     $GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'][$callbackId]['source'] = $source;
@@ -1388,6 +1391,12 @@ function __uopz_update_total_coverage(): void
 
             if (isset($item['request_id'])) {
                 $allExecuted[$id]['request_id'] = $item['request_id'];
+            }
+            if (isset($item['http_method'])) {
+                $allExecuted[$id]['http_method'] = $item['http_method'];
+            }
+            if (isset($item['target_plugin'])) {
+                $allExecuted[$id]['target_plugin'] = $item['target_plugin'];
             }
 
             if (isset($item['endpoint'])) {

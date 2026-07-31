@@ -56,7 +56,7 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
             gap_report, seed_report = generator.build_reports(payload)
 
         row = gap_report["callbacks"][0]
-        seed_item = seed_report["suggested_seeds"][0]
+        seed_item = next(item for item in seed_report["suggested_seeds"] if item["seed"]["method"] == "POST")
         self.assertEqual(row["source_resolution"]["status"], "zip_mapped")
         self.assertEqual(seed_item["source_resolution"]["status"], "zip_mapped")
         self.assertEqual(seed_item["seed"]["body"]["item_id"], "FUZZ")
@@ -95,9 +95,13 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
         gap_report, seed_report = LiveHookSeedGenerator().build_reports(payload)
 
         public = next(
-            item for item in seed_report["suggested_seeds"] if item["hook_name"] == "wp_ajax_nopriv_example_lookup"
+            item for item in seed_report["suggested_seeds"]
+            if item["hook_name"] == "wp_ajax_nopriv_example_lookup" and item["seed"]["method"] == "POST"
         )
-        auth = next(item for item in seed_report["suggested_seeds"] if item["hook_name"] == "wp_ajax_example_lookup")
+        auth = next(
+            item for item in seed_report["suggested_seeds"]
+            if item["hook_name"] == "wp_ajax_example_lookup" and item["seed"]["method"] == "POST"
+        )
 
         self.assertEqual(public["seed_priority"], "highest")
         self.assertEqual(auth["seed_priority"], "high")
@@ -199,7 +203,8 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
         seed = item["seed"]
         self.assertEqual(item["entrypoint_type"], "rest_route")
         self.assertEqual(seed["path"], "/wp-json/demo/v1/items")
-        self.assertEqual(seed["methods"], ["GET"])
+        self.assertEqual(seed["method"], "GET")
+        self.assertEqual(seed["method_source"], "rest_declaration")
         self.assertEqual(seed["query_params"]["term"], "FUZZ")
         self.assertNotIn("term", seed["body"])
         self.assertNotIn("action", seed["body"])
@@ -258,7 +263,7 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
 
         _, seed_report = LiveHookSeedGenerator().build_reports(payload)
 
-        item = seed_report['suggested_seeds'][0]
+        item = next(item for item in seed_report['suggested_seeds'] if item['seed']['method'] == 'POST')
         seed = item['seed']
         self.assertEqual(item['entrypoint_type'], 'login_form')
         self.assertEqual(seed['path'], '/wp-login.php')

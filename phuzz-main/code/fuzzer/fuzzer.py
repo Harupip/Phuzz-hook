@@ -521,7 +521,7 @@ class Fuzzer:
                                     cookies=the_cookies,
                                     headers=the_headers)
 
-        elif candidate.http_method in ["POST", "PUT", "DELETE"]:
+        elif candidate.http_method in ["POST", "PUT", "PATCH", "DELETE"]:
             if the_headers.get('Content-Type', '') in ['application/json']:
                 req = requests.Request(method=candidate.http_method, 
                                     url=urlparse.urlunparse(url_parts),

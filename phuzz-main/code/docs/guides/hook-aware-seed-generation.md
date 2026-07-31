@@ -34,16 +34,32 @@ The source file must be readable from the host running the exporter. If a covera
 
 ## Direct HTTP Hook Mapping
 
-The generator creates replayable seeds for these hook families:
+The generator creates replayable seeds for these hook families. A hook prefix identifies the WordPress dispatcher, action, and authentication mode; it does not prove the HTTP verb.
 
-| Hook family | Method | Path | Auth mode | Priority |
+| Hook family | Path | Method decision | Auth mode | Priority |
 | --- | --- | --- | --- | --- |
-| `wp_ajax_nopriv_*` | `POST` | `/wp-admin/admin-ajax.php` | `unauth-capable` | `highest` |
-| `admin_post_nopriv_*` | `POST` | `/wp-admin/admin-post.php` | `unauth-capable` | `highest` |
-| `wp_ajax_*` | `POST` | `/wp-admin/admin-ajax.php` | `authenticated` | `high` |
-| `admin_post_*` | `POST` | `/wp-admin/admin-post.php` | `authenticated` | `high` |
+| `wp_ajax_nopriv_*` | `/wp-admin/admin-ajax.php` | evidence resolver | `unauth-capable` | `highest` |
+| `admin_post_nopriv_*` | `/wp-admin/admin-post.php` | evidence resolver | `unauth-capable` | `highest` |
+| `wp_ajax_*` | `/wp-admin/admin-ajax.php` | evidence resolver | `authenticated` | `high` |
+| `admin_post_*` | `/wp-admin/admin-post.php` | evidence resolver | `authenticated` | `high` |
 
 Other hooks stay manual-only unless later code adds a supported route mapping.
+
+### Why Almost Every Seed Used To Be POST
+
+The original entrypoint rules coupled two different decisions: mapping a hook to its endpoint and choosing a convenient replay method. AJAX, admin-post, login, and heartbeat templates stored `POST`, and `seed_template_for_callback()` copied that value before the generator inspected parameter provenance. `_GET` could therefore move a parameter into the query string without changing the already-selected `POST` method. Tests covered the resulting templates, so the compatibility assumption remained stable even though the hook prefix never proved the verb.
+
+Method selection is now centralized in the seed generator. The precedence is: declared REST method, correlated runtime request method, parameter-source inference, then the single compatibility fallback `DEFAULT_HTTP_METHOD_FALLBACK`. Every seed records `method_source`, `method_confidence`, `method_evidence`, and `seed_variant_id`.
+
+### When POST Can Still Appear
+
+- A declared REST `POST`, a correlated successful runtime `POST`, or a callback that reads only `$_POST` is evidence-backed POST.
+- `$_REQUEST`, or a callback that reads both `$_GET` and `$_POST`, produces distinct GET and POST variants.
+- Cookie-only, unreadable source, `FILES`, raw body, or otherwise absent verb evidence uses compatibility `POST` with `method_source=fallback`, `method_confidence=low`, and null evidence. Cookie and body placement do not prove a verb.
+- Version 1 artifacts keep their stored method for compatibility and are marked `method_source=legacy_artifact`, not observed.
+- Old runtime artifacts that cannot be correlated by plugin, hook/route, callback, and request ID are not accepted as runtime evidence.
+
+`$_GET` is query-string provenance rather than absolute proof of an HTTP GET request. The generator nevertheless emits the canonical GET variant at medium confidence when it is the only available source.
 
 ## Entrypoint Rule Ownership
 
@@ -242,7 +258,7 @@ Akismet also produced an authenticated seed for `wp_ajax_comment_author_deurl`, 
 
 This verification runs one generated config explicitly through `FUZZER_CONFIG`. The opt-in batch runner now automates sequential config selection; callback-level proof still comes from request hook coverage.
 
-Example `suggested_seeds.json` entry:
+Example `suggested_seeds.json` GET variant:
 
 ```json
 {
@@ -252,10 +268,18 @@ Example `suggested_seeds.json` entry:
   "seed_priority": "highest",
   "generation_status": "supported_http_seed",
   "seed": {
-    "method": "POST",
+    "method": "GET",
+    "method_source": "ambiguous_request_expansion",
+    "method_confidence": "low",
+    "method_evidence": {
+      "sources": ["REQUEST"],
+      "alternative_methods": ["GET", "POST"]
+    },
+    "seed_variant_id": "get",
     "path": "/wp-admin/admin-ajax.php",
     "content_type": "application/x-www-form-urlencoded",
-    "body": {
+    "body": {},
+    "query_params": {
       "action": "example_lookup",
       "item_id": "FUZZ"
     },
@@ -275,17 +299,22 @@ Example `suggested_seeds.json` entry:
         "line": 42
       }
     ],
-    "query_params": {},
     "cookies": {}
   }
 }
 ```
 
+The same `$_REQUEST` callback also produces a POST variant with `action` and `item_id` in `body`.
+
 Placement rules:
 
-- `GET` params go into `seed.query_params`.
-- `COOKIE` params go into `seed.cookies`.
-- `POST`, `REQUEST`, `FILES`, and `BODY_JSON` params go into `seed.body`.
+- `GET` source params go into `seed.query_params`; `POST` source params go into `seed.body`.
+- `REQUEST` produces a GET/query variant and a POST/body variant.
+- If both GET and POST sources exist, each parameter retains its source-based query/body placement in both method variants.
+- `COOKIE` params go into `seed.cookies` and do not select a method.
+- `FILES` and `BODY_JSON` are body-placement evidence only and do not select a method.
+- REST declarations expand to one seed row per method. GET, DELETE, and OPTIONS default to query placement; POST, PUT, and PATCH default to body placement unless parameter provenance is more specific.
+- JSON content type is not inferred without route or request evidence.
 - `action` stays in `fixed_params` and is not added to `fuzzable_params`.
 
 ## Entrypoint Replay Validation
@@ -359,19 +388,19 @@ Outputs:
 - `setup_required_candidates.json`
 - `non_entry_hooks.json`
 
-Direct HTTP candidates receive an `http_template` with method, path, and fixed params. Supported direct mappings include:
+Direct HTTP candidates receive an `http_template` with path, fixed params, and a compatibility method template. The direct classifier establishes replay reachability, not a detected method. The seed generator later resolves the method from evidence.
 
-| Hook family | Entry type | Method | Path | Auth |
+| Hook family | Entry type | Template method | Path | Auth |
 | --- | --- | --- | --- | --- |
-| `wp_ajax_nopriv_*` | `ajax_unauthenticated` | `POST` | `/wp-admin/admin-ajax.php` | no |
-| `wp_ajax_*` | `ajax_authenticated` | `POST` | `/wp-admin/admin-ajax.php` | yes |
-| `admin_post_nopriv_*` | `admin_post_unauthenticated` | `POST` | `/wp-admin/admin-post.php` | no |
-| `admin_post_*` | `admin_post_authenticated` | `POST` | `/wp-admin/admin-post.php` | yes |
-| `admin_action_*` | `admin_action` | `GET` | `/wp-admin/admin.php` | yes |
-| `login_form_*` | `login_form` | `POST` | `/wp-login.php` | no |
-| `heartbeat_received` | `heartbeat_authenticated` | `POST` | `/wp-admin/admin-ajax.php` | yes |
-| `heartbeat_nopriv_received` | `heartbeat_unauthenticated` | `POST` | `/wp-admin/admin-ajax.php` | no |
-| `rest_route:<namespace>/<route>` | `rest_route` | registered methods | `/wp-json/<namespace>/<route>` | depends on permission callback |
+| `wp_ajax_nopriv_*` | `ajax_unauthenticated` | `POST` fallback (low) | `/wp-admin/admin-ajax.php` | no |
+| `wp_ajax_*` | `ajax_authenticated` | `POST` fallback (low) | `/wp-admin/admin-ajax.php` | yes |
+| `admin_post_nopriv_*` | `admin_post_unauthenticated` | `POST` fallback (low) | `/wp-admin/admin-post.php` | no |
+| `admin_post_*` | `admin_post_authenticated` | `POST` fallback (low) | `/wp-admin/admin-post.php` | yes |
+| `admin_action_*` | `admin_action` | `GET` fallback (low) | `/wp-admin/admin.php` | yes |
+| `login_form_*` | `login_form` | `POST` fallback (low) | `/wp-login.php` | no |
+| `heartbeat_received` | `heartbeat_authenticated` | `POST` fallback (low) | `/wp-admin/admin-ajax.php` | yes |
+| `heartbeat_nopriv_received` | `heartbeat_unauthenticated` | `POST` fallback (low) | `/wp-admin/admin-ajax.php` | no |
+| `rest_route:<namespace>/<route>` | `rest_route` | declared methods (high) | `/wp-json/<namespace>/<route>` | depends on permission callback |
 
 `setup_required` means the hook can be HTTP-relevant but needs extra setup before automatic PHUZZ config generation, for example shortcode pages, rewrite endpoints, REST route records that were not resolved from `register_rest_route`, or XML-RPC method maps.
 
@@ -393,6 +422,9 @@ Compact candidate shape:
   "parent_hook_name": null,
   "parent_callback_id": null,
   "action": "demo_lookup",
+  "method_source": "fallback",
+  "method_confidence": "low",
+  "method_evidence": null,
   "http_template": {
     "method": "POST",
     "path": "/wp-admin/admin-ajax.php",
@@ -402,7 +434,7 @@ Compact candidate shape:
     }
   },
   "auth_required": false,
-  "confidence": "high"
+  "confidence": "low"
 }
 ```
 
@@ -502,6 +534,7 @@ python -m unittest `
   tests.test_bootstrap_probe_runner `
   tests.test_entry_classifier `
   tests.test_bootstrap_entry_discovery `
+  tests.test_seed_method_inference `
   tests.test_seed_validator `
   tests.test_uopz_multistage_metadata_contract `
   -v

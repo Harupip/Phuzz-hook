@@ -127,6 +127,10 @@ class SeedToConfigExporterTests(unittest.TestCase):
                 'fuzzing_ready': True,
                 'setup_required': False,
                 'manual_analysis': False,
+                'method_source': 'legacy_artifact',
+                'method_confidence': 'low',
+                'method_evidence': None,
+                'seed_variant_id': '',
             },
         )
 

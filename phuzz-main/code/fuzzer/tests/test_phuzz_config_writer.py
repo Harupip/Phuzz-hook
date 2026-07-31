@@ -59,6 +59,9 @@ class PhuzzConfigWriterTests(unittest.TestCase):
                 "callback_repr": "abc_handler",
                 "entry_type": "ajax_unauthenticated",
                 "generated_by": "hookphuzz_bootstrap_entry_discovery",
+                "method_source": "legacy_artifact",
+                "method_confidence": "low",
+                "method_evidence": None,
             },
         )
 

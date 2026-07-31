@@ -26,6 +26,8 @@ class EntrypointRuleTests(unittest.TestCase):
         self.assertEqual(details["entry_type"], "ajax_unauthenticated")
         self.assertFalse(details["auth_required"])
         self.assertEqual(details["http_template"]["body_params"], {"action": "demo_lookup"})
+        self.assertEqual(details["method_source"], "fallback")
+        self.assertEqual(details["method_confidence"], "low")
 
     def test_heartbeat_uses_exact_admin_ajax_action(self) -> None:
         details = direct_http_details("heartbeat_received")

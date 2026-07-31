@@ -4,13 +4,14 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-# WordPress AJAX: POST admin-ajax.php with action in the form body.
+DEFAULT_HTTP_METHOD_FALLBACK = "POST"
+
+# WordPress AJAX endpoint mapping. Method is resolved from evidence later.
 _AJAX_RULES = (
     {
         "prefix": "wp_ajax_nopriv_",
         "entry_type": "ajax_unauthenticated",
         "path": "/wp-admin/admin-ajax.php",
-        "method": "POST",
         "param_target": "body_params",
         "auth_required": False,
         "reason": "WordPress AJAX nopriv hook maps directly to admin-ajax.php?action=<action>",
@@ -19,20 +20,18 @@ _AJAX_RULES = (
         "prefix": "wp_ajax_",
         "entry_type": "ajax_authenticated",
         "path": "/wp-admin/admin-ajax.php",
-        "method": "POST",
         "param_target": "body_params",
         "auth_required": True,
         "reason": "WordPress AJAX hook maps directly to admin-ajax.php?action=<action>",
     },
 )
 
-# Admin Post: POST admin-post.php with action in the form body.
+# Admin Post endpoint mapping. Method is resolved from evidence later.
 _ADMIN_POST_RULES = (
     {
         "prefix": "admin_post_nopriv_",
         "entry_type": "admin_post_unauthenticated",
         "path": "/wp-admin/admin-post.php",
-        "method": "POST",
         "param_target": "body_params",
         "auth_required": False,
         "reason": "WordPress admin-post nopriv hook maps directly to admin-post.php?action=<action>",
@@ -41,7 +40,6 @@ _ADMIN_POST_RULES = (
         "prefix": "admin_post_",
         "entry_type": "admin_post_authenticated",
         "path": "/wp-admin/admin-post.php",
-        "method": "POST",
         "param_target": "body_params",
         "auth_required": True,
         "reason": "WordPress admin-post hook maps directly to admin-post.php?action=<action>",
@@ -54,20 +52,19 @@ _ADMIN_ACTION_RULES = (
         "prefix": "admin_action_",
         "entry_type": "admin_action",
         "path": "/wp-admin/admin.php",
-        "method": "GET",
+        "fallback_method": "GET",
         "param_target": "query_params",
         "auth_required": True,
         "reason": "WordPress admin action hook maps directly to admin.php?action=<action>",
     },
 )
 
-# Login Form: POST wp-login.php with action in the query string.
+# Login Form endpoint mapping; action remains in the query string.
 _LOGIN_FORM_RULES = (
     {
         "prefix": "login_form_",
         "entry_type": "login_form",
         "path": "/wp-login.php",
-        "method": "POST",
         "param_target": "query_params",
         "auth_required": False,
         "reason": "WordPress login form hook maps directly to wp-login.php?action=<action>",
@@ -88,7 +85,6 @@ DIRECT_HTTP_EXACT_RULES = {
     "heartbeat_received": {
         "entry_type": "heartbeat_authenticated",
         "path": "/wp-admin/admin-ajax.php",
-        "method": "POST",
         "param_target": "body_params",
         "action": "heartbeat",
         "body_params": _HEARTBEAT_BODY_PARAMS,
@@ -98,7 +94,6 @@ DIRECT_HTTP_EXACT_RULES = {
     "heartbeat_nopriv_received": {
         "entry_type": "heartbeat_unauthenticated",
         "path": "/wp-admin/admin-ajax.php",
-        "method": "POST",
         "param_target": "body_params",
         "action": "heartbeat",
         "body_params": _HEARTBEAT_BODY_PARAMS,
@@ -160,6 +155,9 @@ def seed_template_for_callback(
         "auth_mode": "authenticated" if details["auth_required"] else "unauth-capable",
         "fixed_params": list(http_template.get("body_params") or {}) + list(http_template.get("query_params") or {}),
         "entrypoint_type": entrypoint_type,
+        "method_source": details.get("method_source", "fallback"),
+        "method_confidence": details.get("method_confidence", "low"),
+        "method_evidence": details.get("method_evidence"),
     }
 
 
@@ -175,11 +173,14 @@ def rest_seed_template(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
         "method": methods[0],
         "methods": methods,
         "path": template["path"],
-        "content_type": "application/json",
+        "content_type": str(metadata.get("content_type") or ""),
         "body": {},
         "auth_mode": "authenticated" if _rest_auth_required(metadata) else "unauth-capable",
         "fixed_params": [],
         "entrypoint_type": "rest_route",
+        "method_source": "rest_declaration",
+        "method_confidence": "high",
+        "method_evidence": {"methods": methods},
     }
 
 
@@ -215,13 +216,16 @@ def _build_direct_details(rule: Mapping[str, Any], action: str) -> dict[str, Any
         "entry_type": rule["entry_type"],
         "action": action,
         "http_template": {
-            "method": rule["method"],
+            "method": str(rule.get("fallback_method") or DEFAULT_HTTP_METHOD_FALLBACK),
             "path": rule["path"],
             "query_params": query_params,
             "body_params": body_params,
         },
         "auth_required": rule["auth_required"],
-        "confidence": "high",
+        "confidence": "low",
+        "method_source": "fallback",
+        "method_confidence": "low",
+        "method_evidence": None,
         "reason": rule["reason"],
     }
 

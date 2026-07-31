@@ -173,8 +173,10 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
             item for item in gap_report["callbacks"] if item["hook_name"] == "wp_ajax_nopriv_sac_post_type_call"
         )
         direct_seed = next(
-            item for item in seed_report["suggested_seeds"] if item["hook_name"] == "wp_ajax_nopriv_sac_post_type_call"
-        )["seed"]
+            item["seed"]
+            for item in seed_report["suggested_seeds"]
+            if item["hook_name"] == "wp_ajax_nopriv_sac_post_type_call" and item["seed"]["method"] == "POST"
+        )
 
         self.assertIn({"source": "REQUEST", "name": "orderby"}, [
             {"source": item["source"], "name": item["name"]} for item in callback_row["input_params"]
@@ -228,7 +230,7 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
 
             _, seed_report = LiveHookSeedGenerator().build_reports(payload)
 
-        seed = seed_report["suggested_seeds"][0]["seed"]
+        seed = next(item["seed"] for item in seed_report["suggested_seeds"] if item["seed"]["method"] == "POST")
         self.assertEqual(seed["body"]["action"], "vx_form_save_api_settings")
         self.assertEqual(seed["body"]["vx_nonce"], "fuzz")
         self.assertEqual(seed["body"]["cfx_settings[alert_emails]"], "FUZZ")

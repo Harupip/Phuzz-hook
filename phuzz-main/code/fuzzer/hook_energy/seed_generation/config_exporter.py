@@ -223,7 +223,10 @@ def _selector_for_generated_param(param_name: str) -> str:
 def _build_file_slug(seed_item: Mapping[str, Any]) -> str:
     hook_name = str(seed_item.get("hook_name", "hook")).strip() or "hook"
     callback_id = str(seed_item.get("callback_id", "callback")).strip() or "callback"
-    return f"{_safe_slug(hook_name)}-{_safe_slug(callback_id)}"
+    seed = seed_item.get("seed")
+    variant = str(seed.get("seed_variant_id", "")) if isinstance(seed, Mapping) else ""
+    suffix = f"-{_safe_slug(variant)}" if variant else ""
+    return f"{_safe_slug(hook_name)}-{_safe_slug(callback_id)}{suffix}"
 
 
 def _build_config_slug(output_dir: Path, file_slug: str) -> str:
@@ -308,6 +311,10 @@ def _metadata_for_seed_item(
         'fuzzing_ready': fuzzing_ready,
         'setup_required': bool(seed_item.get('setup_required', False)),
         'manual_analysis': bool(seed_item.get('manual_analysis', False)),
+        'method_source': str(seed.get('method_source') or 'legacy_artifact'),
+        'method_confidence': str(seed.get('method_confidence') or 'low'),
+        'method_evidence': seed.get('method_evidence'),
+        'seed_variant_id': str(seed.get('seed_variant_id') or ''),
     }
     route = seed_item.get('route') or seed_item.get('rest_route')
     if route:
@@ -337,6 +344,10 @@ def _summary_metadata(seed_item: Mapping[str, Any], config: Mapping[str, Any]) -
         'setup_required',
         'manual_analysis',
         'missing_requirements',
+        'method_source',
+        'method_confidence',
+        'method_evidence',
+        'seed_variant_id',
     )
     return {key: metadata[key] for key in keys if key in metadata}
 

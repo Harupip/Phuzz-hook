@@ -13,6 +13,9 @@ class ImportedSeedRequest:
     content_type: str
     body: dict[str, Any]
     auth_mode: str
+    method_source: str = "legacy_artifact"
+    method_confidence: str = "low"
+    method_evidence: Any = None
     query_params: dict[str, Any] = field(default_factory=dict)
     headers: dict[str, Any] = field(default_factory=dict)
     cookies: dict[str, Any] = field(default_factory=dict)
@@ -23,6 +26,9 @@ class ImportedSeedRequest:
             "request_id": self.request_id,
             "source": self.source,
             "http_method": self.http_method,
+            "method_source": self.method_source,
+            "method_confidence": self.method_confidence,
+            "method_evidence": self.method_evidence,
             "path": self.path,
             "content_type": self.content_type,
             "body": self.body,

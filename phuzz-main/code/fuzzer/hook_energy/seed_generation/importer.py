@@ -35,13 +35,17 @@ class HookSeedImporter:
         callbacks = payload.get("callbacks")
         if not isinstance(callbacks, list):
             raise ValueError("hook_gap_report.json must contain a callbacks array")
+        seed_callbacks = callbacks
+        if self.suggested_seeds.exists():
+            suggestions_payload = json.loads(self.suggested_seeds.read_text(encoding="utf-8"))
+            suggestions = suggestions_payload.get("suggested_seeds")
+            if isinstance(suggestions, list) and suggestions:
+                seed_callbacks = suggestions
 
         result = ImportedSeedResult()
 
-        for callback in callbacks:
+        for callback in seed_callbacks:
             if not self._is_replayable(callback):
-                if self._is_manual_only(callback):
-                    result.manual_analysis_queue.append(self._build_manual_entry(callback))
                 continue
 
             imported_request = self._build_request(callback)
@@ -49,6 +53,10 @@ class HookSeedImporter:
                 result.authenticated_queue.append(imported_request)
             else:
                 result.unauthenticated_queue.append(imported_request)
+
+        for callback in callbacks:
+            if self._is_manual_only(callback):
+                result.manual_analysis_queue.append(self._build_manual_entry(callback))
 
         if self.source_pipeline is not None and self.source_plugin is not None:
             result.warnings.extend(
@@ -96,13 +104,19 @@ class HookSeedImporter:
     def _build_request(self, callback: dict[str, Any]) -> ImportedSeedRequest:
         seed = callback["seed"]
         return ImportedSeedRequest(
-            request_id=f"seed-import-{callback['callback_id']}",
+            request_id=(
+                f"seed-import-{callback['callback_id']}-"
+                f"{seed.get('seed_variant_id') or str(seed['method']).lower()}"
+            ),
             source="external-hook-gap-report",
             http_method=seed["method"],
             path=seed["path"],
             content_type=seed["content_type"],
             body=dict(seed["body"]),
             auth_mode=seed["auth_mode"],
+            method_source=str(seed.get("method_source") or "legacy_artifact"),
+            method_confidence=str(seed.get("method_confidence") or "low"),
+            method_evidence=seed.get("method_evidence"),
             query_params=dict(seed.get("query_params", {}))
             if isinstance(seed.get("query_params"), Mapping)
             else {},
