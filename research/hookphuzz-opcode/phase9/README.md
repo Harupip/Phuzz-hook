@@ -12,6 +12,17 @@ Run from repository root:
 bash research/hookphuzz-opcode/phase9/run.sh
 ```
 
+If Docker Desktop builds run through a TLS-intercepting proxy, provide its
+trusted root certificate so BuildKit can verify WordPress and WP-CLI downloads:
+
+```bash
+export HOOKPHUZZ_BUILD_CA_FILE=/path/to/proxy-root-ca.crt
+bash research/hookphuzz-opcode/phase9/run.sh
+```
+
+The certificate is passed as a BuildKit secret and is not copied into the
+image. Without it, the runner fails closed at Docker build time.
+
 ## Status
 
 `PHASE_9_PASS` was recorded by the clean run `phase9-20260720T183318Z-7402` with runner exit status 0. Evidence: `results/phase9-validation-summary.json`, `results/replay-validation-summary.json`, `results/concurrency-summary.json`, and `results/stability-summary.json`.

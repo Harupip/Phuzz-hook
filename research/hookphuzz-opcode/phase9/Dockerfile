@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 ARG WORDPRESS_VERSION=6.5.5
 
 FROM php:8.2.10-apache AS build
@@ -19,15 +20,18 @@ FROM php:8.2.10-apache AS base
 ARG WORDPRESS_VERSION
 ARG WP_CLI_VERSION=2.10.0
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl mariadb-client \
+RUN --mount=type=secret,id=environment_ca,required=false \
+    apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl mariadb-client \
     && rm -rf /var/lib/apt/lists/* \
     && docker-php-ext-install mysqli \
+    && update-ca-certificates \
+    && if [ -s /run/secrets/environment_ca ]; then install -m 0644 /run/secrets/environment_ca /usr/local/share/ca-certificates/hookphuzz-environment-ca.crt && update-ca-certificates; fi \
     && mkdir -p /usr/src/wordpress /shared/opcode-events /logs \
-    && curl -fsSL "https://wordpress.org/wordpress-${WORDPRESS_VERSION}.tar.gz" -o /tmp/wordpress.tar.gz \
+    && curl --fail --show-error --silent --location --http1.1 --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 120 --output /tmp/wordpress.tar.gz "https://wordpress.org/wordpress-${WORDPRESS_VERSION}.tar.gz" \
     && tar -xzf /tmp/wordpress.tar.gz -C /usr/src/wordpress --strip-components=1 \
     && rm /tmp/wordpress.tar.gz \
-    && curl -fsSL "https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION}/wp-cli-${WP_CLI_VERSION}.phar" -o /usr/local/bin/wp \
+    && curl --fail --show-error --silent --location --http1.1 --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 120 --output /usr/local/bin/wp "https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION}/wp-cli-${WP_CLI_VERSION}.phar" \
     && chmod +x /usr/local/bin/wp \
     && chown -R www-data:www-data /shared /logs
 

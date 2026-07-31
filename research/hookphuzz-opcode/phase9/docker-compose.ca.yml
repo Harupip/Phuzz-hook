@@ -1,0 +1,21 @@
+services:
+  enabled:
+    build:
+      secrets:
+        - environment_ca
+  disabled:
+    build:
+      secrets:
+        - environment_ca
+  enabled-static:
+    build:
+      secrets:
+        - environment_ca
+  verifier:
+    build:
+      secrets:
+        - environment_ca
+
+secrets:
+  environment_ca:
+    file: ${HOOKPHUZZ_BUILD_CA_FILE}

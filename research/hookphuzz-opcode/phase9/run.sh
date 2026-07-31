@@ -7,6 +7,12 @@ history_dir="$phase_dir/results-history"
 compose=(docker compose -p hookphuzz-opcode-phase9 -f "$phase_dir/docker-compose.yml")
 export PHASE9_RUN_ID="phase9-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM"
 
+if [[ -n "${HOOKPHUZZ_BUILD_CA_FILE:-}" ]]; then
+  [[ -f "$HOOKPHUZZ_BUILD_CA_FILE" ]] || { echo "HOOKPHUZZ_BUILD_CA_FILE missing: $HOOKPHUZZ_BUILD_CA_FILE" >&2; exit 1; }
+  openssl x509 -in "$HOOKPHUZZ_BUILD_CA_FILE" -noout >/dev/null || { echo "HOOKPHUZZ_BUILD_CA_FILE is not a certificate: $HOOKPHUZZ_BUILD_CA_FILE" >&2; exit 1; }
+  compose+=(-f "$phase_dir/docker-compose.ca.yml")
+fi
+
 cleanup() {
   timeout 120s "${compose[@]}" down --volumes --remove-orphans > /dev/null 2>&1 || true
 }
