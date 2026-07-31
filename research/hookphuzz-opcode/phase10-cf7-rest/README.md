@@ -1,12 +1,24 @@
 # Phase 10 CF7 REST
 
-Independent Docker lab for Contact Form 7 5.7.7 REST runtime parameter discovery. It builds its own copied Phase 9 opcode extension and pinned CF7 archive; it does not mount prior phase code or results.
+## Goal
 
-Run:
+Discover Contact Form 7 5.7.7 REST parameters and replay the generated config.
+
+## Run
 
 ```bash
-HOOKPHUZZ_BUILD_CA_FILE=/secure/path/environment-root-ca.crt \
 bash research/hookphuzz-opcode/phase10-cf7-rest/run.sh
 ```
 
-Without a private CA, omit `HOOKPHUZZ_BUILD_CA_FILE`. Current artifacts are in `results/`; prior artifacts stay in `results/history/`. The only PASS claim is REST registration, callback reachability, `WP_REST_Request::get_param` observation, config generation, and replay validation.
+Use `HOOKPHUZZ_BUILD_CA_FILE` only for an approved private TLS root.
+
+## Evidence
+
+The retained result is `PHASE_10_CF7_REST_FAIL`; authentication blocked
+callback/runtime proof. Read `results/final-report.md` and `run.stdout.log`.
+
+## Boundary
+
+PASS requires registration, callback reachability, runtime
+`WP_REST_Request::get_param`, config generation, and replay. The copied Phase 9
+extension is intentional: this lab must remain independent of other phase code.

@@ -1,19 +1,25 @@
-# Phase 10A CRM Perks Forms
+# Phase 10 CRM Perks Forms
 
-Independent CRM-only lab. Reuses Phase 9 extension source unchanged at Docker build time. WordPress MU observer uses UOPZ only for AJAX registration, callback entry, and `cfx_form::post` root-read evidence; CRM source stays read-only.
+## Goal
 
-Run clean:
+Prove authenticated AJAX discovery, nested parameter generation, and semantic
+replay against CRM Perks Forms 1.0.7.
+
+## Run
 
 ```bash
 bash research/hookphuzz-opcode/phase10-crm/run.sh
 ```
 
-`results/` is deleted at start. OPcache/JIT disabled. Cookie and nonce remain `/tmp` inside the transient web container; reports contain redacted references only.
+Use `HOOKPHUZZ_BUILD_CA_FILE` only for an approved private TLS root.
 
-If this network uses an approved private TLS root, export it locally then pass its PEM file without committing it:
+## Evidence
 
-```bash
-HOOKPHUZZ_BUILD_CA_FILE=/secure/path/environment-root-ca.crt bash research/hookphuzz-opcode/phase10-crm/run.sh
-```
+The retained result is `PHASE_10_CRM_PASS`. Verify current work with
+`results/gate-summary.json`, `final-status.txt`, and replay evidence.
 
-The runner validates the PEM and mounts it only as a BuildKit secret. Public networks need no variable.
+## Boundary
+
+The lab reuses frozen Phase 9 extension source. UOPZ observes registration,
+callback entry, and `cfx_form::post`; it does not modify CRM source. Secrets
+remain transient and reports stay redacted.
