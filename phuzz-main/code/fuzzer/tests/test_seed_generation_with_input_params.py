@@ -56,10 +56,12 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
             gap_report, seed_report = generator.build_reports(payload)
 
         row = gap_report["callbacks"][0]
-        seed_item = next(item for item in seed_report["suggested_seeds"] if item["seed"]["method"] == "POST")
+        seed_item = seed_report["suggested_seeds"][0]
         self.assertEqual(row["source_resolution"]["status"], "zip_mapped")
         self.assertEqual(seed_item["source_resolution"]["status"], "zip_mapped")
-        self.assertEqual(seed_item["seed"]["body"]["item_id"], "FUZZ")
+        self.assertIsNone(seed_item["seed"]["method"])
+        self.assertEqual(seed_item["seed"]["method_confidence"], "ambiguous")
+        self.assertEqual(seed_item["seed"]["unresolved_params"]["item_id"], "FUZZ")
 
     def test_wp_ajax_seed_keeps_action_fixed_and_adds_extracted_fuzzable_params(self) -> None:
         payload = {
@@ -204,7 +206,7 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
         self.assertEqual(item["entrypoint_type"], "rest_route")
         self.assertEqual(seed["path"], "/wp-json/demo/v1/items")
         self.assertEqual(seed["method"], "GET")
-        self.assertEqual(seed["method_source"], "rest_declaration")
+        self.assertEqual(seed["method_source"], "route_declared")
         self.assertEqual(seed["query_params"]["term"], "FUZZ")
         self.assertNotIn("term", seed["body"])
         self.assertNotIn("action", seed["body"])

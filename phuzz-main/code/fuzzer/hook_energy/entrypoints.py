@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any
 
+from .method_resolution import normalize_http_methods, resolve_http_methods
 
-DEFAULT_HTTP_METHOD_FALLBACK = "POST"
 
 # WordPress AJAX endpoint mapping. Method is resolved from evidence later.
 _AJAX_RULES = (
@@ -52,7 +52,6 @@ _ADMIN_ACTION_RULES = (
         "prefix": "admin_action_",
         "entry_type": "admin_action",
         "path": "/wp-admin/admin.php",
-        "fallback_method": "GET",
         "param_target": "query_params",
         "auth_required": True,
         "reason": "WordPress admin action hook maps directly to admin.php?action=<action>",
@@ -107,12 +106,16 @@ def direct_http_details(hook_name: str | None, metadata: Mapping[str, Any] | Non
     # REST route: runtime already resolved register_rest_route() into entrypoint_type=rest_route.
     rest_template = rest_http_template(metadata or {})
     if rest_template is not None and _is_first_class_rest_route(hook_name, metadata or {}):
+        decision = resolve_http_methods(
+            route_declared_methods=(metadata or {}).get("methods", (metadata or {}).get("method"))
+        )[0]
         return {
             "entry_type": "rest_route",
             "action": None,
             "http_template": rest_template,
             "auth_required": _rest_auth_required(metadata or {}),
-            "confidence": "high",
+            "confidence": "high" if decision["method_status"] == "resolved" else "low",
+            **{key: decision[key] for key in _METHOD_FIELDS},
             "reason": "WordPress REST route maps directly to /wp-json/<namespace>/<route>",
         }
 
@@ -155,9 +158,7 @@ def seed_template_for_callback(
         "auth_mode": "authenticated" if details["auth_required"] else "unauth-capable",
         "fixed_params": list(http_template.get("body_params") or {}) + list(http_template.get("query_params") or {}),
         "entrypoint_type": entrypoint_type,
-        "method_source": details.get("method_source", "fallback"),
-        "method_confidence": details.get("method_confidence", "low"),
-        "method_evidence": details.get("method_evidence"),
+        **{key: details.get(key) for key in _METHOD_FIELDS},
     }
 
 
@@ -166,11 +167,13 @@ def rest_seed_template(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
     template = rest_http_template(metadata)
     if template is None:
         return None
-    methods = _normalize_methods(metadata.get("methods", metadata.get("method", template["method"])))
-    if not methods:
-        methods = [template["method"]]
+    decisions = resolve_http_methods(
+        route_declared_methods=metadata.get("methods", metadata.get("method"))
+    )
+    decision = decisions[0]
+    methods = decision["candidate_methods"] if decision["method_status"] == "resolved" else []
     return {
-        "method": methods[0],
+        "method": decision["resolved_method"],
         "methods": methods,
         "path": template["path"],
         "content_type": str(metadata.get("content_type") or ""),
@@ -178,9 +181,7 @@ def rest_seed_template(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
         "auth_mode": "authenticated" if _rest_auth_required(metadata) else "unauth-capable",
         "fixed_params": [],
         "entrypoint_type": "rest_route",
-        "method_source": "rest_declaration",
-        "method_confidence": "high",
-        "method_evidence": {"methods": methods},
+        **{key: decision[key] for key in _METHOD_FIELDS},
     }
 
 
@@ -199,8 +200,8 @@ def rest_http_template(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
     if namespace and not route.startswith(f"{namespace}/"):
         route = f"{namespace}/{route}"
 
-    methods = _normalize_methods(metadata.get("methods", metadata.get("method", "GET")))
-    method = methods[0] if methods else "GET"
+    methods = normalize_http_methods(metadata.get("methods", metadata.get("method")))
+    method = methods[0] if methods else None
     return {"method": method, "path": f"/wp-json/{route}", "query_params": {}, "body_params": {}}
 
 
@@ -212,20 +213,19 @@ def _build_direct_details(rule: Mapping[str, Any], action: str) -> dict[str, Any
     else:
         body_params["action"] = action
 
+    decision = resolve_http_methods()[0]
     return {
         "entry_type": rule["entry_type"],
         "action": action,
         "http_template": {
-            "method": str(rule.get("fallback_method") or DEFAULT_HTTP_METHOD_FALLBACK),
+            "method": decision["resolved_method"],
             "path": rule["path"],
             "query_params": query_params,
             "body_params": body_params,
         },
         "auth_required": rule["auth_required"],
         "confidence": "low",
-        "method_source": "fallback",
-        "method_confidence": "low",
-        "method_evidence": None,
+        **{key: decision[key] for key in _METHOD_FIELDS},
         "reason": rule["reason"],
     }
 
@@ -239,9 +239,13 @@ def _rest_auth_required(metadata: Mapping[str, Any]) -> bool:
     return permission_callback not in {"", "__return_true"}
 
 
-def _normalize_methods(value: Any) -> list[str]:
-    if isinstance(value, Sequence) and not isinstance(value, str):
-        raw_items = list(value)
-    else:
-        raw_items = [value]
-    return [str(item).upper() for item in raw_items if str(item or "").strip()]
+_METHOD_FIELDS = (
+    "resolved_method",
+    "candidate_methods",
+    "method_status",
+    "method_source",
+    "method_confidence",
+    "method_evidence",
+    "observed_request_method",
+    "route_declared_methods",
+)

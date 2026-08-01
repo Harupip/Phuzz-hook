@@ -1,0 +1,14 @@
+services:
+  wordpress:
+    volumes:
+      - type: bind
+        source: ${HOOKPHUZZ_METHOD_RESULTS}
+        target: /results
+      - type: bind
+        source: ${HOOKPHUZZ_METHOD_HARNESS}
+        target: /method-regression
+        read_only: true
+      - type: bind
+        source: ${HOOKPHUZZ_METHOD_FUZZER}
+        target: /fuzzer
+        read_only: true

@@ -26,6 +26,9 @@ def build_config_for_seed_item(
     if auth_mode not in {"authenticated", "unauth-capable"}:
         raise SeedConfigSkip("unsupported_auth_mode")
 
+    if seed.get("method_status") == "ambiguous" or seed.get("method_confidence") == "ambiguous":
+        raise SeedConfigSkip("ambiguous_http_method")
+
     methods = _seed_methods(seed)
     path = str(seed.get("path", "")).strip()
     body = seed.get("body")
@@ -142,7 +145,16 @@ def build_generated_param_summary(
 ) -> dict[str, Any]:
     output_dir = Path(output_config_dir)
     suggestions = [item for item in seed_report.get("suggested_seeds", []) if isinstance(item, Mapping)]
-    by_key = {(str(item.get("hook_name", "")), str(item.get("callback_id", ""))): item for item in suggestions}
+    by_key = {
+        (
+            str(item.get("hook_name", "")),
+            str(item.get("callback_id", "")),
+            str((item.get("seed") or {}).get("seed_variant_id", ""))
+            if isinstance(item.get("seed"), Mapping)
+            else "",
+        ): item
+        for item in suggestions
+    }
 
     rows: list[dict[str, Any]] = []
     for generated in config_summary.get("generated", []):
@@ -150,8 +162,11 @@ def build_generated_param_summary(
             continue
         hook_name = str(generated.get("hook_name", ""))
         callback_id = str(generated.get("callback_id", ""))
-        seed_item = by_key.get((hook_name, callback_id), {})
-        config_path = output_dir / f"{_build_file_slug(seed_item)}.json"
+        variant = str(generated.get("seed_variant_id", ""))
+        seed_item = by_key.get((hook_name, callback_id, variant), {})
+        config_slug = str(generated.get("config_slug") or "")
+        config_name = Path(config_slug.replace("\\", "/")).name
+        config_path = output_dir / f"{config_name}.json"
         config = _read_json_object(config_path)
         fuzz_params = _config_fuzz_params(config)
         source_found = _callback_source_found(seed_item)
@@ -178,6 +193,11 @@ def build_generated_param_summary(
                 "param_sources": _param_sources(seed_item, fuzz_params, source_found=source_found),
                 "has_fuzz_params": bool(fuzz_params),
                 "status": status,
+                "resolved_method": _config_metadata_value(config, "resolved_method"),
+                "candidate_methods": _config_metadata_value(config, "candidate_methods") or [],
+                "method_confidence": _config_metadata_value(config, "method_confidence"),
+                "observed_request_method": _config_metadata_value(config, "observed_request_method"),
+                "route_declared_methods": _config_metadata_value(config, "route_declared_methods") or [],
             }
         )
 
@@ -314,6 +334,11 @@ def _metadata_for_seed_item(
         'method_source': str(seed.get('method_source') or 'legacy_artifact'),
         'method_confidence': str(seed.get('method_confidence') or 'low'),
         'method_evidence': seed.get('method_evidence'),
+        'resolved_method': seed.get('resolved_method', seed.get('method')),
+        'candidate_methods': list(seed.get('candidate_methods') or _seed_methods(seed)),
+        'method_status': str(seed.get('method_status') or 'resolved'),
+        'observed_request_method': seed.get('observed_request_method'),
+        'route_declared_methods': list(seed.get('route_declared_methods') or []),
         'seed_variant_id': str(seed.get('seed_variant_id') or ''),
     }
     route = seed_item.get('route') or seed_item.get('rest_route')
@@ -347,6 +372,11 @@ def _summary_metadata(seed_item: Mapping[str, Any], config: Mapping[str, Any]) -
         'method_source',
         'method_confidence',
         'method_evidence',
+        'resolved_method',
+        'candidate_methods',
+        'method_status',
+        'observed_request_method',
+        'route_declared_methods',
         'seed_variant_id',
     )
     return {key: metadata[key] for key in keys if key in metadata}
@@ -373,6 +403,20 @@ def _skipped_row(seed_item: Mapping[str, Any], hook_name: str, callback_id: str,
     route = seed_item.get('route') or seed_item.get('rest_route')
     if route:
         row['route'] = route
+    seed = seed_item.get("seed")
+    if isinstance(seed, Mapping):
+        for key in (
+            "resolved_method",
+            "candidate_methods",
+            "method_status",
+            "method_source",
+            "method_confidence",
+            "method_evidence",
+            "observed_request_method",
+            "route_declared_methods",
+        ):
+            if key in seed:
+                row[key] = seed[key]
     return row
 
 

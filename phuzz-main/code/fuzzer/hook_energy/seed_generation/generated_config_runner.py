@@ -22,9 +22,19 @@ ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
 REQUESTS_DIR = "/shared-tmpfs/hook-coverage/requests"
 STOP_ON_VULN_EXIT_CODE = 1337 % 256
+METHOD_PROVENANCE_FIELDS = (
+    "resolved_method",
+    "candidate_methods",
+    "method_status",
+    "method_source",
+    "method_confidence",
+    "method_evidence",
+    "observed_request_method",
+    "route_declared_methods",
+)
 
 
-def load_generated_configs(path: Path) -> list[dict[str, str]]:
+def load_generated_configs(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if not isinstance(payload, Mapping) or not isinstance(payload.get("generated"), list):
         raise ValueError("generated_config_summary.json must contain a generated array")
@@ -46,6 +56,9 @@ def load_generated_configs(path: Path) -> list[dict[str, str]]:
             if not isinstance(entrypoint_type, str) or not entrypoint_type.strip():
                 raise ValueError(f"generated[{index}].entrypoint_type must be a non-empty string")
             row["entrypoint_type"] = entrypoint_type.strip()
+        for field in METHOD_PROVENANCE_FIELDS:
+            if field in item:
+                row[field] = item[field]
         configs.append(row)
     return configs
 
@@ -159,6 +172,7 @@ def run_generated_configs(
                 "hook_name": config["hook_name"],
                 "callback_id": config["callback_id"],
                 "entrypoint_type": config.get("entrypoint_type"),
+                **_method_metadata(config),
                 "process_status": process_status,
                 "validation_status": validation["status"],
                 "validation_reason": validation["reason"],
@@ -202,6 +216,7 @@ def format_validation_result(report: Mapping[str, Any]) -> dict[str, Any]:
                 'hook_name': row.get('hook_name'),
                 'callback_id': row.get('callback_id'),
                 'entrypoint_type': row.get('entrypoint_type'),
+                **_method_metadata(row),
                 'status': row.get('validation_status'),
                 'callback_reached': bool(row.get('callback_reached')),
                 'failure_category': row.get('failure_category'),
@@ -317,7 +332,11 @@ def _failure_category(process_status: str, validation_status: str) -> str | None
         return 'A. plugin dependency/context missing'
     return 'F. instrumentation/generation bug'
 
-def _matched_artifact(config: Mapping[str, str], artifacts: Sequence[tuple[str, Any]]) -> str | None:
+def _method_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {field: value.get(field) for field in METHOD_PROVENANCE_FIELDS if field in value}
+
+
+def _matched_artifact(config: Mapping[str, Any], artifacts: Sequence[tuple[str, Any]]) -> str | None:
     candidate = {"hook_name": config["hook_name"], "callback_id": config["callback_id"]}
     for name, payload in artifacts:
         validation = evaluate_artifact_payloads(candidate, [payload])
@@ -327,7 +346,7 @@ def _matched_artifact(config: Mapping[str, str], artifacts: Sequence[tuple[str, 
 
 
 def _runner_error_row(
-    config: Mapping[str, str],
+    config: Mapping[str, Any],
     container_name: str,
     started_at: float,
     reason: str,
@@ -338,6 +357,7 @@ def _runner_error_row(
         "hook_name": str(config["hook_name"]),
         "callback_id": str(config["callback_id"]),
         "entrypoint_type": config.get("entrypoint_type"),
+        **_method_metadata(config),
         "process_status": "runner_error",
         "validation_status": "runner_error",
         "validation_reason": reason,

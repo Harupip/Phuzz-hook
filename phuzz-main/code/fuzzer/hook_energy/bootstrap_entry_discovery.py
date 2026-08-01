@@ -76,7 +76,10 @@ def run_discovery_pipeline(
     )
 
     direct_candidates = _load_candidates(classification_paths["direct_http_candidates"])
-    selected = select_candidates_for_validation(direct_candidates, max_validate=max_validate)
+    selected = select_candidates_for_validation(
+        [item for item in direct_candidates if _has_resolved_method(item)],
+        max_validate=max_validate,
+    )
     config_by_candidate = {item["candidate_id"]: item["path"] for item in generated_configs}
     validation_summaries = []
     for candidate in selected:
@@ -180,6 +183,15 @@ def select_candidates_for_validation(candidates: list[dict[str, Any]], *, max_va
         else:
             remaining.append(candidate)
     return (unauthenticated + authenticated + remaining)[: max(0, max_validate)]
+
+
+def _has_resolved_method(candidate: Mapping[str, Any]) -> bool:
+    template = candidate.get("http_template")
+    return (
+        isinstance(template, Mapping)
+        and bool(str(template.get("method") or "").strip())
+        and candidate.get("method_status") != "ambiguous"
+    )
 
 
 def build_final_report(

@@ -116,10 +116,11 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
         direct_seed = next(
             item for item in seed_report["suggested_seeds"] if item["hook_name"] == "wp_ajax_nopriv_sac_post_type_call"
         )
-        self.assertEqual(direct_seed["generation_status"], "supported_http_seed")
-        self.assertEqual(direct_seed["seed"]["method"], "POST")
+        self.assertEqual(direct_seed["generation_status"], "ambiguous_http_method")
+        self.assertIsNone(direct_seed["seed"]["method"])
+        self.assertEqual(direct_seed["seed"]["candidate_methods"], ["GET", "POST"])
         self.assertEqual(direct_seed["seed"]["path"], "/wp-admin/admin-ajax.php")
-        self.assertEqual(direct_seed["seed"]["body"], {"action": "sac_post_type_call"})
+        self.assertEqual(direct_seed["seed"]["unresolved_params"], {"action": "sac_post_type_call"})
         self.assertEqual(direct_seed["seed"]["auth_mode"], "unauth-capable")
 
         manual_only = next(item for item in seed_report["suggested_seeds"] if item["hook_name"] == "admin_menu")
@@ -175,14 +176,14 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
         direct_seed = next(
             item["seed"]
             for item in seed_report["suggested_seeds"]
-            if item["hook_name"] == "wp_ajax_nopriv_sac_post_type_call" and item["seed"]["method"] == "POST"
+            if item["hook_name"] == "wp_ajax_nopriv_sac_post_type_call" and item["seed"]["method"] == "GET"
         )
 
         self.assertIn({"source": "REQUEST", "name": "orderby"}, [
             {"source": item["source"], "name": item["name"]} for item in callback_row["input_params"]
         ])
-        self.assertEqual(direct_seed["body"]["action"], "sac_post_type_call")
-        self.assertEqual(direct_seed["body"]["orderby"], "FUZZ")
+        self.assertEqual(direct_seed["query_params"]["action"], "sac_post_type_call")
+        self.assertEqual(direct_seed["query_params"]["orderby"], "FUZZ")
         self.assertEqual(direct_seed["query_params"]["page"], "FUZZ")
         self.assertEqual(direct_seed["fixed_params"], ["action"])
         self.assertIn("orderby", direct_seed["fuzzable_params"])

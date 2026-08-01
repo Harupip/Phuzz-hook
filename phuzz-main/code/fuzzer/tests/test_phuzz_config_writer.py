@@ -62,6 +62,11 @@ class PhuzzConfigWriterTests(unittest.TestCase):
                 "method_source": "legacy_artifact",
                 "method_confidence": "low",
                 "method_evidence": None,
+                "resolved_method": "POST",
+                "candidate_methods": ["POST"],
+                "method_status": "resolved",
+                "observed_request_method": None,
+                "route_declared_methods": [],
             },
         )
 
@@ -121,6 +126,32 @@ class PhuzzConfigWriterTests(unittest.TestCase):
             self.assertEqual(written[0]["candidate_id"], "cb-public")
             self.assertTrue((output_dir / "cb-public.json").exists())
             self.assertFalse((output_dir / "setup.json").exists())
+
+    def test_ambiguous_candidate_is_not_written(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            direct_file = Path(tmp_dir) / "direct_http_candidates.json"
+            output_dir = Path(tmp_dir) / "generated_phuzz_configs"
+            direct_file.write_text(
+                json.dumps(
+                    {
+                        "candidates": [
+                            build_candidate(
+                                method_status="ambiguous",
+                                http_template={
+                                    "method": None,
+                                    "path": "/wp-admin/admin-ajax.php",
+                                    "body_params": {"action": "abc"},
+                                },
+                            )
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            written = write_candidate_configs(direct_file, output_dir=output_dir, target_base="http://web")
+
+        self.assertEqual(written, [])
 
 
 if __name__ == "__main__":

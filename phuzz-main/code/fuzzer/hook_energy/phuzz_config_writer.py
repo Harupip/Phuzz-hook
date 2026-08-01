@@ -20,8 +20,10 @@ def build_config_for_candidate(candidate: Mapping[str, Any], *, target_base: str
 
     method = str(http_template.get("method", "")).strip().upper()
     path = str(http_template.get("path", "")).strip()
-    if not method or not path:
-        raise ValueError("http_template method and path are required")
+    if not path:
+        raise ValueError("http_template path is required")
+    if not method or candidate.get("method_status") == "ambiguous":
+        raise ValueError("unresolved_http_method")
 
     config: dict[str, Any] = {
         "target": _join_target(target_base, path),
@@ -59,6 +61,11 @@ def build_config_for_candidate(candidate: Mapping[str, Any], *, target_base: str
         "method_source": _optional_string(candidate.get("method_source")) or "legacy_artifact",
         "method_confidence": _optional_string(candidate.get("method_confidence")) or "low",
         "method_evidence": candidate.get("method_evidence"),
+        "resolved_method": _optional_string(candidate.get("resolved_method")) or method,
+        "candidate_methods": list(candidate.get("candidate_methods") or [method]),
+        "method_status": _optional_string(candidate.get("method_status")) or "resolved",
+        "observed_request_method": _optional_string(candidate.get("observed_request_method")),
+        "route_declared_methods": list(candidate.get("route_declared_methods") or []),
     }
 
     return _safe_slug(_optional_string(candidate.get("candidate_id")) or _optional_string(candidate.get("callback_id")) or "candidate"), config
@@ -82,7 +89,12 @@ def write_candidate_configs(
     for candidate in candidates:
         if not isinstance(candidate, Mapping) or candidate.get("classification") != "direct_http":
             continue
-        slug, config = build_config_for_candidate(candidate, target_base=target_base)
+        try:
+            slug, config = build_config_for_candidate(candidate, target_base=target_base)
+        except ValueError as exc:
+            if str(exc) == "unresolved_http_method":
+                continue
+            raise
         config_path = output_path / f"{slug}.json"
         config_path.write_text(
             json.dumps(config, indent=2 if pretty else None, ensure_ascii=False),

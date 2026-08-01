@@ -98,6 +98,11 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                                 "hook_name": "hook-two",
                                 "callback_id": "cb-two",
                                 "entrypoint_type": "rest_route",
+                                "resolved_method": "PATCH",
+                                "candidate_methods": ["PATCH"],
+                                "method_status": "resolved",
+                                "method_confidence": "route_declared",
+                                "route_declared_methods": ["PATCH"],
                             },
                         ]
                     }
@@ -114,6 +119,11 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                         "hook_name": "hook-two",
                         "callback_id": "cb-two",
                         "entrypoint_type": "rest_route",
+                        "resolved_method": "PATCH",
+                        "candidate_methods": ["PATCH"],
+                        "method_status": "resolved",
+                        "method_confidence": "route_declared",
+                        "route_declared_methods": ["PATCH"],
                     },
                 ],
             )

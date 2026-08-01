@@ -16,6 +16,11 @@ class ImportedSeedRequest:
     method_source: str = "legacy_artifact"
     method_confidence: str = "low"
     method_evidence: Any = None
+    resolved_method: str | None = None
+    candidate_methods: list[str] = field(default_factory=list)
+    method_status: str = "resolved"
+    observed_request_method: str | None = None
+    route_declared_methods: list[str] = field(default_factory=list)
     query_params: dict[str, Any] = field(default_factory=dict)
     headers: dict[str, Any] = field(default_factory=dict)
     cookies: dict[str, Any] = field(default_factory=dict)
@@ -29,6 +34,11 @@ class ImportedSeedRequest:
             "method_source": self.method_source,
             "method_confidence": self.method_confidence,
             "method_evidence": self.method_evidence,
+            "resolved_method": self.resolved_method or self.http_method,
+            "candidate_methods": self.candidate_methods or [self.http_method],
+            "method_status": self.method_status,
+            "observed_request_method": self.observed_request_method,
+            "route_declared_methods": self.route_declared_methods,
             "path": self.path,
             "content_type": self.content_type,
             "body": self.body,

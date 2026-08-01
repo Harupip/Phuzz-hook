@@ -26,8 +26,9 @@ class EntrypointRuleTests(unittest.TestCase):
         self.assertEqual(details["entry_type"], "ajax_unauthenticated")
         self.assertFalse(details["auth_required"])
         self.assertEqual(details["http_template"]["body_params"], {"action": "demo_lookup"})
-        self.assertEqual(details["method_source"], "fallback")
-        self.assertEqual(details["method_confidence"], "low")
+        self.assertIsNone(details["http_template"]["method"])
+        self.assertEqual(details["candidate_methods"], ["GET", "POST"])
+        self.assertEqual(details["method_confidence"], "ambiguous")
 
     def test_heartbeat_uses_exact_admin_ajax_action(self) -> None:
         details = direct_http_details("heartbeat_received")
@@ -48,7 +49,8 @@ class EntrypointRuleTests(unittest.TestCase):
         self.assertIsNotNone(details)
         self.assertEqual(details['entry_type'], 'admin_post_unauthenticated')
         self.assertFalse(details['auth_required'])
-        self.assertEqual(details['http_template']['method'], 'POST')
+        self.assertIsNone(details['http_template']['method'])
+        self.assertEqual(details['method_status'], 'ambiguous')
         self.assertEqual(details['http_template']['path'], '/wp-admin/admin-post.php')
         self.assertEqual(details['http_template']['body_params'], {'action': 'export_orders'})
 
@@ -58,7 +60,7 @@ class EntrypointRuleTests(unittest.TestCase):
         self.assertIsNotNone(details)
         self.assertEqual(details['entry_type'], 'login_form')
         self.assertFalse(details['auth_required'])
-        self.assertEqual(details['http_template']['method'], 'POST')
+        self.assertIsNone(details['http_template']['method'])
         self.assertEqual(details['http_template']['path'], '/wp-login.php')
         self.assertEqual(details['http_template']['query_params'], {'action': 'resetpass'})
 

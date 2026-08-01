@@ -106,7 +106,8 @@ class EntryClassifierTests(unittest.TestCase):
         self.assertEqual(report["counts"]["direct_http"], 8)
 
         self.assertEqual(by_hook["wp_ajax_abc"]["entry_type"], "ajax_authenticated")
-        self.assertEqual(by_hook["wp_ajax_abc"]["http_template"]["method"], "POST")
+        self.assertIsNone(by_hook["wp_ajax_abc"]["http_template"]["method"])
+        self.assertEqual(by_hook["wp_ajax_abc"]["method_confidence"], "ambiguous")
         self.assertEqual(by_hook["wp_ajax_abc"]["http_template"]["path"], "/wp-admin/admin-ajax.php")
         self.assertEqual(by_hook["wp_ajax_abc"]["http_template"]["body_params"], {"action": "abc"})
         self.assertTrue(by_hook["wp_ajax_abc"]["auth_required"])
@@ -119,7 +120,7 @@ class EntryClassifierTests(unittest.TestCase):
         self.assertEqual(by_hook["admin_post_nopriv_abc"]["entry_type"], "admin_post_unauthenticated")
         self.assertFalse(by_hook["admin_post_nopriv_abc"]["auth_required"])
         self.assertEqual(by_hook["admin_action_abc"]["entry_type"], "admin_action")
-        self.assertEqual(by_hook["admin_action_abc"]["http_template"]["method"], "GET")
+        self.assertIsNone(by_hook["admin_action_abc"]["http_template"]["method"])
         self.assertEqual(by_hook["admin_action_abc"]["http_template"]["query_params"], {"action": "abc"})
         self.assertEqual(by_hook["login_form_lostpassword"]["entry_type"], "login_form")
         self.assertEqual(by_hook["login_form_lostpassword"]["http_template"]["path"], "/wp-login.php")

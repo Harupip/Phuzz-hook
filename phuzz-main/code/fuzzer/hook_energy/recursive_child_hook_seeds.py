@@ -11,12 +11,14 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from hook_energy.entry_classifier import _classify_callback, _normalize_callback
     from hook_energy.entrypoints import rest_seed_template, seed_template_for_callback
+    from hook_energy.method_resolution import resolve_http_methods
     from hook_energy.seed_generation.config_exporter import export_seed_configs
     from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
     from hook_energy.seed_validator import validate_candidate
 else:
     from .entry_classifier import _classify_callback, _normalize_callback
     from .entrypoints import rest_seed_template, seed_template_for_callback
+    from .method_resolution import resolve_http_methods
     from .seed_generation.config_exporter import export_seed_configs
     from .seed_generation.input_extractor import InputSignatureExtractor
     from .seed_validator import validate_candidate
@@ -308,15 +310,37 @@ def _seed_for_callback(
     if seed is None:
         return None, str(classified.get("reason") or "Unsupported child hook")
 
-    method = str(seed.get("method") or "GET").upper()
+    input_params = extractor.extract(dict(callback)).get("input_params", [])
+    decisions = resolve_http_methods(
+        input_params=input_params,
+        route_declared_methods=(
+            callback.get("methods", callback.get("method"))
+            if str(seed.get("entrypoint_type")) == "rest_route"
+            else None
+        ),
+        runtime_observation=(
+            callback.get("_executed_callback")
+            if isinstance(callback.get("_executed_callback"), Mapping)
+            else None
+        ),
+        expected_callback=callback,
+    )
+    decision = decisions[0]
+    if decision["method_status"] != "resolved":
+        return None, "HTTP method is ambiguous without source, route, or correlated runtime evidence"
+    seed.update(decision)
+    if len(decisions) > 1:
+        seed["methods"] = decision["candidate_methods"]
+    method = str(decision["resolved_method"])
     seed.setdefault("headers", {})
     seed.setdefault("query_params", {})
     seed.setdefault("cookies", {})
     seed.setdefault("fuzzable_params", [])
     seed.setdefault("discovered_file_params", [])
-    if "action" in seed["body"]:
-        seed["query_params"]["action"] = seed["body"].pop("action")
-    input_params = extractor.extract(dict(callback)).get("input_params", [])
+    action = seed["body"].pop("action", seed["query_params"].pop("action", None))
+    if action is not None:
+        target = seed["query_params"] if method in {"GET", "DELETE", "OPTIONS", "HEAD"} else seed["body"]
+        target["action"] = action
     seed["input_params"] = input_params
     for item in input_params:
         name = str(item.get("name") or "").strip()
