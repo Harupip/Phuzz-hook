@@ -117,6 +117,15 @@ class HookSeedImporter:
             method_source=str(seed.get("method_source") or "legacy_artifact"),
             method_confidence=str(seed.get("method_confidence") or "low"),
             method_evidence=seed.get("method_evidence"),
+            resolved_method=str(seed.get("resolved_method") or seed["method"]),
+            candidate_methods=[str(item) for item in (seed.get("candidate_methods") or [seed["method"]])],
+            method_status=str(seed.get("method_status") or "resolved"),
+            observed_request_method=(
+                str(seed["observed_request_method"])
+                if seed.get("observed_request_method")
+                else None
+            ),
+            route_declared_methods=[str(item) for item in seed.get("route_declared_methods", [])],
             query_params=dict(seed.get("query_params", {}))
             if isinstance(seed.get("query_params"), Mapping)
             else {},
@@ -136,7 +145,7 @@ class HookSeedImporter:
         )
 
     def _build_manual_entry(self, callback: dict[str, Any]) -> dict[str, Any]:
-        return ManualAnalysisEntry(
+        row = ManualAnalysisEntry(
             callback_id=callback["callback_id"],
             hook_name=callback["hook_name"],
             callback_name=callback["callback_name"],
@@ -150,6 +159,21 @@ class HookSeedImporter:
             source_line=callback.get("source_line"),
             accepted_args=callback.get("accepted_args"),
         ).__dict__
+        seed = callback.get("seed")
+        if isinstance(seed, Mapping):
+            for key in (
+                "resolved_method",
+                "candidate_methods",
+                "method_status",
+                "method_source",
+                "method_confidence",
+                "method_evidence",
+                "observed_request_method",
+                "route_declared_methods",
+            ):
+                if key in seed:
+                    row[key] = seed[key]
+        return row
 
     def _is_replayable(self, callback: dict[str, Any]) -> bool:
         seed = callback.get("seed")
@@ -173,5 +197,6 @@ class HookSeedImporter:
             and (
                 callback.get("direct_http_supported") is False
                 or callback.get("generation_status") == "manual_analysis_required"
+                or callback.get("generation_status") == "ambiguous_http_method"
             )
         )

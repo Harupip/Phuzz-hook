@@ -122,6 +122,7 @@ def validate_candidate(
         "candidate_id": candidate.get("candidate_id"),
         "hook_name": candidate.get("hook_name"),
         "callback_id": candidate.get("callback_id"),
+        **_method_metadata(candidate),
         "request": {
             "method": request["method"],
             "url": request["url"],
@@ -225,13 +226,30 @@ def _normalize_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
     candidate_id = _optional_string(candidate.get("candidate_id")) or callback_id or callback_repr or "candidate"
     http_template = _normalize_http_template(candidate)
 
+    seed = candidate.get("seed")
+    provenance = seed if isinstance(seed, Mapping) else candidate
     return {
         "candidate_id": candidate_id,
         "hook_name": hook_name,
         "callback_id": callback_id,
         "callback_repr": callback_repr,
         "http_template": http_template,
+        **_method_metadata(provenance),
     }
+
+
+def _method_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+    fields = (
+        "resolved_method",
+        "candidate_methods",
+        "method_status",
+        "method_source",
+        "method_confidence",
+        "method_evidence",
+        "observed_request_method",
+        "route_declared_methods",
+    )
+    return {field: value.get(field) for field in fields if field in value}
 
 
 def _normalize_http_template(candidate: Mapping[str, Any]) -> dict[str, Any]:

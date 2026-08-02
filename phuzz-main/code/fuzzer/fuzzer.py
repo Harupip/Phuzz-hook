@@ -23,14 +23,13 @@ import utils
 from candidate import Candidate
 from mutator import DefaultMutator, EmptyQueueMutator, SingleMutator
 from scoring import DefaultScoringFormula
-from vulncheck import DefaultVulnChecker, ParamBasedVulnChecker
 from utils import fuzz_open
 
 #def print(*args, **kwargs):
 #    pass
 
 class Fuzzer:
-    def __init__(self, fuzzer_id):
+    def __init__(self, fuzzer_id, config_only=False):
 
         self.fuzzer_id = fuzzer_id
         self.start_time = int(time.time())
@@ -94,13 +93,15 @@ class Fuzzer:
         ####
         self.scoring_formula = DefaultScoringFormula()
         self.mutator = DefaultMutator()
-        #self.vulnchecker = DefaultVulnChecker(
-        self.vulnchecker = ParamBasedVulnChecker(
-            mysql_errors_folder=self.mysql_errors_folder,
-            shell_errors_folder=self.shell_errors_folder,
-            unserialize_errors_folder=self.unserialize_errors_folder,
-            pathtraversal_errors_folder=self.pathtraversal_errors_folder,
-            xxe_errors_folder=self.xxe_errors_folder,
+        self.vulnchecker = None
+        if not config_only:
+            from vulncheck import ParamBasedVulnChecker
+            self.vulnchecker = ParamBasedVulnChecker(
+                mysql_errors_folder=self.mysql_errors_folder,
+                shell_errors_folder=self.shell_errors_folder,
+                unserialize_errors_folder=self.unserialize_errors_folder,
+                pathtraversal_errors_folder=self.pathtraversal_errors_folder,
+                xxe_errors_folder=self.xxe_errors_folder,
             )
         ### 
         # END Define Fuzzing modules
@@ -271,11 +272,14 @@ class Fuzzer:
                         param_name = param['name']
                         if r.match(param_name):
                             if not param_name in fixed_dict:
-                                fixed_dict[param_name] = set()
+                                fixed_dict[param_name] = []
                             if 'value' in param:
-                                fixed_dict[param_name].add(param['value'])
+                                if param['value'] not in fixed_dict[param_name]:
+                                    fixed_dict[param_name].append(param['value'])
                             elif 'seeds' in param:
-                                fixed_dict[param_name].update(param['seeds'])
+                                for value in param['seeds']:
+                                    if value not in fixed_dict[param_name]:
+                                        fixed_dict[param_name].append(value)
                             else:
                                 raise Exception(f"Neither seeds nor value for param {param_name}")
 
@@ -294,11 +298,14 @@ class Fuzzer:
                             continue
                         if r.match(param_name):
                             if not param_name in fuzz_dict:
-                                fuzz_dict[param_name] = set()
+                                fuzz_dict[param_name] = []
                             if 'value' in param:
-                                fuzz_dict[param_name].add(param['value'])
+                                if param['value'] not in fuzz_dict[param_name]:
+                                    fuzz_dict[param_name].append(param['value'])
                             elif 'seeds' in param:
-                                fuzz_dict[param_name].update(param['seeds'])
+                                for value in param['seeds']:
+                                    if value not in fuzz_dict[param_name]:
+                                        fuzz_dict[param_name].append(value)
                             else:
                                 raise Exception(f"Neither seeds nor value for param {param_name}")
             else:
@@ -311,11 +318,14 @@ class Fuzzer:
                     if config_key == 'headers' and param_name.lower() in ["host", "cookie"]:
                         continue
                     if not param_name in fuzz_dict:
-                        fuzz_dict[param_name] = set()
+                        fuzz_dict[param_name] = []
                     if 'value' in param:
-                        fuzz_dict[param_name].add(param['value'])
+                        if param['value'] not in fuzz_dict[param_name]:
+                            fuzz_dict[param_name].append(param['value'])
                     elif 'seeds' in param:
-                        fuzz_dict[param_name].update(param['seeds'])
+                        for value in param['seeds']:
+                            if value not in fuzz_dict[param_name]:
+                                fuzz_dict[param_name].append(value)
                     else:
                         raise Exception(f"Neither seeds nor value for param {param_name}")
 
@@ -327,10 +337,10 @@ class Fuzzer:
             setattr(self, f"fuzz_{config_key}", fuzz_dict)
             setattr(self, f"fixed_{config_key}", fixed_dict)
 
-    def load_config(self, config_path):
+    def load_config(self, config_path, config_dir="./configs"):
         try:
             self.config = json.load(
-                open(os.path.join("./configs", f"{config_path}.json"))
+                open(os.path.join(config_dir, f"{config_path}.json"))
             )
         except Exception as e:
             print(e)
@@ -506,6 +516,7 @@ class Fuzzer:
         the_cookies = {**candidate.fuzz_params['cookies'], **candidate.fixed_params['cookies']} # self._urlencode_dict()
         the_headers = {**candidate.fuzz_params['headers'], **candidate.fixed_params['headers']}
         the_headers["X-FUZZER-COVID"] = candidate.coverage_id
+        the_headers.setdefault("X-HookPhuzz-Request-ID", candidate.coverage_id)
 
         # print({
         #     'query': the_params,
@@ -522,7 +533,8 @@ class Fuzzer:
                                     headers=the_headers)
 
         elif candidate.http_method in ["POST", "PUT", "PATCH", "DELETE"]:
-            if the_headers.get('Content-Type', '') in ['application/json']:
+            content_type = the_headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+            if content_type == 'application/json':
                 req = requests.Request(method=candidate.http_method, 
                                     url=urlparse.urlunparse(url_parts),
                                     params=the_params,

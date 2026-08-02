@@ -57,6 +57,10 @@ class BootstrapEntryDiscoveryTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("__uopz_register_rest_route", instrumentation)
+        self.assertIn("argument_definitions", instrumentation)
+        self.assertIn("route_common_argument_definitions", instrumentation)
+        self.assertIn("rest_endpoint_definitions", instrumentation)
+        self.assertIn("__uopz_rest_schema_value", instrumentation)
         self.assertIn("__uopz_record_rest_callback_invocation", instrumentation)
         self.assertIn("__uopz_try_hook_function('register_rest_route'", instrumentation)
         self.assertIn("['entrypoint_type'] = 'rest_route'", instrumentation)
@@ -114,13 +118,13 @@ class BootstrapEntryDiscoveryTests(unittest.TestCase):
             self.assertTrue((out / "runtime_hook_registry.json").exists())
             self.assertTrue((out / "entrypoint_candidates.json").exists())
             self.assertTrue((out / "direct_http_candidates.json").exists())
-            self.assertTrue((out / "generated_phuzz_configs" / "cb-public.json").exists())
-            self.assertTrue((out / "validation_results" / "cb-public.validation_result.json").exists())
+            self.assertFalse((out / "generated_phuzz_configs" / "cb-public.json").exists())
+            self.assertFalse((out / "validation_results" / "cb-public.validation_result.json").exists())
             self.assertTrue((out / "bootstrap_entry_discovery_report.json").exists())
-            self.assertEqual(report["counts"]["generated_phuzz_configs"], 1)
-            self.assertEqual(report["counts"]["validated_candidates"], 1)
-            self.assertEqual(report["counts"]["expected_hook_fired"], 1)
-            self.assertEqual(report["counts"]["expected_callback_reached"], 1)
+            self.assertEqual(report["counts"]["generated_phuzz_configs"], 0)
+            self.assertEqual(report["counts"]["validated_candidates"], 0)
+            self.assertEqual(report["counts"]["expected_hook_fired"], 0)
+            self.assertEqual(report["counts"]["expected_callback_reached"], 0)
 
     def test_validation_selection_prefers_unauthenticated_candidates_and_respects_limit(self) -> None:
         candidates = [

@@ -49,17 +49,18 @@ Other hooks stay manual-only unless later code adds a supported route mapping.
 
 The original entrypoint rules coupled two different decisions: mapping a hook to its endpoint and choosing a convenient replay method. AJAX, admin-post, login, and heartbeat templates stored `POST`, and `seed_template_for_callback()` copied that value before the generator inspected parameter provenance. `_GET` could therefore move a parameter into the query string without changing the already-selected `POST` method. Tests covered the resulting templates, so the compatibility assumption remained stable even though the hook prefix never proved the verb.
 
-Method selection is now centralized in the seed generator. The precedence is: declared REST method, correlated runtime request method, parameter-source inference, then the single compatibility fallback `DEFAULT_HTTP_METHOD_FALLBACK`. Every seed records `method_source`, `method_confidence`, `method_evidence`, and `seed_variant_id`.
+Method selection is centralized in `hook_energy/method_resolution.py`. The precedence is: declared REST method, exact `GET`/`POST` source evidence, then a callback- and request-ID-correlated runtime request method. Every seed records `resolved_method`, `candidate_methods`, `method_status`, `method_source`, `method_confidence`, `method_evidence`, `observed_request_method`, `route_declared_methods`, and `seed_variant_id`.
 
 ### When POST Can Still Appear
 
 - A declared REST `POST`, a correlated successful runtime `POST`, or a callback that reads only `$_POST` is evidence-backed POST.
-- `$_REQUEST`, or a callback that reads both `$_GET` and `$_POST`, produces distinct GET and POST variants.
-- Cookie-only, unreadable source, `FILES`, raw body, or otherwise absent verb evidence uses compatibility `POST` with `method_source=fallback`, `method_confidence=low`, and null evidence. Cookie and body placement do not prove a verb.
+- `$_REQUEST` uses a correlated runtime method when available and is labeled `runtime_observed`; this proves that method worked for the observation, not that the endpoint is method-exclusive.
+- `$_REQUEST` without correlated runtime evidence remains unresolved with `method=null`, `method_status=ambiguous`, and `candidate_methods=[GET, POST]`; export blocks it from becoming a single fuzzing-ready config.
+- Cookie-only, unreadable source, `FILES`, raw body, or otherwise absent verb evidence is also ambiguous. Cookie and body placement do not prove a verb.
 - Version 1 artifacts keep their stored method for compatibility and are marked `method_source=legacy_artifact`, not observed.
 - Old runtime artifacts that cannot be correlated by plugin, hook/route, callback, and request ID are not accepted as runtime evidence.
 
-`$_GET` is query-string provenance rather than absolute proof of an HTTP GET request. The generator nevertheless emits the canonical GET variant at medium confidence when it is the only available source.
+Direct `$_GET`/`INPUT_GET` and `$_POST`/`INPUT_POST` reads are canonical source-exact evidence for GET and POST respectively.
 
 ## Entrypoint Rule Ownership
 
@@ -258,7 +259,7 @@ Akismet also produced an authenticated seed for `wp_ajax_comment_author_deurl`, 
 
 This verification runs one generated config explicitly through `FUZZER_CONFIG`. The opt-in batch runner now automates sequential config selection; callback-level proof still comes from request hook coverage.
 
-Example `suggested_seeds.json` GET variant:
+Example unresolved `suggested_seeds.json` row:
 
 ```json
 {
@@ -268,18 +269,23 @@ Example `suggested_seeds.json` GET variant:
   "seed_priority": "highest",
   "generation_status": "supported_http_seed",
   "seed": {
-    "method": "GET",
-    "method_source": "ambiguous_request_expansion",
-    "method_confidence": "low",
+    "method": null,
+    "resolved_method": null,
+    "candidate_methods": ["GET", "POST"],
+    "method_status": "ambiguous",
+    "method_source": "ambiguous",
+    "method_confidence": "ambiguous",
     "method_evidence": {
       "sources": ["REQUEST"],
-      "alternative_methods": ["GET", "POST"]
+      "candidate_methods": ["GET", "POST"],
+      "reason": "no_exact_source_route_or_correlated_runtime_method"
     },
-    "seed_variant_id": "get",
+    "seed_variant_id": "ambiguous",
     "path": "/wp-admin/admin-ajax.php",
     "content_type": "application/x-www-form-urlencoded",
     "body": {},
-    "query_params": {
+    "query_params": {},
+    "unresolved_params": {
       "action": "example_lookup",
       "item_id": "FUZZ"
     },
@@ -304,12 +310,12 @@ Example `suggested_seeds.json` GET variant:
 }
 ```
 
-The same `$_REQUEST` callback also produces a POST variant with `action` and `item_id` in `body`.
+This row is retained for analysis but is not exported until runtime or route evidence resolves a method.
 
 Placement rules:
 
 - `GET` source params go into `seed.query_params`; `POST` source params go into `seed.body`.
-- `REQUEST` produces a GET/query variant and a POST/body variant.
+- `REQUEST` follows a correlated runtime method; without one it stays in `unresolved_params` and is not exported.
 - If both GET and POST sources exist, each parameter retains its source-based query/body placement in both method variants.
 - `COOKIE` params go into `seed.cookies` and do not select a method.
 - `FILES` and `BODY_JSON` are body-placement evidence only and do not select a method.
@@ -388,18 +394,18 @@ Outputs:
 - `setup_required_candidates.json`
 - `non_entry_hooks.json`
 
-Direct HTTP candidates receive an `http_template` with path, fixed params, and a compatibility method template. The direct classifier establishes replay reachability, not a detected method. The seed generator later resolves the method from evidence.
+Direct HTTP candidates receive an `http_template` with path and fixed params. The direct classifier establishes replay reachability, not a detected method. Non-REST templates remain explicitly ambiguous until the central resolver sees source or correlated runtime evidence.
 
 | Hook family | Entry type | Template method | Path | Auth |
 | --- | --- | --- | --- | --- |
-| `wp_ajax_nopriv_*` | `ajax_unauthenticated` | `POST` fallback (low) | `/wp-admin/admin-ajax.php` | no |
-| `wp_ajax_*` | `ajax_authenticated` | `POST` fallback (low) | `/wp-admin/admin-ajax.php` | yes |
-| `admin_post_nopriv_*` | `admin_post_unauthenticated` | `POST` fallback (low) | `/wp-admin/admin-post.php` | no |
-| `admin_post_*` | `admin_post_authenticated` | `POST` fallback (low) | `/wp-admin/admin-post.php` | yes |
-| `admin_action_*` | `admin_action` | `GET` fallback (low) | `/wp-admin/admin.php` | yes |
-| `login_form_*` | `login_form` | `POST` fallback (low) | `/wp-login.php` | no |
-| `heartbeat_received` | `heartbeat_authenticated` | `POST` fallback (low) | `/wp-admin/admin-ajax.php` | yes |
-| `heartbeat_nopriv_received` | `heartbeat_unauthenticated` | `POST` fallback (low) | `/wp-admin/admin-ajax.php` | no |
+| `wp_ajax_nopriv_*` | `ajax_unauthenticated` | evidence resolver | `/wp-admin/admin-ajax.php` | no |
+| `wp_ajax_*` | `ajax_authenticated` | evidence resolver | `/wp-admin/admin-ajax.php` | yes |
+| `admin_post_nopriv_*` | `admin_post_unauthenticated` | evidence resolver | `/wp-admin/admin-post.php` | no |
+| `admin_post_*` | `admin_post_authenticated` | evidence resolver | `/wp-admin/admin-post.php` | yes |
+| `admin_action_*` | `admin_action` | evidence resolver | `/wp-admin/admin.php` | yes |
+| `login_form_*` | `login_form` | evidence resolver | `/wp-login.php` | no |
+| `heartbeat_received` | `heartbeat_authenticated` | evidence resolver | `/wp-admin/admin-ajax.php` | yes |
+| `heartbeat_nopriv_received` | `heartbeat_unauthenticated` | evidence resolver | `/wp-admin/admin-ajax.php` | no |
 | `rest_route:<namespace>/<route>` | `rest_route` | declared methods (high) | `/wp-json/<namespace>/<route>` | depends on permission callback |
 
 `setup_required` means the hook can be HTTP-relevant but needs extra setup before automatic PHUZZ config generation, for example shortcode pages, rewrite endpoints, REST route records that were not resolved from `register_rest_route`, or XML-RPC method maps.
@@ -422,14 +428,20 @@ Compact candidate shape:
   "parent_hook_name": null,
   "parent_callback_id": null,
   "action": "demo_lookup",
-  "method_source": "fallback",
-  "method_confidence": "low",
-  "method_evidence": null,
+  "resolved_method": null,
+  "candidate_methods": ["GET", "POST"],
+  "method_status": "ambiguous",
+  "method_source": "ambiguous",
+  "method_confidence": "ambiguous",
+  "method_evidence": {
+    "reason": "no_exact_source_route_or_correlated_runtime_method"
+  },
   "http_template": {
-    "method": "POST",
+    "method": null,
     "path": "/wp-admin/admin-ajax.php",
     "query_params": {},
-    "body_params": {
+    "body_params": {},
+    "unresolved_params": {
       "action": "demo_lookup"
     }
   },

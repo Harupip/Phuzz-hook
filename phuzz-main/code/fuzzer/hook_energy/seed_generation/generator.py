@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..entrypoints import direct_http_details, seed_template_for_callback
+from ..method_resolution import resolve_http_methods
 from .input_extractor import InputSignatureExtractor
 from .source_resolver import SourcePathResolver
 
@@ -74,7 +75,9 @@ class LiveHookSeedGenerator:
                     "callback_start_line": item["start_line"] or item["source_line"],
                     "auth_mode": item.get("auth_mode"),
                     "generated_reason": item["generation_status"],
-                    "fuzzing_ready": bool(seed and seed.get("fuzzable_params")),
+                    "fuzzing_ready": bool(
+                        seed and seed.get("method_status") == "resolved" and seed.get("fuzzable_params")
+                    ),
                     "setup_required": item["setup_required"],
                     "manual_analysis": item["manual_analysis"],
                     "missing_requirements": item["missing_requirements"],
@@ -172,7 +175,9 @@ class LiveHookSeedGenerator:
             if seed is not None:
                 entrypoint_type = str(seed.get('entrypoint_type') or entrypoint_type)
             auth_mode = str(seed.get('auth_mode')) if isinstance(seed, dict) else None
-            fuzzing_ready = bool(seed and seed.get('fuzzable_params'))
+            fuzzing_ready = bool(
+                seed and seed.get("method_status") == "resolved" and seed.get('fuzzable_params')
+            )
             missing_requirements = self._missing_requirements(entrypoint_type, seed, source_resolution)
             manual_analysis = generation_status == "manual_analysis_required"
             setup_required = self._setup_required(entrypoint_type, manual_analysis)
@@ -265,6 +270,8 @@ class LiveHookSeedGenerator:
         source_resolution: dict[str, Any],
     ) -> list[str]:
         if seed is not None:
+            if seed.get("method_status") != "resolved":
+                return ["http_method"]
             return [] if seed.get('fuzzable_params') else ['fuzzable_params']
         if entrypoint_type == 'xmlrpc_method_map':
             return ['xmlrpc_method_name', 'xmlrpc_body_template']
@@ -307,7 +314,14 @@ class LiveHookSeedGenerator:
             variant.update(decision)
             self._place_action_for_method(variant)
             variants.append(self._attach_fuzzable_params(variant, input_params))
-        return variants, "supported_http_seed" if variants else "unresolved_http_method"
+        if not variants:
+            return [], "unresolved_http_method"
+        status = (
+            "supported_http_seed"
+            if any(item.get("method_status") == "resolved" for item in variants)
+            else "ambiguous_http_method"
+        )
+        return variants, status
 
     def _method_decisions(
         self,
@@ -315,76 +329,20 @@ class LiveHookSeedGenerator:
         metadata: Mapping[str, Any],
         input_params: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        if str(metadata.get("entrypoint_type", "")) == "rest_route":
-            methods = self._normalize_methods(metadata.get("methods", metadata.get("method", "")))
-            if methods:
-                return [
-                    self._decision(method, "rest_declaration", "high", {"methods": methods})
-                    for method in methods
-                ]
-
-        observed = self._runtime_method(metadata)
-        if observed:
-            return [
-                self._decision(
-                    observed["method"],
-                    "runtime_observed",
-                    "high",
-                    {
-                        "request_method": observed["method"],
-                        "request_id": observed["request_id"],
-                        "target_plugin": observed["target_plugin"],
-                    },
-                )
-            ]
-
-        sources = {
-            str(item.get("source", "")).upper()
-            for item in input_params
-            if str(item.get("source", "")).upper() in {"GET", "POST", "REQUEST"}
-        }
-        if "REQUEST" in sources:
-            evidence = {"sources": sorted(sources), "alternative_methods": ["GET", "POST"]}
-            return [
-                self._decision(method, "ambiguous_request_expansion", "low", evidence)
-                for method in ("GET", "POST")
-            ]
-        if sources == {"GET", "POST"}:
-            return [
-                self._decision(method, "parameter_source", "medium", {"sources": ["GET", "POST"]})
-                for method in ("GET", "POST")
-            ]
-        if sources == {"GET"}:
-            return [self._decision("GET", "parameter_source", "medium", {"sources": ["GET"]})]
-        if sources == {"POST"}:
-            return [self._decision("POST", "parameter_source", "medium", {"sources": ["POST"]})]
-        return [self._decision(str(seed_template_for_callback(hook_name, metadata)["method"]), "fallback", "low", None)]
-
-    @staticmethod
-    def _decision(method: str, source: str, confidence: str, evidence: Any) -> dict[str, Any]:
-        normalized = str(method).upper()
-        return {
-            "method": normalized,
-            "method_source": source,
-            "method_confidence": confidence,
-            "method_evidence": evidence,
-            "seed_variant_id": normalized.lower(),
-        }
-
-    @staticmethod
-    def _runtime_method(metadata: Mapping[str, Any]) -> dict[str, str] | None:
-        observed = metadata.get("_executed_callback")
-        if not isinstance(observed, Mapping):
-            return None
-        required = ("callback_id", "hook_name", "callback_repr")
-        if any(str(observed.get(key, "")) != str(metadata.get(key, "")) for key in required):
-            return None
-        request_id = str(observed.get("request_id", "")).strip()
-        method = str(observed.get("http_method", "")).strip().upper()
-        target_plugin = str(observed.get("target_plugin", "")).strip()
-        if not request_id or not method or not target_plugin:
-            return None
-        return {"method": method, "request_id": request_id, "target_plugin": target_plugin}
+        return resolve_http_methods(
+            input_params=input_params,
+            route_declared_methods=(
+                metadata.get("methods", metadata.get("method"))
+                if str(metadata.get("entrypoint_type", "")) == "rest_route"
+                else None
+            ),
+            runtime_observation=(
+                metadata.get("_executed_callback")
+                if isinstance(metadata.get("_executed_callback"), Mapping)
+                else None
+            ),
+            expected_callback=metadata,
+        )
 
     @staticmethod
     def _place_action_for_method(seed: dict[str, Any]) -> None:
@@ -392,6 +350,10 @@ class LiveHookSeedGenerator:
         query = seed.setdefault("query_params", {})
         action = body.pop("action", query.pop("action", None))
         if action is None:
+            return
+        method_status = seed.get("method_status") or ("resolved" if seed.get("method") else "ambiguous")
+        if method_status != "resolved":
+            seed.setdefault("unresolved_params", {})["action"] = action
             return
         target = (
             query
@@ -435,7 +397,11 @@ class LiveHookSeedGenerator:
             if name in nested_parents and not is_fixed_input:
                 continue
 
-            request_method = str(seed.get("method", "")).upper()
+            request_method = str(seed.get("resolved_method") or seed.get("method") or "").upper()
+            method_status = seed.get("method_status") or ("resolved" if request_method else "ambiguous")
+            if source == "REQUEST" and method_status != "resolved":
+                seed.setdefault("unresolved_params", {})[name] = "FUZZ"
+                continue
             if source == "GET" or (source == "REQUEST" and request_method == "GET"):
                 target = seed["query_params"]
             elif source == "COOKIE":
@@ -461,7 +427,7 @@ class LiveHookSeedGenerator:
             if isinstance(item, dict) and isinstance(item.get("seed"), dict)
         ]
         methods = Counter(str(item["seed"].get("method") or "UNKNOWN") for item in rows)
-        sources = Counter(str(item["seed"].get("method_source") or "legacy_unclassified") for item in rows)
+        sources = Counter(str(item["seed"].get("method_confidence") or "legacy_unclassified") for item in rows)
         grouped = Counter((str(item.get("hook_name")), str(item.get("callback_id"))) for item in rows)
         method_counts = {
             method: methods.get(method, 0)
@@ -470,12 +436,10 @@ class LiveHookSeedGenerator:
         source_counts = {
             source: sources.get(source, 0)
             for source in (
-                "rest_declaration",
+                "route_declared",
                 "runtime_observed",
-                "parameter_source",
-                "ambiguous_request_expansion",
-                "fallback",
-                "unresolved",
+                "source_exact",
+                "ambiguous",
                 "legacy_artifact",
             )
         }
@@ -483,15 +447,17 @@ class LiveHookSeedGenerator:
             "total_seeds": len(rows),
             "methods": method_counts,
             "method_sources": source_counts,
-            "fallback": sources.get("fallback", 0),
-            "unresolved": sources.get("unresolved", 0),
+            "fallback": 0,
+            "unresolved": sources.get("ambiguous", 0),
             "expanded_variants": sum(1 for count in grouped.values() if count > 1),
             "representative_seeds": [
                 {
                     "hook_name": item.get("hook_name"),
                     "callback_id": item.get("callback_id"),
                     "method": item["seed"].get("method"),
-                    "method_source": item["seed"].get("method_source"),
+                    "resolved_method": item["seed"].get("resolved_method"),
+                    "candidate_methods": item["seed"].get("candidate_methods"),
+                    "method_confidence": item["seed"].get("method_confidence"),
                 }
                 for item in rows
             ],
@@ -575,17 +541,3 @@ class LiveHookSeedGenerator:
             return default
         return int(value)
 
-    def _normalize_methods(self, value: Any) -> list[str]:
-        raw_items: list[Any]
-        if isinstance(value, list):
-            raw_items = value
-        else:
-            raw_items = [value]
-
-        methods: list[str] = []
-        for item in raw_items:
-            for part in str(item or "").replace("|", ",").split(","):
-                method = part.strip().upper()
-                if method and method not in methods:
-                    methods.append(method)
-        return methods

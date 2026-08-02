@@ -130,6 +130,11 @@ class SeedToConfigExporterTests(unittest.TestCase):
                 'method_source': 'legacy_artifact',
                 'method_confidence': 'low',
                 'method_evidence': None,
+                'resolved_method': 'POST',
+                'candidate_methods': ['POST'],
+                'method_status': 'resolved',
+                'observed_request_method': None,
+                'route_declared_methods': [],
                 'seed_variant_id': '',
             },
         )
@@ -225,26 +230,10 @@ class SeedToConfigExporterTests(unittest.TestCase):
                 item = build_seed_item(hook_name=hook_name, auth_mode=auth_mode)
                 item["seed"] = seed_template_for_callback(hook_name)
 
-                _, config = build_config_for_seed_item(item)
+                with self.assertRaisesRegex(SeedConfigSkip, "ambiguous_http_method"):
+                    build_config_for_seed_item(item)
 
-                self.assertEqual(config["target"], "http://web/wp-admin/admin-ajax.php")
-                self.assertEqual(config["entrypoint_type"], "heartbeat")
-                self.assertEqual(config["config_type"], "replay_only")
-                self.assertEqual(config["metadata"]["auth_mode"], auth_mode)
-                self.assertFalse(config["metadata"]["fuzzing_ready"])
-                self.assertFalse(config["metadata"]["setup_required"])
-                self.assertFalse(config["metadata"]["manual_analysis"])
-                self.assertEqual(config["body_params"]["fixed"], ["action", "_nonce", "screen_id", "data\\[hookphuzz_probe\\]"])
-                self.assertEqual(config["body_params"]["fuzz"], [])
-                self.assertEqual(
-                    config["body_params"]["data"],
-                    [
-                        {"name": "action", "value": "heartbeat"},
-                        {"name": "_nonce", "value": "hookphuzz"},
-                        {"name": "screen_id", "value": "front"},
-                        {"name": "data[hookphuzz_probe]", "value": "1"},
-                    ],
-                )
+                self.assertEqual(item["seed"]["method_confidence"], "ambiguous")
                 self.assertEqual(item["seed"]["body"], heartbeat_body)
 
     def test_bracket_param_data_name_stays_raw_and_fuzz_selector_is_escaped(self):

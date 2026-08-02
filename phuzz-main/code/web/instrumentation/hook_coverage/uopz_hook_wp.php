@@ -729,18 +729,24 @@ function __uopz_rest_hook_name(string $namespace, string $route): string
 
 function __uopz_normalize_rest_methods($methods): array
 {
-    $items = is_array($methods) ? $methods : [$methods ?: 'GET'];
     $normalized = [];
-    foreach ($items as $item) {
+    $add = static function ($item) use (&$add, &$normalized): void {
+        if (is_array($item)) {
+            foreach ($item as $nested) {
+                $add($nested);
+            }
+            return;
+        }
         foreach (explode(',', str_replace('|', ',', (string) $item)) as $part) {
             $method = strtoupper(trim($part));
             if ($method !== '' && !in_array($method, $normalized, true)) {
                 $normalized[] = $method;
             }
         }
-    }
+    };
+    $add($methods);
 
-    return $normalized ?: ['GET'];
+    return $normalized;
 }
 
 function __uopz_rest_endpoint_args($args): array
@@ -750,10 +756,13 @@ function __uopz_rest_endpoint_args($args): array
     }
 
     if (array_key_exists('callback', $args)) {
+        $args['__hookphuzz_endpoint_index'] = 0;
+        $args['__hookphuzz_common_args'] = [];
         return [$args];
     }
 
     $endpoints = [];
+    $commonArgs = isset($args['args']) && is_array($args['args']) ? $args['args'] : [];
     foreach ($args as $key => $entry) {
         if (!is_int($key) || !is_array($entry) || !array_key_exists('callback', $entry)) {
             continue;
@@ -761,10 +770,35 @@ function __uopz_rest_endpoint_args($args): array
         if (!array_key_exists('permission_callback', $entry) && array_key_exists('permission_callback', $args)) {
             $entry['permission_callback'] = $args['permission_callback'];
         }
+        $entry['__hookphuzz_endpoint_index'] = $key;
+        $entry['__hookphuzz_common_args'] = $commonArgs;
+        $entry['__hookphuzz_final_args'] = array_merge(
+            $commonArgs,
+            isset($entry['args']) && is_array($entry['args']) ? $entry['args'] : []
+        );
         $endpoints[] = $entry;
     }
 
     return $endpoints;
+}
+
+function __uopz_rest_schema_value($value, string $key = '')
+{
+    if ($key === 'validate_callback' || $key === 'sanitize_callback') {
+        return $value === null ? null : __uopz_callback_repr($value);
+    }
+    if (is_null($value) || is_bool($value) || is_int($value) || is_float($value) || is_string($value)) {
+        return $value;
+    }
+    if (is_array($value)) {
+        $normalized = [];
+        foreach ($value as $itemKey => $itemValue) {
+            $normalized[(string) $itemKey] = __uopz_rest_schema_value($itemValue, (string) $itemKey);
+        }
+        ksort($normalized, SORT_STRING);
+        return $normalized;
+    }
+    return is_object($value) ? ['unsupported' => 'object'] : ['unsupported' => gettype($value)];
 }
 
 function __uopz_register_rest_route(string $namespace, string $route, $args): void
@@ -789,9 +823,23 @@ function __uopz_register_rest_route(string $namespace, string $route, $args): vo
         $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['namespace'] = trim($namespace, '/');
         $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['route'] = '/' . trim($route, '/');
         $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['methods'] =
-            __uopz_normalize_rest_methods($entry['methods'] ?? 'GET');
+            __uopz_normalize_rest_methods($entry['methods'] ?? null);
         $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['permission_callback'] =
             $permissionCallback === null ? null : __uopz_callback_repr($permissionCallback);
+        $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['rest_argument_schema_version'] = 1;
+        $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['endpoint_definition_index'] =
+            $entry['__hookphuzz_endpoint_index'] ?? 0;
+        $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['route_common_argument_definitions'] =
+            __uopz_rest_schema_value($entry['__hookphuzz_common_args'] ?? []);
+        $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['argument_definitions'] =
+            __uopz_rest_schema_value($entry['__hookphuzz_final_args'] ?? ($entry['args'] ?? []));
+        $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['rest_endpoint_definitions'][] = [
+            'endpoint_definition_index' => $entry['__hookphuzz_endpoint_index'] ?? 0,
+            'methods' => __uopz_normalize_rest_methods($entry['methods'] ?? null),
+            'permission_callback' => $permissionCallback === null ? null : __uopz_callback_repr($permissionCallback),
+            'argument_definitions' => __uopz_rest_schema_value($entry['__hookphuzz_final_args'] ?? ($entry['args'] ?? [])),
+            'route_common_argument_definitions' => __uopz_rest_schema_value($entry['__hookphuzz_common_args'] ?? []),
+        ];
     }
 }
 

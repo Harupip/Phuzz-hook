@@ -1,0 +1,18 @@
+services:
+  db:
+    image: mariadb:10.11.8
+    environment: { MARIADB_DATABASE: wordpress, MARIADB_USER: wordpress, MARIADB_PASSWORD: wordpress, MARIADB_ROOT_PASSWORD: root-password }
+    healthcheck: { test: ["CMD-SHELL", "mariadb-admin ping -h localhost -uroot -proot-password --silent"], interval: 1s, timeout: 3s, retries: 90 }
+  web:
+    image: hookphuzz-phase11-rest-method:local
+    build: { context: ., dockerfile: Dockerfile }
+    depends_on: { db: { condition: service_healthy } }
+    environment: { WORDPRESS_DB_HOST: db, WORDPRESS_DB_NAME: wordpress, WORDPRESS_DB_USER: wordpress, WORDPRESS_DB_PASSWORD: wordpress }
+    volumes:
+      - phase11-wp:/var/www/html
+      - ./fixture-plugin:/var/www/html/wp-content/plugins/hookphuzz-phase11:ro
+      - ./scripts:/phase11/scripts:ro
+      - ./results:/results
+      - ../../../phuzz-main/code/fuzzer:/hookphuzz-fuzzer:ro
+    healthcheck: { test: ["CMD-SHELL", "curl -fsS http://localhost/wp-login.php >/dev/null"], interval: 1s, timeout: 3s, retries: 90 }
+volumes: { phase11-wp: }

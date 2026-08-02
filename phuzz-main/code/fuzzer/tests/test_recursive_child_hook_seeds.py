@@ -24,7 +24,7 @@ def child(
     stable_id=None,
     **extra,
 ):
-    return {
+    row = {
         "hook_name": hook_name,
         "callback_id": callback_id,
         "callback_repr": callback_id,
@@ -36,6 +36,18 @@ def child(
         "source_line": 12,
         **extra,
     }
+    row.setdefault(
+        "_executed_callback",
+        {
+            "callback_id": callback_id,
+            "hook_name": hook_name,
+            "callback_repr": callback_id,
+            "request_id": f"req-{callback_id}",
+            "http_method": "POST",
+            "target_plugin": "fixture",
+        },
+    )
+    return row
 
 
 def coverage(*callbacks):
@@ -59,8 +71,8 @@ class RecursiveChildHookSeedTests(unittest.TestCase):
         self.assertEqual(item["child_hook_name"], "wp_ajax_nopriv_child")
         self.assertEqual(item["child_callback"], "cb-child")
         self.assertEqual(item["seed"]["path"], "/wp-admin/admin-ajax.php")
-        self.assertEqual(item["seed"]["query_params"]["action"], "child")
-        self.assertNotIn("action", item["seed"]["body"])
+        self.assertEqual(item["seed"]["body"]["action"], "child")
+        self.assertNotIn("action", item["seed"]["query_params"])
 
     def test_duplicate_children_use_stable_id_then_hook_and_callback(self):
         duplicate = child(stable_id="stable-child")
