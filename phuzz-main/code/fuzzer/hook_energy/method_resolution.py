@@ -5,7 +5,6 @@ from typing import Any
 
 
 VALID_HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD")
-AMBIGUOUS_HTTP_METHODS = ["GET", "POST"]
 
 _REST_CONSTANTS = {
     "WP_REST_SERVER::READABLE": ["GET"],
@@ -36,6 +35,24 @@ def resolve_http_methods(
     )
 
     if route_methods:
+        if observed_method and observed_method not in route_methods:
+            return [_blocked_decision(
+                status="conflict",
+                candidates=route_methods,
+                route_methods=route_methods,
+                observed_method=observed_method,
+                reason="observed_request_method_not_declared_by_route",
+                evidence={"route_declared_methods": route_methods, "observed_request_method": observed_method},
+            )]
+        if observed_method:
+            return [_resolved_decision(
+                observed_method,
+                candidates=route_methods,
+                confidence="runtime_observed",
+                evidence={"route_declared_methods": route_methods, "request_id": observed["request_id"]},
+                observed_method=observed_method,
+                route_methods=route_methods,
+            )]
         evidence = {"route_declared_methods": route_methods}
         return [
             _resolved_decision(
@@ -50,6 +67,16 @@ def resolve_http_methods(
         ]
 
     exact_methods = [method for method in ("GET", "POST") if method in sources]
+    if exact_methods and observed_method and observed_method not in exact_methods:
+        return [_blocked_decision(
+            status="conflict",
+            candidates=exact_methods,
+            route_methods=[],
+            observed_method=observed_method,
+            reason="runtime_observation_conflicts_with_source_exact",
+            evidence={"parameter_sources": sources, "source_exact_methods": exact_methods, "observed_request_method": observed_method},
+        )]
+
     if exact_methods:
         evidence = {"parameter_sources": sources, "source_exact_methods": exact_methods}
         return [
@@ -87,7 +114,7 @@ def resolve_http_methods(
         {
             "method": None,
             "resolved_method": None,
-            "candidate_methods": list(AMBIGUOUS_HTTP_METHODS),
+            "candidate_methods": [],
             "method_status": "ambiguous",
             "method_source": "ambiguous",
             "method_confidence": "ambiguous",
@@ -98,6 +125,9 @@ def resolve_http_methods(
             "observed_request_method": observed_method,
             "route_declared_methods": [],
             "seed_variant_id": "ambiguous",
+            "export_allowed": False,
+            "replay_allowed": False,
+            "block_reason": "no_correlated_runtime_or_declared_or_source_exact_method",
         }
     ]
 
@@ -189,6 +219,35 @@ def _resolved_decision(
         "observed_request_method": observed_method,
         "route_declared_methods": list(route_methods),
         "seed_variant_id": method.lower(),
+        "export_allowed": True,
+        "replay_allowed": True,
+        "block_reason": None,
+    }
+
+
+def _blocked_decision(
+    *,
+    status: str,
+    candidates: list[str],
+    route_methods: list[str],
+    observed_method: str | None,
+    reason: str,
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "method": None,
+        "resolved_method": None,
+        "candidate_methods": list(candidates),
+        "method_status": status,
+        "method_source": status,
+        "method_confidence": status,
+        "method_evidence": dict(evidence),
+        "observed_request_method": observed_method,
+        "route_declared_methods": list(route_methods),
+        "seed_variant_id": status,
+        "export_allowed": False,
+        "replay_allowed": False,
+        "block_reason": reason,
     }
 
 

@@ -27,7 +27,7 @@ class EntrypointRuleTests(unittest.TestCase):
         self.assertFalse(details["auth_required"])
         self.assertEqual(details["http_template"]["body_params"], {"action": "demo_lookup"})
         self.assertIsNone(details["http_template"]["method"])
-        self.assertEqual(details["candidate_methods"], ["GET", "POST"])
+        self.assertEqual(details["candidate_methods"], [])
         self.assertEqual(details["method_confidence"], "ambiguous")
 
     def test_heartbeat_uses_exact_admin_ajax_action(self) -> None:

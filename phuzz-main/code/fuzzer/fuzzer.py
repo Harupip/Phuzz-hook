@@ -506,6 +506,7 @@ class Fuzzer:
         the_cookies = {**candidate.fuzz_params['cookies'], **candidate.fixed_params['cookies']} # self._urlencode_dict()
         the_headers = {**candidate.fuzz_params['headers'], **candidate.fixed_params['headers']}
         the_headers["X-FUZZER-COVID"] = candidate.coverage_id
+        the_headers.setdefault("X-HookPhuzz-Request-ID", candidate.coverage_id)
 
         # print({
         #     'query': the_params,
@@ -522,7 +523,8 @@ class Fuzzer:
                                     headers=the_headers)
 
         elif candidate.http_method in ["POST", "PUT", "PATCH", "DELETE"]:
-            if the_headers.get('Content-Type', '') in ['application/json']:
+            content_type = the_headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+            if content_type == 'application/json':
                 req = requests.Request(method=candidate.http_method, 
                                     url=urlparse.urlunparse(url_parts),
                                     params=the_params,

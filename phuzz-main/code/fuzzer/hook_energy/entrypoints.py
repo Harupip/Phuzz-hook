@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .method_resolution import normalize_http_methods, resolve_http_methods
+from .rest_routes import materialize_rest_route
 
 
 # WordPress AJAX endpoint mapping. Method is resolved from evidence later.
@@ -172,8 +173,9 @@ def rest_seed_template(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
     )
     decision = decisions[0]
     methods = decision["candidate_methods"] if decision["method_status"] == "resolved" else []
+    route_ready = template.get("route_materialization_status") == "materialized"
     return {
-        "method": decision["resolved_method"],
+        "method": decision["resolved_method"] if route_ready else None,
         "methods": methods,
         "path": template["path"],
         "content_type": str(metadata.get("content_type") or ""),
@@ -182,6 +184,20 @@ def rest_seed_template(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
         "fixed_params": [],
         "entrypoint_type": "rest_route",
         **{key: decision[key] for key in _METHOD_FIELDS},
+        "route_pattern": template.get("route_pattern"),
+        "materialized_route": template.get("materialized"),
+        "route_materialization": {
+            key: template[key]
+            for key in ("route_materialization_status", "pattern", "materialized", "substitutions", "block_reason")
+            if key in template
+        },
+        "export_allowed": bool(decision.get("export_allowed")) and route_ready,
+        "replay_allowed": bool(decision.get("replay_allowed")) and route_ready,
+        "block_reason": (
+            decision.get("block_reason")
+            if route_ready
+            else template.get("block_reason") or "unsupported_route_materialization"
+        ),
     }
 
 
@@ -197,12 +213,33 @@ def rest_http_template(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
             route = hook_name.removeprefix("rest_route:").strip("/")
     if not route:
         return None
-    if namespace and not route.startswith(f"{namespace}/"):
-        route = f"{namespace}/{route}"
+    if namespace and route.startswith(f"{namespace}/"):
+        route_pattern = "/" + route.removeprefix(f"{namespace}/")
+    else:
+        route_pattern = "/" + route
+    materialization = materialize_rest_route(route_pattern)
+    if materialization["route_materialization_status"] != "materialized":
+        return {
+            "method": None,
+            "path": "",
+            "query_params": {},
+            "body_params": {},
+            "route_pattern": route_pattern,
+            **materialization,
+        }
+    materialized_route = str(materialization["materialized"]).strip("/")
+    route = f"{namespace}/{materialized_route}" if namespace else materialized_route
 
     methods = normalize_http_methods(metadata.get("methods", metadata.get("method")))
     method = methods[0] if methods else None
-    return {"method": method, "path": f"/wp-json/{route}", "query_params": {}, "body_params": {}}
+    return {
+        "method": method,
+        "path": f"/wp-json/{route}",
+        "query_params": {},
+        "body_params": {},
+        "route_pattern": route_pattern,
+        **materialization,
+    }
 
 
 def _build_direct_details(rule: Mapping[str, Any], action: str) -> dict[str, Any]:
@@ -248,4 +285,7 @@ _METHOD_FIELDS = (
     "method_evidence",
     "observed_request_method",
     "route_declared_methods",
+    "export_allowed",
+    "replay_allowed",
+    "block_reason",
 )

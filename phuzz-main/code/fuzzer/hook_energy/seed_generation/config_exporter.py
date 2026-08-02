@@ -26,8 +26,11 @@ def build_config_for_seed_item(
     if auth_mode not in {"authenticated", "unauth-capable"}:
         raise SeedConfigSkip("unsupported_auth_mode")
 
-    if seed.get("method_status") == "ambiguous" or seed.get("method_confidence") == "ambiguous":
+    method_status = seed.get("method_status")
+    if method_status == "ambiguous" or seed.get("method_confidence") == "ambiguous":
         raise SeedConfigSkip("ambiguous_http_method")
+    if seed.get("export_allowed") is False or (method_status and method_status != "resolved"):
+        raise SeedConfigSkip(str(seed.get("block_reason") or "blocked_http_method"))
 
     methods = _seed_methods(seed)
     path = str(seed.get("path", "")).strip()

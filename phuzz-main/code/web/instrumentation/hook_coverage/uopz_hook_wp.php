@@ -729,18 +729,24 @@ function __uopz_rest_hook_name(string $namespace, string $route): string
 
 function __uopz_normalize_rest_methods($methods): array
 {
-    $items = is_array($methods) ? $methods : [$methods ?: 'GET'];
     $normalized = [];
-    foreach ($items as $item) {
+    $add = static function ($item) use (&$add, &$normalized): void {
+        if (is_array($item)) {
+            foreach ($item as $nested) {
+                $add($nested);
+            }
+            return;
+        }
         foreach (explode(',', str_replace('|', ',', (string) $item)) as $part) {
             $method = strtoupper(trim($part));
             if ($method !== '' && !in_array($method, $normalized, true)) {
                 $normalized[] = $method;
             }
         }
-    }
+    };
+    $add($methods);
 
-    return $normalized ?: ['GET'];
+    return $normalized;
 }
 
 function __uopz_rest_endpoint_args($args): array
@@ -789,7 +795,7 @@ function __uopz_register_rest_route(string $namespace, string $route, $args): vo
         $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['namespace'] = trim($namespace, '/');
         $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['route'] = '/' . trim($route, '/');
         $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['methods'] =
-            __uopz_normalize_rest_methods($entry['methods'] ?? 'GET');
+            __uopz_normalize_rest_methods($entry['methods'] ?? null);
         $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'][$callbackId]['permission_callback'] =
             $permissionCallback === null ? null : __uopz_callback_repr($permissionCallback);
     }

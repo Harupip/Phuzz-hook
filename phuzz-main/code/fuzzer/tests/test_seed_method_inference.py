@@ -104,7 +104,7 @@ class MethodInferenceTests(unittest.TestCase):
         self.assertEqual(get_seed["query_params"], {"action": "fixture_get", "id": "FUZZ"})
         self.assertEqual(post_seed["body"], {"action": "fixture_post", "id": "FUZZ"})
         self.assertIsNone(request["method"])
-        self.assertEqual(request["candidate_methods"], ["GET", "POST"])
+        self.assertEqual(request["candidate_methods"], [])
         self.assertEqual(request["method_confidence"], "ambiguous")
         self.assertEqual(request["unresolved_params"]["id"], "FUZZ")
         self.assertEqual(mixed["GET"]["query_params"]["a"], "FUZZ")
@@ -237,7 +237,7 @@ class MethodInferenceTests(unittest.TestCase):
         item = next(row for row in self.rows if row["callback_id"] == "request-only")
         decision = item["seed"]
         self.assertIsNone(decision["resolved_method"])
-        self.assertEqual(decision["candidate_methods"], ["GET", "POST"])
+        self.assertEqual(decision["candidate_methods"], [])
         with self.assertRaisesRegex(SeedConfigSkip, "ambiguous_http_method"):
             build_config_for_seed_item(item)
 
