@@ -6,14 +6,16 @@ repo_root="$(cd "$phase_dir/../../../.." && pwd)"
 phase11_dir="$phase_dir/.."
 results="$phase_dir/results"
 run_id="phase11b-cf7-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM"
-compose=(docker compose -p hookphuzz-phase11b-cf7 -f "$phase_dir/docker-compose.yml")
+helper=(python3 "$phase_dir/scripts/cf7_lifecycle.py")
+project=$("${helper[@]}" project-name --run-id "$run_id" --owner phase11b)
+compose=(docker compose --project-name "$project" --file "$phase_dir/docker-compose.yml")
 export PHASE11B_RUN_ID="$run_id"
 export PHASE11B_LOCAL_USERNAME="phase11bcf7"
 export PHASE11B_DENIED_USERNAME="phase11bcf7denied"
 export PHASE11B_LOCAL_PASSWORD="local-${run_id}-${RANDOM}"
 export PHASE11B_DENIED_PASSWORD="local-denied-${run_id}-${RANDOM}"
 
-cleanup() { timeout 120s "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true; }
+cleanup() { timeout 180s "${helper[@]}" stop --phase-dir "$phase_dir" --results-dir "$results" --run-id "$run_id" --owner phase11b --project-name "$project" >/dev/null 2>&1 || true; }
 
 archive_current_run() {
   mkdir -p "$results/history" "$phase_dir/configs" "$phase_dir/artifacts"
@@ -31,21 +33,13 @@ archive_current_run() {
 main() {
   trap cleanup EXIT
   cleanup
-  docker image inspect hookphuzz-phase11-rest-method:local >/dev/null
-  timeout 300s docker build --pull=false --progress=plain -t hookphuzz-phase11b-cf7:local -f "$phase_dir/Dockerfile" "$repo_root"
-  timeout 300s "${compose[@]}" up -d --no-build
-  for _ in $(seq 1 90); do
-    "${compose[@]}" exec -T web curl -fsS http://localhost/wp-login.php >/dev/null && break
-    sleep 1
-  done
-  "${compose[@]}" exec -T web curl -fsS http://localhost/wp-login.php >/dev/null
-  timeout 90s "${compose[@]}" exec -T web bash /phase11b/scripts/setup-wordpress.sh > "$results/setup-wordpress.log"
+  timeout 600s "${helper[@]}" start --phase-dir "$phase_dir" --run-id "$run_id" --results-dir "$results" --owner phase11b --project-name "$project"
   {
     "${compose[@]}" exec -T web php -v
     "${compose[@]}" exec -T web php -r 'echo "Zend=" . zend_version() . PHP_EOL; echo "UOPZ=" . phpversion("uopz") . PHP_EOL;'
     "${compose[@]}" exec -T web wp --allow-root --path=/var/www/html core version
     "${compose[@]}" exec -T web wp --allow-root --path=/var/www/html plugin get contact-form-7 --field=version
-    printf 'host=local Docker\ncontainer=hookphuzz-phase11b-cf7-web\nrun_id=%s\n' "$run_id"
+    printf 'host=local Docker\ncompose_project=%s\nrun_id=%s\n' "$project" "$run_id"
   } > "$results/environment.txt"
   timeout 180s "${compose[@]}" exec -T web python3 /phase11b/scripts/run_phase11b.py
 }

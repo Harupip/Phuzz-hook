@@ -21,7 +21,7 @@ services:
       FUZZER_HOOK_OUTPUT_DIR: /shared-tmpfs/hook-coverage
     volumes:
       - phase12-wp:/var/www/html
-      - ./results:/results
+      - ${PHASE12_RESULTS_DIR}:/results
       - ./scripts:/phase12/scripts:ro
       - ../phase11-rest-method-generalization/phase11b-cf7/scripts:/phase11b/scripts:ro
       - ./fixture-plugin:/var/www/html/wp-content/plugins/hookphuzz-phase12-fixture:ro

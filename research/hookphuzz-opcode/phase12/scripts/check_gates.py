@@ -3,12 +3,13 @@
 import json, sys
 from pathlib import Path
 
-root, run_id = Path(sys.argv[1]), sys.argv[2]
-required = json.loads((root.parent / 'required-gates.json').read_text())['required_gates']
+root, run_id, started_epoch, expected_project = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+required = json.loads((Path(__file__).resolve().parents[1] / 'required-gates.json').read_text())['required_gates']
 def read(name):
     try:
-        value = json.loads((root / name).read_text())
-        return value if value.get('run_id') == run_id else {}
+        path = root / name
+        value = json.loads(path.read_text())
+        return value if path.stat().st_mtime >= started_epoch and value.get('run_id') == run_id else {}
     except (OSError, json.JSONDecodeError): return {}
 capture, normalized, config = read('route-argument-capture.json'), read('normalized-schemas.json'), read('config-loader-e2e.json')
 matrix_doc, defaults, negatives, methods = read('fixture-matrix-final.json'), read('default-origin-results.json'), read('negative-tests-final.json'), read('method-schema-isolation.json')
@@ -29,7 +30,7 @@ gates = {
  'method_schema_isolation':methods.get('pass'), 'route_without_args':matrix.get('route_without_args'), 'runtime_only':any(row.get('parameter_status') == 'runtime_only' for row in resolution.get('parameters',[])), 'declared_not_observed':matrix.get('declared_not_observed'), 'unsupported_pattern':matrix.get('unsupported_pattern'), 'unsupported_nested_object':matrix.get('unsupported_nested_object'), 'schema_runtime_conflict':matrix.get('schema_runtime_conflict'), 'multiple_endpoint_definitions':matrix.get('multiple_endpoint_definitions'),
  'wrong_callback_rejected':negative.get('wrong_callback_rejected'), 'wrong_request_id_rejected':negative.get('wrong_request_id_rejected'), 'stale_artifact_rejected':negative.get('stale_artifact_rejected'), 'wrong_location_rejected':negative.get('wrong_location_rejected'), 'runtime_only_export_rejected':negative.get('runtime_only_export_rejected'),
  'concurrency':concurrency.get('unique_request_ids') == 5 and concurrency.get('all_correlated') and concurrency.get('no_cross_request_contamination'),
- 'cf7_current_run':cf7.get('pass') is True,
+ 'cf7_current_run':cf7.get('pass') is True and cf7.get('compose_project') == expected_project,
 }
 missing = [name for name in required if name not in gates or gates[name] is None]
 failed = [name for name in required if name in gates and gates[name] is False]
