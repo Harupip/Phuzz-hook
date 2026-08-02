@@ -223,7 +223,7 @@ def _build_param_section(
 ) -> dict[str, Any]:
     fixed: list[str] = []
     fuzz: list[str] = []
-    data: list[dict[str, str]] = []
+    data: list[dict[str, Any]] = []
 
     for name, value in values.items():
         param_name = str(name)
@@ -231,7 +231,8 @@ def _build_param_section(
             data.append({"name": param_name, "value": "fuzz"})
             fuzz.append(_selector_for_generated_param(param_name))
         else:
-            data.append({"name": param_name, "value": str(value)})
+            # JSON request preparation relies on native booleans and numbers.
+            data.append({"name": param_name, "value": value})
             fixed.append(_selector_for_generated_param(param_name))
 
     return {"data": data, "fixed": fixed, "fuzz": fuzz, "weight": 1}

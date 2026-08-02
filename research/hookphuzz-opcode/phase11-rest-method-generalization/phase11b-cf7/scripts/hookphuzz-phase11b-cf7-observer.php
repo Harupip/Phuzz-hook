@@ -44,6 +44,10 @@ $hp11b_write = static function () use (&$hp11b_doc, $hp11b_id): void {
                 'declared_methods' => $entry['methods'] ?? [],
                 'callback' => $entry['callback_repr'],
                 'permission_callback' => $entry['permission_callback'] ?? null,
+                'rest_argument_schema_version' => $entry['rest_argument_schema_version'] ?? null,
+                'endpoint_definition_index' => $entry['endpoint_definition_index'] ?? null,
+                'route_common_argument_definitions' => $entry['route_common_argument_definitions'] ?? [],
+                'argument_definitions' => $entry['argument_definitions'] ?? [],
                 'source_file' => $entry['source_file'] ?? null,
                 'source_line' => $entry['source_line'] ?? null,
             ];

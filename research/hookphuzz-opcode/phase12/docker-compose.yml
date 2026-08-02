@@ -1,0 +1,32 @@
+services:
+  db:
+    image: mariadb:10.11.8
+    environment: { MARIADB_DATABASE: wordpress, MARIADB_USER: wordpress, MARIADB_PASSWORD: wordpress, MARIADB_ROOT_PASSWORD: root-password }
+    healthcheck: { test: ["CMD-SHELL", "mariadb-admin ping -h localhost -uroot -proot-password --silent"], interval: 1s, timeout: 3s, retries: 90 }
+  web:
+    image: hookphuzz-phase11b-cf7:local
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      PHASE11B_LOCAL_USERNAME: ${PHASE11B_LOCAL_USERNAME}
+      PHASE11B_LOCAL_PASSWORD: ${PHASE11B_LOCAL_PASSWORD}
+      PHASE11B_DENIED_USERNAME: ${PHASE11B_DENIED_USERNAME}
+      PHASE11B_DENIED_PASSWORD: ${PHASE11B_DENIED_PASSWORD}
+      PHASE11B_RUN_ID: ${PHASE11B_RUN_ID}
+      WP_TARGET_PLUGIN: hookphuzz-phase12-fixture
+      TARGET_APP_PATH: /var/www/html/wp-content/plugins/hookphuzz-phase12-fixture/
+      FUZZER_HOOK_OUTPUT_DIR: /shared-tmpfs/hook-coverage
+    volumes:
+      - phase12-wp:/var/www/html
+      - ./results:/results
+      - ./scripts:/phase12/scripts:ro
+      - ../phase11-rest-method-generalization/phase11b-cf7/scripts:/phase11b/scripts:ro
+      - ./fixture-plugin:/var/www/html/wp-content/plugins/hookphuzz-phase12-fixture:ro
+      - ../../../phuzz-main/code/fuzzer:/hookphuzz-fuzzer:ro
+      - ../../../phuzz-main/code/web/instrumentation/hook_coverage/uopz_hook_wp.php:/var/www/html/wp-content/mu-plugins/uopz_hook_wp.php:ro
+    tmpfs: [/shared-tmpfs]
+    healthcheck: { test: ["CMD-SHELL", "curl -fsS http://localhost/wp-login.php >/dev/null"], interval: 1s, timeout: 3s, retries: 90 }
+volumes: { phase12-wp: }

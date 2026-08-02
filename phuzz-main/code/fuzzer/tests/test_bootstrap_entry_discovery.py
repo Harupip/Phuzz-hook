@@ -57,6 +57,10 @@ class BootstrapEntryDiscoveryTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("__uopz_register_rest_route", instrumentation)
+        self.assertIn("argument_definitions", instrumentation)
+        self.assertIn("route_common_argument_definitions", instrumentation)
+        self.assertIn("rest_endpoint_definitions", instrumentation)
+        self.assertIn("__uopz_rest_schema_value", instrumentation)
         self.assertIn("__uopz_record_rest_callback_invocation", instrumentation)
         self.assertIn("__uopz_try_hook_function('register_rest_route'", instrumentation)
         self.assertIn("['entrypoint_type'] = 'rest_route'", instrumentation)
