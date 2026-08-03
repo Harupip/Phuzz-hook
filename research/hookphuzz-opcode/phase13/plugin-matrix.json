@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {"slug":"contact-form-7","version":"5.7.7","zip":"contact-form-7.zip","origin":"repository pinned local ZIP","rationale":"authenticated runtime-only search regression"},
+    {"slug":"gamipress","version":"7.3.1","zip":"gamipress.zip","origin":"repository pinned local ZIP","rationale":"existing local real-plugin REST target"},
+    {"slug":"woocommerce","version":"7.8.0","zip":"woocommerce.zip","origin":"repository pinned local ZIP","rationale":"broad real REST route coverage"}
+  ]
+}
