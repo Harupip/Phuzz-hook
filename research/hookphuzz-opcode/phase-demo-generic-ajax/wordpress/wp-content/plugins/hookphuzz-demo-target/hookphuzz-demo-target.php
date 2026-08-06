@@ -42,6 +42,26 @@ function hookphuzz_save_profile(): void
     wp_die();
 }
 
+add_action('init', 'hookphuzz_register_demo_action');
+function hookphuzz_register_demo_action(): void
+{
+    $name = 'hookphuzz_demo_discover';
+    add_action('wp_ajax_nopriv_' . $name, 'hookphuzz_demo_discover_callback');
+}
+
+function hookphuzz_demo_discover_callback(): void
+{
+    $marker = $_POST['demo_discovered_param'] ?? null;
+    echo wp_json_encode([
+        'callback' => 'hookphuzz_demo_discover_callback',
+        'parameter' => 'demo_discovered_param',
+        'source' => 'POST',
+        'marker' => $marker,
+        'request_id' => $_SERVER['HTTP_X_HOOKPHUZZ_REQUEST_ID'] ?? null,
+    ]);
+    wp_die();
+}
+
 /*
  * Ví dụ khác: chỉ bật MỘT block thay cho hook/callback mặc định ở trên.
  * Nếu bật nhiều hook cùng lúc, đặt HOOKPHUZZ_DEMO_HOOK=<ten-hook> khi chạy.
