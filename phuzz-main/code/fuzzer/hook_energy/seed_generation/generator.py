@@ -134,10 +134,10 @@ class LiveHookSeedGenerator:
         registered_callbacks = coverage_data.get("registered_callbacks", {})
         executed_callbacks = coverage_data.get("executed_callbacks", {})
 
-        if not isinstance(registered_callbacks, dict):
+        registered_callbacks = self._callback_mapping(registered_callbacks)
+        executed_callbacks = self._callback_mapping(executed_callbacks)
+        if registered_callbacks is None:
             raise ValueError("total_coverage payload must contain a registered_callbacks mapping")
-        if not isinstance(executed_callbacks, dict):
-            executed_callbacks = {}
 
         rows: list[dict[str, Any]] = []
         for callback_id, registered_entry in sorted(registered_callbacks.items()):
@@ -540,4 +540,18 @@ class LiveHookSeedGenerator:
         if value in (None, ""):
             return default
         return int(value)
+
+    @staticmethod
+    def _callback_mapping(value: Any) -> dict[str, Any] | None:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, list):
+            mapped: dict[str, Any] = {}
+            for index, item in enumerate(value):
+                if not isinstance(item, dict):
+                    continue
+                callback_id = str(item.get("callback_id") or index)
+                mapped[callback_id] = item
+            return mapped
+        return None
 

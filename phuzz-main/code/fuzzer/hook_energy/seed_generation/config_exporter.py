@@ -91,6 +91,7 @@ def export_seed_configs(
     output_config_dir: str | Path,
     summary_path: str | Path | None = None,
     target_base: str = "http://web",
+    write_param_summary: bool = True,
 ) -> dict[str, list[dict[str, str]]]:
     output_dir = Path(output_config_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -129,13 +130,14 @@ def export_seed_configs(
     if summary_path is not None:
         Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
         Path(summary_path).write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        param_summary_path = Path(summary_path).with_name("generated_param_summary.json")
-        param_summary = build_generated_param_summary(
-            seed_report,
-            summary,
-            output_config_dir=output_dir,
-        )
-        param_summary_path.write_text(json.dumps(param_summary, indent=2), encoding="utf-8")
+        if write_param_summary:
+            param_summary_path = Path(summary_path).with_name("generated_param_summary.json")
+            param_summary = build_generated_param_summary(
+                seed_report,
+                summary,
+                output_config_dir=output_dir,
+            )
+            param_summary_path.write_text(json.dumps(param_summary, indent=2), encoding="utf-8")
 
     return summary
 

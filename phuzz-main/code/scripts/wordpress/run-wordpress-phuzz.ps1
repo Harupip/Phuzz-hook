@@ -4,6 +4,7 @@ param(
     [switch]$ForcePlugins,
     [switch]$NoFollowLogs,
     [switch]$RunGeneratedConfigs,
+    [switch]$UseEntrypointPipeline,
     [ValidatePattern('^[a-zA-Z0-9_./-]+$')]
     [string]$BootstrapConfigSlug = "",
     [ValidateRange(1, 86400)]
@@ -21,6 +22,10 @@ $scriptRoot = (Resolve-Path -LiteralPath (Join-Path $scriptDir "..\..")).Path
 $pluginScript = Join-Path $scriptRoot "web\applications\wordpress\_plugins\download-plugins.ps1"
 $fuzzerService = "fuzzer-wordpress-plugin"
 $webUrl = "http://localhost:8080/"
+
+if ($UseEntrypointPipeline -and -not $RunGeneratedConfigs) {
+    throw "-UseEntrypointPipeline requires -RunGeneratedConfigs."
+}
 
 if (-not $BootstrapConfigSlug) {
     if ($RunGeneratedConfigs) {
@@ -111,7 +116,8 @@ function Export-LiveSeedSuggestions {
         [string]$ScriptRoot,
         [int]$WaitSeconds,
         [string[]]$ComposeArgs,
-        [string]$PluginSlug
+        [string]$PluginSlug,
+        [switch]$UseEntrypointPipeline
     )
 
     $webContainerId = (& $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] ps -q web).Trim()
@@ -123,6 +129,7 @@ function Export-LiveSeedSuggestions {
     $coverageSnapshot = Join-Path ([System.IO.Path]::GetTempPath()) "phuzz-live-total-coverage.json"
     $outputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
     $exportCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\export_cli.py"
+    $pipelineCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\pipeline_cli.py"
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     $snapshotReady = $false
     $pluginSourceTempRoot = $null
@@ -175,8 +182,23 @@ function Export-LiveSeedSuggestions {
             $sourceArgs = @("--unresolved-source-reason", $unresolvedSourceReason)
         }
 
-        Write-Host "Exporting hook_gap_report.json and suggested_seeds.* to $outputDir"
-        python $exportCli --coverage-file $coverageSnapshot --output-dir $outputDir @sourceArgs
+        if ($UseEntrypointPipeline) {
+            $outputConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-config\$PluginSlug"
+            Write-Host "Running entrypoint pipeline into $outputDir"
+            python $pipelineCli `
+                --coverage-file $coverageSnapshot `
+                --plugin-slug $PluginSlug `
+                --output-dir $outputDir `
+                --output-config-dir $outputConfigDir `
+                --minimal-artifacts `
+                @sourceArgs
+        } else {
+            Write-Host "Exporting hook_gap_report.json and suggested_seeds.* to $outputDir"
+            python $exportCli --coverage-file $coverageSnapshot --output-dir $outputDir @sourceArgs
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "Seed export failed."
+        }
     } finally {
         if ($pluginSourceTempRoot -and (Test-Path -LiteralPath $pluginSourceTempRoot)) {
             try {
@@ -207,6 +229,85 @@ function Convert-LiveSeedSuggestionsToConfigs {
         --suggested-seeds $suggestedSeeds `
         --output-config-dir $outputConfigDir `
         --summary $summaryPath
+}
+
+function Write-EntrypointPluginProofFile {
+    param(
+        [string]$SeedOutputDir,
+        [string]$PluginSlug,
+        [string]$RunnerLog
+    )
+
+    $pipelinePath = Join-Path $SeedOutputDir "entrypoint_pipeline_summary.json"
+    $configPath = Join-Path $SeedOutputDir "generated_config_summary.json"
+    $runPath = Join-Path $SeedOutputDir "generated_config_run_summary.json"
+    if (-not (Test-Path -LiteralPath $pipelinePath)) {
+        return
+    }
+
+    $proofDir = Join-Path $SeedOutputDir "entrypoint-proof"
+    New-Item -ItemType Directory -Path $proofDir -Force | Out-Null
+    $proofPath = Join-Path $proofDir "PLUGIN_GENERATION_PROOF.md"
+    $pipeline = Get-Content -LiteralPath $pipelinePath -Raw | ConvertFrom-Json
+    $run = $null
+    if (Test-Path -LiteralPath $runPath) {
+        $run = Get-Content -LiteralPath $runPath -Raw | ConvertFrom-Json
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("# Entrypoint generated plugin proof")
+    $lines.Add("")
+    $lines.Add("Plugin: ``$PluginSlug``")
+    $lines.Add("")
+    $lines.Add("## Counters")
+    $lines.Add("")
+    $lines.Add(("- registered: {0}" -f $pipeline.summary.registered))
+    $lines.Add(("- direct_http_candidates: {0}" -f $pipeline.summary.direct_http_candidates))
+    $lines.Add(("- generated: {0}" -f $pipeline.summary.generated))
+    $lines.Add(("- ambiguous_http_method: {0}" -f $pipeline.summary.ambiguous_http_method))
+    $lines.Add("")
+    $lines.Add("## Generated configs")
+    $lines.Add("")
+
+    foreach ($entry in @($pipeline.entrypoints | Where-Object { $_.config_status -eq "generated" })) {
+        $lines.Add(("### [{0}] {1}" -f $entry.method, $entry.hook_name))
+        $lines.Add("")
+        $lines.Add(("- callback: ``{0}``" -f $entry.callback_repr))
+        $lines.Add(("- action: ``{0}``" -f $entry.action))
+        foreach ($param in @($entry.parameters)) {
+            if ($param.name) {
+                $lines.Add(("- param: ``{0}`` from ``{1}`` as ``{2}``" -f $param.name, $param.source, $param.location))
+            }
+        }
+        $lines.Add(("- config_slug: ``{0}``" -f $entry.config_slug))
+        $lines.Add(("- config_path: ``{0}``" -f $entry.config_path))
+        $lines.Add("")
+    }
+
+    if ($run) {
+        $lines.Add("## Replay")
+        $lines.Add("")
+        $lines.Add(("- callback_reached: {0}/{1}" -f $run.counts.callback_reached, $run.counts.total))
+        foreach ($row in @($run.runs)) {
+            if ($row.matched_artifact) {
+                $lines.Add(("- matched_artifact: ``{0}``" -f $row.matched_artifact))
+            }
+        }
+        $lines.Add("")
+    }
+
+    $lines.Add("## Source artifacts")
+    $lines.Add("")
+    $lines.Add(("- runtime coverage snapshot: ``{0}``" -f (Join-Path $SeedOutputDir "runtime_coverage_snapshot.json")))
+    $lines.Add(("- pipeline summary: ``{0}``" -f $pipelinePath))
+    $lines.Add(("- config summary: ``{0}``" -f $configPath))
+    $lines.Add(("- replay summary: ``{0}``" -f $runPath))
+    if ($RunnerLog) {
+        $lines.Add(("- replay log: ``{0}``" -f $RunnerLog))
+    }
+
+    $lines | Set-Content -LiteralPath $proofPath -Encoding UTF8
+    Write-Host "Entrypoint plugin proof file: $proofPath"
 }
 
 Push-Location $scriptRoot
@@ -250,25 +351,58 @@ try {
     Write-Host "Starting fuzzer container"
     Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", $fuzzerService, "--build")
 
-    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug
-    Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug
+    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug -UseEntrypointPipeline:$UseEntrypointPipeline
+    if (-not $UseEntrypointPipeline) {
+        Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug
+    }
 
     if ($RunGeneratedConfigs) {
         $seedOutputDir = Join-Path $scriptRoot "fuzzer\output\seed_generation"
         $generatedConfigSummary = Join-Path $seedOutputDir "generated_config_summary.json"
         $generatedRunSummary = Join-Path $seedOutputDir "generated_config_run_summary.json"
         $generatedConfigRunner = Join-Path $scriptRoot "fuzzer\hook_energy\seed_generation\generated_config_runner.py"
+        $generatedRunnerLog = $null
 
         Write-Host "Stopping default fuzzer before generated config batch"
         Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("stop", "--timeout", "30", $fuzzerService)
 
         Write-Host "Running generated hook configs sequentially"
-        python $generatedConfigRunner `
-            --generated-config-summary $generatedConfigSummary `
-            --output-file $generatedRunSummary `
-            --timeout-seconds $GeneratedConfigTimeoutSeconds `
-            --service $fuzzerService
-        if ($LASTEXITCODE -ne 0) {
+        if ($UseEntrypointPipeline) {
+            $generatedLogDir = Join-Path $seedOutputDir "entrypoint-proof\logs"
+            New-Item -ItemType Directory -Path $generatedLogDir -Force | Out-Null
+            $generatedRunnerLog = Join-Path $generatedLogDir "generated_config_runner.log"
+            $generatedRunnerStdout = Join-Path $generatedLogDir "generated_config_runner.stdout.log"
+            $generatedRunnerStderr = Join-Path $generatedLogDir "generated_config_runner.stderr.log"
+            $generatedArgs = @(
+                $generatedConfigRunner,
+                "--generated-config-summary", $generatedConfigSummary,
+                "--output-file", $generatedRunSummary,
+                "--timeout-seconds", $GeneratedConfigTimeoutSeconds,
+                "--service", $fuzzerService
+            )
+            $generatedProcess = Start-Process `
+                -FilePath "python" `
+                -ArgumentList $generatedArgs `
+                -Wait `
+                -PassThru `
+                -WindowStyle Hidden `
+                -RedirectStandardOutput $generatedRunnerStdout `
+                -RedirectStandardError $generatedRunnerStderr
+            $generatedExitCode = $generatedProcess.ExitCode
+            Get-Content -LiteralPath $generatedRunnerStdout, $generatedRunnerStderr -ErrorAction SilentlyContinue |
+                Set-Content -LiteralPath $generatedRunnerLog -Encoding UTF8
+        } else {
+            python $generatedConfigRunner `
+                --generated-config-summary $generatedConfigSummary `
+                --output-file $generatedRunSummary `
+                --timeout-seconds $GeneratedConfigTimeoutSeconds `
+                --service $fuzzerService
+            $generatedExitCode = $LASTEXITCODE
+        }
+        if ($UseEntrypointPipeline) {
+            Write-EntrypointPluginProofFile -SeedOutputDir $seedOutputDir -PluginSlug $PluginSlug -RunnerLog $generatedRunnerLog
+        }
+        if ($generatedExitCode -ne 0) {
             throw "Generated hook config batch failed. See $generatedRunSummary"
         }
 

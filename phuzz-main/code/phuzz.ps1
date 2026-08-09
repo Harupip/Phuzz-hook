@@ -14,6 +14,7 @@ param(
     [int]$SeedWaitSeconds = 45,
     [ValidateRange(1, 30)]
     [int]$GeneratedConfigTimeoutSeconds = 30,
+    [switch]$UseEntrypointPipeline,
     [ValidateRange(1, 20)]
     [int]$MaxHookDepth = 3,
     [ValidateRange(1, 300)]
@@ -59,6 +60,7 @@ Useful options:
   -WebTimeoutSeconds <seconds>     Wait window for WordPress HTTP 200. Default: 240.
   -SeedWaitSeconds <seconds>       Wait window for live hook coverage snapshot. Default: 45.
   -GeneratedConfigTimeoutSeconds   Per generated-config run window. Default/max: 30.
+  -UseEntrypointPipeline           Opt-in generated mode to the entrypoint pipeline.
   -RecursiveInputFile <path>       Child-hook input artifact. Repeat for multiple files.
   -RecursiveHookCoverageDir <path> Hook coverage dir with requests/ for recursive validation.
   -RecursiveBaseUrl <url>          WordPress base URL for recursive validation. Default: http://localhost:8080.
@@ -641,9 +643,17 @@ if (-not (Test-Path -LiteralPath $runnerPath)) {
     throw "Missing WordPress PHUZZ runner: $runnerPath"
 }
 
+if ($UseEntrypointPipeline -and $PSBoundParameters.ContainsKey("Mode") -and $Mode -ne "generated") {
+    throw "-UseEntrypointPipeline is only supported with -Mode generated."
+}
+
 $interactive = -not $PSBoundParameters.ContainsKey("Mode")
 if ($interactive) {
     $Mode = Read-MenuMode
+}
+
+if ($UseEntrypointPipeline -and $Mode -ne "generated") {
+    throw "-UseEntrypointPipeline is only supported with -Mode generated."
 }
 
 if (-not $PSBoundParameters.ContainsKey("PluginSlug")) {
@@ -691,6 +701,9 @@ switch ($Mode) {
     "generated" {
         $runnerParams["RunGeneratedConfigs"] = $true
         $runnerParams["GeneratedConfigTimeoutSeconds"] = $GeneratedConfigTimeoutSeconds
+        if ($UseEntrypointPipeline) {
+            $runnerParams["UseEntrypointPipeline"] = $true
+        }
     }
     default {
         throw "Unsupported mode '$Mode'."

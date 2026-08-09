@@ -30,6 +30,7 @@ class PhuzzWrapperContractTests(unittest.TestCase):
 
         self.assertIn("scripts\\wordpress\\run-wordpress-phuzz.ps1", script)
         self.assertIn("RunGeneratedConfigs", script)
+        self.assertIn("UseEntrypointPipeline", script)
         self.assertIn("-NoFollowLogs", script)
         self.assertIn("[string]$PluginSlug", script)
         self.assertIn("$runnerParams", script)
@@ -291,8 +292,55 @@ sys.exit(2)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-RunGeneratedConfigs", result.stdout)
+        self.assertNotIn("-UseEntrypointPipeline", result.stdout)
         self.assertIn("-GeneratedConfigTimeoutSeconds 30", result.stdout)
         self.assertIn("-PluginSlug gamipress", result.stdout)
+
+    def test_guided_wrapper_generated_mode_can_opt_into_entrypoint_pipeline(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode",
+                "generated",
+                "-PluginSlug",
+                "gamipress",
+                "-UseEntrypointPipeline",
+                "-NoFollowLogs",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-RunGeneratedConfigs", result.stdout)
+        self.assertIn("-UseEntrypointPipeline", result.stdout)
+
+    def test_guided_wrapper_rejects_entrypoint_pipeline_outside_generated_mode(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode",
+                "default",
+                "-UseEntrypointPipeline",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("UseEntrypointPipeline", result.stderr)
 
     def test_guided_wrapper_generated_mode_defaults_to_30_second_config_runs(self):
         result = subprocess.run(
@@ -410,6 +458,22 @@ sys.exit(2)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("WebTimeoutSeconds", result.stderr)
+
+    def test_wordpress_runner_keeps_export_cli_and_adds_opt_in_pipeline_branch(self):
+        script = (CODE_DIR / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1").read_text(encoding="utf-8-sig")
+
+        self.assertIn("[switch]$UseEntrypointPipeline", script)
+        self.assertIn("export_cli.py", script)
+        self.assertIn("pipeline_cli.py", script)
+        self.assertIn("--output-config-dir", script)
+        self.assertIn("--minimal-artifacts", script)
+        self.assertIn("-UseEntrypointPipeline requires -RunGeneratedConfigs", script)
+        self.assertIn("Write-EntrypointPluginProofFile", script)
+        self.assertIn("PLUGIN_GENERATION_PROOF.md", script)
+        self.assertIn("entrypoint-proof\\logs", script)
+        self.assertIn("Start-Process", script)
+        self.assertIn("generated_config_runner.stdout.log", script)
+        self.assertIn("generated_config_runner.stderr.log", script)
 
 
 if __name__ == "__main__":
