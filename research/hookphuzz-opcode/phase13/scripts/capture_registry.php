@@ -27,8 +27,9 @@ try {
     hp13_diag('script_started');
     if (!defined('ABSPATH')) throw new RuntimeException('registry_wordpress_not_loaded');
     hp13_diag('wordpress_loaded');
-    $slug=(string)getenv('PHASE13_PLUGIN_SLUG'); $version=(string)getenv('PHASE13_PLUGIN_VERSION');
-    if ($slug==='' || !is_plugin_active($slug.'/'.$slug.'.php') && $slug!=='contact-form-7') throw new RuntimeException('registry_plugin_not_active');
+    $slug=(string)getenv('PHASE13_PLUGIN_SLUG'); $version=(string)getenv('PHASE13_PLUGIN_VERSION'); $main=(string)getenv('PHASE13_PLUGIN_MAIN_FILE');
+    if ($main==='') $main=$slug.'/'.$slug.'.php';
+    if ($slug==='' || !is_plugin_active($main)) throw new RuntimeException('registry_plugin_not_active');
     hp13_diag('target_plugin_verified',['plugin'=>$slug]); hp13_diag('before_rest_server_init'); $server=rest_get_server(); hp13_diag('after_rest_server_init');
     $routes=$server->get_routes(); if (!is_array($routes)) throw new RuntimeException('registry_route_enumeration_failure'); hp13_diag('routes_received',['route_count'=>count($routes)]);
     $rows=[]; $index=0; hp13_diag('before_endpoint_normalization');

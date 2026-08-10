@@ -33,8 +33,8 @@ run_step install_wordpress wordpress_installation_failure bash -c 'wp core is-in
 run_step verify_plugin_zip plugin_zip_missing bash -c 'test -f "/plugin-zips/$PHASE13_PLUGIN_ZIP"'
 run_step verify_plugin_sha256 sha256_mismatch bash -c 'actual=$(sha256sum "/plugin-zips/$PHASE13_PLUGIN_ZIP" | awk "{print \$1}"); test "$actual" = "$PHASE13_PLUGIN_SHA256"'
 run_step install_plugin plugin_install_failure wp plugin install "/plugin-zips/$PHASE13_PLUGIN_ZIP" --force --quiet "${args[@]}"
-run_step activate_plugin plugin_activation_failure wp plugin activate "$PHASE13_PLUGIN_SLUG" --quiet "${args[@]}"
-run_step verify_plugin_version plugin_version_mismatch bash -c 'test "$(wp plugin get "$PHASE13_PLUGIN_SLUG" --field=version --allow-root --path=/var/www/html)" = "$PHASE13_PLUGIN_VERSION"'
+run_step activate_plugin plugin_activation_failure wp plugin activate "$PHASE13_PLUGIN_MAIN_FILE" --quiet "${args[@]}"
+run_step verify_plugin_version plugin_version_mismatch bash -c 'test "$(wp plugin get "$PHASE13_PLUGIN_MAIN_FILE" --field=version --allow-root --path=/var/www/html)" = "$PHASE13_PLUGIN_VERSION"'
 capture_registry() {
   local tmp="$PHASE13_RESULTS_DIR/registry.json.tmp" raw_out raw_err process validation
   raw_out=$(mktemp /tmp/phase13-registry-out.XXXXXX); raw_err=$(mktemp /tmp/phase13-registry-err.XXXXXX)
