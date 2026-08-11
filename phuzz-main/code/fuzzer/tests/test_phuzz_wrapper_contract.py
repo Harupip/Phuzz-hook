@@ -18,12 +18,72 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertTrue(script_path.exists(), "Expected phuzz-main/code/phuzz.ps1 to exist")
         script = script_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"recursive\")]", script)
+        self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"recursive\", \"zend-discovery\")]", script)
         self.assertIn("[string]$Mode", script)
         self.assertIn("[switch]$DryRun", script)
         self.assertIn("[switch]$Help", script)
         self.assertIn("[switch]$RunRecursiveConfigs", script)
         self.assertIn("Read-Host", script)
+
+    def test_guided_wrapper_exposes_isolated_zend_discovery_mode(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode",
+                "zend-discovery",
+                "-PluginSlug",
+                "demo-plugin",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("zend_discovery", result.stdout)
+        self.assertIn("--plugin-zip", result.stdout)
+        self.assertIn("demo-plugin.zip", result.stdout)
+        self.assertNotIn("Delegating to WordPress PHUZZ runner", result.stdout)
+
+    def test_zend_wrapper_prints_seed_config_and_replay_paths(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode",
+                "zend-discovery",
+                "-PluginSlug",
+                "demo-plugin",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Zend seed artifacts", result.stdout)
+        self.assertIn("Zend PHUZZ configs", result.stdout)
+        self.assertIn("Zend PHUZZ replay", result.stdout)
+
+    def test_zend_mode_bootstraps_its_own_target_scoped_web_service(self):
+        script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")
+
+        self.assertIn("New-ZendPluginOverrideFile", script)
+        self.assertIn("TARGET_APP_PATH: /var/www/html/wp-content/plugins/$SelectedPluginSlug/", script)
+        self.assertIn("docker", script)
+        self.assertIn("X-Zend-Discovery-Run-ID", script)
+        self.assertIn("--write-probe-plan", script)
+        self.assertIn("/shared-tmpfs/hook-coverage/requests", script)
+        self.assertIn("phuzz-loader-summary.json", script)
 
     def test_guided_wrapper_delegates_to_existing_wordpress_runner(self):
         script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")

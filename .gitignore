@@ -14,3 +14,6 @@ research/hookphuzz-opcode/phase*/full-run.*
 research/hookphuzz-opcode/phase*/scripts/__pycache__/
 research/hookphuzz-opcode/phase*/tests/__pycache__/
 research/hookphuzz-opcode/demo-weekly/results/
+
+# Immutable runtime artifacts from local Zend discovery runs.
+phuzz-main/code/fuzzer/output/zend-discovery/

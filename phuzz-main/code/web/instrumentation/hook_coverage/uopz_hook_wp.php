@@ -32,6 +32,7 @@ $__uopz_uri = $_SERVER['REQUEST_URI'] ?? '';
 $__uopz_path = parse_url($__uopz_uri, PHP_URL_PATH) ?: '';
 $__uopz_slug = trim(str_replace(['/', '.', '?', '&', '='], '_', $__uopz_path), '_') ?: 'index';
 $__uopz_slug = substr($__uopz_slug, 0, 30);
+$__uopz_zend_run_id = (string) ($_SERVER['HTTP_X_ZEND_DISCOVERY_RUN_ID'] ?? '');
 
 // Energy calculation da chuyen sang Python (fuzzing/energy.py).
 // PHP chi can ghi raw hook_coverage vao per-request JSON.
@@ -41,6 +42,7 @@ $__uopz_slug = substr($__uopz_slug, 0, 30);
 $GLOBALS['__uopz_request'] = [
     'schema_version' => 'uopz-request-v3',
     'request_id' => date('His') . "_{$__uopz_method}_{$__uopz_slug}_" . bin2hex(random_bytes(2)),
+    'run_id' => $__uopz_zend_run_id,
     'timestamp' => date('Y-m-d H:i:s'),
     'http_method' => $__uopz_method,
     'target_plugin' => (string) (getenv('WP_TARGET_PLUGIN') ?: ''),
