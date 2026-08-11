@@ -18,7 +18,11 @@ from zend_discovery.engine import (
     BLOCKED_NEEDS_RECIPE,
     BLOCKED_UNSAFE_AUTO_PROBE,
     build_catalog,
+    canonical_identity,
+    canonical_identity_id,
     correlate_artifact,
+    correlate_pass1_artifact,
+    enrich_current_run,
     read_plugin_metadata,
     run_discovery,
     select_auto_probes,
@@ -37,6 +41,239 @@ class StaticExtractor:
 
 
 class ZendDiscoveryTests(unittest.TestCase):
+    def pass1_candidate(self) -> dict:
+        return {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "ajax",
+            "action": "demo_fetch_items",
+            "callback_id": "ajax-public",
+            "method": "post",
+            "auth_mode": "nopriv",
+            "legacy_run_id": "legacy-1",
+            "pass1_request_id": "pass1-1",
+        }
+
+    def pass1_artifact(self, candidate: dict, **updates: object) -> dict:
+        artifact = {
+            "legacy_run_id": candidate["legacy_run_id"],
+            "request_id": candidate["pass1_request_id"],
+            "target_plugin": candidate["plugin_slug"],
+            "canonical_identity_id": canonical_identity_id(candidate),
+            "callback_id": candidate["callback_id"],
+            "http_method": candidate["method"].upper(),
+            "auth_variant": "unauthenticated",
+            "hook_coverage": {"executed_callbacks": {"ajax-public": {"callback_id": "ajax-public"}}},
+        }
+        artifact.update(updates)
+        return artifact
+
+    def test_canonical_identity_is_deterministic_and_excludes_callback_display(self) -> None:
+        candidate = self.pass1_candidate()
+        candidate["callback_repr"] = "Demo::fetch"
+
+        self.assertEqual(
+            canonical_identity(candidate),
+            {
+                "plugin_slug": "demo-plugin",
+                "entrypoint_type": "ajax",
+                "dispatch_identity": {"dispatcher": "ajax", "action": "demo_fetch_items"},
+                "callback_identity": "ajax-public",
+                "resolved_method": "POST",
+                "auth_variant": "unauthenticated",
+            },
+        )
+        candidate["callback_repr"] = "Renamed::display_only"
+        self.assertEqual(canonical_identity_id(candidate), canonical_identity_id(self.pass1_candidate()))
+        self.assertEqual(
+            canonical_identity(
+                {
+                    "plugin_slug": "demo-plugin",
+                    "entrypoint_type": "rest",
+                    "namespace": "demo/v1",
+                    "route_pattern": "/items/(?P<id>\\d+)",
+                    "endpoint_definition_index": 2,
+                    "materialized_route": "/wp-json/demo/v1/items/7",
+                    "callback_id": "rest-items",
+                    "resolved_method": "get",
+                    "auth_variant": "authenticated",
+                }
+            )["dispatch_identity"],
+            {
+                "namespace": "demo/v1",
+                "route_pattern": "/items/(?P<id>\\d+)",
+                "endpoint_definition_index": 2,
+                "materialized_route": "/wp-json/demo/v1/items/7",
+            },
+        )
+
+    def test_pass1_correlation_requires_exact_identity_fields_and_callback_proof(self) -> None:
+        candidate = self.pass1_candidate()
+        identity_id = canonical_identity_id(candidate)
+        artifact = {
+            "legacy_run_id": "legacy-1",
+            "request_id": "pass1-1",
+            "target_plugin": "demo-plugin",
+            "canonical_identity_id": identity_id,
+            "callback_id": "ajax-public",
+            "http_method": "POST",
+            "auth_variant": "unauthenticated",
+            "hook_coverage": {"executed_callbacks": {"ajax-public": {"callback_id": "ajax-public"}}},
+        }
+
+        self.assertIs(
+            correlate_pass1_artifact(
+                candidate,
+                artifact,
+                legacy_run_id="legacy-1",
+                pass1_request_id="pass1-1",
+                plugin_slug="demo-plugin",
+            ),
+            artifact,
+        )
+        for field, wrong_value in (
+            ("legacy_run_id", "other-run"),
+            ("request_id", "other-request"),
+            ("target_plugin", "other-plugin"),
+            ("canonical_identity_id", "0" * 64),
+            ("callback_id", "other-callback"),
+            ("http_method", "GET"),
+            ("auth_variant", "authenticated"),
+        ):
+            rejected = dict(artifact)
+            rejected[field] = wrong_value
+            self.assertIsNone(
+                correlate_pass1_artifact(
+                    candidate,
+                    rejected,
+                    legacy_run_id="legacy-1",
+                    pass1_request_id="pass1-1",
+                    plugin_slug="demo-plugin",
+                ),
+                field,
+            )
+        rejected = dict(artifact)
+        rejected["hook_coverage"] = {"executed_callbacks": {}}
+        self.assertIsNone(
+            correlate_pass1_artifact(
+                candidate,
+                rejected,
+                legacy_run_id="legacy-1",
+                pass1_request_id="pass1-1",
+                plugin_slug="demo-plugin",
+            )
+        )
+        legacy_artifact = dict(artifact)
+        legacy_artifact.pop("legacy_run_id")
+        legacy_artifact["run_id"] = "legacy-1"
+        self.assertIsNotNone(
+            correlate_pass1_artifact(
+                candidate,
+                legacy_artifact,
+                legacy_run_id="legacy-1",
+                pass1_request_id="pass1-1",
+                plugin_slug="demo-plugin",
+            )
+        )
+
+    def test_enrichment_resolves_direct_current_run_get_and_post_only(self) -> None:
+        get_candidate = self.pass1_candidate()
+        get_candidate["method"] = "GET"
+        get_artifact = self.pass1_artifact(get_candidate)
+        callback = {"callback_id": "ajax-public"}
+        extractor = StaticExtractor([{"name": "search", "source": "GET"}, {"name": "term", "source": "POST"}])
+
+        get_seed = enrich_current_run(get_candidate, callback, get_artifact, extractor)
+
+        self.assertTrue(get_seed["probe_replay_allowed"])
+        self.assertTrue(get_seed["final_fuzz_export_allowed"])
+        self.assertEqual(get_seed["parameters"][0]["location"], "query")
+        post = next(row for row in get_seed["parameters"] if row["name"] == "term")
+        self.assertEqual(post["location"], "unknown")
+        self.assertTrue(post["blocked"])
+        self.assertEqual(post["blocked_reason"], "unresolved_location")
+
+        post_candidate = self.pass1_candidate()
+        post_seed = enrich_current_run(
+            post_candidate,
+            callback,
+            self.pass1_artifact(post_candidate),
+            StaticExtractor([{"name": "term", "source": "POST"}]),
+        )
+        self.assertEqual(post_seed["parameters"][0]["location"], "form")
+        self.assertFalse(post_seed["parameters"][0]["blocked"])
+
+    def test_enrichment_uses_runtime_query_form_and_json_without_values(self) -> None:
+        candidate = self.pass1_candidate()
+        artifact = self.pass1_artifact(
+            candidate,
+            request_params={
+                "query_params": {"page": "this-value-must-not-persist"},
+                "form_params": {"term": "also-secret-submitted-value"},
+                "json_params": {"payload": {"nested": "private"}},
+            },
+        )
+
+        seed = enrich_current_run(candidate, {"callback_id": "ajax-public"}, artifact, StaticExtractor([]))
+
+        by_name = {row["name"]: row for row in seed["parameters"]}
+        self.assertEqual(by_name["page"]["location"], "query")
+        self.assertEqual(by_name["term"]["location"], "form")
+        self.assertEqual(by_name["payload"]["location"], "json")
+        self.assertEqual(by_name["payload"]["safe_observed_type"], "object")
+        self.assertTrue(by_name["term"]["redacted_value_metadata"]["redacted"])
+        encoded = json.dumps(seed, sort_keys=True)
+        self.assertNotIn("this-value-must-not-persist", encoded)
+        self.assertNotIn("also-secret-submitted-value", encoded)
+        self.assertNotIn("private", encoded)
+
+    def test_enrichment_blocks_schema_get_param_request_and_method_only_evidence(self) -> None:
+        candidate = self.pass1_candidate()
+        callback = {
+            "callback_id": "ajax-public",
+            "argument_definitions": {"schema_only": {"required": False}},
+        }
+        extractor = StaticExtractor(
+            [
+                {"name": "via_get_param", "source": "REST_GET_PARAM"},
+                {"name": "via_request", "source": "REQUEST"},
+                {"name": "method_only", "source": "METHOD"},
+            ]
+        )
+
+        seed = enrich_current_run(candidate, callback, self.pass1_artifact(candidate), extractor)
+
+        self.assertFalse(seed["final_fuzz_export_allowed"])
+        self.assertEqual({row["location"] for row in seed["parameters"]}, {"unknown"})
+        self.assertTrue(all(row["blocked"] for row in seed["parameters"]))
+        evidence_kinds = {
+            evidence["kind"]
+            for row in seed["parameters"]
+            for evidence in row["evidence"]
+        }
+        self.assertEqual(
+            evidence_kinds,
+            {"rest_schema_declared", "rest_get_param_name_only", "static_candidate", "zend_superglobal_read"},
+        )
+
+    def test_enrichment_blocks_sensitive_names_and_invalid_pass1_proof(self) -> None:
+        candidate = self.pass1_candidate()
+        artifact = self.pass1_artifact(candidate)
+        artifact["hook_coverage"] = {"executed_callbacks": {}}
+
+        seed = enrich_current_run(
+            candidate,
+            {"callback_id": "ajax-public"},
+            artifact,
+            StaticExtractor([{"name": "session_token", "source": "POST"}]),
+        )
+
+        self.assertFalse(seed["probe_replay_allowed"])
+        self.assertFalse(seed["final_fuzz_export_allowed"])
+        parameter = seed["parameters"][0]
+        self.assertTrue(parameter["blocked"])
+        self.assertEqual(parameter["blocked_reason"], "security_field")
+        self.assertEqual(seed["blocked_parameters"], [parameter])
+
     def make_plugin_zip(self, root: Path) -> Path:
         plugin = root / "demo-plugin.zip"
         with zipfile.ZipFile(plugin, "w") as archive:

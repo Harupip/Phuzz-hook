@@ -8,20 +8,20 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
     from hook_energy.seed_generation.source_resolver import SourcePathResolver
-    from zend_discovery.parameter_seeds import build_parameter_seed
+    from zend_discovery.parameter_seeds import build_enriched_parameters, build_parameter_seed
     from zend_discovery.source_materializer import materialize_plugin_source
 else:
     from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
     from hook_energy.seed_generation.source_resolver import SourcePathResolver
 
-    from .parameter_seeds import build_parameter_seed
+    from .parameter_seeds import build_enriched_parameters, build_parameter_seed
     from .source_materializer import materialize_plugin_source
 
 
@@ -34,6 +34,126 @@ BLOCKED_NEEDS_RECIPE = "BLOCKED_NEEDS_RECIPE"
 READ_ACTION = re.compile(r"(?:get|list|fetch|search|load|view)", re.IGNORECASE)
 RECIPE_FIELDS = {"selector", "auth_mode", "fixed_fields", "seed_values"}
 FORBIDDEN_RECIPE_FIELDS = re.compile(r"(?:secret|cookie|password|token|authorization)", re.IGNORECASE)
+
+
+def canonical_identity(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    entrypoint_type = str(candidate.get("entrypoint_type") or candidate.get("kind") or "").lower()
+    if entrypoint_type in {"ajax", "admin-post", "admin_post"}:
+        dispatch_identity: dict[str, Any] = {
+            "dispatcher": entrypoint_type,
+            "action": str(candidate.get("action") or ""),
+        }
+    elif entrypoint_type == "rest":
+        dispatch_identity = {
+            "namespace": str(candidate.get("namespace") or ""),
+            "route_pattern": str(candidate.get("route_pattern") or candidate.get("route") or ""),
+            "endpoint_definition_index": candidate.get("endpoint_definition_index"),
+            "materialized_route": str(candidate.get("materialized_route") or candidate.get("route") or ""),
+        }
+    else:
+        dispatch_identity = {
+            "path": str(candidate.get("path") or candidate.get("route") or ""),
+            "fixed_selectors": candidate.get("fixed_selectors", {}),
+        }
+    return {
+        "plugin_slug": str(candidate.get("plugin_slug") or ""),
+        "entrypoint_type": entrypoint_type,
+        "dispatch_identity": dispatch_identity,
+        "callback_identity": str(candidate.get("callback_id") or ""),
+        "resolved_method": _candidate_method(candidate),
+        "auth_variant": _candidate_auth_variant(candidate, entrypoint_type),
+    }
+
+
+def canonical_identity_id(candidate: Mapping[str, Any]) -> str:
+    encoded = json.dumps(canonical_identity(candidate), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def correlate_pass1_artifact(
+    candidate: Mapping[str, Any],
+    artifact: Mapping[str, Any],
+    *,
+    legacy_run_id: str,
+    pass1_request_id: str,
+    plugin_slug: str,
+) -> dict[str, Any] | None:
+    identity = canonical_identity(candidate)
+    artifact_legacy_run_id = artifact.get("legacy_run_id", artifact.get("run_id"))
+    if (
+        artifact_legacy_run_id != legacy_run_id
+        or artifact.get("request_id") != pass1_request_id
+        or artifact.get("target_plugin") != plugin_slug
+        or identity["plugin_slug"] != plugin_slug
+        or artifact.get("canonical_identity_id") != canonical_identity_id(candidate)
+        or artifact.get("callback_id") != identity["callback_identity"]
+        or str(artifact.get("http_method") or "").upper() != identity["resolved_method"]
+        or artifact.get("auth_variant") != identity["auth_variant"]
+        or not _callback_executed(dict(artifact), identity["callback_identity"])
+    ):
+        return None
+    return artifact if isinstance(artifact, dict) else dict(artifact)
+
+
+def enrich_current_run(
+    candidate: Mapping[str, Any],
+    callback: Mapping[str, Any],
+    artifact: Mapping[str, Any],
+    extractor: Any,
+) -> dict[str, Any]:
+    identity = canonical_identity(candidate)
+    legacy_run_id = str(candidate.get("legacy_run_id") or "")
+    pass1_request_id = str(candidate.get("pass1_request_id") or "")
+    proof = (
+        correlate_pass1_artifact(
+            candidate,
+            artifact,
+            legacy_run_id=legacy_run_id,
+            pass1_request_id=pass1_request_id,
+            plugin_slug=identity["plugin_slug"],
+        )
+        if legacy_run_id and pass1_request_id
+        else None
+    )
+    parameters, blocked = build_enriched_parameters(
+        candidate,
+        callback,
+        artifact,
+        extractor,
+        valid_pass1_proof=proof is not None,
+    )
+    result = {
+        **identity,
+        "canonical_identity_id": canonical_identity_id(candidate),
+        "legacy_run_id": legacy_run_id,
+        "pass1_request_id": pass1_request_id,
+        "parameters": parameters,
+        "blocked_parameters": blocked,
+        "probe_replay_allowed": proof is not None,
+        "final_fuzz_export_allowed": any(item["fuzzable"] for item in parameters),
+        "source_resolution_status": "resolved" if any(item["fuzzable"] for item in parameters) else "unresolved",
+    }
+    return result
+
+
+def _candidate_method(candidate: Mapping[str, Any]) -> str:
+    method = candidate.get("resolved_method") or candidate.get("method")
+    if not method:
+        methods = candidate.get("methods")
+        method = methods[0] if isinstance(methods, list) and methods else ""
+    return str(method).upper()
+
+
+def _candidate_auth_variant(candidate: Mapping[str, Any], entrypoint_type: str) -> str:
+    value = str(candidate.get("auth_variant") or candidate.get("auth_mode") or "").lower()
+    if value in {"authenticated", "auth"}:
+        return "authenticated"
+    if value in {"unauthenticated", "nopriv", "public"}:
+        return "unauthenticated"
+    hook_name = str(candidate.get("hook_name") or "")
+    if hook_name.startswith("wp_ajax_nopriv_") or entrypoint_type.endswith("nopriv"):
+        return "unauthenticated"
+    return "authenticated"
 
 
 def read_plugin_metadata(plugin_zip: Path, plugin_slug: str) -> dict[str, str]:

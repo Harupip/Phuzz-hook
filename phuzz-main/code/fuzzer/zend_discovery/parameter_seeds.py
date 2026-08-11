@@ -9,6 +9,152 @@ FORBIDDEN_PARAMETER_NAME = re.compile(
     r"(?:nonce|cookie|secret|password|token|authorization)", re.IGNORECASE
 )
 SAFE_METHODS = {"GET", "HEAD", "POST"}
+ENRICHED_LOCATIONS = {"query", "form", "json"}
+
+
+def build_enriched_parameters(
+    candidate: Mapping[str, Any],
+    callback: Mapping[str, Any],
+    artifact: Mapping[str, Any],
+    extractor: Any,
+    *,
+    valid_pass1_proof: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return value-free parameter provenance for a correlated Pass 1 request."""
+    method = str(candidate.get("resolved_method") or candidate.get("method") or artifact.get("http_method") or "").upper()
+    rows: dict[str, dict[str, Any]] = {}
+
+    def add(
+        name: Any,
+        *,
+        locations: set[str] | None = None,
+        evidence: dict[str, Any],
+        observed_value: Any = _MISSING,
+        forced_block: str | None = None,
+    ) -> None:
+        name = str(name or "")
+        if not name:
+            return
+        row = rows.setdefault(
+            name,
+            {
+                "name": name,
+                "_locations": set(),
+                "evidence": [],
+                "_observed_value": _MISSING,
+                "_forced_block": None,
+            },
+        )
+        if locations:
+            row["_locations"].update(locations)
+        if evidence not in row["evidence"]:
+            row["evidence"].append(evidence)
+        if observed_value is not _MISSING:
+            row["_observed_value"] = observed_value
+        if forced_block and row["_forced_block"] is None:
+            row["_forced_block"] = forced_block
+
+    extracted = extractor.extract(dict(callback))
+    static_params = extracted.get("input_params", []) if isinstance(extracted, Mapping) else []
+    for item in static_params if isinstance(static_params, list) else []:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("name")
+        source = str(item.get("source") or "").upper()
+        if source in {"GET", "POST", "REQUEST", "COOKIE"}:
+            direct_location = {"GET": "query", "POST": "form"}.get(source)
+            locations = {direct_location} if direct_location and method == source else set()
+            add(
+                name,
+                locations=locations,
+                evidence={"kind": "zend_superglobal_read", "superglobal": f"$_{source}"},
+                forced_block="security_field" if source == "COOKIE" else None,
+            )
+        elif source in {"REST_GET_PARAM", "GET_PARAM", "WP_REST_REQUEST_GET_PARAM"}:
+            add(name, evidence={"kind": "rest_get_param_name_only"})
+        elif source in {"HEADER", "HEADERS", "SELECTOR"}:
+            add(name, evidence={"kind": "static_candidate"}, forced_block="auth_material")
+        else:
+            add(name, evidence={"kind": "static_candidate"})
+
+    definitions = callback.get("argument_definitions", {})
+    if isinstance(definitions, Mapping):
+        for name in definitions:
+            add(name, evidence={"kind": "rest_schema_declared"})
+
+    bootstrap = candidate.get("fixed_bootstrap", {})
+    if isinstance(bootstrap, Mapping):
+        for name in bootstrap:
+            add(name, evidence={"kind": "fixed_bootstrap"}, forced_block="fixed_bootstrap")
+
+    for key, location, evidence_kind in (
+        ("query_params", "query", "runtime_query_observed"),
+        ("form_params", "form", "runtime_form_body_observed"),
+        ("json_params", "json", "runtime_json_observed"),
+    ):
+        values = artifact.get("request_params", {})
+        values = values.get(key, {}) if isinstance(values, Mapping) else {}
+        if isinstance(values, Mapping):
+            for name, value in values.items():
+                add(name, locations={location}, evidence={"kind": evidence_kind}, observed_value=value)
+    request_params = artifact.get("request_params", {})
+    body_values = request_params.get("body_params", {}) if isinstance(request_params, Mapping) else {}
+    if isinstance(body_values, Mapping):
+        content_type = str(artifact.get("content_type") or artifact.get("request_content_type") or "").lower()
+        location, evidence_kind = ("json", "runtime_json_observed") if "json" in content_type else ("form", "runtime_form_body_observed")
+        for name, value in body_values.items():
+            add(name, locations={location}, evidence={"kind": evidence_kind}, observed_value=value)
+
+    parameters: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for row in rows.values():
+        locations = row.pop("_locations")
+        observed_value = row.pop("_observed_value")
+        forced_block = row.pop("_forced_block")
+        if _blocked_name(row["name"]):
+            reason = "security_field"
+        elif forced_block:
+            reason = forced_block
+        elif not valid_pass1_proof:
+            reason = "pass1_proof_missing"
+        elif len(locations) == 1:
+            reason = None
+        else:
+            reason = "unresolved_location"
+        location = next(iter(locations)) if len(locations) == 1 else "unknown"
+        item: dict[str, Any] = {
+            "name": row["name"],
+            "location": location,
+            "location_confidence": "runtime" if observed_value is not _MISSING else ("direct" if reason is None else "unresolved"),
+            "evidence": row["evidence"],
+            "blocked": reason is not None,
+            "blocked_reason": reason,
+            "fuzzable": bool(valid_pass1_proof and reason is None and location in ENRICHED_LOCATIONS),
+            "redacted_value_metadata": {"observed": observed_value is not _MISSING, "redacted": observed_value is not _MISSING},
+        }
+        if observed_value is not _MISSING:
+            item["safe_observed_type"] = _safe_observed_type(observed_value)
+        parameters.append(item)
+        if item["blocked"]:
+            blocked.append(item)
+    return parameters, blocked
+
+
+_MISSING = object()
+
+
+def _safe_observed_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, Mapping):
+        return "object"
+    if isinstance(value, (list, tuple)):
+        return "array"
+    return "string"
 
 
 def build_parameter_seed(
