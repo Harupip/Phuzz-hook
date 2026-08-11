@@ -101,9 +101,14 @@ def build_enriched_parameters(
     body_values = request_params.get("body_params", {}) if isinstance(request_params, Mapping) else {}
     if isinstance(body_values, Mapping):
         content_type = str(artifact.get("content_type") or artifact.get("request_content_type") or "").lower()
-        location, evidence_kind = ("json", "runtime_json_observed") if "json" in content_type else ("form", "runtime_form_body_observed")
+        if "json" in content_type:
+            location, evidence_kind = "json", "runtime_json_observed"
+        elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+            location, evidence_kind = "form", "runtime_form_body_observed"
+        else:
+            location, evidence_kind = None, "runtime_form_body_observed"
         for name, value in body_values.items():
-            add(name, locations={location}, evidence={"kind": evidence_kind}, observed_value=value)
+            add(name, locations={location} if location else set(), evidence={"kind": evidence_kind}, observed_value=value)
 
     parameters: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
@@ -125,7 +130,7 @@ def build_enriched_parameters(
         item: dict[str, Any] = {
             "name": row["name"],
             "location": location,
-            "location_confidence": "runtime" if observed_value is not _MISSING else ("direct" if reason is None else "unresolved"),
+            "location_confidence": "runtime" if observed_value is not _MISSING and location != "unknown" else ("direct" if reason is None else "unresolved"),
             "evidence": row["evidence"],
             "blocked": reason is not None,
             "blocked_reason": reason,

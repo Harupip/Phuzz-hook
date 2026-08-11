@@ -175,6 +175,73 @@ class ZendDiscoveryTests(unittest.TestCase):
             )
         )
 
+    def test_pass1_rejects_unknown_auth_but_normalizes_unauth_capable(self) -> None:
+        candidate = self.pass1_candidate()
+        candidate.pop("auth_mode")
+        self.assertEqual(canonical_identity(candidate)["auth_variant"], "unresolved")
+        artifact = self.pass1_artifact(candidate)
+        artifact["auth_variant"] = "unresolved"
+        self.assertIsNone(
+            correlate_pass1_artifact(
+                candidate,
+                artifact,
+                legacy_run_id="legacy-1",
+                pass1_request_id="pass1-1",
+                plugin_slug="demo-plugin",
+            )
+        )
+        candidate["auth_mode"] = "unauth-capable"
+        self.assertEqual(canonical_identity(candidate)["auth_variant"], "unauthenticated")
+
+    def test_enrichment_ignores_runtime_fields_from_rejected_artifact(self) -> None:
+        candidate = self.pass1_candidate()
+        artifact = self.pass1_artifact(
+            candidate,
+            target_plugin="other-plugin",
+            request_params={"query_params": {"untrusted_runtime_field": "must-not-import"}},
+        )
+
+        seed = enrich_current_run(candidate, {"callback_id": "ajax-public"}, artifact, StaticExtractor([]))
+
+        self.assertFalse(seed["probe_replay_allowed"])
+        self.assertFalse(seed["final_fuzz_export_allowed"])
+        self.assertNotIn("untrusted_runtime_field", {row["name"] for row in seed["parameters"]})
+
+    def test_enrichment_requires_callback_identity_before_extraction(self) -> None:
+        candidate = self.pass1_candidate()
+
+        seed = enrich_current_run(
+            candidate,
+            {"callback_id": "wrong-callback"},
+            self.pass1_artifact(candidate),
+            StaticExtractor([{"name": "term", "source": "POST"}]),
+        )
+
+        self.assertFalse(seed["probe_replay_allowed"])
+        self.assertFalse(seed["final_fuzz_export_allowed"])
+        self.assertEqual(seed["parameters"], [])
+
+    def test_enrichment_blocks_body_params_without_explicit_transport_type(self) -> None:
+        candidate = self.pass1_candidate()
+        absent_type = self.pass1_artifact(
+            candidate,
+            request_params={"body_params": {"unknown_body": "value"}},
+        )
+        unsupported_type = self.pass1_artifact(
+            candidate,
+            request_content_type="text/plain",
+            request_params={"body_params": {"plain_body": "value"}},
+        )
+
+        absent_seed = enrich_current_run(candidate, {"callback_id": "ajax-public"}, absent_type, StaticExtractor([]))
+        unsupported_seed = enrich_current_run(candidate, {"callback_id": "ajax-public"}, unsupported_type, StaticExtractor([]))
+
+        for seed in (absent_seed, unsupported_seed):
+            self.assertFalse(seed["final_fuzz_export_allowed"])
+            self.assertEqual(seed["parameters"][0]["location"], "unknown")
+            self.assertTrue(seed["parameters"][0]["blocked"])
+            self.assertEqual(seed["parameters"][0]["blocked_reason"], "unresolved_location")
+
     def test_enrichment_resolves_direct_current_run_get_and_post_only(self) -> None:
         get_candidate = self.pass1_candidate()
         get_candidate["method"] = "GET"

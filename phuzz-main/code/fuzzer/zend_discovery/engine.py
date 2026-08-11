@@ -89,6 +89,7 @@ def correlate_pass1_artifact(
         or artifact.get("callback_id") != identity["callback_identity"]
         or str(artifact.get("http_method") or "").upper() != identity["resolved_method"]
         or artifact.get("auth_variant") != identity["auth_variant"]
+        or identity["auth_variant"] == "unresolved"
         or not _callback_executed(dict(artifact), identity["callback_identity"])
     ):
         return None
@@ -115,10 +116,22 @@ def enrich_current_run(
         if legacy_run_id and pass1_request_id
         else None
     )
+    if str(callback.get("callback_id") or "") != identity["callback_identity"]:
+        return {
+            **identity,
+            "canonical_identity_id": canonical_identity_id(candidate),
+            "legacy_run_id": legacy_run_id,
+            "pass1_request_id": pass1_request_id,
+            "parameters": [],
+            "blocked_parameters": [],
+            "probe_replay_allowed": False,
+            "final_fuzz_export_allowed": False,
+            "source_resolution_status": "unresolved",
+        }
     parameters, blocked = build_enriched_parameters(
         candidate,
         callback,
-        artifact,
+        proof or {},
         extractor,
         valid_pass1_proof=proof is not None,
     )
@@ -148,12 +161,12 @@ def _candidate_auth_variant(candidate: Mapping[str, Any], entrypoint_type: str) 
     value = str(candidate.get("auth_variant") or candidate.get("auth_mode") or "").lower()
     if value in {"authenticated", "auth"}:
         return "authenticated"
-    if value in {"unauthenticated", "nopriv", "public"}:
+    if value in {"unauthenticated", "nopriv", "public", "unauth-capable", "unauth_capable"}:
         return "unauthenticated"
     hook_name = str(candidate.get("hook_name") or "")
     if hook_name.startswith("wp_ajax_nopriv_") or entrypoint_type.endswith("nopriv"):
         return "unauthenticated"
-    return "authenticated"
+    return "unresolved"
 
 
 def read_plugin_metadata(plugin_zip: Path, plugin_slug: str) -> dict[str, str]:
