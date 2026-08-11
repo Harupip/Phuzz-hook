@@ -1,4 +1,5 @@
 import json
+import copy
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,8 @@ from hook_energy.seed_generation.config_exporter import (
     build_config_for_seed_item,
     export_seed_configs,
 )
+from hook_energy.seed_generation.zend_bridge import merge_enriched_seeds
+from zend_discovery.engine import canonical_identity_id
 
 
 def build_seed_item(*, hook_name="wp_ajax_nopriv_example_lookup", auth_mode="unauth-capable"):
@@ -79,6 +82,99 @@ def build_rest_seed_item(*, method="GET", fuzzable_params=None):
 
 
 class SeedToConfigExporterTests(unittest.TestCase):
+    def test_zend_bridge_replaces_only_accepted_nonempty_seed_without_mutating_raw_report(self):
+        accepted_raw = build_seed_item()
+        accepted_raw["plugin_slug"] = "demo-plugin"
+        accepted_raw["entrypoint_type"] = "ajax"
+        accepted_raw["seed"]["method"] = "POST"
+        accepted_raw["seed"]["resolved_method"] = "POST"
+        accepted_raw["seed"]["method_status"] = "resolved"
+        accepted_raw["seed"]["body"]["bootstrap"] = "keep"
+        accepted_raw["seed"]["fixed_params"].append("bootstrap")
+        rejected_raw = copy.deepcopy(accepted_raw)
+        rejected_raw["callback_id"] = "cb-without-proof"
+        raw_report = {"plugin_slug": "demo-plugin", "suggested_seeds": [accepted_raw, rejected_raw]}
+        original = copy.deepcopy(raw_report)
+        candidate = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "ajax",
+            "action": "example_lookup",
+            "callback_id": "cb-public",
+            "method": "POST",
+            "auth_mode": "unauth-capable",
+        }
+        replacement = copy.deepcopy(accepted_raw)
+        replacement["seed"]["fuzzable_params"] = ["term"]
+        replacement["seed"]["body"]["term"] = "FUZZ"
+        enriched_report = {
+            "legacy_run_id": "legacy-1",
+            "enriched_seeds": [
+                {
+                    "canonical_identity_id": canonical_identity_id(candidate),
+                    "accepted_pass1_proof": True,
+                    "probe_replay_allowed": True,
+                    "final_fuzz_export_allowed": True,
+                    "fuzzable_params": ["term"],
+                    "seed_item": replacement,
+                },
+                {
+                    "canonical_identity_id": "unmatched",
+                    "accepted_pass1_proof": True,
+                    "probe_replay_allowed": True,
+                    "final_fuzz_export_allowed": True,
+                    "fuzzable_params": ["term"],
+                    "seed_item": replacement,
+                },
+            ],
+        }
+
+        merged = merge_enriched_seeds(raw_report, enriched_report)
+
+        self.assertEqual(raw_report, original)
+        self.assertEqual(merged["suggested_seeds"], [replacement])
+        self.assertEqual(merged["suggested_seeds"][0]["seed"]["body"]["bootstrap"], "keep")
+        self.assertEqual(merged["suggested_seeds"][0]["seed"]["fuzzable_params"], ["term"])
+
+    def test_zend_bridge_drops_zero_fuzz_and_unproven_candidates(self):
+        raw = build_seed_item()
+        raw["plugin_slug"] = "demo-plugin"
+        raw["entrypoint_type"] = "ajax"
+        raw_report = {"plugin_slug": "demo-plugin", "suggested_seeds": [raw]}
+        candidate = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "ajax",
+            "action": "example_lookup",
+            "callback_id": "cb-public",
+            "method": "POST",
+            "auth_mode": "unauth-capable",
+        }
+
+        merged = merge_enriched_seeds(
+            raw_report,
+            {
+                "enriched_seeds": [
+                    {
+                        "canonical_identity_id": canonical_identity_id(candidate),
+                        "accepted_pass1_proof": False,
+                        "probe_replay_allowed": True,
+                        "final_fuzz_export_allowed": True,
+                        "fuzzable_params": ["term"],
+                        "seed_item": raw,
+                    },
+                    {
+                        "canonical_identity_id": canonical_identity_id(candidate),
+                        "accepted_pass1_proof": True,
+                        "probe_replay_allowed": True,
+                        "final_fuzz_export_allowed": True,
+                        "fuzzable_params": [],
+                        "seed_item": raw,
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(merged["suggested_seeds"], [])
+
     def test_unauth_seed_becomes_phuzz_config_with_fixed_action_and_fuzzed_params(self):
         slug, config = build_config_for_seed_item(build_seed_item(), target_base="http://web")
 

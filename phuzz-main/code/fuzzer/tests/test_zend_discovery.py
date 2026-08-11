@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,11 +19,10 @@ from zend_discovery.engine import (
     build_catalog,
     canonical_identity,
     canonical_identity_id,
-    correlate_artifact,
     correlate_pass1_artifact,
     enrich_current_run,
     read_plugin_metadata,
-    run_discovery,
+    run_enrichment,
     select_auto_probes,
 )
 from zend_discovery.source_materializer import materialize_plugin_source
@@ -505,117 +503,123 @@ class ZendDiscoveryTests(unittest.TestCase):
         blocked = next(item for item in catalog if item["callback_id"] == "ajax-write")
         self.assertEqual(blocked["status"], BLOCKED_UNSAFE_AUTO_PROBE)
 
-    def test_correlation_rejects_cross_plugin_and_accepts_exact_runtime_proof(self) -> None:
-        endpoint = build_catalog(self.registry(), "demo-plugin")[0]
-        artifact = {
-            "run_id": "run-1",
-            "request_id": "request-1",
-            "target_plugin": "demo-plugin",
-            "http_method": "POST",
-            "http_target": "/wp-admin/admin-ajax.php?action=demo_fetch_items",
-            "hook_coverage": {"executed_callbacks": {"ajax-public": {"callback_id": "ajax-public"}}},
+    def raw_seed_item(self, *, callback_id: str = "ajax-public", action: str = "demo_fetch_items") -> dict:
+        return {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "ajax",
+            "hook_name": f"wp_ajax_nopriv_{action}",
+            "callback_id": callback_id,
+            "pass1_request_id": f"pass1-{callback_id}",
+            "seed": {
+                "method": "POST",
+                "resolved_method": "POST",
+                "method_status": "resolved",
+                "path": "/wp-admin/admin-ajax.php",
+                "body": {"action": action, "bootstrap": "preserve"},
+                "query_params": {},
+                "fixed_params": ["action", "bootstrap"],
+                "fuzzable_params": [],
+                "auth_mode": "unauth-capable",
+            },
         }
 
-        self.assertEqual(correlate_artifact(endpoint, artifact, "run-1", "demo-plugin")["request_id"], "request-1")
-        artifact["target_plugin"] = "other-plugin"
-        self.assertIsNone(correlate_artifact(endpoint, artifact, "run-1", "demo-plugin"))
+    def pass1_artifact_for_raw(
+        self, item: dict, *, raw_value: str = "never-write-this", include_param: bool = True
+    ) -> dict:
+        candidate = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "ajax",
+            "action": item["seed"]["body"]["action"],
+            "callback_id": item["callback_id"],
+            "method": "POST",
+            "auth_mode": "unauth-capable",
+            "legacy_run_id": "legacy-1",
+            "pass1_request_id": item["pass1_request_id"],
+        }
+        artifact = {
+            "legacy_run_id": "legacy-1",
+            "request_id": item["pass1_request_id"],
+            "target_plugin": "demo-plugin",
+            "canonical_identity_id": canonical_identity_id(candidate),
+            "callback_id": item["callback_id"],
+            "http_method": "POST",
+            "auth_variant": "unauthenticated",
+            "content_type": "application/x-www-form-urlencoded",
+            "hook_coverage": {"executed_callbacks": {item["callback_id"]: {"callback_id": item["callback_id"]}}},
+        }
+        if include_param:
+            artifact["request_params"] = {"body_params": {"term": raw_value}}
+        return artifact
 
-    def test_run_writes_immutable_outputs_and_generates_config_only_from_proof(self) -> None:
+    def test_run_enrichment_writes_only_value_free_zend_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             plugin = self.make_plugin_zip(root)
-            request = self.registry()
-            request.update(
-                {
-                    "run_id": "run-1",
-                    "request_id": "request-1",
-                    "target_plugin": "demo-plugin",
-                    "http_method": "POST",
-                    "http_target": "/wp-admin/admin-ajax.php?action=demo_fetch_items",
-                    "hook_coverage": {
-                        **request["hook_coverage"],
-                        "executed_callbacks": {"ajax-public": {"callback_id": "ajax-public"}},
-                    },
-                }
-            )
-            summary = run_discovery(
+            item = self.raw_seed_item()
+            summary = run_enrichment(
                 plugin_zip=plugin,
                 plugin_slug="demo-plugin",
-                run_id="run-1",
+                legacy_run_id="legacy-1",
                 registry=self.registry(),
-                request_artifacts=[request],
+                raw_seed_report={"suggested_seeds": [item]},
+                pass1_artifacts=[self.pass1_artifact_for_raw(item)],
                 output_root=root / "output",
             )
 
-            output = root / "output" / "run-1"
-            self.assertEqual(summary["stages"]["integrity"], "PASS")
-            self.assertEqual(summary["stages"]["replay"], "PASS")
-            self.assertTrue((output / "run-summary.json").exists())
-            self.assertTrue((output / "endpoint-catalog.json").exists())
-            self.assertTrue((output / "runtime" / "request-1.json").exists())
-            self.assertTrue((output / "configs" / "ajax-public.json").exists())
-            self.assertTrue((output / "generated_config_summary.json").exists())
-            config = json.loads((output / "configs" / "ajax-public.json").read_text(encoding="utf-8"))
-            self.assertEqual(config["body_params"]["fixed"], ["action"])
-            self.assertEqual(config["body_params"]["fuzz"], ["term"])
+            output = root / "output" / "legacy-1"
+            identity_id = canonical_identity_id(
+                {
+                    "plugin_slug": "demo-plugin",
+                    "entrypoint_type": "ajax",
+                    "action": "demo_fetch_items",
+                    "callback_id": "ajax-public",
+                    "method": "POST",
+                    "auth_mode": "unauth-capable",
+                }
+            )
+            self.assertEqual(
+                {path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()},
+                {
+                    f"seeds/{identity_id}--POST.json",
+                    "zend_enriched_seeds.json",
+                    "zend-enrichment-summary.json",
+                    "endpoint-catalog.json",
+                },
+            )
+            seed = json.loads((output / "seeds" / f"{identity_id}--POST.json").read_text(encoding="utf-8"))
+            self.assertTrue(seed["accepted_pass1_proof"])
+            self.assertTrue(seed["probe_replay_allowed"])
+            self.assertTrue(seed["final_fuzz_export_allowed"])
+            self.assertEqual(seed["seed_item"]["seed"]["fixed_params"], ["action", "bootstrap"])
+            self.assertNotIn("pass2_request_id", json.dumps(seed))
+            self.assertNotIn("never-write-this", json.dumps(seed))
+            self.assertEqual(summary["final_fuzz_export_allowed"], 1)
 
-    def test_run_writes_seed_before_config_and_preserves_parameter_evidence(self) -> None:
+    def test_run_enrichment_blocks_zero_fuzz_but_continues_independent_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             plugin = self.make_plugin_zip(root)
-            artifact = {
-                "run_id": "run-1",
-                "request_id": "request-1",
-                "target_plugin": "demo-plugin",
-                "http_method": "POST",
-                "http_target": "/wp-admin/admin-ajax.php?action=demo_fetch_items",
-                "request_params": {"body_params": {"term": "redacted"}},
-                "hook_coverage": {"executed_callbacks": {"ajax-public": {"callback_id": "ajax-public"}}},
-            }
+            blocked = self.raw_seed_item(callback_id="ajax-write", action="demo_save")
+            accepted = self.raw_seed_item()
+            registry = self.registry()
+            registry["hook_coverage"]["registered_callbacks"]["ajax-write"]["source_file"] = None
+            summary = run_enrichment(
+                plugin,
+                "demo-plugin",
+                "legacy-1",
+                registry,
+                {"suggested_seeds": [blocked, accepted]},
+                [
+                    self.pass1_artifact_for_raw(blocked, include_param=False),
+                    self.pass1_artifact_for_raw(accepted),
+                ],
+                root / "output",
+            )
 
-            run_discovery(plugin, "demo-plugin", "run-1", self.registry(), [artifact], root / "output")
-
-            output = root / "output" / "run-1"
-            seed = json.loads((output / "seeds" / "ajax-public.json").read_text(encoding="utf-8"))
-            config = json.loads((output / "configs" / "ajax-public.json").read_text(encoding="utf-8"))
-            self.assertEqual(seed["parameters"][0]["name"], "term")
-            self.assertIn("static:POST", seed["parameters"][0]["evidence"])
-            self.assertEqual(config["body_params"]["fuzz"], ["term"])
-
-    def test_run_blocks_proven_callback_with_no_fuzzable_parameter(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
-            plugin = root / "demo-plugin.zip"
-            with zipfile.ZipFile(plugin, "w") as archive:
-                archive.writestr("demo-plugin/demo-plugin.php", "<?php\n/*\nPlugin Name: Demo Plugin\nVersion: 1.2.3\n*/\n")
-                archive.writestr("demo-plugin/ajax.php", "<?php\ncheck_ajax_referer('demo', 'nonce');\n")
-            artifact = {
-                "run_id": "run-1",
-                "request_id": "request-1",
-                "target_plugin": "demo-plugin",
-                "http_method": "POST",
-                "http_target": "/wp-admin/admin-ajax.php?action=demo_fetch_items",
-                "hook_coverage": {"executed_callbacks": {"ajax-public": {"callback_id": "ajax-public"}}},
-            }
-
-            summary = run_discovery(plugin, "demo-plugin", "run-1", self.registry(), [artifact], root / "output")
-
-            output = root / "output" / "run-1"
-            endpoint = next(row for row in summary["endpoints"] if row["callback_id"] == "ajax-public")
-            self.assertEqual(endpoint["status"], BLOCKED_NEEDS_RECIPE)
-            self.assertFalse((output / "configs" / "ajax-public.json").exists())
-
-    def test_recipe_rejects_secrets_and_unknown_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
-            plugin = self.make_plugin_zip(root)
-            recipe = root / "recipe.json"
-            recipe.write_text(json.dumps({"selector": {"callback_id": "ajax-public"}, "password": "nope"}), encoding="utf-8")
-
-            summary = run_discovery(plugin, "demo-plugin", "run-1", self.registry(), [], root / "output", recipe)
-
-            self.assertEqual(summary["stages"]["recipe"], "FAILED")
-            self.assertIn(BLOCKED_NEEDS_RECIPE, {item["status"] for item in summary["endpoints"]})
+            rows = {row["canonical_identity_id"]: row for row in summary["enriched_seeds"]}
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(sum(row["final_fuzz_export_allowed"] for row in rows.values()), 1)
+            self.assertEqual(summary["final_fuzz_export_allowed"], 1)
 
     def test_uopz_captures_zend_run_id_from_request_header(self) -> None:
         instrumentation = (
@@ -625,47 +629,12 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertIn("HTTP_X_ZEND_DISCOVERY_RUN_ID", instrumentation)
         self.assertIn("'run_id' =>", instrumentation)
 
-    def test_engine_cli_runs_as_direct_script(self) -> None:
-        result = subprocess.run(
-            [sys.executable, str(FUZZER_DIR / "zend_discovery" / "engine.py"), "--help"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+    def test_engine_has_no_legacy_runner_imports(self) -> None:
+        engine_source = (FUZZER_DIR / "zend_discovery" / "engine.py").read_text(encoding="utf-8")
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Build Zend discovery artifacts", result.stdout)
-
-    def test_engine_cli_accepts_powershell_utf8_bom_registry(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
-            registry_path = root / "registry.json"
-            probe_plan = root / "probe-plan.json"
-            registry_path.write_text(json.dumps(self.registry()), encoding="utf-8-sig")
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(FUZZER_DIR / "zend_discovery" / "engine.py"),
-                    "--plugin-zip",
-                    str(self.make_plugin_zip(root)),
-                    "--plugin-slug",
-                    "demo-plugin",
-                    "--run-id",
-                    "run-1",
-                    "--registry",
-                    str(registry_path),
-                    "--write-probe-plan",
-                    str(probe_plan),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue(probe_plan.exists())
-
+        self.assertNotIn("config_exporter", engine_source)
+        self.assertNotIn("generated_config_runner", engine_source)
+        self.assertNotIn("run_discovery", engine_source)
 
 if __name__ == "__main__":
     unittest.main()
