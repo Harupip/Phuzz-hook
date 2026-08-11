@@ -19,6 +19,7 @@ from zend_discovery.engine import (
     build_catalog,
     canonical_identity,
     canonical_identity_id,
+    candidate_from_seed_item,
     correlate_pass1_artifact,
     enrich_current_run,
     read_plugin_metadata,
@@ -526,24 +527,15 @@ class ZendDiscoveryTests(unittest.TestCase):
     def pass1_artifact_for_raw(
         self, item: dict, *, raw_value: str = "never-write-this", include_param: bool = True
     ) -> dict:
-        candidate = {
-            "plugin_slug": "demo-plugin",
-            "entrypoint_type": "ajax",
-            "action": item["seed"]["body"]["action"],
-            "callback_id": item["callback_id"],
-            "method": "POST",
-            "auth_mode": "unauth-capable",
-            "legacy_run_id": "legacy-1",
-            "pass1_request_id": item["pass1_request_id"],
-        }
+        candidate = candidate_from_seed_item(item, plugin_slug="demo-plugin", legacy_run_id="legacy-1")
         artifact = {
             "legacy_run_id": "legacy-1",
             "request_id": item["pass1_request_id"],
             "target_plugin": "demo-plugin",
             "canonical_identity_id": canonical_identity_id(candidate),
-            "callback_id": item["callback_id"],
-            "http_method": "POST",
-            "auth_variant": "unauthenticated",
+            "callback_id": candidate["callback_id"],
+            "http_method": candidate["method"],
+            "auth_variant": canonical_identity(candidate)["auth_variant"],
             "content_type": "application/x-www-form-urlencoded",
             "hook_coverage": {"executed_callbacks": {item["callback_id"]: {"callback_id": item["callback_id"]}}},
         }
@@ -590,7 +582,13 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertTrue(seed["accepted_pass1_proof"])
             self.assertTrue(seed["probe_replay_allowed"])
             self.assertTrue(seed["final_fuzz_export_allowed"])
-            self.assertEqual(seed["seed_item"]["seed"]["fixed_params"], ["action", "bootstrap"])
+            self.assertEqual(
+                seed["seed_patch"]["fixed_bootstrap"],
+                [
+                    {"name": "action", "provenance": "legacy_fixed_param"},
+                    {"name": "bootstrap", "provenance": "legacy_fixed_param"},
+                ],
+            )
             self.assertNotIn("pass2_request_id", json.dumps(seed))
             self.assertNotIn("never-write-this", json.dumps(seed))
             self.assertEqual(summary["final_fuzz_export_allowed"], 1)
@@ -620,6 +618,114 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertEqual(sum(row["final_fuzz_export_allowed"] for row in rows.values()), 1)
             self.assertEqual(summary["final_fuzz_export_allowed"], 1)
+
+    def test_legacy_entrypoint_variants_keep_distinct_actions_and_seed_files(self) -> None:
+        first = self.raw_seed_item()
+        first["entrypoint_type"] = "ajax_unauthenticated"
+        second = self.raw_seed_item(action="demo_fetch_other")
+        second["entrypoint_type"] = "wp_ajax_nopriv"
+        first_candidate = candidate_from_seed_item(first, plugin_slug="demo-plugin", legacy_run_id="legacy-1")
+        second_candidate = candidate_from_seed_item(second, plugin_slug="demo-plugin", legacy_run_id="legacy-1")
+
+        self.assertEqual(first_candidate["entrypoint_type"], "ajax")
+        self.assertEqual(second_candidate["entrypoint_type"], "ajax")
+        admin_post = self.raw_seed_item(action="demo_export")
+        admin_post["entrypoint_type"] = "admin_post_authenticated"
+        admin_post["hook_name"] = "admin_post_demo_export"
+        admin_post["seed"]["auth_mode"] = "authenticated"
+        rest = self.raw_seed_item(action="")
+        rest["entrypoint_type"] = "wp_rest_route"
+        rest["hook_name"] = "rest_route:demo/v1/items"
+        self.assertEqual(candidate_from_seed_item(admin_post)["entrypoint_type"], "admin-post")
+        self.assertEqual(candidate_from_seed_item(rest)["entrypoint_type"], "rest")
+        self.assertNotEqual(canonical_identity_id(first_candidate), canonical_identity_id(second_candidate))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            plugin = self.make_plugin_zip(root)
+            summary = run_enrichment(
+                plugin,
+                "demo-plugin",
+                "legacy-1",
+                self.registry(),
+                {"suggested_seeds": [first, second]},
+                [self.pass1_artifact_for_raw(first), self.pass1_artifact_for_raw(second)],
+                root / "output",
+            )
+
+            identities = {row["canonical_identity_id"] for row in summary["enriched_seeds"]}
+            seed_files = list((root / "output" / "legacy-1" / "seeds").glob("*.json"))
+            self.assertEqual(len(identities), 2)
+            self.assertEqual(len(seed_files), 2)
+
+    def test_zend_artifacts_exclude_raw_legacy_and_pass2_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            plugin = self.make_plugin_zip(root)
+            item = self.raw_seed_item()
+            item["pass2_request_id"] = "pass2-secret"
+            item["authorization"] = "legacy-auth-secret"
+            item["seed"]["body"]["token"] = "legacy-token-secret"
+            artifact = self.pass1_artifact_for_raw(item, raw_value="submitted-secret")
+            artifact["pass2_request_id"] = "artifact-pass2-secret"
+            artifact["request_params"]["body_params"]["authorization"] = "artifact-auth-secret"
+
+            run_enrichment(
+                plugin,
+                "demo-plugin",
+                "legacy-1",
+                self.registry(),
+                {"suggested_seeds": [item]},
+                [artifact],
+                root / "output",
+            )
+
+            for path in (root / "output" / "legacy-1").rglob("*.json"):
+                persisted = path.read_text(encoding="utf-8")
+                for forbidden in (
+                    "pass2_request_id",
+                    "pass2-secret",
+                    "artifact-pass2-secret",
+                    "authorization",
+                    "legacy-auth-secret",
+                    "artifact-auth-secret",
+                    "legacy-token-secret",
+                    "submitted-secret",
+                    "seed_item",
+                ):
+                    self.assertNotIn(forbidden, persisted, path)
+
+    def test_run_enrichment_rejects_cross_plugin_raw_candidate_and_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            item = self.raw_seed_item()
+            item["plugin_slug"] = "other-plugin"
+
+            with self.assertRaisesRegex(ValueError, "RAW_CANDIDATE_PLUGIN_MISMATCH"):
+                run_enrichment(
+                    self.make_plugin_zip(root),
+                    "demo-plugin",
+                    "legacy-1",
+                    self.registry(),
+                    {"suggested_seeds": [item]},
+                    [self.pass1_artifact_for_raw(item)],
+                    root / "output",
+                )
+
+            valid = self.raw_seed_item()
+            foreign_artifact = self.pass1_artifact_for_raw(valid)
+            foreign_artifact["legacy_run_id"] = "legacy-2"
+            foreign_artifact["target_plugin"] = "other-plugin"
+            result = run_enrichment(
+                self.make_plugin_zip(root),
+                "demo-plugin",
+                "legacy-2",
+                self.registry(),
+                {"suggested_seeds": [valid]},
+                [foreign_artifact],
+                root / "output",
+            )
+            self.assertFalse(result["enriched_seeds"][0]["accepted_pass1_proof"])
 
     def test_uopz_captures_zend_run_id_from_request_header(self) -> None:
         instrumentation = (

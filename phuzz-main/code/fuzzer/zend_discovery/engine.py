@@ -23,6 +23,7 @@ SKIPPED = "SKIPPED"
 BLOCKED_UNSAFE_AUTO_PROBE = "BLOCKED_UNSAFE_AUTO_PROBE"
 BLOCKED_NEEDS_RECIPE = "BLOCKED_NEEDS_RECIPE"
 READ_ACTION = re.compile(r"(?:get|list|fetch|search|load|view)", re.IGNORECASE)
+PERSISTENCE_FORBIDDEN_KEY = re.compile(r"(?:authorization|cookie|password|secret|token|pass2)", re.IGNORECASE)
 
 
 def canonical_identity(candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -190,7 +191,7 @@ def _target_owned(entry: dict[str, Any], plugin_slug: str) -> bool:
 
 
 def _ajax_action(hook_name: str) -> str | None:
-    for prefix in ("wp_ajax_nopriv_", "wp_ajax_"):
+    for prefix in ("wp_ajax_nopriv_", "wp_ajax_", "admin_post_nopriv_", "admin_post_"):
         if hook_name.startswith(prefix):
             return hook_name[len(prefix) :]
     return None
@@ -254,12 +255,11 @@ def candidate_from_seed_item(
     """Normalize one legacy seed item for the Task 1 canonical identity helper."""
     seed = seed_item.get("seed")
     seed = seed if isinstance(seed, Mapping) else {}
-    entrypoint_type = str(seed_item.get("entrypoint_type") or seed.get("entrypoint_type") or "").lower()
-    if entrypoint_type == "rest_route":
-        entrypoint_type = "rest"
+    raw_entrypoint_type = str(seed_item.get("entrypoint_type") or seed.get("entrypoint_type") or "").lower()
     body = seed.get("body") if isinstance(seed.get("body"), Mapping) else {}
     query = seed.get("query_params") if isinstance(seed.get("query_params"), Mapping) else {}
     hook_name = str(seed_item.get("hook_name") or "")
+    entrypoint_type = _canonical_entrypoint_type(raw_entrypoint_type, hook_name)
     action = str(seed_item.get("action") or body.get("action") or query.get("action") or _ajax_action(hook_name) or "")
     method = str(seed.get("resolved_method") or seed.get("method") or seed_item.get("resolved_method") or seed_item.get("method") or "").upper()
     return {
@@ -274,37 +274,54 @@ def candidate_from_seed_item(
         "fixed_selectors": seed_item.get("fixed_selectors", {}),
         "callback_id": str(seed_item.get("callback_id") or ""),
         "method": method,
-        "auth_mode": str(seed.get("auth_mode") or seed_item.get("auth_mode") or ""),
+        "auth_mode": str(seed.get("auth_mode") or seed_item.get("auth_mode") or _entrypoint_auth_variant(raw_entrypoint_type)),
         "legacy_run_id": legacy_run_id,
         "pass1_request_id": str(seed_item.get("pass1_request_id") or seed.get("pass1_request_id") or ""),
         "fixed_bootstrap": seed_item.get("fixed_bootstrap", {}),
     }
 
 
-def _legacy_seed_item(raw_item: Mapping[str, Any], enriched: Mapping[str, Any]) -> dict[str, Any]:
-    item = deepcopy(dict(raw_item))
-    seed = item.get("seed")
-    if not isinstance(seed, dict):
-        seed = {}
-        item["seed"] = seed
-    method = str(enriched["method"])
-    fuzzable_params = list(enriched["fuzzable_params"])
-    seed["method"] = method
-    seed["resolved_method"] = method
-    seed["method_status"] = "resolved"
-    seed["method_confidence"] = "zend_pass1"
-    seed["export_allowed"] = bool(enriched["final_fuzz_export_allowed"])
-    seed["fuzzable_params"] = fuzzable_params
-    seed.setdefault("body", {})
-    seed.setdefault("query_params", {})
-    for parameter in enriched["parameters"]:
-        if parameter.get("name") not in fuzzable_params:
-            continue
-        target = seed["query_params"] if parameter.get("location") == "query" else seed["body"]
-        if isinstance(target, dict):
-            target[str(parameter["name"])] = "FUZZ"
-    item["source_resolution"] = deepcopy(enriched["source_resolution"])
-    return item
+def _canonical_entrypoint_type(raw_entrypoint_type: str, hook_name: str) -> str:
+    if hook_name.startswith(("admin_post_nopriv_", "admin_post_")) or raw_entrypoint_type in {"admin-post", "admin_post"}:
+        return "admin-post"
+    if hook_name.startswith(("wp_ajax_nopriv_", "wp_ajax_")) or raw_entrypoint_type.startswith("ajax"):
+        return "ajax"
+    if raw_entrypoint_type in {"rest", "rest_route", "rest_api", "wp_rest", "wp_rest_route"}:
+        return "rest"
+    return raw_entrypoint_type
+
+
+def _entrypoint_auth_variant(raw_entrypoint_type: str) -> str:
+    if raw_entrypoint_type in {"ajax_authenticated", "admin_post_authenticated"}:
+        return "authenticated"
+    if raw_entrypoint_type in {"ajax_unauthenticated", "admin_post_unauthenticated"}:
+        return "unauth-capable"
+    return ""
+
+
+def _fixed_bootstrap(raw_item: Mapping[str, Any]) -> list[dict[str, str]]:
+    seed = raw_item.get("seed") if isinstance(raw_item.get("seed"), Mapping) else {}
+    names = list(seed.get("fixed_params", [])) if isinstance(seed.get("fixed_params"), list) else []
+    bootstrap = raw_item.get("fixed_bootstrap")
+    if isinstance(bootstrap, Mapping):
+        names.extend(bootstrap.keys())
+    return [
+        {"name": str(name), "provenance": "legacy_fixed_param"}
+        for name in dict.fromkeys(names)
+        if str(name) and not PERSISTENCE_FORBIDDEN_KEY.search(str(name))
+    ]
+
+
+def _sanitize_persisted(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _sanitize_persisted(item)
+            for key, item in value.items()
+            if not PERSISTENCE_FORBIDDEN_KEY.search(str(key))
+        }
+    if isinstance(value, list):
+        return [_sanitize_persisted(item) for item in value]
+    return value
 
 
 def _enriched_record(
@@ -334,19 +351,33 @@ def _enriched_record(
     extracted = extractor.extract(dict(callback))
     source_resolution = extracted.get("source_resolution", {}) if isinstance(extracted, Mapping) else {}
     current = enrich_current_run(candidate, callback, proof or {}, extractor)
-    fuzzable_params = [row["name"] for row in current["parameters"] if row.get("fuzzable")]
+    parameters = [
+        row for row in current["parameters"]
+        if not PERSISTENCE_FORBIDDEN_KEY.search(str(row.get("name") or ""))
+    ]
+    blocked_parameters = [
+        row for row in current["blocked_parameters"]
+        if not PERSISTENCE_FORBIDDEN_KEY.search(str(row.get("name") or ""))
+    ]
+    fuzzable_parameters = [
+        {"name": str(row["name"]), "location": str(row["location"])}
+        for row in parameters if row.get("fuzzable")
+    ]
+    fuzzable_params = [row["name"] for row in fuzzable_parameters]
     record: dict[str, Any] = {
-        **identity,
+        "canonical_identity": identity,
         "canonical_identity_id": identity_id,
         "legacy_run_id": candidate["legacy_run_id"],
         "pass1_request_id": candidate["pass1_request_id"],
         "plugin_slug": plugin["slug"],
         "plugin_sha256": plugin["sha256"],
         "method": identity["resolved_method"],
+        "auth_variant": identity["auth_variant"],
+        "entrypoint_type": identity["entrypoint_type"],
         "source_resolution": deepcopy(source_resolution),
         "source_resolution_status": current["source_resolution_status"],
-        "parameters": current["parameters"],
-        "blocked_parameters": current["blocked_parameters"],
+        "parameters": parameters,
+        "blocked_parameters": blocked_parameters,
         "provenance": {
             "pass1": {
                 "legacy_run_id": candidate["legacy_run_id"],
@@ -361,9 +392,22 @@ def _enriched_record(
         "probe_replay_allowed": bool(current["probe_replay_allowed"]),
         "final_fuzz_export_allowed": bool(current["final_fuzz_export_allowed"] and fuzzable_params),
         "fuzzable_params": fuzzable_params,
+        "seed_patch": {
+            "canonical_identity": identity,
+            "canonical_identity_id": identity_id,
+            "method": identity["resolved_method"],
+            "auth_variant": identity["auth_variant"],
+            "entrypoint_type": identity["entrypoint_type"],
+            "fuzzable_parameters": fuzzable_parameters,
+            "fixed_bootstrap": _fixed_bootstrap(raw_item),
+            "gates": {
+                "accepted_pass1_proof": proof is not None,
+                "probe_replay_allowed": bool(current["probe_replay_allowed"]),
+                "final_fuzz_export_allowed": bool(current["final_fuzz_export_allowed"] and fuzzable_params),
+            },
+        },
     }
-    record["seed_item"] = _legacy_seed_item(raw_item, record)
-    return record
+    return _sanitize_persisted(record)
 
 
 def run_enrichment(
@@ -376,17 +420,20 @@ def run_enrichment(
     output_root: Path,
 ) -> dict[str, Any]:
     """Write value-free Zend enrichment artifacts from offline Pass 1 evidence."""
+    plugin = read_plugin_metadata(Path(plugin_zip), plugin_slug)
+    raw_items = raw_seed_report.get("suggested_seeds", [])
+    if not isinstance(raw_items, list):
+        raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
+    for raw_item in raw_items:
+        if isinstance(raw_item, Mapping) and raw_item.get("plugin_slug") and raw_item["plugin_slug"] != plugin_slug:
+            raise ValueError("RAW_CANDIDATE_PLUGIN_MISMATCH")
     output_dir = Path(output_root) / legacy_run_id
     if output_dir.exists():
         raise ValueError("RUN_OUTPUT_ALREADY_EXISTS")
-    plugin = read_plugin_metadata(Path(plugin_zip), plugin_slug)
     output_dir.mkdir(parents=True)
     seeds_dir = output_dir / "seeds"
     seeds_dir.mkdir()
     callbacks = _registered(registry)
-    raw_items = raw_seed_report.get("suggested_seeds", [])
-    if not isinstance(raw_items, list):
-        raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
     artifacts = [artifact for artifact in pass1_artifacts if isinstance(artifact, Mapping)]
     enriched: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="zend-enrichment-") as source_dir:
@@ -409,7 +456,7 @@ def run_enrichment(
     catalog = [
         {
             "canonical_identity_id": row["canonical_identity_id"],
-            "callback_id": row["callback_identity"],
+            "callback_id": row["canonical_identity"]["callback_identity"],
             "method": row["method"],
             "accepted_pass1_proof": row["accepted_pass1_proof"],
             "probe_replay_allowed": row["probe_replay_allowed"],
