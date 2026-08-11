@@ -242,6 +242,26 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertTrue(seed["parameters"][0]["blocked"])
             self.assertEqual(seed["parameters"][0]["blocked_reason"], "unresolved_location")
 
+    def test_enrichment_rejects_body_content_type_substring_matches(self) -> None:
+        candidate = self.pass1_candidate()
+        json_like = self.pass1_artifact(
+            candidate,
+            request_content_type="text/plain; profile=json",
+            request_params={"body_params": {"json_like": "value"}},
+        )
+        form_like = self.pass1_artifact(
+            candidate,
+            request_content_type="text/plain; note=multipart/form-data",
+            request_params={"body_params": {"form_like": "value"}},
+        )
+
+        for artifact in (json_like, form_like):
+            seed = enrich_current_run(candidate, {"callback_id": "ajax-public"}, artifact, StaticExtractor([]))
+            self.assertFalse(seed["final_fuzz_export_allowed"])
+            self.assertEqual(seed["parameters"][0]["location"], "unknown")
+            self.assertTrue(seed["parameters"][0]["blocked"])
+            self.assertEqual(seed["parameters"][0]["blocked_reason"], "unresolved_location")
+
     def test_enrichment_resolves_direct_current_run_get_and_post_only(self) -> None:
         get_candidate = self.pass1_candidate()
         get_candidate["method"] = "GET"

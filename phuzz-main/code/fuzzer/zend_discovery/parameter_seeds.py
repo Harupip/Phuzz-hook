@@ -100,10 +100,10 @@ def build_enriched_parameters(
     request_params = artifact.get("request_params", {})
     body_values = request_params.get("body_params", {}) if isinstance(request_params, Mapping) else {}
     if isinstance(body_values, Mapping):
-        content_type = str(artifact.get("content_type") or artifact.get("request_content_type") or "").lower()
-        if "json" in content_type:
+        media_type = str(artifact.get("content_type") or artifact.get("request_content_type") or "").split(";", 1)[0].strip().lower()
+        if media_type == "application/json" or media_type.endswith("+json"):
             location, evidence_kind = "json", "runtime_json_observed"
-        elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        elif media_type in {"application/x-www-form-urlencoded", "multipart/form-data"}:
             location, evidence_kind = "form", "runtime_form_body_observed"
         else:
             location, evidence_kind = None, "runtime_form_body_observed"
