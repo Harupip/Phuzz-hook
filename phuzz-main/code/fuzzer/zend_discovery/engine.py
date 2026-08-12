@@ -124,6 +124,7 @@ def normalize_runtime_evidence(
         return normalize_rest_parameter_events(
             candidate,
             zend_artifact,
+            uopz_artifact=uopz_artifact,
             canonical_callback=canonical_callback,
             fixed_bootstrap=fixed,
         )
@@ -184,13 +185,7 @@ def prepare_callback_registry(registry: Mapping[str, Any], plugin_slug: str) -> 
     for callback_id, raw in _registered(dict(registry)).items():
         if not isinstance(raw, Mapping) or not _target_owned(dict(raw), plugin_slug):
             continue
-        canonical = str(
-            raw.get("canonical_callback")
-            or raw.get("callback_repr")
-            or raw.get("callback_name")
-            or raw.get("function_name")
-            or callback_id
-        ).strip()
+        canonical = _canonical_php_callback(raw, callback_id)
         if not canonical:
             continue
         registrations.append(
@@ -210,6 +205,20 @@ def prepare_callback_registry(registry: Mapping[str, Any], plugin_slug: str) -> 
         "callback_map": callback_map,
         "registrations": registrations,
     }
+
+
+def _canonical_php_callback(raw: Mapping[str, Any], callback_id: str) -> str:
+    class_name = str(raw.get("class_name") or "").strip()
+    method_name = str(raw.get("method_name") or "").strip()
+    if class_name and method_name:
+        return f"{class_name}::{method_name}"
+    return str(
+        raw.get("canonical_callback")
+        or raw.get("callback_repr")
+        or raw.get("callback_name")
+        or raw.get("function_name")
+        or callback_id
+    ).strip()
 
 
 def _php_callable_type(raw: Mapping[str, Any], canonical: str) -> str:

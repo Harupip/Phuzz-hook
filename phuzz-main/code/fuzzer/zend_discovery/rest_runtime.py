@@ -20,6 +20,7 @@ def normalize_rest_parameter_events(
     candidate: Mapping[str, Any],
     zend_artifact: Mapping[str, Any],
     *,
+    uopz_artifact: Mapping[str, Any],
     canonical_callback: str,
     fixed_bootstrap: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
@@ -38,10 +39,39 @@ def normalize_rest_parameter_events(
         "materialized_route": str(candidate.get("materialized_route") or candidate.get("route") or ""),
         "method": method,
     }
+    transport_events: list[Mapping[str, Any]] = list(events)
+    if method in {"GET", "HEAD"}:
+        request_params = uopz_artifact.get("request_params")
+        query_params = request_params.get("query_params") if isinstance(request_params, Mapping) else None
+        uopz_events = uopz_artifact.get("rest_parameter_events")
+        observed: dict[str, int] = {}
+        duplicate_observation = False
+        if isinstance(query_params, Mapping) and isinstance(uopz_events, list):
+            for event in uopz_events:
+                if not isinstance(event, Mapping) or event.get("accessor") != "WP_REST_Request::get_param":
+                    continue
+                name = event.get("name")
+                if isinstance(name, str) and name in query_params:
+                    if name in observed:
+                        duplicate_observation = True
+                        break
+                    observed[name] = 1
+        if duplicate_observation:
+            return []
+        transport_events.extend(
+            {
+                **expected,
+                "name": name,
+                "location": "query",
+                "observed_count": count,
+            }
+            for name, count in observed.items()
+        )
+
     accepted_events: list[Mapping[str, Any]] = []
     locations_by_name: dict[str, set[str]] = {}
     seen: set[tuple[str, str]] = set()
-    for event in events:
+    for event in transport_events:
         if not isinstance(event, Mapping) or any(event.get(key) != value for key, value in expected.items()):
             continue
         name = event.get("name")

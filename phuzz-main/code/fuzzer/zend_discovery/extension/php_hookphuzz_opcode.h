@@ -1,15 +1,15 @@
-#ifndef PHP_HOOKPHUZZ_OPCODE_PHASE9_H
-#define PHP_HOOKPHUZZ_OPCODE_PHASE9_H
+#ifndef PHP_HOOKPHUZZ_OPCODE_H
+#define PHP_HOOKPHUZZ_OPCODE_H
 
-extern zend_module_entry hookphuzz_opcode_phase9_module_entry;
-#define phpext_hookphuzz_opcode_phase9_ptr &hookphuzz_opcode_phase9_module_entry
+extern zend_module_entry hookphuzz_opcode_module_entry;
+#define phpext_hookphuzz_opcode_ptr &hookphuzz_opcode_module_entry
 
-#define PHP_HOOKPHUZZ_OPCODE_PHASE9_VERSION "0.8.0"
-#define HOOKPHUZZ_OPCODE_PHASE9_MAX_EVENTS 4096
-#define HOOKPHUZZ_PHASE9_MAX_REGISTRY_BYTES (1024 * 1024)
-#define HOOKPHUZZ_PHASE9_MAX_TARGETS 256
-#define HOOKPHUZZ_PHASE9_MAX_CALLBACK_BYTES 255
-#define HOOKPHUZZ_OPCODE_PHASE5_MAX_EVENTS HOOKPHUZZ_OPCODE_PHASE9_MAX_EVENTS
+#define PHP_HOOKPHUZZ_OPCODE_VERSION "0.8.0"
+#define HOOKPHUZZ_OPCODE_MAX_EVENTS 4096
+#define HOOKPHUZZ_MAX_REGISTRY_BYTES (1024 * 1024)
+#define HOOKPHUZZ_MAX_TARGETS 256
+#define HOOKPHUZZ_MAX_CALLBACK_BYTES 255
+#define HOOKPHUZZ_OPCODE_PHASE5_MAX_EVENTS HOOKPHUZZ_OPCODE_MAX_EVENTS
 
 typedef enum {
     HOOKPHUZZ_SOURCE_GET,
@@ -54,7 +54,7 @@ typedef struct _hookphuzz_context_frame {
     uint32_t depth;
 } hookphuzz_context_frame;
 
-ZEND_BEGIN_MODULE_GLOBALS(hookphuzz_opcode_phase9)
+ZEND_BEGIN_MODULE_GLOBALS(hookphuzz_opcode)
     zend_long dropped_event_count;
     uint32_t event_count;
     hookphuzz_event *events;
@@ -78,10 +78,10 @@ ZEND_BEGIN_MODULE_GLOBALS(hookphuzz_opcode_phase9)
     zend_long registry_schema_version;
     zend_string *target_load_status;
     zend_bool file_targets_loaded;
-ZEND_END_MODULE_GLOBALS(hookphuzz_opcode_phase9)
+ZEND_END_MODULE_GLOBALS(hookphuzz_opcode)
 
-ZEND_EXTERN_MODULE_GLOBALS(hookphuzz_opcode_phase9)
-#define HOOKPHUZZ_PHASE9_G(v) ZEND_MODULE_GLOBALS_ACCESSOR(hookphuzz_opcode_phase9, v)
-#define HOOKPHUZZ_PHASE5_G(v) HOOKPHUZZ_PHASE9_G(v)
+ZEND_EXTERN_MODULE_GLOBALS(hookphuzz_opcode)
+#define HOOKPHUZZ_G(v) ZEND_MODULE_GLOBALS_ACCESSOR(hookphuzz_opcode, v)
+#define HOOKPHUZZ_PHASE5_G(v) HOOKPHUZZ_G(v)
 
 #endif

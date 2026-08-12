@@ -78,6 +78,31 @@ GET and POST source map independently of HTTP request method:
 
 Example: a POST request that reads `$_GET['x']` still creates a query parameter `x`.
 
+## Mainline CRM And REST Addendum
+
+The current mainline keeps Stage 1 direct Zend evidence narrow, but the legacy
+generated flow may still carry source/helper seed information into the Zend
+bridge. This matters for `crm-perks-forms`:
+
+- UOPZ/coverage registers callback `cfx_form_admin_pages->save_api_settings`.
+- Zend target loading needs canonical callback
+  `cfx_form_admin_pages::save_api_settings`.
+- Pass 1 request body must include fixed `action=vx_form_save_api_settings`.
+- CRM also needs fixed `vx_nonce`.
+- Runtime observes parent `cfx_settings`.
+- Static/helper seed data keeps leaf `cfx_settings[alert_emails]`.
+- The final fuzz config must fuzz `cfx_settings\\[alert_emails\\]`, not parent
+  `cfx_settings`.
+
+REST `WP_REST_Request::get_param()` is handled by UOPZ:
+
+- UOPZ records value-free events such as
+  `{"accessor":"WP_REST_Request::get_param","name":"search"}`.
+- `rest_runtime.py` accepts GET/HEAD query evidence only when that name exists
+  in the same UOPZ artifact's `request_params.query_params`.
+- unrelated query keys are not promoted to evidence.
+- form and JSON remain fail closed until dedicated raw snapshots exist.
+
 ## Runtime Evidence Contract
 
 The generator consumes only normalized value-free evidence. Example:
@@ -122,7 +147,7 @@ Given:
 Check:
 
 ```text
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/phase9-callback-registry.json
+fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/hookphuzz-callback-registry.json
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/zend_convergence_summary.json
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/iterations/<n>/state.json
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/pass1-generated_config_summary.json
@@ -167,6 +192,43 @@ Expected result:
 - iteration 2 sends both and converges with no new parameter
 - all three request IDs differ, share one `legacy_run_id`, and one canonical candidate key
 - final generated config has fixed `action` and fuzzable POST `name`, `age`
+
+## Known Passing CRM Command
+
+From `phuzz-main/code`:
+
+```powershell
+rtk powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\wordpress\run-wordpress-phuzz.ps1 `
+  -PluginSlug crm-perks-forms `
+  -RunGeneratedConfigs `
+  -UseZendDiscovery `
+  -NoFollowLogs `
+  -SeedWaitSeconds 25 `
+  -GeneratedConfigTimeoutSeconds 8 `
+  -WebTimeoutSeconds 180
+```
+
+Required PASS checks:
+
+- command exits `0`
+- `fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/zend_convergence_summary.json`
+  has `status=CONVERGED`
+- convergence iterations contain fresh request IDs
+- Pass 1 and Pass 2 run summaries both have `callback_reached=1`
+- Zend target loading has `file_target_count > 0` and `rejected_count == 0`
+- `callback_summaries` includes
+  `cfx_form_admin_pages::save_api_settings`
+- final config under
+  `fuzzer/configs/generated-config/crm-perks-forms/` is `fuzzing_ready`
+- final config body fixes `action`, `vx_nonce`
+- final config body fuzz list contains only
+  `cfx_settings\\[alert_emails\\]`
+
+Quick inspection after the run:
+
+```powershell
+rtk python -c "import json; from pathlib import Path; base=Path('fuzzer/output/seed_generation'); run=max((base/'zend-bridge').iterdir(), key=lambda p:p.stat().st_mtime).name; conv=json.loads((base/'zend-bridge'/run/'zend_convergence_summary.json').read_text(encoding='utf-8-sig')); summ=json.loads((base/'generated_config_summary.json').read_text(encoding='utf-8-sig')); cfg=json.loads(Path(summ['generated'][0]['config_path']).read_text(encoding='utf-8-sig')); print(run, conv.get('status'), [i.get('request_id') for i in conv.get('iterations', [])], cfg['body_params'])"
+```
 
 ## Current Verified Proof
 

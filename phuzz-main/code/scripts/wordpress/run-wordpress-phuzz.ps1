@@ -434,7 +434,7 @@ function Initialize-ZendCallbackRegistry {
     )
 
     $bridgeWorkDir = Join-Path (Join-Path $SeedOutputDir "zend-bridge") $LegacyRunId
-    $registryPath = Join-Path $bridgeWorkDir "phase9-callback-registry.json"
+    $registryPath = Join-Path $bridgeWorkDir "hookphuzz-callback-registry.json"
     $coverageSnapshot = Join-Path $SeedOutputDir "runtime_coverage_snapshot.json"
     $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_bridge_cli.py"
 
@@ -455,7 +455,7 @@ function Initialize-ZendCallbackRegistry {
     if ($LASTEXITCODE -ne 0) {
         throw "Could not prepare /shared/opcode-events."
     }
-    docker cp $registryPath "${webContainerId}:/shared/phase9-callback-registry.json"
+    docker cp $registryPath "${webContainerId}:/shared/hookphuzz-callback-registry.json"
     if ($LASTEXITCODE -ne 0) {
         throw "Could not copy Zend callback registry into web container."
     }
@@ -555,11 +555,12 @@ function Invoke-ZendConvergence {
     $historyPath = Join-Path $bridgeWorkDir "zend_convergence_summary.json"
     $statePath = Join-Path $bridgeWorkDir "zend_convergence_state.json"
     $rawSuggestedSeeds = Join-Path $SeedOutputDir "suggested_seeds.json"
-    $registry = Join-Path $bridgeWorkDir "phase9-callback-registry.json"
+    $registry = Join-Path $bridgeWorkDir "hookphuzz-callback-registry.json"
     $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_bridge_cli.py"
     $generatedConfigRunner = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\generated_config_runner.py"
     $finalConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-config\$PluginSlug"
     $finalConfigSummary = Join-Path $SeedOutputDir "generated_config_summary.json"
+    $finalMergedSuggestedSeeds = Join-Path $SeedOutputDir "zend_merged_suggested_seeds.json"
     $history = @()
     $seenRequestIds = New-Object System.Collections.Generic.HashSet[string]
     $seenConfigHashes = New-Object System.Collections.Generic.HashSet[string]
@@ -631,6 +632,7 @@ function Invoke-ZendConvergence {
                 ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $historyPath -Encoding UTF8
 
             if ($state.status -eq "CONVERGED") {
+                Copy-Item -LiteralPath $mergedSeedsPath -Destination $finalMergedSuggestedSeeds -Force
                 Convert-LiveSeedSuggestionsToConfigs `
                     -ScriptRoot $ScriptRoot `
                     -PluginSlug $PluginSlug `
@@ -718,7 +720,7 @@ try {
     Write-Host "Starting fuzzer container"
     Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", $fuzzerService, "--build")
 
-    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug -UseEntrypointPipeline:$UseEntrypointPipeline -RuntimeParametersOnly:$UseZendDiscovery
+    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug -UseEntrypointPipeline:$UseEntrypointPipeline -RuntimeParametersOnly:$false
     if (-not $UseEntrypointPipeline) {
         Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug
     }

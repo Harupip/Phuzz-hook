@@ -138,6 +138,7 @@ def _apply_patch(raw_item: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[
     seed["export_allowed"] = True
     seed["replay_allowed"] = True
     seed.pop("block_reason", None)
+    fuzzable_parameters = _effective_fuzzable_parameters(seed, patch["fuzzable_parameters"])
     seed["fuzzable_params"] = []
     seed["input_params"] = []
     body = seed.setdefault("body", {})
@@ -145,7 +146,7 @@ def _apply_patch(raw_item: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[
     headers = seed.setdefault("headers", {})
     if not isinstance(body, dict) or not isinstance(query, dict) or not isinstance(headers, dict):
         return item
-    for parameter in patch["fuzzable_parameters"]:
+    for parameter in fuzzable_parameters:
         name = str(parameter["name"])
         location = str(parameter["location"])
         if location == "query":
@@ -168,6 +169,49 @@ def _apply_patch(raw_item: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[
             }
         )
     return item
+
+
+def _effective_fuzzable_parameters(
+    seed: Mapping[str, Any],
+    runtime_parameters: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    input_params = seed.get("input_params")
+    static_params = input_params if isinstance(input_params, list) else []
+    effective: list[dict[str, Any]] = []
+    for parameter in runtime_parameters:
+        if not isinstance(parameter, Mapping):
+            continue
+        name = str(parameter.get("name") or "")
+        location = str(parameter.get("location") or "")
+        children = [
+            {
+                "name": str(item.get("name")),
+                "location": location,
+                "evidence_kind": str(parameter.get("evidence_kind") or "zend_runtime"),
+            }
+            for item in static_params
+            if isinstance(item, Mapping)
+            and item.get("fuzzable") is not False
+            and str(item.get("name") or "").startswith(f"{name}[")
+            and _input_param_location(item, location) == location
+        ]
+        effective.extend(children or [dict(parameter)])
+    deduped: dict[tuple[str, str], dict[str, Any]] = {}
+    for parameter in effective:
+        deduped.setdefault((str(parameter.get("name") or ""), str(parameter.get("location") or "")), parameter)
+    return list(deduped.values())
+
+
+def _input_param_location(item: Mapping[str, Any], default: str) -> str:
+    location = str(item.get("location") or "").lower()
+    if location in {"query", "form", "json"}:
+        return location
+    source = str(item.get("source") or "").upper()
+    if source == "GET":
+        return "query"
+    if source == "POST":
+        return "form"
+    return default
 
 
 def materialize_convergence_seeds(

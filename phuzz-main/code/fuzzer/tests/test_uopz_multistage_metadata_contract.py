@@ -56,6 +56,16 @@ class UopzMultistageMetadataContractTests(unittest.TestCase):
         self.assertIn("__uopz_pop_callback_stack();", body)
         self.assertIn("finally {", body)
 
+    def test_rest_get_param_hook_uses_existing_retry_capable_method_installer(self) -> None:
+        source = UOPZ_HOOK_FILE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "__uopz_try_hook_method('WP_REST_Request', 'get_param', function (...$args)",
+            source,
+        )
+        self.assertIn("'accessor' => 'WP_REST_Request::get_param'", source)
+        self.assertIn("'rest_parameter_events'", source)
+
 
 if __name__ == "__main__":
     unittest.main()

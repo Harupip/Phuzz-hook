@@ -67,6 +67,7 @@ def build_enrichment_inputs(
     if not isinstance(raw_items, list):
         raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
     by_key = {_seed_key(item): item for item in raw_items if isinstance(item, Mapping)}
+    matched_items: list[dict[str, Any]] = []
     artifacts: list[dict[str, Any]] = []
     for row in pass1_run_summary.get("runs", []):
         if not isinstance(row, Mapping) or row.get("callback_reached") is not True:
@@ -87,7 +88,9 @@ def build_enrichment_inputs(
             seed["pass1_request_id"] = request_id
         raw_item["pass1_request_id"] = request_id
         candidate = candidate_from_seed_item(raw_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
+        matched_items.append(raw_item)
         artifacts.append(artifact)
+    raw_copy["suggested_seeds"] = matched_items
     return raw_copy, artifacts
 
 

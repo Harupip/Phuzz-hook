@@ -57,6 +57,7 @@ $GLOBALS['__uopz_request'] = [
     'http_target' => $__uopz_uri,
     'endpoint' => __uopz_detect_endpoint(),
     'input_signature' => __uopz_build_input_signature(),
+    'rest_parameter_events' => [],
     'request_params' => [
         'query_params' => $_GET ?? [],
         'body_params' => $_POST ?? [],
@@ -1120,6 +1121,18 @@ function __uopz_try_hook_method(string $className, string $methodName, Closure $
     return (bool) $ok;
 }
 
+function __uopz_record_rest_parameter($key): void
+{
+    if (!is_scalar($key) || (string) $key === '') {
+        return;
+    }
+
+    $GLOBALS['__uopz_request']['rest_parameter_events'][] = [
+        'accessor' => 'WP_REST_Request::get_param',
+        'name' => (string) $key,
+    ];
+}
+
 // Day la diem cai dat chinh. Co the goi lai an toan sau khi WP load xong.
 function __uopz_install_wp_hooks(): void
 {
@@ -1193,6 +1206,14 @@ function __uopz_install_wp_hooks(): void
         }
 
         __uopz_register_rest_route($namespace, $route, $routeArgs);
+    });
+
+    $installResults[] = __uopz_try_hook_method('WP_REST_Request', 'get_param', function (...$args) {
+        if (!__is_target_app_code() || !array_key_exists(0, $args)) {
+            return;
+        }
+
+        __uopz_record_rest_parameter($args[0]);
     });
 
     $installResults[] = __uopz_try_hook_function('remove_filter', function (...$args) {

@@ -154,6 +154,104 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertEqual(evidence[0]["source"], "REST_QUERY")
         self.assertEqual(evidence[0]["canonical_callback"], "Demo::list_items")
 
+    def test_normalize_runtime_evidence_exports_only_uopz_observed_rest_query_parameter(self) -> None:
+        candidate = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "rest",
+            "namespace": "demo/v1",
+            "route_pattern": "/items",
+            "endpoint_definition_index": 0,
+            "materialized_route": "/wp-json/demo/v1/items",
+            "callback_id": "rest-items",
+            "method": "GET",
+            "auth_mode": "nopriv",
+            "legacy_run_id": "legacy-1",
+            "pass1_request_id": "rest-request-uopz-1",
+        }
+        uopz = self.pass1_artifact(
+            candidate,
+            hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+            request_params={"query_params": {"search": "hello", "page": "1", "debug": "0"}},
+            rest_parameter_events=[{"accessor": "WP_REST_Request::get_param", "name": "search"}],
+        )
+        registry = {"schema_version": 1, "callback_map": {"rest-items": "Demo::list_items"}}
+        zend = {
+            "schema_version": 4,
+            "run_id": "legacy-1",
+            "request_id": "rest-request-uopz-1",
+            "request_method": "GET",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "rest_parameter_events": [],
+        }
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual(
+            evidence,
+            [{
+                "name": "search", "path": ["search"], "source": "REST_QUERY", "location": "query",
+                "helper_depth": 0, "observed_count": 1, "evidence_kind": "zend_rest_runtime",
+                "fuzzable": True, "run_id": "legacy-1", "request_id": "rest-request-uopz-1",
+                "plugin_slug": "demo-plugin", "callback_id": "rest-items",
+                "canonical_callback": "Demo::list_items", "namespace": "demo/v1",
+                "route_pattern": "/items", "materialized_route": "/wp-json/demo/v1/items",
+                "endpoint_definition_index": 0, "request_method": "GET",
+            }],
+        )
+
+    def test_normalize_runtime_evidence_rejects_unproven_uopz_rest_query_events(self) -> None:
+        candidate = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "rest",
+            "namespace": "demo/v1",
+            "route_pattern": "/items",
+            "endpoint_definition_index": 0,
+            "materialized_route": "/wp-json/demo/v1/items",
+            "callback_id": "rest-items",
+            "method": "GET",
+            "auth_mode": "nopriv",
+            "legacy_run_id": "legacy-1",
+            "pass1_request_id": "rest-request-uopz-reject",
+        }
+        registry = {"schema_version": 1, "callback_map": {"rest-items": "Demo::list_items"}}
+        zend = {
+            "schema_version": 4, "run_id": "legacy-1", "request_id": "rest-request-uopz-reject",
+            "request_method": "GET", "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "rest_parameter_events": [],
+        }
+        cases = [
+            ([], {"search": "hello"}),
+            ([{"accessor": "WP_REST_Request::get_param", "name": "missing"}], {"search": "hello"}),
+            ([
+                {"accessor": "WP_REST_Request::get_param", "name": "search"},
+                {"accessor": "WP_REST_Request::get_param", "name": "search"},
+            ], {"search": "hello"}),
+            ([{"accessor": "WP_REST_Request::get_param", "name": "access_token"}], {"access_token": "secret"}),
+            ([{"accessor": "WP_REST_Request::get_param", "name": "filters[name]"}], {"filters[name]": "value"}),
+            ([{"accessor": "WP_REST_Request::get_param", "name": "search"}], {}),
+            ([{"accessor": "other", "name": "search"}], {"search": "hello"}),
+        ]
+
+        for events, query_params in cases:
+            with self.subTest(events=events, query_params=query_params):
+                uopz = self.pass1_artifact(
+                    candidate,
+                    hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+                    request_params={"query_params": query_params},
+                    rest_parameter_events=events,
+                )
+                self.assertEqual(normalize_runtime_evidence(candidate, uopz, zend, registry), [])
+
+        unsupported_candidate = {**candidate, "method": "POST"}
+        unsupported_zend = {**zend, "request_method": "POST"}
+        uopz = self.pass1_artifact(
+            unsupported_candidate,
+            hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+            request_params={"body_params": {"search": "hello"}, "json_params": {"search": "hello"}},
+            rest_parameter_events=[{"accessor": "WP_REST_Request::get_param", "name": "search"}],
+        )
+        self.assertEqual(normalize_runtime_evidence(unsupported_candidate, uopz, unsupported_zend, registry), [])
+
     def test_normalize_runtime_evidence_rejects_ambiguous_or_mismatched_rest_event(self) -> None:
         candidate = {
             "plugin_slug": "demo-plugin",
@@ -226,7 +324,7 @@ class ZendDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(normalize_runtime_evidence(candidate, uopz, zend, registry), [])
 
-    def test_callback_registry_uses_php_callable_type_for_phase9_extension(self) -> None:
+    def test_callback_registry_uses_php_callable_type_for_zend_extension(self) -> None:
         registry = {
             "data": {
                 "registered_callbacks": {
@@ -246,6 +344,31 @@ class ZendDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(prepared["registrations"][0]["callback_type"], "function")
         self.assertEqual(prepared["registrations"][0]["wordpress_callback_type"], "action")
+
+    def test_callback_registry_canonicalizes_object_method_for_zend_extension(self) -> None:
+        registry = {
+            "data": {
+                "registered_callbacks": {
+                    "cb-crm": {
+                        "callback_id": "cb-crm",
+                        "hook_name": "wp_ajax_vx_form_save_api_settings",
+                        "callback_repr": "cfx_form_admin_pages->save_api_settings",
+                        "class_name": "cfx_form_admin_pages",
+                        "method_name": "save_api_settings",
+                        "type": "action",
+                        "target_plugin": "crm-perks-forms",
+                        "source_file": "/var/www/html/wp-content/plugins/crm-perks-forms/includes/admin-pages.php",
+                    }
+                }
+            }
+        }
+
+        prepared = prepare_callback_registry(registry, "crm-perks-forms")
+
+        self.assertEqual(prepared["callback_map"]["cb-crm"], "cfx_form_admin_pages::save_api_settings")
+        self.assertEqual(prepared["registrations"][0]["callback"], "cfx_form_admin_pages->save_api_settings")
+        self.assertEqual(prepared["registrations"][0]["callback_type"], "object_method")
+        self.assertNotIn("->", prepared["registrations"][0]["canonical_callback"])
 
     def test_pass1_correlation_accepts_raw_uopz_artifact_without_optional_identity_fields(self) -> None:
         candidate = self.pass1_candidate()
@@ -1015,12 +1138,14 @@ class ZendDiscoveryTests(unittest.TestCase):
             FUZZER_DIR
             / "zend_discovery"
             / "extension"
-            / "hookphuzz_opcode_phase9.c"
+            / "hookphuzz_opcode.c"
         ).read_text(encoding="utf-8")
 
+        self.assertIn('#include "php_hookphuzz_opcode.h"', extension)
+        self.assertIn("zend_module_entry hookphuzz_opcode_module_entry", extension)
         self.assertIn("HTTP_X_HOOKPHUZZ_RUN_ID", extension)
-        self.assertNotIn("HTTP_X_PHASE9_RUN_ID", extension)
         self.assertIn('"rest_parameter_events"', extension)
+        self.assertNotIn("phase9", extension.lower())
 
     def test_phase2_fixture_uses_direct_post_dimension_reads(self) -> None:
         fixture = FUZZER_DIR / "tests" / "fixtures" / "hookphuzz-entrypoint-direct-fixture" / "hookphuzz-entrypoint-direct-fixture.php"
@@ -1034,6 +1159,28 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertNotIn("isset($_POST", source)
         with zipfile.ZipFile(plugin_zip) as archive:
             archived = archive.read("hookphuzz-entrypoint-direct-fixture/hookphuzz-entrypoint-direct-fixture.php").decode("utf-8")
+        self.assertEqual(archived.replace("\r\n", "\n"), source.replace("\r\n", "\n"))
+
+    def test_rest_get_param_fixture_is_packaged_with_search_only_callback(self) -> None:
+        fixture = (
+            FUZZER_DIR
+            / "tests"
+            / "fixtures"
+            / "hookphuzz-rest-get-param-fixture"
+            / "hookphuzz-rest-get-param-fixture.php"
+        )
+        plugin_zip = FUZZER_DIR.parent / "web" / "applications" / "wordpress" / "_plugins" / "hookphuzz-rest-get-param-fixture.zip"
+        source = fixture.read_text(encoding="utf-8")
+
+        self.assertIn("get_param('search')", source)
+        self.assertIn("register_rest_route('hookphuzz-rest-get-param/v1', '/search'", source)
+        with zipfile.ZipFile(plugin_zip) as archive:
+            self.assertTrue(all("\\" not in entry.filename for entry in archive.infolist()))
+            self.assertIn("hookphuzz-rest-get-param-fixture/", archive.namelist())
+            self.assertTrue(all(entry.create_system == 3 for entry in archive.infolist()))
+            archived = archive.read(
+                "hookphuzz-rest-get-param-fixture/hookphuzz-rest-get-param-fixture.php"
+            ).decode("utf-8")
         self.assertEqual(archived.replace("\r\n", "\n"), source.replace("\r\n", "\n"))
 
     def test_convergence_identity_and_diff_keep_only_new_runtime_parameters(self) -> None:
@@ -1194,9 +1341,12 @@ class ZendDiscoveryTests(unittest.TestCase):
             zend_dir.mkdir()
             (uopz_dir / "request-0.json").write_text(json.dumps(uopz), encoding="utf-8")
             (zend_dir / "request-0.json").write_text(json.dumps(zend), encoding="utf-8")
+            extra = json.loads(json.dumps(item))
+            extra["hook_name"] = "wp_ajax_other"
+            extra["callback_id"] = "other-callback"
 
             result = converge_iteration(
-                raw_report={"suggested_seeds": [item]}, pass_run_summary=summary,
+                raw_report={"suggested_seeds": [item, extra]}, pass_run_summary=summary,
                 pass_artifacts_dir=uopz_dir, zend_events_dir=zend_dir,
                 registry=prepare_callback_registry(self.registry(), "demo-plugin"),
                 plugin_slug="demo-plugin", legacy_run_id="legacy-1", known_state={"known_parameters": []},

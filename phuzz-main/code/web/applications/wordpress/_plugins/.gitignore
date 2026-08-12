@@ -1,1 +1,2 @@
 *.zip
+!hookphuzz-rest-get-param-fixture.zip

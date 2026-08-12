@@ -5,10 +5,10 @@ RUN apt-get update \
     && pecl channel-update pecl.php.net \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /usr/src/hookphuzz_opcode_phase9
+WORKDIR /usr/src/hookphuzz_opcode
 COPY phuzz-main/code/fuzzer/zend_discovery/extension/ ./
 RUN phpize \
-    && ./configure --enable-hookphuzz_opcode_phase9 \
+    && ./configure --enable-hookphuzz_opcode \
     && make -j"$(nproc)" \
     && make install
 
@@ -41,7 +41,7 @@ COPY phuzz-main/code/web/instrumentation/ /var/www/fuzzer/
 COPY phuzz-main/code/web/entrypoint.sh /
 RUN mkdir -p /shared/opcode-events \
     && chown -R www-data:www-data /shared \
-    && printf 'extension=hookphuzz_opcode_phase9.so\nhookphuzz_opcode.target_callbacks=\nhookphuzz_opcode.target_callbacks_file=/shared/phase9-callback-registry.json\n' > "$PHP_INI_DIR/conf.d/50-hookphuzz-opcode-phase9.ini"
+    && printf 'extension=hookphuzz_opcode.so\nhookphuzz_opcode.target_callbacks=\nhookphuzz_opcode.target_callbacks_file=/shared/hookphuzz-callback-registry.json\n' > "$PHP_INI_DIR/conf.d/50-hookphuzz-opcode.ini"
 
 COPY --from=composer:latest@sha256:1ac7a547cb88acb0de62663b70f2b3d80ad27355288245159404b6ae40cd9ca3 /usr/bin/composer /usr/local/bin/composer
 

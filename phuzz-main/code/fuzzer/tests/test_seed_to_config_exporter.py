@@ -260,6 +260,80 @@ class SeedToConfigExporterTests(unittest.TestCase):
         self.assertEqual(seed["body"]["bootstrap"], "keep")
         self.assertEqual(seed["body"]["term"], "FUZZ")
 
+    def test_zend_bridge_keeps_static_nested_leaf_when_runtime_proves_parent(self):
+        raw = build_seed_item(hook_name="wp_ajax_vx_form_save_api_settings", auth_mode="authenticated")
+        raw["plugin_slug"] = "crm-perks-forms"
+        raw["entrypoint_type"] = "ajax_authenticated"
+        raw["seed"].update(
+            {
+                "body": {
+                    "action": "vx_form_save_api_settings",
+                    "vx_nonce": "fuzz",
+                    "cfx_settings[alert_emails]": "FUZZ",
+                },
+                "method": "POST",
+                "resolved_method": "POST",
+                "method_status": "resolved",
+                "fixed_params": ["action", "vx_nonce"],
+                "fuzzable_params": ["cfx_settings[alert_emails]"],
+                "input_params": [
+                    {
+                        "name": "vx_nonce",
+                        "source": "POST",
+                        "role": "security_nonce",
+                        "fuzzable": False,
+                    },
+                    {
+                        "name": "cfx_settings[alert_emails]",
+                        "source": "POST",
+                        "confidence": "static_regex",
+                        "fuzzable": True,
+                    },
+                ],
+            }
+        )
+        candidate = candidate_from_seed_item(raw, plugin_slug="crm-perks-forms")
+        identity = canonical_identity(candidate)
+        identity_id = canonical_identity_id(candidate)
+        patch = {
+            "canonical_identity": identity,
+            "canonical_identity_id": identity_id,
+            "method": "POST",
+            "auth_variant": "authenticated",
+            "entrypoint_type": "ajax",
+            "canonical_callback": "cfx_form_admin_pages::save_api_settings",
+            "fuzzable_parameters": [{"name": "cfx_settings", "location": "form"}],
+            "fixed_bootstrap": [{"name": "action", "provenance": "legacy_fixed_param"}],
+            "gates": {"accepted_pass1_proof": True, "final_fuzz_export_allowed": True},
+        }
+
+        merged = merge_enriched_seeds(
+            {"plugin_slug": "crm-perks-forms", "suggested_seeds": [raw]},
+            {
+                "enriched_seeds": [
+                    {
+                        "plugin_slug": "crm-perks-forms",
+                        "canonical_identity": identity,
+                        "canonical_identity_id": identity_id,
+                        "method": "POST",
+                        "auth_variant": "authenticated",
+                        "entrypoint_type": "ajax",
+                        "accepted_pass1_proof": True,
+                        "final_fuzz_export_allowed": True,
+                        "fuzzable_params": ["cfx_settings"],
+                        "parameters": [{"name": "cfx_settings", "location": "form", "fuzzable": True}],
+                        "seed_patch": patch,
+                    }
+                ]
+            },
+        )
+
+        seed = merged["suggested_seeds"][0]["seed"]
+        self.assertEqual(seed["body"]["cfx_settings[alert_emails]"], "FUZZ")
+        self.assertNotIn("cfx_settings", seed["body"])
+        self.assertEqual(seed["fuzzable_params"], ["cfx_settings[alert_emails]"])
+        self.assertEqual(seed["input_params"][0]["name"], "cfx_settings[alert_emails]")
+
     def test_zend_bridge_matches_live_raw_report_without_top_level_plugin_slug(self):
         raw = build_seed_item()
         raw["entrypoint_type"] = "ajax"

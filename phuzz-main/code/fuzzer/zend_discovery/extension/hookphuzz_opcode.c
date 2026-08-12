@@ -3,7 +3,7 @@
 #endif
 
 #include "php.h"
-#include "php_hookphuzz_opcode_phase9.h"
+#include "php_hookphuzz_opcode.h"
 #include "ext/json/php_json.h"
 #include "ext/standard/info.h"
 #include "main/SAPI.h"
@@ -25,13 +25,13 @@
 
 #define HOOKPHUZZ_ARTIFACT_DIR "/shared/opcode-events"
 
-ZEND_DECLARE_MODULE_GLOBALS(hookphuzz_opcode_phase9)
+ZEND_DECLARE_MODULE_GLOBALS(hookphuzz_opcode)
 
 PHP_INI_BEGIN()
     STD_PHP_INI_ENTRY("hookphuzz_opcode.target_callbacks", "", PHP_INI_SYSTEM, OnUpdateString,
-        target_callbacks_ini, zend_hookphuzz_opcode_phase9_globals, hookphuzz_opcode_phase9_globals)
+        target_callbacks_ini, zend_hookphuzz_opcode_globals, hookphuzz_opcode_globals)
     STD_PHP_INI_ENTRY("hookphuzz_opcode.target_callbacks_file", "", PHP_INI_SYSTEM, OnUpdateString,
-        target_callbacks_file_ini, zend_hookphuzz_opcode_phase9_globals, hookphuzz_opcode_phase9_globals)
+        target_callbacks_file_ini, zend_hookphuzz_opcode_globals, hookphuzz_opcode_globals)
 PHP_INI_END()
 
 static const char *hookphuzz_source_name(hookphuzz_source source)
@@ -139,20 +139,20 @@ static void hookphuzz_release_targets(void)
 {
     uint32_t index;
 
-    for (index = 0; index < HOOKPHUZZ_PHASE9_G(target_callback_count); index++) {
-        zend_string_release(HOOKPHUZZ_PHASE9_G(target_callbacks)[index]);
+    for (index = 0; index < HOOKPHUZZ_G(target_callback_count); index++) {
+        zend_string_release(HOOKPHUZZ_G(target_callbacks)[index]);
     }
-    if (HOOKPHUZZ_PHASE9_G(target_callbacks) != NULL) efree(HOOKPHUZZ_PHASE9_G(target_callbacks));
-    HOOKPHUZZ_PHASE9_G(target_callbacks) = NULL;
-    HOOKPHUZZ_PHASE9_G(target_callback_count) = 0;
-    if (HOOKPHUZZ_PHASE9_G(target_load_status) != NULL) zend_string_release(HOOKPHUZZ_PHASE9_G(target_load_status));
-    HOOKPHUZZ_PHASE9_G(target_load_status) = NULL;
+    if (HOOKPHUZZ_G(target_callbacks) != NULL) efree(HOOKPHUZZ_G(target_callbacks));
+    HOOKPHUZZ_G(target_callbacks) = NULL;
+    HOOKPHUZZ_G(target_callback_count) = 0;
+    if (HOOKPHUZZ_G(target_load_status) != NULL) zend_string_release(HOOKPHUZZ_G(target_load_status));
+    HOOKPHUZZ_G(target_load_status) = NULL;
 }
 
 static void hookphuzz_set_target_status(const char *status)
 {
-    if (HOOKPHUZZ_PHASE9_G(target_load_status) != NULL) zend_string_release(HOOKPHUZZ_PHASE9_G(target_load_status));
-    HOOKPHUZZ_PHASE9_G(target_load_status) = zend_string_init(status, strlen(status), 0);
+    if (HOOKPHUZZ_G(target_load_status) != NULL) zend_string_release(HOOKPHUZZ_G(target_load_status));
+    HOOKPHUZZ_G(target_load_status) = zend_string_init(status, strlen(status), 0);
 }
 
 static zend_bool hookphuzz_valid_callback_name(const zend_string *name)
@@ -160,7 +160,7 @@ static zend_bool hookphuzz_valid_callback_name(const zend_string *name)
     const char *value;
     size_t index, separators = 0;
 
-    if (name == NULL || ZSTR_LEN(name) == 0 || ZSTR_LEN(name) > HOOKPHUZZ_PHASE9_MAX_CALLBACK_BYTES) return 0;
+    if (name == NULL || ZSTR_LEN(name) == 0 || ZSTR_LEN(name) > HOOKPHUZZ_MAX_CALLBACK_BYTES) return 0;
     value = ZSTR_VAL(name);
     for (index = 0; index < ZSTR_LEN(name); index++) {
         if (isalnum((unsigned char) value[index]) || value[index] == '_' || value[index] == '\\') continue;
@@ -179,19 +179,19 @@ static zend_bool hookphuzz_add_target(const zend_string *name)
     uint32_t index;
 
     if (!hookphuzz_valid_callback_name(name)) return 0;
-    for (index = 0; index < HOOKPHUZZ_PHASE9_G(target_callback_count); index++) {
-        if (zend_string_equals_ci(name, HOOKPHUZZ_PHASE9_G(target_callbacks)[index])) return 0;
+    for (index = 0; index < HOOKPHUZZ_G(target_callback_count); index++) {
+        if (zend_string_equals_ci(name, HOOKPHUZZ_G(target_callbacks)[index])) return 0;
     }
-    if (HOOKPHUZZ_PHASE9_G(target_callback_count) == HOOKPHUZZ_PHASE9_MAX_TARGETS) return 0;
-    HOOKPHUZZ_PHASE9_G(target_callbacks) = erealloc(HOOKPHUZZ_PHASE9_G(target_callbacks),
-        sizeof(zend_string *) * (HOOKPHUZZ_PHASE9_G(target_callback_count) + 1));
-    HOOKPHUZZ_PHASE9_G(target_callbacks)[HOOKPHUZZ_PHASE9_G(target_callback_count)++] = zend_string_copy((zend_string *) name);
+    if (HOOKPHUZZ_G(target_callback_count) == HOOKPHUZZ_MAX_TARGETS) return 0;
+    HOOKPHUZZ_G(target_callbacks) = erealloc(HOOKPHUZZ_G(target_callbacks),
+        sizeof(zend_string *) * (HOOKPHUZZ_G(target_callback_count) + 1));
+    HOOKPHUZZ_G(target_callbacks)[HOOKPHUZZ_G(target_callback_count)++] = zend_string_copy((zend_string *) name);
     return 1;
 }
 
 static void hookphuzz_parse_targets(void)
 {
-    const char *cursor = HOOKPHUZZ_PHASE9_G(target_callbacks_ini);
+    const char *cursor = HOOKPHUZZ_G(target_callbacks_ini);
 
     if (cursor == NULL) return;
     while (*cursor != '\0') {
@@ -203,7 +203,7 @@ static void hookphuzz_parse_targets(void)
         while (end > start && isspace((unsigned char) end[-1])) end--;
         if (end > start) {
             zend_string *name = zend_string_init(start, end - start, 0);
-            if (hookphuzz_add_target(name)) HOOKPHUZZ_PHASE9_G(static_target_count)++;
+            if (hookphuzz_add_target(name)) HOOKPHUZZ_G(static_target_count)++;
             zend_string_release(name);
         }
     }
@@ -236,16 +236,16 @@ static void hookphuzz_load_file_targets(void)
     zval document, *schema, *registrations, *registration;
     HashTable *document_hash, *registration_hash, *registrations_hash;
 
-    if (HOOKPHUZZ_PHASE9_G(target_callbacks_file_ini) == NULL || HOOKPHUZZ_PHASE9_G(target_callbacks_file_ini)[0] == '\0') {
+    if (HOOKPHUZZ_G(target_callbacks_file_ini) == NULL || HOOKPHUZZ_G(target_callbacks_file_ini)[0] == '\0') {
         hookphuzz_set_target_status("disabled");
         return;
     }
-    fd = open(HOOKPHUZZ_PHASE9_G(target_callbacks_file_ini), O_RDONLY);
+    fd = open(HOOKPHUZZ_G(target_callbacks_file_ini), O_RDONLY);
     if (fd < 0) {
         hookphuzz_set_target_status(errno == ENOENT ? "missing" : "malformed");
         return;
     }
-    if (fstat(fd, &file_stat) != 0 || file_stat.st_size < 0 || file_stat.st_size > HOOKPHUZZ_PHASE9_MAX_REGISTRY_BYTES) {
+    if (fstat(fd, &file_stat) != 0 || file_stat.st_size < 0 || file_stat.st_size > HOOKPHUZZ_MAX_REGISTRY_BYTES) {
         close(fd); hookphuzz_set_target_status("malformed"); return;
     }
     if (file_stat.st_size == 0) { close(fd); hookphuzz_set_target_status("empty"); return; }
@@ -268,27 +268,27 @@ static void hookphuzz_load_file_targets(void)
     if (registrations_hash == NULL) {
         zval_ptr_dtor(&document); hookphuzz_set_target_status("malformed"); return;
     }
-    HOOKPHUZZ_PHASE9_G(registry_schema_version) = 1;
+    HOOKPHUZZ_G(registry_schema_version) = 1;
     ZEND_HASH_FOREACH_VAL(registrations_hash, registration) {
         zval *canonical, *type, *callback;
         registration_hash = hookphuzz_json_hash(registration);
-        if (registration_hash == NULL) { HOOKPHUZZ_PHASE9_G(target_rejected_count)++; continue; }
+        if (registration_hash == NULL) { HOOKPHUZZ_G(target_rejected_count)++; continue; }
         canonical = zend_hash_str_find(registration_hash, ZEND_STRL("canonical_callback"));
         type = zend_hash_str_find(registration_hash, ZEND_STRL("callback_type"));
         callback = zend_hash_str_find(registration_hash, ZEND_STRL("callback"));
         if (canonical == NULL || Z_TYPE_P(canonical) != IS_STRING || type == NULL || Z_TYPE_P(type) != IS_STRING
             || (callback != NULL && (Z_TYPE_P(callback) != IS_STRING || Z_STRLEN_P(callback) == 0
-                || Z_STRLEN_P(callback) > HOOKPHUZZ_PHASE9_MAX_CALLBACK_BYTES))
+                || Z_STRLEN_P(callback) > HOOKPHUZZ_MAX_CALLBACK_BYTES))
             || (strcmp(Z_STRVAL_P(type), "function") != 0 && strcmp(Z_STRVAL_P(type), "static_method") != 0
                 && strcmp(Z_STRVAL_P(type), "object_method") != 0)) {
-            HOOKPHUZZ_PHASE9_G(target_rejected_count)++; continue;
+            HOOKPHUZZ_G(target_rejected_count)++; continue;
         }
-        if (hookphuzz_add_target(Z_STR_P(canonical))) HOOKPHUZZ_PHASE9_G(file_target_count)++;
-        else if (hookphuzz_valid_callback_name(Z_STR_P(canonical))) HOOKPHUZZ_PHASE9_G(target_duplicate_count)++;
-        else HOOKPHUZZ_PHASE9_G(target_rejected_count)++;
+        if (hookphuzz_add_target(Z_STR_P(canonical))) HOOKPHUZZ_G(file_target_count)++;
+        else if (hookphuzz_valid_callback_name(Z_STR_P(canonical))) HOOKPHUZZ_G(target_duplicate_count)++;
+        else HOOKPHUZZ_G(target_rejected_count)++;
     } ZEND_HASH_FOREACH_END();
     zval_ptr_dtor(&document);
-    hookphuzz_set_target_status((HOOKPHUZZ_PHASE9_G(target_duplicate_count) || HOOKPHUZZ_PHASE9_G(target_rejected_count))
+    hookphuzz_set_target_status((HOOKPHUZZ_G(target_duplicate_count) || HOOKPHUZZ_G(target_rejected_count))
         ? "partially_loaded" : "loaded");
 }
 
@@ -297,8 +297,8 @@ static zend_bool hookphuzz_is_target(const zend_string *name)
     uint32_t index;
 
     if (name == NULL) return 0;
-    for (index = 0; index < HOOKPHUZZ_PHASE9_G(target_callback_count); index++) {
-        if (zend_string_equals_ci(name, HOOKPHUZZ_PHASE9_G(target_callbacks)[index])) return 1;
+    for (index = 0; index < HOOKPHUZZ_G(target_callback_count); index++) {
+        if (zend_string_equals_ci(name, HOOKPHUZZ_G(target_callbacks)[index])) return 1;
     }
     return 0;
 }
@@ -307,8 +307,8 @@ static hookphuzz_context_frame *hookphuzz_find_context(const zend_execute_data *
 {
     uint32_t index;
 
-    for (index = HOOKPHUZZ_PHASE9_G(context_count); index > 0; index--) {
-        hookphuzz_context_frame *frame = &HOOKPHUZZ_PHASE9_G(contexts)[index - 1];
+    for (index = HOOKPHUZZ_G(context_count); index > 0; index--) {
+        hookphuzz_context_frame *frame = &HOOKPHUZZ_G(contexts)[index - 1];
         if (frame->execute_data == execute_data) return frame;
     }
     return NULL;
@@ -318,20 +318,20 @@ static void hookphuzz_release_contexts(void)
 {
     uint32_t index;
 
-    for (index = 0; index < HOOKPHUZZ_PHASE9_G(context_count); index++) {
-        zend_string_release(HOOKPHUZZ_PHASE9_G(contexts)[index].root_callback);
-        zend_string_release(HOOKPHUZZ_PHASE9_G(contexts)[index].current_function);
+    for (index = 0; index < HOOKPHUZZ_G(context_count); index++) {
+        zend_string_release(HOOKPHUZZ_G(contexts)[index].root_callback);
+        zend_string_release(HOOKPHUZZ_G(contexts)[index].current_function);
     }
-    if (HOOKPHUZZ_PHASE9_G(contexts) != NULL) efree(HOOKPHUZZ_PHASE9_G(contexts));
-    HOOKPHUZZ_PHASE9_G(contexts) = NULL;
-    HOOKPHUZZ_PHASE9_G(context_count) = 0;
+    if (HOOKPHUZZ_G(contexts) != NULL) efree(HOOKPHUZZ_G(contexts));
+    HOOKPHUZZ_G(contexts) = NULL;
+    HOOKPHUZZ_G(context_count) = 0;
 }
 
 static void hookphuzz_context_begin(zend_execute_data *execute_data)
 {
     zend_string *name = hookphuzz_normalize_function(execute_data);
-    hookphuzz_context_frame *parent = HOOKPHUZZ_PHASE9_G(context_count) == 0 ? NULL
-        : &HOOKPHUZZ_PHASE9_G(contexts)[HOOKPHUZZ_PHASE9_G(context_count) - 1];
+    hookphuzz_context_frame *parent = HOOKPHUZZ_G(context_count) == 0 ? NULL
+        : &HOOKPHUZZ_G(contexts)[HOOKPHUZZ_G(context_count) - 1];
     hookphuzz_context_frame *frame;
 
     if (name == NULL) return;
@@ -339,9 +339,9 @@ static void hookphuzz_context_begin(zend_execute_data *execute_data)
         zend_string_release(name);
         return;
     }
-    HOOKPHUZZ_PHASE9_G(contexts) = erealloc(HOOKPHUZZ_PHASE9_G(contexts),
-        sizeof(hookphuzz_context_frame) * (HOOKPHUZZ_PHASE9_G(context_count) + 1));
-    frame = &HOOKPHUZZ_PHASE9_G(contexts)[HOOKPHUZZ_PHASE9_G(context_count)++];
+    HOOKPHUZZ_G(contexts) = erealloc(HOOKPHUZZ_G(contexts),
+        sizeof(hookphuzz_context_frame) * (HOOKPHUZZ_G(context_count) + 1));
+    frame = &HOOKPHUZZ_G(contexts)[HOOKPHUZZ_G(context_count)++];
     frame->execute_data = execute_data;
     frame->current_function = name;
     if (hookphuzz_is_target(name)) {
@@ -357,15 +357,15 @@ static void hookphuzz_context_end(zend_execute_data *execute_data)
 {
     uint32_t index;
 
-    for (index = HOOKPHUZZ_PHASE9_G(context_count); index > 0; index--) {
-        hookphuzz_context_frame *frame = &HOOKPHUZZ_PHASE9_G(contexts)[index - 1];
+    for (index = HOOKPHUZZ_G(context_count); index > 0; index--) {
+        hookphuzz_context_frame *frame = &HOOKPHUZZ_G(contexts)[index - 1];
         if (frame->execute_data != execute_data) continue;
         zend_string_release(frame->root_callback);
         zend_string_release(frame->current_function);
-        HOOKPHUZZ_PHASE9_G(context_count)--;
-        if (index - 1 != HOOKPHUZZ_PHASE9_G(context_count)) {
-            HOOKPHUZZ_PHASE9_G(contexts)[index - 1] =
-                HOOKPHUZZ_PHASE9_G(contexts)[HOOKPHUZZ_PHASE9_G(context_count)];
+        HOOKPHUZZ_G(context_count)--;
+        if (index - 1 != HOOKPHUZZ_G(context_count)) {
+            HOOKPHUZZ_G(contexts)[index - 1] =
+                HOOKPHUZZ_G(contexts)[HOOKPHUZZ_G(context_count)];
         }
         return;
     }
@@ -375,8 +375,8 @@ static void hookphuzz_release_events(void)
 {
     uint32_t index;
 
-    for (index = 0; index < HOOKPHUZZ_PHASE9_G(event_count); index++) {
-        hookphuzz_event *event = &HOOKPHUZZ_PHASE9_G(events)[index];
+    for (index = 0; index < HOOKPHUZZ_G(event_count); index++) {
+        hookphuzz_event *event = &HOOKPHUZZ_G(events)[index];
         hookphuzz_release_path(event->path, event->depth);
         if (event->filename != NULL) zend_string_release(event->filename);
         if (event->function_name != NULL) zend_string_release(event->function_name);
@@ -384,9 +384,9 @@ static void hookphuzz_release_events(void)
         if (event->root_callback != NULL) zend_string_release(event->root_callback);
         if (event->current_function != NULL) zend_string_release(event->current_function);
     }
-    if (HOOKPHUZZ_PHASE9_G(events) != NULL) efree(HOOKPHUZZ_PHASE9_G(events));
-    HOOKPHUZZ_PHASE9_G(events) = NULL;
-    HOOKPHUZZ_PHASE9_G(event_count) = 0;
+    if (HOOKPHUZZ_G(events) != NULL) efree(HOOKPHUZZ_G(events));
+    HOOKPHUZZ_G(events) = NULL;
+    HOOKPHUZZ_G(event_count) = 0;
 }
 
 static void hookphuzz_release_provenance(void)
@@ -600,7 +600,7 @@ static zend_observer_fcall_handlers hookphuzz_observer_init(zend_execute_data *e
     if (!HOOKPHUZZ_PHASE5_G(artifact_enabled) || execute_data == NULL || execute_data->func == NULL
         || !ZEND_USER_CODE(execute_data->func->type)) return handlers;
     name = hookphuzz_normalize_function(execute_data);
-    observe = hookphuzz_is_target(name) || HOOKPHUZZ_PHASE9_G(context_count) > 0;
+    observe = hookphuzz_is_target(name) || HOOKPHUZZ_G(context_count) > 0;
     if (name != NULL) zend_string_release(name);
     if (observe) {
         handlers.begin = hookphuzz_frame_begin_handler;
@@ -677,15 +677,15 @@ static zend_string *hookphuzz_controlled_marker_from_server(void)
     if (!zend_is_auto_global_str(ZEND_STRL("_SERVER"))) return NULL;
     server = &PG(http_globals)[TRACK_VARS_SERVER];
     if (Z_TYPE_P(server) != IS_ARRAY) return NULL;
-    header = zend_hash_str_find(Z_ARRVAL_P(server), ZEND_STRL("HTTP_X_PHASE9_MARKER"));
+    header = zend_hash_str_find(Z_ARRVAL_P(server), ZEND_STRL("HTTP_X_HOOKPHUZZ_MARKER"));
     if (header == NULL || Z_TYPE_P(header) != IS_STRING
-        || Z_STRLEN_P(header) < sizeof("PHASE9_") - 1
-        || memcmp(Z_STRVAL_P(header), "PHASE9_", sizeof("PHASE9_") - 1) != 0) return NULL;
+        || Z_STRLEN_P(header) < sizeof("HOOKPHUZZ_") - 1
+        || memcmp(Z_STRVAL_P(header), "HOOKPHUZZ_", sizeof("HOOKPHUZZ_") - 1) != 0) return NULL;
     return zend_string_copy(Z_STR_P(header));
 }
 
 /* The run id is correlation metadata only.  Parameter proof remains the
- * marker returned by the fixture after reading phase9_key. */
+ * marker returned by the fixture after reading hookphuzz_key. */
 static zend_string *hookphuzz_run_id_from_server(void)
 {
     zval *server;
@@ -806,16 +806,16 @@ static void hookphuzz_add_target_loading(zval *document)
 {
     zval loading;
     array_init(&loading);
-    add_assoc_long(&loading, "static_target_count", HOOKPHUZZ_PHASE9_G(static_target_count));
-    add_assoc_long(&loading, "file_target_count", HOOKPHUZZ_PHASE9_G(file_target_count));
-    add_assoc_long(&loading, "effective_target_count", HOOKPHUZZ_PHASE9_G(target_callback_count));
-    add_assoc_string(&loading, "load_status", HOOKPHUZZ_PHASE9_G(target_load_status) == NULL ? "disabled"
-        : ZSTR_VAL(HOOKPHUZZ_PHASE9_G(target_load_status)));
-    if (HOOKPHUZZ_PHASE9_G(registry_schema_version) > 0) {
-        add_assoc_long(&loading, "registry_schema_version", HOOKPHUZZ_PHASE9_G(registry_schema_version));
+    add_assoc_long(&loading, "static_target_count", HOOKPHUZZ_G(static_target_count));
+    add_assoc_long(&loading, "file_target_count", HOOKPHUZZ_G(file_target_count));
+    add_assoc_long(&loading, "effective_target_count", HOOKPHUZZ_G(target_callback_count));
+    add_assoc_string(&loading, "load_status", HOOKPHUZZ_G(target_load_status) == NULL ? "disabled"
+        : ZSTR_VAL(HOOKPHUZZ_G(target_load_status)));
+    if (HOOKPHUZZ_G(registry_schema_version) > 0) {
+        add_assoc_long(&loading, "registry_schema_version", HOOKPHUZZ_G(registry_schema_version));
     } else add_assoc_null(&loading, "registry_schema_version");
-    add_assoc_long(&loading, "duplicate_count", HOOKPHUZZ_PHASE9_G(target_duplicate_count));
-    add_assoc_long(&loading, "rejected_count", HOOKPHUZZ_PHASE9_G(target_rejected_count));
+    add_assoc_long(&loading, "duplicate_count", HOOKPHUZZ_G(target_duplicate_count));
+    add_assoc_long(&loading, "rejected_count", HOOKPHUZZ_G(target_rejected_count));
     add_assoc_zval(document, "target_loading", &loading);
 }
 
@@ -914,7 +914,7 @@ static void hookphuzz_flush_artifact(void)
 
     HOOKPHUZZ_PHASE5_G(artifact_flushed) = 1;
     if (hookphuzz_encode_artifact(&json) != SUCCESS) {
-        hookphuzz_log("hookphuzz_opcode_phase9: artifact JSON encoding failed");
+        hookphuzz_log("hookphuzz_opcode: artifact JSON encoding failed");
         return;
     }
     snprintf(final_path, sizeof(final_path), HOOKPHUZZ_ARTIFACT_DIR "/%s.json", ZSTR_VAL(HOOKPHUZZ_PHASE5_G(request_id)));
@@ -925,7 +925,7 @@ static void hookphuzz_flush_artifact(void)
         int error_code = errno;
         if (fd >= 0) close(fd);
         unlink(temp_path);
-        snprintf(message, sizeof(message), "hookphuzz_opcode_phase9: artifact write failed for %s: %s",
+        snprintf(message, sizeof(message), "hookphuzz_opcode: artifact write failed for %s: %s",
             ZSTR_VAL(HOOKPHUZZ_PHASE5_G(request_id)), strerror(error_code));
         hookphuzz_log(message);
         smart_str_free(&json);
@@ -935,14 +935,14 @@ static void hookphuzz_flush_artifact(void)
     if (syscall(SYS_renameat2, AT_FDCWD, temp_path, AT_FDCWD, final_path, RENAME_NOREPLACE) != 0) {
         int error_code = errno;
         unlink(temp_path);
-        snprintf(message, sizeof(message), "hookphuzz_opcode_phase9: artifact finalization failed for %s: %s",
+        snprintf(message, sizeof(message), "hookphuzz_opcode: artifact finalization failed for %s: %s",
             ZSTR_VAL(HOOKPHUZZ_PHASE5_G(request_id)), strerror(error_code));
         hookphuzz_log(message);
     }
     smart_str_free(&json);
 }
 
-PHP_MINIT_FUNCTION(hookphuzz_opcode_phase9)
+PHP_MINIT_FUNCTION(hookphuzz_opcode)
 {
     if (zend_get_user_opcode_handler(ZEND_FETCH_R) != NULL
         || zend_get_user_opcode_handler(ZEND_FETCH_DIM_R) != NULL
@@ -959,7 +959,7 @@ PHP_MINIT_FUNCTION(hookphuzz_opcode_phase9)
     return SUCCESS;
 }
 
-PHP_MSHUTDOWN_FUNCTION(hookphuzz_opcode_phase9)
+PHP_MSHUTDOWN_FUNCTION(hookphuzz_opcode)
 {
     if (zend_get_user_opcode_handler(ZEND_FETCH_R) == hookphuzz_fetch_handler) zend_set_user_opcode_handler(ZEND_FETCH_R, NULL);
     if (zend_get_user_opcode_handler(ZEND_FETCH_DIM_R) == hookphuzz_fetch_dim_r_handler) zend_set_user_opcode_handler(ZEND_FETCH_DIM_R, NULL);
@@ -970,11 +970,11 @@ PHP_MSHUTDOWN_FUNCTION(hookphuzz_opcode_phase9)
     return SUCCESS;
 }
 
-PHP_RINIT_FUNCTION(hookphuzz_opcode_phase9)
+PHP_RINIT_FUNCTION(hookphuzz_opcode)
 {
     zend_string *header;
 
-#if defined(ZTS) && defined(COMPILE_DL_HOOKPHUZZ_OPCODE_PHASE9)
+#if defined(ZTS) && defined(COMPILE_DL_HOOKPHUZZ_OPCODE)
     ZEND_TSRMLS_CACHE_UPDATE();
 #endif
     HOOKPHUZZ_PHASE5_G(dropped_event_count) = 0;
@@ -987,27 +987,27 @@ PHP_RINIT_FUNCTION(hookphuzz_opcode_phase9)
     HOOKPHUZZ_PHASE5_G(request_uri) = NULL;
     HOOKPHUZZ_PHASE5_G(artifact_enabled) = 0;
     HOOKPHUZZ_PHASE5_G(artifact_flushed) = 0;
-    HOOKPHUZZ_PHASE9_G(context_count) = 0;
-    HOOKPHUZZ_PHASE9_G(contexts) = NULL;
-    HOOKPHUZZ_PHASE9_G(target_callbacks) = NULL;
-    HOOKPHUZZ_PHASE9_G(target_callback_count) = 0;
-    HOOKPHUZZ_PHASE9_G(static_target_count) = 0;
-    HOOKPHUZZ_PHASE9_G(file_target_count) = 0;
-    HOOKPHUZZ_PHASE9_G(target_duplicate_count) = 0;
-    HOOKPHUZZ_PHASE9_G(target_rejected_count) = 0;
-    HOOKPHUZZ_PHASE9_G(registry_schema_version) = 0;
-    HOOKPHUZZ_PHASE9_G(target_load_status) = NULL;
-    HOOKPHUZZ_PHASE9_G(file_targets_loaded) = 1;
+    HOOKPHUZZ_G(context_count) = 0;
+    HOOKPHUZZ_G(contexts) = NULL;
+    HOOKPHUZZ_G(target_callbacks) = NULL;
+    HOOKPHUZZ_G(target_callback_count) = 0;
+    HOOKPHUZZ_G(static_target_count) = 0;
+    HOOKPHUZZ_G(file_target_count) = 0;
+    HOOKPHUZZ_G(target_duplicate_count) = 0;
+    HOOKPHUZZ_G(target_rejected_count) = 0;
+    HOOKPHUZZ_G(registry_schema_version) = 0;
+    HOOKPHUZZ_G(target_load_status) = NULL;
+    HOOKPHUZZ_G(file_targets_loaded) = 1;
     hookphuzz_parse_targets();
     hookphuzz_load_file_targets();
 
     header = hookphuzz_request_id_from_server();
     if (header == NULL) {
-        hookphuzz_log("hookphuzz_opcode_phase9: request artifact skipped: missing X-Fuzzer-Covid");
+        hookphuzz_log("hookphuzz_opcode: request artifact skipped: missing X-Fuzzer-Covid");
         return SUCCESS;
     }
     if (!hookphuzz_valid_request_id(header)) {
-        hookphuzz_log("hookphuzz_opcode_phase9: request artifact skipped: invalid X-Fuzzer-Covid");
+        hookphuzz_log("hookphuzz_opcode: request artifact skipped: invalid X-Fuzzer-Covid");
         zend_string_release(header);
         return SUCCESS;
     }
@@ -1020,7 +1020,7 @@ PHP_RINIT_FUNCTION(hookphuzz_opcode_phase9)
     return SUCCESS;
 }
 
-PHP_RSHUTDOWN_FUNCTION(hookphuzz_opcode_phase9)
+PHP_RSHUTDOWN_FUNCTION(hookphuzz_opcode)
 {
     if (HOOKPHUZZ_PHASE5_G(artifact_enabled) && !HOOKPHUZZ_PHASE5_G(artifact_flushed)) hookphuzz_flush_artifact();
     hookphuzz_release_events();
@@ -1032,26 +1032,26 @@ PHP_RSHUTDOWN_FUNCTION(hookphuzz_opcode_phase9)
     return SUCCESS;
 }
 
-PHP_MINFO_FUNCTION(hookphuzz_opcode_phase9)
+PHP_MINFO_FUNCTION(hookphuzz_opcode)
 {
     php_info_print_table_start();
-    php_info_print_table_header(2, "hookphuzz_opcode_phase9 support", "enabled");
+    php_info_print_table_header(2, "hookphuzz_opcode support", "enabled");
     php_info_print_table_row(2, "configured user opcodes", "ZEND_FETCH_R, ZEND_FETCH_DIM_R, ZEND_FETCH_IS, ZEND_FETCH_DIM_IS, ZEND_ISSET_ISEMPTY_DIM_OBJ");
     php_info_print_table_row(2, "artifact output", HOOKPHUZZ_ARTIFACT_DIR);
     php_info_print_table_row(2, "event limit per request", "4096");
     php_info_print_table_end();
 }
 
-zend_module_entry hookphuzz_opcode_phase9_module_entry = {
-    STANDARD_MODULE_HEADER, "hookphuzz_opcode_phase9", NULL,
-    PHP_MINIT(hookphuzz_opcode_phase9), PHP_MSHUTDOWN(hookphuzz_opcode_phase9),
-    PHP_RINIT(hookphuzz_opcode_phase9), PHP_RSHUTDOWN(hookphuzz_opcode_phase9),
-    PHP_MINFO(hookphuzz_opcode_phase9), PHP_HOOKPHUZZ_OPCODE_PHASE9_VERSION, STANDARD_MODULE_PROPERTIES
+zend_module_entry hookphuzz_opcode_module_entry = {
+    STANDARD_MODULE_HEADER, "hookphuzz_opcode", NULL,
+    PHP_MINIT(hookphuzz_opcode), PHP_MSHUTDOWN(hookphuzz_opcode),
+    PHP_RINIT(hookphuzz_opcode), PHP_RSHUTDOWN(hookphuzz_opcode),
+    PHP_MINFO(hookphuzz_opcode), PHP_HOOKPHUZZ_OPCODE_VERSION, STANDARD_MODULE_PROPERTIES
 };
 
-#ifdef COMPILE_DL_HOOKPHUZZ_OPCODE_PHASE9
+#ifdef COMPILE_DL_HOOKPHUZZ_OPCODE
 # ifdef ZTS
 ZEND_TSRMLS_CACHE_DEFINE();
 # endif
-ZEND_GET_MODULE(hookphuzz_opcode_phase9)
+ZEND_GET_MODULE(hookphuzz_opcode)
 #endif
