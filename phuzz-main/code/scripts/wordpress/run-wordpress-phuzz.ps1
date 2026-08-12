@@ -407,11 +407,6 @@ function Copy-ZendOpcodeArtifacts {
         if ($row.matched_artifact) {
             [void]$names.Add([string]$row.matched_artifact)
         }
-        foreach ($name in @($row.request_artifacts)) {
-            if ($name) {
-                [void]$names.Add([string]$name)
-            }
-        }
     }
     foreach ($name in $names) {
         if ([System.IO.Path]::GetFileName($name) -ne $name) {

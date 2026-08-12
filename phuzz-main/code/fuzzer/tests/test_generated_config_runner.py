@@ -438,6 +438,17 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("mkdir -p /shared/opcode-events && chown www-data:www-data /shared/opcode-events", script)
         self.assertNotIn("zend-runner-summary", script)
 
+    def test_zend_artifact_copy_uses_only_callback_matched_request(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+        zend_copy = script[
+            script.index("function Copy-ZendOpcodeArtifacts"):
+            script.index("function Initialize-ZendCallbackRegistry")
+        ]
+
+        self.assertIn("if ($row.matched_artifact)", zend_copy)
+        self.assertNotIn("request_artifacts", zend_copy)
+
     def test_wordpress_runner_uses_shared_bootstrap_config_for_generated_mode(self):
         runner_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
         runner = runner_path.read_text(encoding="utf-8-sig")
