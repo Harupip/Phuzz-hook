@@ -10,12 +10,12 @@ from typing import Any, Mapping, Sequence
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from hook_energy.seed_generation.config_exporter import export_seed_configs
-    from hook_energy.seed_generation.zend_bridge import merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, prepare_callback_registry, run_enrichment
+    from zend_discovery.convergence import advance_convergence_state, materialize_convergence_seeds, merge_enriched_seeds
+    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, run_enrichment
 else:
     from .config_exporter import export_seed_configs
-    from .zend_bridge import merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, prepare_callback_registry, run_enrichment
+    from zend_discovery.convergence import advance_convergence_state, materialize_convergence_seeds, merge_enriched_seeds
+    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, run_enrichment
 
 
 def _read_json(path: Path) -> Any:
@@ -93,7 +93,7 @@ def build_enrichment_inputs(
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run offline Zend enrichment for a legacy generated Pass 1 run.")
-    parser.add_argument("--operation", choices=("prepare-registry", "correlate-enrich", "verify-pass2"), default="correlate-enrich")
+    parser.add_argument("--operation", choices=("prepare-registry", "correlate-enrich", "converge-iteration", "verify-pass2"), default="correlate-enrich")
     parser.add_argument("--plugin-zip")
     parser.add_argument("--plugin-slug")
     parser.add_argument("--legacy-run-id")
@@ -108,6 +108,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-config-dir")
     parser.add_argument("--generated-config-summary")
     parser.add_argument("--pass2-run-summary")
+    parser.add_argument("--convergence-state")
+    parser.add_argument("--convergence-state-output")
+    parser.add_argument("--convergence-merged-seeds")
     return parser
 
 
@@ -132,6 +135,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"accepted={summary['accepted']} total={summary['total']}"
             )
             return 0 if summary["accepted"] == summary["total"] and summary["total"] > 0 else 1
+        if args.operation == "converge-iteration":
+            _require(
+                args, "plugin_slug", "legacy_run_id", "registry", "raw_suggested_seeds",
+                "pass1_run_summary", "pass1_artifacts_dir", "zend_events_dir", "convergence_state",
+                "convergence_state_output", "convergence_merged_seeds", "output_config_dir",
+                "generated_config_summary",
+            )
+            result = converge_iteration(
+                raw_report=_read_json(Path(args.raw_suggested_seeds)),
+                pass_run_summary=_read_json(Path(args.pass1_run_summary)),
+                pass_artifacts_dir=Path(args.pass1_artifacts_dir),
+                zend_events_dir=Path(args.zend_events_dir),
+                registry=_read_json(Path(args.registry)),
+                plugin_slug=args.plugin_slug,
+                legacy_run_id=args.legacy_run_id,
+                known_state=_read_json(Path(args.convergence_state)),
+            )
+            _write_json(Path(args.convergence_state_output), result)
+            _write_json(Path(args.convergence_merged_seeds), result["merged_suggested_seeds"])
+            export_seed_configs(
+                result["merged_suggested_seeds"],
+                output_config_dir=Path(args.output_config_dir),
+                summary_path=Path(args.generated_config_summary),
+                replay_only=True,
+            )
+            print(f"Zend convergence iteration: status={result['status']} new={len(result['new_parameters'])}")
+            return 0
 
         _require(
             args,
@@ -196,6 +226,73 @@ def _require(args: argparse.Namespace, *names: str) -> None:
     missing = [name.replace("_", "-") for name in names if not getattr(args, name, None)]
     if missing:
         raise ValueError("missing required arguments: " + ", ".join(f"--{name}" for name in missing))
+
+
+def converge_iteration(
+    *,
+    raw_report: Mapping[str, Any],
+    pass_run_summary: Mapping[str, Any],
+    pass_artifacts_dir: Path,
+    zend_events_dir: Path,
+    registry: Mapping[str, Any],
+    plugin_slug: str,
+    legacy_run_id: str,
+    known_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Correlate one replay and materialize its direct runtime discoveries."""
+    raw_for_iteration, uopz_artifacts = build_enrichment_inputs(
+        raw_report, pass_run_summary, pass_artifacts_dir,
+        plugin_slug=plugin_slug, legacy_run_id=legacy_run_id,
+    )
+    raw_items = raw_for_iteration.get("suggested_seeds", [])
+    rows = pass_run_summary.get("runs", [])
+    if not isinstance(raw_items, list) or len(raw_items) != 1 or not isinstance(rows, list) or len(rows) != 1:
+        raise RuntimeError("REPLAY_FAILED: Phase 2 requires exactly one generated candidate and one replay row")
+    row = rows[0]
+    if not isinstance(row, Mapping) or row.get("callback_reached") is not True:
+        raise RuntimeError("REPLAY_FAILED: callback was not reached")
+    artifact_name = str(row.get("matched_artifact") or "")
+    if not artifact_name or Path(artifact_name).name != artifact_name:
+        raise RuntimeError("REPLAY_FAILED: matched request artifact is missing")
+    request_id = Path(artifact_name).stem
+    if not request_id or len(uopz_artifacts) != 1:
+        raise RuntimeError("REPLAY_FAILED: matched request artifact correlation failed")
+    uopz = uopz_artifacts[0]
+    if str(uopz.get("request_id") or "") != request_id or uopz.get("compat_request_id_matches") is False:
+        raise RuntimeError("REPLAY_FAILED: request-ID headers are incompatible")
+    zend_path = zend_events_dir / artifact_name
+    if not zend_path.is_file():
+        raise RuntimeError("REPLAY_FAILED: matched Zend artifact is missing")
+    zend = _read_json(zend_path)
+    if not isinstance(zend, Mapping) or str(zend.get("request_id") or "") != request_id:
+        raise RuntimeError("REPLAY_FAILED: Zend request correlation failed")
+    raw_item = raw_items[0]
+    if not isinstance(raw_item, Mapping):
+        raise RuntimeError("REPLAY_FAILED: generated candidate is invalid")
+    candidate = candidate_from_seed_item(raw_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
+    candidate_key = canonical_identity_id(candidate)
+    observed = normalize_runtime_evidence(candidate, uopz, zend, registry)
+    prior = known_state.get("known_parameters", [])
+    if not isinstance(prior, list):
+        raise ValueError("convergence state known_parameters must be a list")
+    advanced = advance_convergence_state(prior, observed)
+    merged = materialize_convergence_seeds(
+        raw_for_iteration,
+        plugin_slug=plugin_slug,
+        candidate_key=candidate_key,
+        known_parameters=advanced["known_parameters"],
+    )
+    return {
+        "status": "CONVERGED" if not advanced["new_parameters"] else "CONTINUE",
+        "legacy_run_id": legacy_run_id,
+        "candidate_key": candidate_key,
+        "request_id": request_id,
+        "known_before": prior,
+        "observed_parameters": observed,
+        "new_parameters": advanced["new_parameters"],
+        "known_parameters": advanced["known_parameters"],
+        "merged_suggested_seeds": merged,
+    }
 
 
 def verify_pass2_contract(

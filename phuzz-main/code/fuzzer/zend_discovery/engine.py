@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .parameter_seeds import build_enriched_parameters
+from .rest_runtime import normalize_rest_parameter_events
 
 
 PASS = "PASS"
@@ -71,6 +72,7 @@ def correlate_pass1_artifact(
     if (
         artifact_legacy_run_id != legacy_run_id
         or artifact.get("request_id") != pass1_request_id
+        or artifact.get("compat_request_id_matches") is False
         or artifact.get("target_plugin") != plugin_slug
         or identity["plugin_slug"] != plugin_slug
         or (artifact_identity_id and artifact_identity_id != canonical_identity_id(candidate))
@@ -117,6 +119,14 @@ def normalize_runtime_evidence(
     zend_method = str(zend_artifact.get("request_method") or zend_artifact.get("method") or "").upper()
     if zend_method and zend_method != str(identity["resolved_method"]).upper():
         return []
+    fixed = candidate.get("fixed_bootstrap") if isinstance(candidate.get("fixed_bootstrap"), Mapping) else {}
+    if identity["entrypoint_type"] == "rest":
+        return normalize_rest_parameter_events(
+            candidate,
+            zend_artifact,
+            canonical_callback=canonical_callback,
+            fixed_bootstrap=fixed,
+        )
     summaries = zend_artifact.get("callback_summaries")
     if not isinstance(summaries, list):
         return []
@@ -127,7 +137,6 @@ def normalize_runtime_evidence(
     if not isinstance(parameters, list):
         return []
     normalized: list[dict[str, Any]] = []
-    fixed = candidate.get("fixed_bootstrap") if isinstance(candidate.get("fixed_bootstrap"), Mapping) else {}
     for parameter in parameters:
         if not isinstance(parameter, Mapping):
             continue

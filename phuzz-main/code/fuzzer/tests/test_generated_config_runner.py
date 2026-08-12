@@ -438,6 +438,19 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("mkdir -p /shared/opcode-events && chown www-data:www-data /shared/opcode-events", script)
         self.assertNotIn("zend-runner-summary", script)
 
+    def test_wordpress_runner_gates_phase2_to_one_candidate_and_preserves_stage1_fallback(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("function Invoke-ZendConvergence", script)
+        self.assertIn("Phase 2 requires exactly one generated candidate", script)
+        self.assertIn("Invoke-ZendConvergence", script)
+        self.assertIn("Invoke-ZendDiscoveryBridge", script)
+        self.assertIn("Invoke-ZendPass2Verification", script)
+        self.assertIn("candidate_key", script)
+        self.assertIn("REPLAY_FAILED", script)
+        self.assertIn("REPEATED_CONFIG", script)
+
     def test_zend_artifact_copy_uses_only_callback_matched_request(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
         script = script_path.read_text(encoding="utf-8-sig")

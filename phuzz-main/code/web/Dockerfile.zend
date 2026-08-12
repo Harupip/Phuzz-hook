@@ -6,7 +6,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/hookphuzz_opcode_phase9
-COPY research/hookphuzz-opcode/phase9/extension/ ./
+COPY phuzz-main/code/fuzzer/zend_discovery/extension/ ./
 RUN phpize \
     && ./configure --enable-hookphuzz_opcode_phase9 \
     && make -j"$(nproc)" \

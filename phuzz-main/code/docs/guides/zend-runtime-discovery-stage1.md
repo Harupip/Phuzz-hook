@@ -1,4 +1,4 @@
-# Zend Runtime Discovery Stage 1
+# Zend Runtime Discovery Stage 1 and Phase 2
 
 Stage 1 la che do opt-in cho generated WordPress flow. Muc tieu la lay parameter fuzzing tu bang chung Zend runtime, khong lay tu static regex/source scan.
 
@@ -44,7 +44,7 @@ Bridge chi tao parameter neu co bang chung dong thoi tu:
 - exact Zend `callback_summaries.callback`
 - Zend parameter la direct top-level `$_GET['name']` hoac `$_POST['name']`
 
-Pass 2 replay generated config bang production `Fuzzer.load_config` va `Fuzzer.prepare_request`, voi request ID moi nhung cung `legacy_run_id`. Pass 2 chi pass neu callback dung duoc reach va Zend re-observe dung tung parameter.
+Neu Pass 1 sinh chinh xac mot generated candidate, Phase 2 thay the legacy Pass 2 bang toi da ba replay-only convergence iterations. Moi iteration giu mot `candidate_key` canonical, nhung phai co `request_id` khac nhau. Chi Zend evidence cua matched artifact cung request ID duoc diff vao state; static extraction khong the them parameter. `new_parameters=[]` ghi `CONVERGED`; callback/correlation/replay failure ghi `REPLAY_FAILED`; hash config lap ghi `REPEATED_CONFIG`; sau iteration 2 van co parameter moi ghi `ITERATION_LIMIT`. Zero hoac nhieu hon mot candidate van dung Stage 1 bridge/Pass 2 cu.
 
 ## Scope Stage 1
 
@@ -123,6 +123,8 @@ Check:
 
 ```text
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/phase9-callback-registry.json
+fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/zend_convergence_summary.json
+fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/iterations/<n>/state.json
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/pass1-generated_config_summary.json
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/pass1-generated_config_run_summary.json
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/logs/pass1-uopz/
@@ -149,26 +151,26 @@ The Stage 1 Docker gate uses:
 hookphuzz-entrypoint-direct-fixture
 ```
 
-The fixture callback reads:
+The Phase 2 fixture callback reads direct POST dimensions (not `??` / `isset`):
 
 ```php
-$x = $_GET['x'] ?? null;
-$y = $_POST['y'] ?? null;
+$name = $_POST['name'];
+if ($name) {
+    $age = $_POST['age'];
+}
 ```
 
 Expected result:
 
-- generated config method: `POST`
-- `x` in `query_params.fuzz`
-- `y` in `body_params.fuzz`
-- fixed `action` in `body_params.fixed`
-- Pass 1 request ID and Pass 2 request ID are different
-- both pass IDs share the same `legacy_run_id`
-- Pass 2 verifier prints `Zend Pass 2 verification: accepted=1 total=1`
+- iteration 0 is action-only and discovers POST `name`
+- iteration 1 sends nonempty `name` and discovers POST `age`
+- iteration 2 sends both and converges with no new parameter
+- all three request IDs differ, share one `legacy_run_id`, and one canonical candidate key
+- final generated config has fixed `action` and fuzzable POST `name`, `age`
 
 ## Current Verified Proof
 
-Last verified Stage 1 proof:
+Historical Stage 1 proof (not Phase 2 evidence):
 
 ```text
 legacy-20260812T070836Z-3f78d654
@@ -177,7 +179,7 @@ legacy-20260812T070836Z-3f78d654
 Proof summary:
 
 - Pass 1 callback reached: yes
-- Pass 1 Zend observed: GET `x`, POST `y`
+- Pass 1 Zend observed: historical fixture GET `x`, POST `y`
 - Bridge: `accepted_pass1_proof=1 final_fuzz_export_allowed=1 generated=1`
 - Pass 2 callback reached: yes
 - Pass 2 Zend verification: `accepted=1 total=1`
