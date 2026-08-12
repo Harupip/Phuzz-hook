@@ -18,14 +18,15 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertTrue(script_path.exists(), "Expected phuzz-main/code/phuzz.ps1 to exist")
         script = script_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"recursive\", \"zend-discovery\")]", script)
+        self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"recursive\")]", script)
         self.assertIn("[string]$Mode", script)
+        self.assertIn("[switch]$UseZendDiscovery", script)
         self.assertIn("[switch]$DryRun", script)
         self.assertIn("[switch]$Help", script)
         self.assertIn("[switch]$RunRecursiveConfigs", script)
         self.assertIn("Read-Host", script)
 
-    def test_guided_wrapper_exposes_isolated_zend_discovery_mode(self):
+    def test_guided_wrapper_rejects_public_zend_discovery_mode(self):
         result = subprocess.run(
             [
                 "powershell",
@@ -44,13 +45,10 @@ class PhuzzWrapperContractTests(unittest.TestCase):
             timeout=30,
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("zend_discovery", result.stdout)
-        self.assertIn("--plugin-zip", result.stdout)
-        self.assertIn("demo-plugin.zip", result.stdout)
-        self.assertNotIn("Delegating to WordPress PHUZZ runner", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("zend-discovery", result.stderr)
 
-    def test_zend_wrapper_prints_seed_config_and_replay_paths(self):
+    def test_guided_wrapper_generated_mode_can_opt_into_zend_discovery(self):
         result = subprocess.run(
             [
                 "powershell",
@@ -58,10 +56,9 @@ class PhuzzWrapperContractTests(unittest.TestCase):
                 "Bypass",
                 "-File",
                 str(CODE_DIR / "phuzz.ps1"),
-                "-Mode",
-                "zend-discovery",
-                "-PluginSlug",
-                "demo-plugin",
+                "-Mode", "generated",
+                "-PluginSlug", "demo-plugin",
+                "-UseZendDiscovery",
                 "-DryRun",
             ],
             capture_output=True,
@@ -70,20 +67,29 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Zend seed artifacts", result.stdout)
-        self.assertIn("Zend PHUZZ configs", result.stdout)
-        self.assertIn("Zend PHUZZ replay", result.stdout)
+        self.assertIn("-RunGeneratedConfigs", result.stdout)
+        self.assertIn("-UseZendDiscovery", result.stdout)
+        self.assertNotIn("-Mode zend-discovery", result.stdout)
 
-    def test_zend_mode_bootstraps_its_own_target_scoped_web_service(self):
-        script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")
+    def test_guided_wrapper_rejects_zend_discovery_outside_generated_mode(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode", "default",
+                "-UseZendDiscovery",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
 
-        self.assertIn("New-ZendPluginOverrideFile", script)
-        self.assertIn("TARGET_APP_PATH: /var/www/html/wp-content/plugins/$SelectedPluginSlug/", script)
-        self.assertIn("docker", script)
-        self.assertIn("X-Zend-Discovery-Run-ID", script)
-        self.assertIn("--write-probe-plan", script)
-        self.assertIn("/shared-tmpfs/hook-coverage/requests", script)
-        self.assertIn("phuzz-loader-summary.json", script)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("UseZendDiscovery", result.stderr)
 
     def test_guided_wrapper_delegates_to_existing_wordpress_runner(self):
         script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")
@@ -380,6 +386,7 @@ sys.exit(2)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-RunGeneratedConfigs", result.stdout)
         self.assertIn("-UseEntrypointPipeline", result.stdout)
+        self.assertNotIn("-UseZendDiscovery", result.stdout)
 
     def test_guided_wrapper_rejects_entrypoint_pipeline_outside_generated_mode(self):
         result = subprocess.run(

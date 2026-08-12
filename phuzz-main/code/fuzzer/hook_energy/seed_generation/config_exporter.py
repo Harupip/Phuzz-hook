@@ -17,6 +17,7 @@ def build_config_for_seed_item(
     seed_item: Mapping[str, Any],
     *,
     target_base: str = "http://web",
+    replay_only: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     seed = seed_item.get("seed")
     if not isinstance(seed, Mapping):
@@ -27,9 +28,9 @@ def build_config_for_seed_item(
         raise SeedConfigSkip("unsupported_auth_mode")
 
     method_status = seed.get("method_status")
-    if method_status == "ambiguous" or seed.get("method_confidence") == "ambiguous":
+    if not replay_only and (method_status == "ambiguous" or seed.get("method_confidence") == "ambiguous"):
         raise SeedConfigSkip("ambiguous_http_method")
-    if seed.get("export_allowed") is False or (method_status and method_status != "resolved"):
+    if not replay_only and (seed.get("export_allowed") is False or (method_status and method_status != "resolved")):
         raise SeedConfigSkip(str(seed.get("block_reason") or "blocked_http_method"))
 
     methods = _seed_methods(seed)
@@ -92,6 +93,7 @@ def export_seed_configs(
     summary_path: str | Path | None = None,
     target_base: str = "http://web",
     write_param_summary: bool = True,
+    replay_only: bool = False,
 ) -> dict[str, list[dict[str, str]]]:
     output_dir = Path(output_config_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -109,15 +111,18 @@ def export_seed_configs(
         hook_name = str(item.get("hook_name", ""))
         callback_id = str(item.get("callback_id", ""))
         try:
-            file_slug, config = build_config_for_seed_item(item, target_base=target_base)
+            file_slug, config = build_config_for_seed_item(item, target_base=target_base, replay_only=replay_only)
         except SeedConfigSkip as exc:
             summary["skipped"].append(_skipped_row(item, hook_name, callback_id, exc.reason))
             continue
+        if replay_only:
+            _force_replay_only(config)
 
         config_path = output_dir / f"{file_slug}.json"
         config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         generated_row = {
             "config_slug": _build_config_slug(output_dir, file_slug),
+            "config_path": str(config_path),
             "hook_name": hook_name,
             "callback_id": callback_id,
         }
@@ -140,6 +145,27 @@ def export_seed_configs(
             param_summary_path.write_text(json.dumps(param_summary, indent=2), encoding="utf-8")
 
     return summary
+
+
+def _force_replay_only(config: dict[str, Any]) -> None:
+    for section_name in ("query_params", "body_params"):
+        section = config.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        data = section.get("data", [])
+        if not isinstance(data, list):
+            data = []
+        section["fixed"] = [
+            _selector_for_generated_param(str(item.get("name")))
+            for item in data
+            if isinstance(item, Mapping) and str(item.get("name"))
+        ]
+        section["fuzz"] = []
+    config["config_type"] = "replay_only"
+    metadata = config.get("metadata")
+    if isinstance(metadata, dict):
+        metadata["fuzzing_ready"] = False
+        metadata["generated_reason"] = "zend_pass1_replay_only"
 
 
 def build_generated_param_summary(

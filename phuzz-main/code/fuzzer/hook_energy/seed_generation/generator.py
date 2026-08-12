@@ -23,14 +23,19 @@ class LiveHookSeedGenerator:
         host_source_root: str | Path | None = None,
         source_root: str | Path | None = None,
         unresolved_source_reason: str | None = None,
+        runtime_parameters_only: bool = False,
     ) -> None:
-        resolver = SourcePathResolver(
-            container_source_root=container_source_root,
-            host_source_root=host_source_root,
-            source_root=source_root,
-            unresolved_reason=unresolved_source_reason,
-        )
-        self.input_extractor = input_extractor or InputSignatureExtractor(source_resolver=resolver)
+        self.runtime_parameters_only = runtime_parameters_only
+        if runtime_parameters_only:
+            self.input_extractor = None
+        else:
+            resolver = SourcePathResolver(
+                container_source_root=container_source_root,
+                host_source_root=host_source_root,
+                source_root=source_root,
+                unresolved_reason=unresolved_source_reason,
+            )
+            self.input_extractor = input_extractor or InputSignatureExtractor(source_resolver=resolver)
 
     def build_reports(self, coverage_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         callback_rows = self._build_callback_rows(coverage_payload)
@@ -149,7 +154,18 @@ class LiveHookSeedGenerator:
             is_active = bool(registered_entry.get("is_active", True))
             status = "covered" if execute_count > 0 else "uncovered"
             seed_priority, priority_rank, target_family = self._classify_seed_priority(hook_name, is_active)
-            extraction = self.input_extractor.extract(registered_entry)
+            extraction = (
+                {
+                    "input_params": [],
+                    "source_resolution": {
+                        "source_file": str(registered_entry.get("source_file") or ""),
+                        "status": "runtime_only",
+                        "resolved_source_file": None,
+                    },
+                }
+                if self.runtime_parameters_only
+                else self.input_extractor.extract(registered_entry)
+            )
             input_params = extraction.get("input_params", [])
             source_resolution = extraction.get(
                 "source_resolution",
@@ -308,7 +324,18 @@ class LiveHookSeedGenerator:
             return [], "manual_analysis_required"
 
         variants = []
-        for decision in self._method_decisions(hook_name, callback_metadata or {}, input_params or []):
+        decisions = (
+            [{
+                "method": "POST",
+                "resolved_method": "POST",
+                "method_status": "resolved",
+                "method_confidence": "runtime_probe",
+                "candidate_methods": ["POST"],
+            }]
+            if self.runtime_parameters_only and hook_name.startswith(("wp_ajax_nopriv_", "wp_ajax_"))
+            else self._method_decisions(hook_name, callback_metadata or {}, input_params or [])
+        )
+        for decision in decisions:
             variant = copy.deepcopy(seed)
             variant.pop("methods", None)
             variant.update(decision)

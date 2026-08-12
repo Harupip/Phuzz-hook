@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("default", "seed-config", "generated", "recursive", "zend-discovery")]
+    [ValidateSet("default", "seed-config", "generated", "recursive")]
     [string]$Mode,
     [ValidatePattern('^[a-zA-Z0-9_.-]+$')]
     [string]$PluginSlug,
@@ -15,14 +15,13 @@ param(
     [ValidateRange(1, 30)]
     [int]$GeneratedConfigTimeoutSeconds = 30,
     [switch]$UseEntrypointPipeline,
+    [switch]$UseZendDiscovery,
     [ValidateRange(1, 20)]
     [int]$MaxHookDepth = 3,
     [ValidateRange(1, 300)]
     [int]$RecursiveValidationTimeoutSeconds = 10,
     [switch]$RunRecursiveConfigs,
     [switch]$DryRun,
-    [string]$ZendRegistryPath,
-    [string[]]$ZendRequestArtifact,
     [switch]$Help
 )
 
@@ -32,7 +31,6 @@ $scriptRoot = Split-Path -Parent $PSCommandPath
 $runnerPath = Join-Path $scriptRoot "scripts\wordpress\run-wordpress-phuzz.ps1"
 $recursiveHelperPath = Join-Path $scriptRoot "fuzzer\hook_energy\recursive_child_hook_seeds.py"
 $generatedConfigRunnerPath = Join-Path $scriptRoot "fuzzer\hook_energy\seed_generation\generated_config_runner.py"
-$zendDiscoveryEnginePath = Join-Path $scriptRoot "fuzzer\zend_discovery\engine.py"
 $pluginDir = Join-Path $scriptRoot "web\applications\wordpress\_plugins"
 $configDir = Join-Path $scriptRoot "fuzzer\configs\wordpress"
 
@@ -47,7 +45,7 @@ Usage:
   .\phuzz.ps1 -Mode generated -PluginSlug gamipress -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs
   .\phuzz.ps1 -Mode recursive
   .\phuzz.ps1 -Mode recursive -RunRecursiveConfigs
-  .\phuzz.ps1 -Mode zend-discovery -PluginSlug <local-zip-slug> -ZendRegistryPath <coverage.json>
+  .\phuzz.ps1 -Mode generated -PluginSlug gamipress -UseZendDiscovery -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs
   .\phuzz.ps1 -Mode recursive -RecursiveInputFile fuzzer\output\hook-coverage\requests\latest.json
   .\phuzz.ps1 -Mode generated -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs -DryRun
 
@@ -56,7 +54,6 @@ Modes:
   seed-config  Start WordPress, export hook seeds, generate PHUZZ configs, do not follow logs.
   generated    Export seeds/configs, then run generated hook configs sequentially.
   recursive    Generate recursive child-hook seeds/configs from request artifacts.
-  zend-discovery  Catalog one local plugin ZIP from UOPZ runtime proof; never starts the legacy runner.
 
 Useful options:
   -PluginSlug <slug>               WordPress plugin ZIP/config slug. Default: show-all-comments-in-one-page.
@@ -66,14 +63,13 @@ Useful options:
   -SeedWaitSeconds <seconds>       Wait window for live hook coverage snapshot. Default: 45.
   -GeneratedConfigTimeoutSeconds   Per generated-config run window. Default/max: 30.
   -UseEntrypointPipeline           Opt-in generated mode to the entrypoint pipeline.
+  -UseZendDiscovery                Opt-in generated mode to two-pass Zend parameter enrichment.
   -RecursiveInputFile <path>       Child-hook input artifact. Repeat for multiple files.
   -RecursiveHookCoverageDir <path> Hook coverage dir with requests/ for recursive validation.
   -RecursiveBaseUrl <url>          WordPress base URL for recursive validation. Default: http://localhost:8080.
   -MaxHookDepth <depth>            Recursive child-hook depth. Default: 3.
   -RecursiveValidationTimeoutSeconds <seconds> Per child-hook replay timeout. Default: 10.
   -RunRecursiveConfigs             Run recursive generated configs after recursive discovery.
-  -ZendRegistryPath <path>         UOPZ registry JSON for zend-discovery. Required outside -DryRun.
-  -ZendRequestArtifact <path>      UOPZ request artifact JSON. Repeat for each proof file.
   -DryRun                          Print the delegated command without running it.
 "@
 }
@@ -100,16 +96,14 @@ function Read-MenuMode {
     Write-Host "  2) seed-config - Start web, export hook seeds, generate PHUZZ configs"
     Write-Host "  3) generated   - Generate configs, then run them sequentially"
     Write-Host "  4) recursive   - Generate recursive child-hook seeds/configs from request artifacts"
-    Write-Host "  5) zend-discovery - Catalog one local ZIP from UOPZ runtime proof"
 
-    $choice = (Read-Host "Select [1-5]").Trim()
+    $choice = (Read-Host "Select [1-4]").Trim()
     switch ($choice) {
         "1" { return "default" }
         "2" { return "seed-config" }
         "3" { return "generated" }
         "4" { return "recursive" }
-        "5" { return "zend-discovery" }
-        default { throw "Invalid selection '$choice'. Choose 1, 2, 3, 4, or 5." }
+        default { throw "Invalid selection '$choice'. Choose 1, 2, 3, or 4." }
     }
 }
 
@@ -643,161 +637,6 @@ function Invoke-RecursiveSeedConfigSetup {
     }
 }
 
-function New-ZendPluginOverrideFile {
-    param([string]$SelectedPluginSlug)
-
-    $path = Join-Path $env:TEMP ("phuzz-zend-{0}.override.yml" -f ([guid]::NewGuid().ToString("N")))
-    @(
-        "services:"
-        "  web:"
-        "    environment:"
-        "      WP_TARGET_PLUGIN: $SelectedPluginSlug"
-        "      FUZZER_COVERAGE_PATH: /var/www/html/wp-content/plugins/$SelectedPluginSlug/"
-        "      TARGET_APP_PATH: /var/www/html/wp-content/plugins/$SelectedPluginSlug/"
-    ) | Set-Content -LiteralPath $path -Encoding ASCII
-    return $path
-}
-
-function Invoke-ZendCompose {
-    param([string[]]$ComposeArgs, [string[]]$AdditionalArgs)
-
-    & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] @AdditionalArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "Zend sandbox docker compose failed: $($AdditionalArgs -join ' ')"
-    }
-}
-
-function Copy-ZendContainerFile {
-    param([string[]]$ComposeArgs, [string]$ContainerPath, [string]$LocalPath)
-
-    & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] exec -T web sh -lc "cat $ContainerPath" |
-        Set-Content -LiteralPath $LocalPath -Encoding UTF8
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not copy Zend runtime file: $ContainerPath"
-    }
-}
-
-function Wait-ZendWebReady {
-    param([string]$Url, [int]$TimeoutSeconds, [hashtable]$Headers)
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        try {
-            $response = Invoke-WebRequest -Uri $Url -Headers $Headers -UseBasicParsing -TimeoutSec 10
-            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
-                return
-            }
-        } catch {
-        }
-        Start-Sleep -Seconds 2
-    }
-    throw "Zend sandbox bootstrap timed out waiting for $Url"
-}
-
-function Invoke-ZendDiscoveryMode {
-    if (-not (Test-Path -LiteralPath $zendDiscoveryEnginePath)) {
-        throw "Missing Zend discovery engine: $zendDiscoveryEnginePath"
-    }
-
-    $pluginZip = Join-Path $pluginDir "$PluginSlug.zip"
-    $runId = "zend-" + (Get-Date -Format "yyyyMMddTHHmmssZ") + "-" + [guid]::NewGuid().ToString("N").Substring(0, 8)
-    $registryPath = $ZendRegistryPath
-    $runtimeRoot = $null
-    $overridePath = $null
-    $composeArgs = $null
-    $zendOutputDir = Join-Path $scriptRoot "fuzzer\output\zend-discovery\$runId"
-    $generatedSummary = Join-Path $zendOutputDir "generated_config_summary.json"
-    $loaderSummary = Join-Path $zendOutputDir "replays\phuzz-loader-summary.json"
-    $artifactPaths = @($ZendRequestArtifact | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    $requestHeaders = @{ "X-Zend-Discovery-Run-ID" = $runId }
-    $arguments = @(
-        $zendDiscoveryEnginePath,
-        "--plugin-zip", $pluginZip,
-        "--plugin-slug", $PluginSlug,
-        "--run-id", $runId,
-        "--registry", $(if ($registryPath) { $registryPath } else { "<captured UOPZ registry>" })
-    )
-    foreach ($artifact in $artifactPaths) {
-        $arguments += @("--request-artifact", $artifact)
-    }
-
-    Write-Host "Zend discovery command:"
-    Write-Host ("  " + (Format-ArgumentCommand -Command "python" -Arguments $arguments))
-    Write-Host "Zend seed artifacts: $(Join-Path $zendOutputDir 'seeds')"
-    Write-Host "Zend PHUZZ configs: $(Join-Path $zendOutputDir 'configs')"
-    Write-Host "Zend PHUZZ replay: $loaderSummary"
-    if ($DryRun) {
-        return
-    }
-    if (-not (Test-Path -LiteralPath $pluginZip)) {
-        throw "Missing local plugin ZIP: $pluginZip"
-    }
-    try {
-        if ([string]::IsNullOrWhiteSpace($registryPath)) {
-            $runtimeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("phuzz-zend-" + $runId)
-            New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
-            $overridePath = New-ZendPluginOverrideFile -SelectedPluginSlug $PluginSlug
-            $composeArgs = @("docker", "compose", "-f", "docker-compose.yml", "-f", $overridePath)
-
-            Invoke-ZendCompose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", "db", "web", "--build")
-            Wait-ZendWebReady -Url "http://localhost:8080/" -TimeoutSeconds $WebTimeoutSeconds -Headers $requestHeaders
-            $registryPath = Join-Path $runtimeRoot "total_coverage.json"
-            Copy-ZendContainerFile -ComposeArgs $composeArgs -ContainerPath "/shared-tmpfs/hook-coverage/total_coverage.json" -LocalPath $registryPath
-
-            $probePlanPath = Join-Path $runtimeRoot "probe-plan.json"
-            python $zendDiscoveryEnginePath --plugin-zip $pluginZip --plugin-slug $PluginSlug --run-id $runId --registry $registryPath --write-probe-plan $probePlanPath
-            if ($LASTEXITCODE -ne 0) { throw "Could not create Zend probe plan." }
-            foreach ($probe in @(Get-Content -LiteralPath $probePlanPath -Raw | ConvertFrom-Json)) {
-                $uri = "http://localhost:8080$($probe.route)"
-                try {
-                    if ($probe.kind -eq "ajax") {
-                        Invoke-WebRequest -Uri $uri -Method Post -Body @{ action = $probe.action } -Headers $requestHeaders -UseBasicParsing -TimeoutSec 15 | Out-Null
-                    } else {
-                        Invoke-WebRequest -Uri $uri -Method $probe.method -Headers $requestHeaders -UseBasicParsing -TimeoutSec 15 | Out-Null
-                    }
-                } catch {
-                    Write-Warning "Zend probe request failed for $($probe.callback_id): $($_.Exception.Message)"
-                }
-            }
-            $names = & $composeArgs[0] $composeArgs[1..($composeArgs.Count - 1)] exec -T web sh -lc "find /shared-tmpfs/hook-coverage/requests -maxdepth 1 -type f -name '*.json' -printf '%f\n'"
-            if ($LASTEXITCODE -ne 0) { throw "Could not list Zend request proof." }
-            foreach ($name in $names) {
-                $safeName = "$name".Trim()
-                if ([System.IO.Path]::GetFileName($safeName) -ne $safeName) { throw "Invalid Zend request proof name: $safeName" }
-                $localArtifact = Join-Path $runtimeRoot $safeName
-                Copy-ZendContainerFile -ComposeArgs $composeArgs -ContainerPath "/shared-tmpfs/hook-coverage/requests/$safeName" -LocalPath $localArtifact
-                $artifactPaths += $localArtifact
-            }
-        }
-        if (-not (Test-Path -LiteralPath $registryPath)) {
-            throw "Zend discovery requires current UOPZ registry: $registryPath"
-        }
-        foreach ($artifact in $artifactPaths) {
-            if (-not (Test-Path -LiteralPath $artifact)) {
-                throw "Missing Zend request artifact: $artifact"
-            }
-        }
-        $arguments = @($zendDiscoveryEnginePath, "--plugin-zip", $pluginZip, "--plugin-slug", $PluginSlug, "--run-id", $runId, "--registry", $registryPath)
-        foreach ($artifact in $artifactPaths) { $arguments += @("--request-artifact", $artifact) }
-        python @arguments
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        if (Test-Path -LiteralPath $generatedSummary) {
-            $generated = Get-Content -LiteralPath $generatedSummary -Raw | ConvertFrom-Json
-            if (@($generated.generated).Count -gt 0) {
-                python $generatedConfigRunnerPath --generated-config-summary $generatedSummary --output-file $loaderSummary --timeout-seconds $GeneratedConfigTimeoutSeconds
-                if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            } else {
-                Write-Host "Zend PHUZZ replay: SKIPPED (no config with fuzzable parameters)"
-            }
-        } else {
-            Write-Host "Zend PHUZZ replay: SKIPPED (generated config summary missing)"
-        }
-    } finally {
-        if ($overridePath -and (Test-Path -LiteralPath $overridePath)) { Remove-Item -LiteralPath $overridePath -Force }
-        if ($runtimeRoot -and (Test-Path -LiteralPath $runtimeRoot)) { Remove-Item -LiteralPath $runtimeRoot -Recurse -Force }
-    }
-}
-
 if ($Help) {
     Show-Usage
     exit 0
@@ -805,6 +644,9 @@ if ($Help) {
 
 if ($UseEntrypointPipeline -and $PSBoundParameters.ContainsKey("Mode") -and $Mode -ne "generated") {
     throw "-UseEntrypointPipeline is only supported with -Mode generated."
+}
+if ($UseZendDiscovery -and $PSBoundParameters.ContainsKey("Mode") -and $Mode -ne "generated") {
+    throw "-UseZendDiscovery is only supported with -Mode generated."
 }
 
 $interactive = -not $PSBoundParameters.ContainsKey("Mode")
@@ -815,10 +657,13 @@ if ($interactive) {
 if ($UseEntrypointPipeline -and $Mode -ne "generated") {
     throw "-UseEntrypointPipeline is only supported with -Mode generated."
 }
+if ($UseZendDiscovery -and $Mode -ne "generated") {
+    throw "-UseZendDiscovery is only supported with -Mode generated."
+}
 
 if (-not $PSBoundParameters.ContainsKey("PluginSlug")) {
     if ($interactive) {
-        $PluginSlug = Read-PluginSlug -RequireConfig ($Mode -ne "generated" -and $Mode -ne "zend-discovery")
+        $PluginSlug = Read-PluginSlug -RequireConfig ($Mode -ne "generated")
     } else {
         $PluginSlug = "show-all-comments-in-one-page"
     }
@@ -832,11 +677,6 @@ if ($Mode -eq "recursive") {
         Invoke-RecursiveSeedConfigSetup
     }
     Invoke-RecursiveChildHookMode
-    exit 0
-}
-
-if ($Mode -eq "zend-discovery") {
-    Invoke-ZendDiscoveryMode
     exit 0
 }
 
@@ -872,6 +712,9 @@ switch ($Mode) {
         $runnerParams["GeneratedConfigTimeoutSeconds"] = $GeneratedConfigTimeoutSeconds
         if ($UseEntrypointPipeline) {
             $runnerParams["UseEntrypointPipeline"] = $true
+        }
+        if ($UseZendDiscovery) {
+            $runnerParams["UseZendDiscovery"] = $true
         }
     }
     default {

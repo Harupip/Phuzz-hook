@@ -103,6 +103,7 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                                 "method_status": "resolved",
                                 "method_confidence": "route_declared",
                                 "route_declared_methods": ["PATCH"],
+                                "seed_variant_id": "rest-patch",
                             },
                         ]
                     }
@@ -124,6 +125,7 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                         "method_status": "resolved",
                         "method_confidence": "route_declared",
                         "route_declared_methods": ["PATCH"],
+                        "seed_variant_id": "rest-patch",
                     },
                 ],
             )
@@ -173,6 +175,24 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertIn("FUZZER_CONFIG=generated-hooks/two", runner.commands[1])
         self.assertNotIn("capture_output", runner.calls[0][1])
         self.assertNotIn("text", runner.calls[0][1])
+
+    def test_legacy_run_id_is_passed_to_each_generated_request(self):
+        runner = FakeRunner([completed(0), completed(0)])
+        artifacts = FakeArtifacts([set(), set(), set(), set()], {})
+
+        report = run_generated_configs(
+            [generated_config(), generated_config("generated-hooks/two", "hook-two", "cb-two")],
+            timeout_seconds=5,
+            legacy_run_id="legacy-123",
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=artifacts.load,
+        )
+
+        self.assertEqual(report["legacy_run_id"], "legacy-123")
+        for command in runner.commands:
+            self.assertIn("-e", command)
+            self.assertIn("HOOKPHUZZ_LEGACY_RUN_ID=legacy-123", command)
 
     def test_stop_on_vuln_exit_is_recorded_as_vuln_found_not_failed(self):
         runner = FakeRunner([completed(57)])
@@ -383,6 +403,9 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         script = script_path.read_text(encoding="utf-8-sig")
 
         self.assertIn("[switch]$RunGeneratedConfigs", script)
+        self.assertIn("[switch]$UseZendDiscovery", script)
+        self.assertIn("-UseZendDiscovery requires -RunGeneratedConfigs.", script)
+        self.assertIn("HOOKPHUZZ_LEGACY_RUN_ID: $LegacyRunId", script)
         self.assertIn("[string]$PluginSlug = \"show-all-comments-in-one-page\"", script)
         self.assertIn("[ValidateRange(1, 30)]", script)
         self.assertIn("[int]$GeneratedConfigTimeoutSeconds = 30", script)
@@ -401,6 +424,19 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("--generated-config-summary", script)
         self.assertIn("--output-file", script)
         self.assertIn("--timeout-seconds", script)
+        self.assertIn("--legacy-run-id", script)
+
+    def test_wordpress_runner_has_legacy_owned_zend_two_pass_bridge(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("Invoke-ZendDiscoveryBridge", script)
+        self.assertIn("pass1-generated_config_run_summary.json", script)
+        self.assertIn("zend_enriched_seeds.json", script)
+        self.assertIn("zend_merged_suggested_seeds.json", script)
+        self.assertIn("pass2-generated_config_run_summary.json", script)
+        self.assertIn("mkdir -p /shared/opcode-events && chown www-data:www-data /shared/opcode-events", script)
+        self.assertNotIn("zend-runner-summary", script)
 
     def test_wordpress_runner_uses_shared_bootstrap_config_for_generated_mode(self):
         runner_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"

@@ -3,17 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import tempfile
 import zipfile
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
 
-from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
-from hook_energy.seed_generation.source_resolver import SourcePathResolver
-
 from .parameter_seeds import build_enriched_parameters
-from .source_materializer import materialize_plugin_source
 
 
 PASS = "PASS"
@@ -70,20 +65,168 @@ def correlate_pass1_artifact(
 ) -> dict[str, Any] | None:
     identity = canonical_identity(candidate)
     artifact_legacy_run_id = artifact.get("legacy_run_id", artifact.get("run_id"))
+    artifact_identity_id = str(artifact.get("canonical_identity_id") or "")
+    artifact_callback_id = str(artifact.get("callback_id") or "")
+    artifact_auth_variant = str(artifact.get("auth_variant") or "")
     if (
         artifact_legacy_run_id != legacy_run_id
         or artifact.get("request_id") != pass1_request_id
         or artifact.get("target_plugin") != plugin_slug
         or identity["plugin_slug"] != plugin_slug
-        or artifact.get("canonical_identity_id") != canonical_identity_id(candidate)
-        or artifact.get("callback_id") != identity["callback_identity"]
+        or (artifact_identity_id and artifact_identity_id != canonical_identity_id(candidate))
+        or (artifact_callback_id and artifact_callback_id != identity["callback_identity"])
         or str(artifact.get("http_method") or "").upper() != identity["resolved_method"]
-        or artifact.get("auth_variant") != identity["auth_variant"]
+        or (artifact_auth_variant and artifact_auth_variant != identity["auth_variant"])
         or identity["auth_variant"] == "unresolved"
         or not _callback_executed(dict(artifact), identity["callback_identity"])
     ):
         return None
     return artifact if isinstance(artifact, dict) else dict(artifact)
+
+
+def normalize_runtime_evidence(
+    candidate: Mapping[str, Any],
+    uopz_artifact: Mapping[str, Any],
+    zend_artifact: Mapping[str, Any],
+    registry: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Return only direct, value-free GET/POST evidence with complete Pass 1 correlation."""
+    identity = canonical_identity(candidate)
+    proof = correlate_pass1_artifact(
+        candidate,
+        uopz_artifact,
+        legacy_run_id=str(candidate.get("legacy_run_id") or ""),
+        pass1_request_id=str(candidate.get("pass1_request_id") or ""),
+        plugin_slug=identity["plugin_slug"],
+    )
+    callback_map = _callback_map(registry)
+    canonical_callback = str(callback_map.get(identity["callback_identity"]) or "")
+    loading = zend_artifact.get("target_loading") if isinstance(zend_artifact.get("target_loading"), Mapping) else {}
+    if (
+        proof is None
+        or registry.get("schema_version") != 1
+        or not canonical_callback
+        or str(zend_artifact.get("request_id") or "") != str(candidate.get("pass1_request_id") or "")
+        or loading.get("load_status") not in {"loaded", "partially_loaded"}
+        or int(loading.get("file_target_count") or 0) < 1
+    ):
+        return []
+    zend_run_id = str(zend_artifact.get("run_id") or "")
+    if zend_run_id and zend_run_id != str(candidate.get("legacy_run_id") or ""):
+        return []
+    zend_method = str(zend_artifact.get("request_method") or zend_artifact.get("method") or "").upper()
+    if zend_method and zend_method != str(identity["resolved_method"]).upper():
+        return []
+    summaries = zend_artifact.get("callback_summaries")
+    if not isinstance(summaries, list):
+        return []
+    matched = [summary for summary in summaries if isinstance(summary, Mapping) and summary.get("callback") == canonical_callback]
+    if len(matched) != 1:
+        return []
+    parameters = matched[0].get("unique_parameters")
+    if not isinstance(parameters, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    fixed = candidate.get("fixed_bootstrap") if isinstance(candidate.get("fixed_bootstrap"), Mapping) else {}
+    for parameter in parameters:
+        if not isinstance(parameter, Mapping):
+            continue
+        source = str(parameter.get("source") or "").upper()
+        path = parameter.get("path")
+        try:
+            helper_depth = int(parameter.get("helper_depth"))
+            observed_count = int(parameter.get("observed_count"))
+        except (TypeError, ValueError):
+            continue
+        if (
+            source not in {"GET", "POST"}
+            or not isinstance(path, list)
+            or len(path) != 1
+            or not isinstance(path[0], str)
+            or not path[0]
+            or helper_depth != 0
+            or observed_count < 1
+            or path[0] in fixed
+        ):
+            continue
+        normalized.append(
+            {
+                "name": path[0],
+                "path": [path[0]],
+                "source": source,
+                "location": "query" if source == "GET" else "form",
+                "helper_depth": 0,
+                "observed_count": observed_count,
+                "evidence_kind": "zend_runtime",
+                "fuzzable": True,
+                "run_id": str(candidate.get("legacy_run_id") or ""),
+                "request_id": str(candidate.get("pass1_request_id") or ""),
+                "plugin_slug": identity["plugin_slug"],
+                "callback_id": identity["callback_identity"],
+                "canonical_callback": canonical_callback,
+                "request_method": zend_method,
+            }
+        )
+    return sorted(normalized, key=lambda item: (item["source"], item["name"]))
+
+
+def prepare_callback_registry(registry: Mapping[str, Any], plugin_slug: str) -> dict[str, Any]:
+    registrations: list[dict[str, str]] = []
+    for callback_id, raw in _registered(dict(registry)).items():
+        if not isinstance(raw, Mapping) or not _target_owned(dict(raw), plugin_slug):
+            continue
+        canonical = str(
+            raw.get("canonical_callback")
+            or raw.get("callback_repr")
+            or raw.get("callback_name")
+            or raw.get("function_name")
+            or callback_id
+        ).strip()
+        if not canonical:
+            continue
+        registrations.append(
+            {
+                "callback_id": str(raw.get("callback_id") or callback_id),
+                "hook_name": str(raw.get("hook_name") or ""),
+                "callback": str(raw.get("callback_repr") or canonical),
+                "canonical_callback": canonical,
+                "callback_type": _php_callable_type(raw, canonical),
+                "wordpress_callback_type": str(raw.get("type") or raw.get("callback_type") or ""),
+            }
+        )
+    callback_map = {row["callback_id"]: row["canonical_callback"] for row in registrations}
+    return {
+        "schema_version": 1,
+        "plugin_slug": plugin_slug,
+        "callback_map": callback_map,
+        "registrations": registrations,
+    }
+
+
+def _php_callable_type(raw: Mapping[str, Any], canonical: str) -> str:
+    if str(raw.get("class_name") or "") and str(raw.get("method_name") or ""):
+        return "static_method" if bool(raw.get("is_static")) else "object_method"
+    if "::" in canonical:
+        return "static_method"
+    return "function"
+
+
+def _callback_map(registry: Mapping[str, Any]) -> dict[str, str]:
+    direct = registry.get("callback_map")
+    if isinstance(direct, Mapping):
+        return {str(key): str(value) for key, value in direct.items() if str(key) and str(value)}
+    rows = registry.get("registrations")
+    if not isinstance(rows, list):
+        return {}
+    mapped: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        callback_id = str(row.get("callback_id") or "").strip()
+        canonical = str(row.get("canonical_callback") or "").strip()
+        if callback_id and canonical:
+            mapped[callback_id] = canonical
+    return mapped
 
 
 def enrich_current_run(
@@ -262,6 +405,13 @@ def candidate_from_seed_item(
     entrypoint_type = _canonical_entrypoint_type(raw_entrypoint_type, hook_name)
     action = str(seed_item.get("action") or body.get("action") or query.get("action") or _ajax_action(hook_name) or "")
     method = str(seed.get("resolved_method") or seed.get("method") or seed_item.get("resolved_method") or seed_item.get("method") or "").upper()
+    fixed_bootstrap: dict[str, str] = {}
+    fixed_params = seed.get("fixed_params")
+    if isinstance(fixed_params, list):
+        fixed_bootstrap.update({str(name): "legacy_fixed_param" for name in fixed_params if str(name)})
+    raw_bootstrap = seed_item.get("fixed_bootstrap")
+    if isinstance(raw_bootstrap, Mapping):
+        fixed_bootstrap.update({str(name): str(value) for name, value in raw_bootstrap.items() if str(name)})
     return {
         "plugin_slug": str(seed_item.get("plugin_slug") or plugin_slug),
         "entrypoint_type": entrypoint_type,
@@ -277,7 +427,7 @@ def candidate_from_seed_item(
         "auth_mode": str(seed.get("auth_mode") or seed_item.get("auth_mode") or _entrypoint_auth_variant(raw_entrypoint_type)),
         "legacy_run_id": legacy_run_id,
         "pass1_request_id": str(seed_item.get("pass1_request_id") or seed.get("pass1_request_id") or ""),
-        "fixed_bootstrap": seed_item.get("fixed_bootstrap", {}),
+        "fixed_bootstrap": fixed_bootstrap,
     }
 
 
@@ -327,38 +477,30 @@ def _sanitize_persisted(value: Any) -> Any:
 def _enriched_record(
     raw_item: Mapping[str, Any],
     candidate: Mapping[str, Any],
-    callback: Mapping[str, Any],
-    artifacts: list[Mapping[str, Any]],
-    extractor: InputSignatureExtractor,
+    runtime_registry: Mapping[str, Any],
+    uopz_artifacts: list[Mapping[str, Any]],
+    zend_artifacts: list[Mapping[str, Any]],
     plugin: Mapping[str, str],
 ) -> dict[str, Any]:
     identity = canonical_identity(candidate)
     identity_id = canonical_identity_id(candidate)
-    proof = next(
-        (
-            matched
-            for artifact in artifacts
-            if (matched := correlate_pass1_artifact(
-                candidate,
-                artifact,
-                legacy_run_id=str(candidate["legacy_run_id"]),
-                pass1_request_id=str(candidate["pass1_request_id"]),
-                plugin_slug=str(candidate["plugin_slug"]),
-            )) is not None
-        ),
-        None,
-    )
-    extracted = extractor.extract(dict(callback))
-    source_resolution = extracted.get("source_resolution", {}) if isinstance(extracted, Mapping) else {}
-    current = enrich_current_run(candidate, callback, proof or {}, extractor)
-    parameters = [
-        row for row in current["parameters"]
-        if not PERSISTENCE_FORBIDDEN_KEY.search(str(row.get("name") or ""))
-    ]
-    blocked_parameters = [
-        row for row in current["blocked_parameters"]
-        if not PERSISTENCE_FORBIDDEN_KEY.search(str(row.get("name") or ""))
-    ]
+    canonical_callback = _callback_map(runtime_registry).get(identity["callback_identity"], "")
+    proof = None
+    proof_artifact: Mapping[str, Any] = {}
+    for artifact in uopz_artifacts:
+        matched = correlate_pass1_artifact(
+            candidate,
+            artifact,
+            legacy_run_id=str(candidate["legacy_run_id"]),
+            pass1_request_id=str(candidate["pass1_request_id"]),
+            plugin_slug=str(candidate["plugin_slug"]),
+        )
+        if matched is not None:
+            proof = matched
+            proof_artifact = artifact
+            break
+    zend = next((item for item in zend_artifacts if str(item.get("request_id") or "") == str(candidate["pass1_request_id"])), {})
+    parameters = normalize_runtime_evidence(candidate, proof_artifact, zend, runtime_registry)
     fuzzable_parameters = [
         {"name": str(row["name"]), "location": str(row["location"])}
         for row in parameters if row.get("fuzzable")
@@ -374,10 +516,7 @@ def _enriched_record(
         "method": identity["resolved_method"],
         "auth_variant": identity["auth_variant"],
         "entrypoint_type": identity["entrypoint_type"],
-        "source_resolution": deepcopy(source_resolution),
-        "source_resolution_status": current["source_resolution_status"],
         "parameters": parameters,
-        "blocked_parameters": blocked_parameters,
         "provenance": {
             "pass1": {
                 "legacy_run_id": candidate["legacy_run_id"],
@@ -389,8 +528,8 @@ def _enriched_record(
             }
         },
         "accepted_pass1_proof": proof is not None,
-        "probe_replay_allowed": bool(current["probe_replay_allowed"]),
-        "final_fuzz_export_allowed": bool(current["final_fuzz_export_allowed"] and fuzzable_params),
+        "probe_replay_allowed": proof is not None,
+        "final_fuzz_export_allowed": bool(proof is not None and fuzzable_params),
         "fuzzable_params": fuzzable_params,
         "seed_patch": {
             "canonical_identity": identity,
@@ -398,12 +537,18 @@ def _enriched_record(
             "method": identity["resolved_method"],
             "auth_variant": identity["auth_variant"],
             "entrypoint_type": identity["entrypoint_type"],
+            "canonical_callback": canonical_callback,
             "fuzzable_parameters": fuzzable_parameters,
+            "run_id": candidate["legacy_run_id"],
+            "request_id": candidate["pass1_request_id"],
+            "request_method": identity["resolved_method"],
+            "method_confidence": "runtime_observed",
+            "method_source": "runtime_observed",
             "fixed_bootstrap": _fixed_bootstrap(raw_item),
             "gates": {
                 "accepted_pass1_proof": proof is not None,
-                "probe_replay_allowed": bool(current["probe_replay_allowed"]),
-                "final_fuzz_export_allowed": bool(current["final_fuzz_export_allowed"] and fuzzable_params),
+                "probe_replay_allowed": proof is not None,
+                "final_fuzz_export_allowed": bool(proof is not None and fuzzable_params),
             },
         },
     }
@@ -418,6 +563,7 @@ def run_enrichment(
     raw_seed_report: Mapping[str, Any],
     pass1_artifacts: list[dict[str, Any]],
     output_root: Path,
+    zend_artifacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Write value-free Zend enrichment artifacts from offline Pass 1 evidence."""
     plugin = read_plugin_metadata(Path(plugin_zip), plugin_slug)
@@ -433,26 +579,21 @@ def run_enrichment(
     output_dir.mkdir(parents=True)
     seeds_dir = output_dir / "seeds"
     seeds_dir.mkdir()
-    callbacks = _registered(registry)
+    runtime_registry = (
+        dict(registry)
+        if registry.get("schema_version") == 1 and isinstance(registry.get("registrations"), list)
+        else prepare_callback_registry(registry, plugin_slug)
+    )
     artifacts = [artifact for artifact in pass1_artifacts if isinstance(artifact, Mapping)]
+    zend_events = [artifact for artifact in zend_artifacts or [] if isinstance(artifact, Mapping)]
     enriched: list[dict[str, Any]] = []
-    with tempfile.TemporaryDirectory(prefix="zend-enrichment-") as source_dir:
-        source_root = materialize_plugin_source(Path(plugin_zip), plugin_slug, Path(source_dir))
-        extractor = InputSignatureExtractor(
-            source_resolver=SourcePathResolver(
-                container_source_root=f"/var/www/html/wp-content/plugins/{plugin_slug}",
-                host_source_root=source_root,
-                source_root=source_root,
-            )
-        )
-        for raw_item in raw_items:
-            if not isinstance(raw_item, Mapping):
-                continue
-            candidate = candidate_from_seed_item(raw_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
-            callback = callbacks.get(candidate["callback_id"], {"callback_id": candidate["callback_id"]})
-            record = _enriched_record(raw_item, candidate, callback, artifacts, extractor, plugin)
-            enriched.append(record)
-            _write_json(seeds_dir / f"{record['canonical_identity_id']}--{record['method']}.json", record)
+    for raw_item in raw_items:
+        if not isinstance(raw_item, Mapping):
+            continue
+        candidate = candidate_from_seed_item(raw_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
+        record = _enriched_record(raw_item, candidate, runtime_registry, artifacts, zend_events, plugin)
+        enriched.append(record)
+        _write_json(seeds_dir / f"{record['canonical_identity_id']}--{record['method']}.json", record)
     catalog = [
         {
             "canonical_identity_id": row["canonical_identity_id"],
@@ -464,7 +605,7 @@ def run_enrichment(
         }
         for row in enriched
     ]
-    report = {"legacy_run_id": legacy_run_id, "enriched_seeds": enriched}
+    report = {"legacy_run_id": legacy_run_id, "callback_registry": runtime_registry, "enriched_seeds": enriched}
     summary = {
         "legacy_run_id": legacy_run_id,
         "plugin_slug": plugin_slug,

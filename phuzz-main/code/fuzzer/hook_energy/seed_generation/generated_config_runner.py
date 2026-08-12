@@ -31,6 +31,7 @@ METHOD_PROVENANCE_FIELDS = (
     "method_evidence",
     "observed_request_method",
     "route_declared_methods",
+    "seed_variant_id",
 )
 
 
@@ -96,6 +97,7 @@ def run_generated_configs(
     *,
     timeout_seconds: int,
     service: str = "fuzzer-wordpress-plugin",
+    legacy_run_id: str = "",
     run_command: CommandRunner = subprocess.run,
     list_artifacts: ArtifactLister = list_request_artifacts,
     load_artifact: ArtifactLoader = load_request_artifact,
@@ -123,8 +125,10 @@ def run_generated_configs(
             container_name,
             "-e",
             f"FUZZER_CONFIG={_runtime_config_slug(config)}",
-            service,
         ]
+        if legacy_run_id:
+            command += ["-e", f"HOOKPHUZZ_LEGACY_RUN_ID={legacy_run_id}"]
+        command.append(service)
         try:
             result = run_command(
                 command,
@@ -194,7 +198,7 @@ def run_generated_configs(
         "no_artifact",
         "not_observed",
     )
-    return {
+    report = {
         "timeout_seconds": timeout_seconds,
         "runs": runs,
         "counts": {
@@ -205,6 +209,9 @@ def run_generated_configs(
             **{status: sum(row["validation_status"] == status for row in runs) for status in statuses},
         },
     }
+    if legacy_run_id:
+        report["legacy_run_id"] = legacy_run_id
+    return report
 
 
 def format_validation_result(report: Mapping[str, Any]) -> dict[str, Any]:
@@ -258,6 +265,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-seconds", type=int, default=300)
     parser.add_argument("--service", default="fuzzer-wordpress-plugin")
     parser.add_argument("--output-format", choices=("default", "recursive"), default="default")
+    parser.add_argument("--legacy-run-id", default="")
     return parser
 
 
@@ -270,6 +278,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             generated_configs,
             timeout_seconds=args.timeout_seconds,
             service=args.service,
+            legacy_run_id=args.legacy_run_id,
         )
         report["generated_config_summary"] = str(source_path)
         output_report = format_recursive_summary(report) if args.output_format == "recursive" else report

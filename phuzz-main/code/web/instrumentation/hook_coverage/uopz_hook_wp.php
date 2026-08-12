@@ -32,7 +32,12 @@ $__uopz_uri = $_SERVER['REQUEST_URI'] ?? '';
 $__uopz_path = parse_url($__uopz_uri, PHP_URL_PATH) ?: '';
 $__uopz_slug = trim(str_replace(['/', '.', '?', '&', '='], '_', $__uopz_path), '_') ?: 'index';
 $__uopz_slug = substr($__uopz_slug, 0, 30);
-$__uopz_zend_run_id = (string) ($_SERVER['HTTP_X_ZEND_DISCOVERY_RUN_ID'] ?? '');
+$__uopz_generated_request_id = date('His') . "_{$__uopz_method}_{$__uopz_slug}_" . bin2hex(random_bytes(2));
+$__uopz_header_request_id = (string) ($_SERVER['HTTP_X_FUZZER_COVID'] ?? '');
+$__uopz_compat_request_id = (string) ($_SERVER['HTTP_X_HOOKPHUZZ_REQUEST_ID'] ?? '');
+$__uopz_request_id = $__uopz_header_request_id !== '' ? $__uopz_header_request_id : $__uopz_generated_request_id;
+$__uopz_request_id = preg_replace('/[^A-Za-z0-9_.-]/', '_', $__uopz_request_id) ?: $__uopz_generated_request_id;
+$__uopz_legacy_run_id = (string) ($_SERVER['HTTP_X_HOOKPHUZZ_RUN_ID'] ?? '');
 
 // Energy calculation da chuyen sang Python (fuzzing/energy.py).
 // PHP chi can ghi raw hook_coverage vao per-request JSON.
@@ -41,8 +46,11 @@ $__uopz_zend_run_id = (string) ($_SERVER['HTTP_X_ZEND_DISCOVERY_RUN_ID'] ?? '');
 // Đây là payload chính sẽ được ghi ra JSON khi request kết thúc.
 $GLOBALS['__uopz_request'] = [
     'schema_version' => 'uopz-request-v3',
-    'request_id' => date('His') . "_{$__uopz_method}_{$__uopz_slug}_" . bin2hex(random_bytes(2)),
-    'run_id' => $__uopz_zend_run_id,
+    'request_id' => $__uopz_request_id,
+    'legacy_run_id' => $__uopz_legacy_run_id,
+    'run_id' => $__uopz_legacy_run_id,
+    'compat_request_id' => $__uopz_compat_request_id,
+    'compat_request_id_matches' => $__uopz_compat_request_id === '' || $__uopz_compat_request_id === $__uopz_header_request_id,
     'timestamp' => date('Y-m-d H:i:s'),
     'http_method' => $__uopz_method,
     'target_plugin' => (string) (getenv('WP_TARGET_PLUGIN') ?: ''),

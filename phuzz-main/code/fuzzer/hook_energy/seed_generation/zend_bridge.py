@@ -26,6 +26,7 @@ def _accepted_patch(row: Mapping[str, Any], candidate: Mapping[str, Any]) -> Map
         or patch.get("method") != identity["resolved_method"]
         or patch.get("auth_variant") != identity["auth_variant"]
         or patch.get("entrypoint_type") != identity["entrypoint_type"]
+        or not str(patch.get("canonical_callback") or "")
     ):
         return None
     parameters = patch.get("fuzzable_parameters")
@@ -62,9 +63,20 @@ def _apply_patch(raw_item: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[
     seed["method"] = method
     seed["resolved_method"] = method
     seed["method_status"] = "resolved"
-    seed["method_confidence"] = "zend_pass1"
+    seed["method_confidence"] = "runtime_observed"
+    seed["method_source"] = "runtime_observed"
+    seed["method_evidence"] = {
+        "evidence_kind": "runtime_request",
+        "run_id": str(patch.get("run_id") or ""),
+        "request_id": str(patch.get("request_id") or ""),
+        "request_method": str(patch.get("request_method") or method),
+    }
+    seed["zend_canonical_callback"] = str(patch.get("canonical_callback") or "")
     seed["export_allowed"] = True
+    seed["replay_allowed"] = True
+    seed.pop("block_reason", None)
     seed["fuzzable_params"] = []
+    seed["input_params"] = []
     body = seed.setdefault("body", {})
     query = seed.setdefault("query_params", {})
     if not isinstance(body, dict) or not isinstance(query, dict):
@@ -74,6 +86,16 @@ def _apply_patch(raw_item: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[
         target = query if parameter["location"] == "query" else body
         target[name] = "FUZZ"
         seed["fuzzable_params"].append(name)
+        seed["input_params"].append(
+            {
+                "name": name,
+                "path": [name],
+                "source": "GET" if parameter["location"] == "query" else "POST",
+                "location": parameter["location"],
+                "fuzzable": True,
+                "evidence_kind": "zend_runtime",
+            }
+        )
     return item
 
 
@@ -87,11 +109,12 @@ def merge_enriched_seeds(
     enriched_items = enriched_report.get("enriched_seeds", [])
     if not isinstance(raw_items, list):
         raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
-    plugin_slug = str(raw_report.get("plugin_slug") or "")
+    default_plugin_slug = _default_plugin_slug(raw_report, enriched_items)
     accepted: list[dict[str, Any]] = []
     for raw_item in raw_items:
         if not isinstance(raw_item, Mapping):
             continue
+        plugin_slug = str(raw_item.get("plugin_slug") or default_plugin_slug)
         candidate = candidate_from_seed_item(raw_item, plugin_slug=plugin_slug)
         patch = next(
             (
@@ -105,3 +128,17 @@ def merge_enriched_seeds(
             accepted.append(_apply_patch(raw_item, patch))
     merged["suggested_seeds"] = accepted
     return merged
+
+
+def _default_plugin_slug(raw_report: Mapping[str, Any], enriched_items: Any) -> str:
+    plugin_slug = str(raw_report.get("plugin_slug") or "")
+    if plugin_slug:
+        return plugin_slug
+    if not isinstance(enriched_items, list):
+        return ""
+    for row in enriched_items:
+        if isinstance(row, Mapping):
+            plugin_slug = str(row.get("plugin_slug") or "")
+            if plugin_slug:
+                return plugin_slug
+    return ""

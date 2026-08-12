@@ -22,6 +22,8 @@ from zend_discovery.engine import (
     candidate_from_seed_item,
     correlate_pass1_artifact,
     enrich_current_run,
+    normalize_runtime_evidence,
+    prepare_callback_registry,
     read_plugin_metadata,
     run_enrichment,
     select_auto_probes,
@@ -40,6 +42,99 @@ class StaticExtractor:
 
 
 class ZendDiscoveryTests(unittest.TestCase):
+    def test_normalize_runtime_evidence_maps_direct_get_and_post_independently_of_request_method(self) -> None:
+        candidate = self.pass1_candidate()
+        uopz = self.pass1_artifact(candidate)
+        registry = {
+            "schema_version": 1,
+            "callback_map": {"ajax-public": "Demo::fetch"},
+            "registrations": [{"callback": "Demo::fetch", "canonical_callback": "Demo::fetch", "callback_type": "object_method"}],
+        }
+        zend = {
+            "schema_version": 3,
+            "run_id": "legacy-1",
+            "request_id": "pass1-1",
+            "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{
+                "callback": "Demo::fetch",
+                "unique_parameters": [
+                    {"source": "GET", "path": ["x"], "helper_depth": 0, "observed_count": 1},
+                    {"source": "POST", "path": ["y"], "helper_depth": 0, "observed_count": 2},
+                    {"source": "REQUEST", "path": ["ignored"], "helper_depth": 0, "observed_count": 1},
+                    {"source": "GET", "path": ["nested", "leaf"], "helper_depth": 0, "observed_count": 1},
+                    {"source": "POST", "path": ["helper"], "helper_depth": 1, "observed_count": 1},
+                ],
+            }],
+        }
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual(
+            evidence,
+            [
+                {
+                    "name": "x", "path": ["x"], "source": "GET", "location": "query",
+                    "helper_depth": 0, "observed_count": 1, "evidence_kind": "zend_runtime",
+                    "fuzzable": True, "run_id": "legacy-1", "request_id": "pass1-1",
+                    "plugin_slug": "demo-plugin", "callback_id": "ajax-public",
+                    "canonical_callback": "Demo::fetch", "request_method": "POST",
+                },
+                {
+                    "name": "y", "path": ["y"], "source": "POST", "location": "form",
+                    "helper_depth": 0, "observed_count": 2, "evidence_kind": "zend_runtime",
+                    "fuzzable": True, "run_id": "legacy-1", "request_id": "pass1-1",
+                    "plugin_slug": "demo-plugin", "callback_id": "ajax-public",
+                    "canonical_callback": "Demo::fetch", "request_method": "POST",
+                },
+            ],
+        )
+        for row in evidence:
+            self.assertEqual(row["run_id"], "legacy-1")
+            self.assertEqual(row["request_id"], "pass1-1")
+            self.assertEqual(row["plugin_slug"], "demo-plugin")
+            self.assertEqual(row["callback_id"], "ajax-public")
+            self.assertEqual(row["canonical_callback"], "Demo::fetch")
+            self.assertEqual(row["request_method"], "POST")
+
+    def test_callback_registry_uses_php_callable_type_for_phase9_extension(self) -> None:
+        registry = {
+            "data": {
+                "registered_callbacks": {
+                    "cb": {
+                        "callback_id": "cb",
+                        "hook_name": "wp_ajax_demo",
+                        "callback_repr": "demo_ajax",
+                        "type": "action",
+                        "target_plugin": "demo-plugin",
+                        "source_file": "/var/www/html/wp-content/plugins/demo-plugin/demo.php",
+                    }
+                }
+            }
+        }
+
+        prepared = prepare_callback_registry(registry, "demo-plugin")
+
+        self.assertEqual(prepared["registrations"][0]["callback_type"], "function")
+        self.assertEqual(prepared["registrations"][0]["wordpress_callback_type"], "action")
+
+    def test_pass1_correlation_accepts_raw_uopz_artifact_without_optional_identity_fields(self) -> None:
+        candidate = self.pass1_candidate()
+        artifact = self.pass1_artifact(candidate)
+        artifact.pop("canonical_identity_id", None)
+        artifact.pop("callback_id", None)
+        artifact.pop("auth_variant", None)
+
+        proof = correlate_pass1_artifact(
+            candidate,
+            artifact,
+            legacy_run_id="legacy-1",
+            pass1_request_id="pass1-1",
+            plugin_slug="demo-plugin",
+        )
+
+        self.assertIsNotNone(proof)
+
     def pass1_candidate(self) -> dict:
         return {
             "plugin_slug": "demo-plugin",
@@ -543,6 +638,32 @@ class ZendDiscoveryTests(unittest.TestCase):
             artifact["request_params"] = {"body_params": {"term": raw_value}}
         return artifact
 
+    def zend_artifact_for_raw(self, item: dict, *, source: str = "POST", name: str = "term") -> dict:
+        callback = {
+            "ajax-public": "Demo::fetch",
+            "ajax-write": "Demo::save",
+        }.get(item["callback_id"], str(item["callback_id"]))
+        return {
+            "schema_version": 3,
+            "run_id": "legacy-1",
+            "request_id": item["pass1_request_id"],
+            "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [
+                {
+                    "callback": callback,
+                    "unique_parameters": [
+                        {
+                            "source": source,
+                            "path": [name],
+                            "helper_depth": 0,
+                            "observed_count": 1,
+                        }
+                    ],
+                }
+            ],
+        }
+
     def test_run_enrichment_writes_only_value_free_zend_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -555,6 +676,7 @@ class ZendDiscoveryTests(unittest.TestCase):
                 registry=self.registry(),
                 raw_seed_report={"suggested_seeds": [item]},
                 pass1_artifacts=[self.pass1_artifact_for_raw(item)],
+                zend_artifacts=[self.zend_artifact_for_raw(item)],
                 output_root=root / "output",
             )
 
@@ -582,6 +704,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertTrue(seed["accepted_pass1_proof"])
             self.assertTrue(seed["probe_replay_allowed"])
             self.assertTrue(seed["final_fuzz_export_allowed"])
+            self.assertEqual(seed["fuzzable_params"], ["term"])
             self.assertEqual(
                 seed["seed_patch"]["fixed_bootstrap"],
                 [
@@ -612,6 +735,7 @@ class ZendDiscoveryTests(unittest.TestCase):
                     self.pass1_artifact_for_raw(accepted),
                 ],
                 root / "output",
+                zend_artifacts=[self.zend_artifact_for_raw(accepted)],
             )
 
             rows = {row["canonical_identity_id"]: row for row in summary["enriched_seeds"]}
@@ -651,6 +775,7 @@ class ZendDiscoveryTests(unittest.TestCase):
                 {"suggested_seeds": [first, second]},
                 [self.pass1_artifact_for_raw(first), self.pass1_artifact_for_raw(second)],
                 root / "output",
+                zend_artifacts=[self.zend_artifact_for_raw(first), self.zend_artifact_for_raw(second)],
             )
 
             identities = {row["canonical_identity_id"] for row in summary["enriched_seeds"]}
@@ -678,6 +803,7 @@ class ZendDiscoveryTests(unittest.TestCase):
                 {"suggested_seeds": [item]},
                 [artifact],
                 root / "output",
+                zend_artifacts=[self.zend_artifact_for_raw(item)],
             )
 
             for path in (root / "output" / "legacy-1").rglob("*.json"):
@@ -710,6 +836,7 @@ class ZendDiscoveryTests(unittest.TestCase):
                     {"suggested_seeds": [item]},
                     [self.pass1_artifact_for_raw(item)],
                     root / "output",
+                    zend_artifacts=[self.zend_artifact_for_raw(item)],
                 )
 
             valid = self.raw_seed_item()
@@ -724,16 +851,21 @@ class ZendDiscoveryTests(unittest.TestCase):
                 {"suggested_seeds": [valid]},
                 [foreign_artifact],
                 root / "output",
+                zend_artifacts=[],
             )
             self.assertFalse(result["enriched_seeds"][0]["accepted_pass1_proof"])
 
-    def test_uopz_captures_zend_run_id_from_request_header(self) -> None:
+    def test_uopz_captures_legacy_run_and_request_ids_from_legacy_headers(self) -> None:
         instrumentation = (
             FUZZER_DIR.parent / "web" / "instrumentation" / "hook_coverage" / "uopz_hook_wp.php"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("HTTP_X_ZEND_DISCOVERY_RUN_ID", instrumentation)
+        self.assertIn("HTTP_X_HOOKPHUZZ_RUN_ID", instrumentation)
+        self.assertIn("HTTP_X_FUZZER_COVID", instrumentation)
+        self.assertIn("HTTP_X_HOOKPHUZZ_REQUEST_ID", instrumentation)
+        self.assertIn("'legacy_run_id' =>", instrumentation)
         self.assertIn("'run_id' =>", instrumentation)
+        self.assertNotIn("HTTP_X_ZEND_DISCOVERY_RUN_ID", instrumentation)
 
     def test_engine_has_no_legacy_runner_imports(self) -> None:
         engine_source = (FUZZER_DIR / "zend_discovery" / "engine.py").read_text(encoding="utf-8")

@@ -515,8 +515,11 @@ class Fuzzer:
         the_body_params = {**candidate.fuzz_params['body_params'], **candidate.fixed_params['body_params']}
         the_cookies = {**candidate.fuzz_params['cookies'], **candidate.fixed_params['cookies']} # self._urlencode_dict()
         the_headers = {**candidate.fuzz_params['headers'], **candidate.fixed_params['headers']}
-        the_headers["X-FUZZER-COVID"] = candidate.coverage_id
-        the_headers.setdefault("X-HookPhuzz-Request-ID", candidate.coverage_id)
+        the_headers["X-Fuzzer-Covid"] = candidate.coverage_id
+        the_headers["X-HookPhuzz-Request-ID"] = candidate.coverage_id
+        legacy_run_id = os.environ.get("HOOKPHUZZ_LEGACY_RUN_ID", "")
+        if legacy_run_id:
+            the_headers.setdefault("X-HookPhuzz-Run-ID", legacy_run_id)
 
         # print({
         #     'query': the_params,

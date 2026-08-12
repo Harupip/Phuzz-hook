@@ -101,6 +101,25 @@ def build_live_coverage_payload() -> dict:
 
 
 class LiveHookSeedGeneratorTests(unittest.TestCase):
+    def test_runtime_parameters_only_skips_extractor_and_builds_post_action_probe(self) -> None:
+        class RaisingExtractor:
+            def extract(self, _callback: dict) -> dict:
+                raise AssertionError("runtime-only generation must not inspect static parameters")
+
+        _, seed_report = LiveHookSeedGenerator(
+            input_extractor=RaisingExtractor(),
+            runtime_parameters_only=True,
+        ).build_reports(build_live_coverage_payload())
+
+        item = next(
+            row for row in seed_report["suggested_seeds"]
+            if row["hook_name"] == "wp_ajax_nopriv_sac_post_type_call"
+        )
+        self.assertEqual(item["seed"]["method"], "POST")
+        self.assertEqual(item["seed"]["body"], {"action": "sac_post_type_call"})
+        self.assertEqual(item["seed"]["fuzzable_params"], [])
+        self.assertEqual(item["seed"]["input_params"], [])
+
     def test_generator_derives_direct_http_seed_and_manual_only_entries(self) -> None:
         generator = LiveHookSeedGenerator()
 
@@ -118,7 +137,7 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
         )
         self.assertEqual(direct_seed["generation_status"], "ambiguous_http_method")
         self.assertIsNone(direct_seed["seed"]["method"])
-        self.assertEqual(direct_seed["seed"]["candidate_methods"], ["GET", "POST"])
+        self.assertEqual(direct_seed["seed"]["candidate_methods"], [])
         self.assertEqual(direct_seed["seed"]["path"], "/wp-admin/admin-ajax.php")
         self.assertEqual(direct_seed["seed"]["unresolved_params"], {"action": "sac_post_type_call"})
         self.assertEqual(direct_seed["seed"]["auth_mode"], "unauth-capable")

@@ -22,7 +22,8 @@ def build_config_for_candidate(candidate: Mapping[str, Any], *, target_base: str
     path = str(http_template.get("path", "")).strip()
     if not path:
         raise ValueError("http_template path is required")
-    if not method or candidate.get("method_status") != "resolved" or candidate.get("export_allowed") is False:
+    method_status = candidate.get("method_status")
+    if not method or (method_status is not None and method_status != "resolved") or candidate.get("export_allowed") is False:
         raise ValueError("unresolved_http_method")
 
     config: dict[str, Any] = {

@@ -18,6 +18,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-config-dir", required=True, help="Directory for generated PHUZZ config JSON files.")
     parser.add_argument("--summary", required=True, help="Path to write generated/skipped summary JSON.")
     parser.add_argument("--target-base", default="http://web", help="Base URL used for generated PHUZZ targets.")
+    parser.add_argument("--replay-only", action="store_true", help="Write replay-only configs with no fuzz fields.")
     return parser
 
 
@@ -31,6 +32,7 @@ def main() -> int:
         output_config_dir=Path(args.output_config_dir),
         summary_path=Path(args.summary),
         target_base=args.target_base,
+        replay_only=args.replay_only,
     )
     print(f"Seed config export summary: generated={len(summary['generated'])} skipped={len(summary['skipped'])}")
     for item in summary["generated"]:

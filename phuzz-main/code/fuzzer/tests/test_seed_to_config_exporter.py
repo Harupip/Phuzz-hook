@@ -113,6 +113,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
             "method": "POST",
             "auth_variant": "unauthenticated",
             "entrypoint_type": "ajax",
+            "canonical_callback": "Demo::fetch",
             "fuzzable_parameters": [{"name": "term", "location": "form"}],
             "fixed_bootstrap": [],
             "gates": {"accepted_pass1_proof": True, "final_fuzz_export_allowed": True},
@@ -215,6 +216,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
             "method": "POST",
             "auth_variant": "authenticated",
             "entrypoint_type": "ajax",
+            "canonical_callback": "Demo::fetch",
             "fuzzable_parameters": [{"name": "term", "location": "form"}],
             "fixed_bootstrap": [
                 {"name": "action", "provenance": "legacy_fixed_param"},
@@ -257,6 +259,48 @@ class SeedToConfigExporterTests(unittest.TestCase):
         seed = merged["suggested_seeds"][0]["seed"]
         self.assertEqual(seed["body"]["bootstrap"], "keep")
         self.assertEqual(seed["body"]["term"], "FUZZ")
+
+    def test_zend_bridge_matches_live_raw_report_without_top_level_plugin_slug(self):
+        raw = build_seed_item()
+        raw["entrypoint_type"] = "ajax"
+        candidate = candidate_from_seed_item(raw, plugin_slug="demo-plugin")
+        identity = canonical_identity(candidate)
+        identity_id = canonical_identity_id(candidate)
+        patch = {
+            "canonical_identity": identity,
+            "canonical_identity_id": identity_id,
+            "method": "POST",
+            "auth_variant": "unauthenticated",
+            "entrypoint_type": "ajax",
+            "canonical_callback": "Demo::fetch",
+            "fuzzable_parameters": [{"name": "term", "location": "form"}],
+            "fixed_bootstrap": [{"name": "action", "provenance": "legacy_fixed_param"}],
+            "gates": {"accepted_pass1_proof": True, "final_fuzz_export_allowed": True},
+        }
+
+        merged = merge_enriched_seeds(
+            {"suggested_seeds": [raw]},
+            {
+                "enriched_seeds": [
+                    {
+                        "plugin_slug": "demo-plugin",
+                        "canonical_identity": identity,
+                        "canonical_identity_id": identity_id,
+                        "method": "POST",
+                        "auth_variant": "unauthenticated",
+                        "entrypoint_type": "ajax",
+                        "accepted_pass1_proof": True,
+                        "final_fuzz_export_allowed": True,
+                        "fuzzable_params": ["term"],
+                        "parameters": [{"name": "term", "location": "form", "fuzzable": True}],
+                        "seed_patch": patch,
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(len(merged["suggested_seeds"]), 1)
+        self.assertEqual(merged["suggested_seeds"][0]["seed"]["fuzzable_params"], ["term"])
 
     def test_unauth_seed_becomes_phuzz_config_with_fixed_action_and_fuzzed_params(self):
         slug, config = build_config_for_seed_item(build_seed_item(), target_base="http://web")
@@ -531,6 +575,58 @@ class SeedToConfigExporterTests(unittest.TestCase):
             self.assertEqual(summary["skipped"][0]["reason"], "missing_seed")
             self.assertEqual(json.loads(summary_path.read_text(encoding="utf-8")), summary)
             self.assertTrue((root / "generated_param_summary.json").exists())
+
+    def test_replay_only_export_for_zend_pass1_clears_fuzz_selectors(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            output_dir = root / "pass1-configs"
+            summary = export_seed_configs(
+                {"suggested_seeds": [build_seed_item()]},
+                output_config_dir=output_dir,
+                replay_only=True,
+            )
+
+            config = json.loads((output_dir / "wp_ajax_nopriv_example_lookup-cb-public.json").read_text(encoding="utf-8"))
+            self.assertEqual(config["config_type"], "replay_only")
+            self.assertEqual(config["body_params"]["fuzz"], [])
+            self.assertEqual(config["query_params"]["fuzz"], [])
+            self.assertEqual(set(config["body_params"]["fixed"]), {"action", "item_id"})
+            self.assertEqual(config["query_params"]["fixed"], ["page"])
+            self.assertEqual(summary["generated"][0]["config_path"], str(output_dir / "wp_ajax_nopriv_example_lookup-cb-public.json"))
+
+    def test_replay_only_export_for_zend_pass1_allows_probe_candidate_without_runtime_params(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            output_dir = root / "pass1-configs"
+            item = build_seed_item(hook_name="wp_ajax_hookphuzz_stage1_direct", auth_mode="authenticated")
+            item["seed"].update(
+                {
+                    "body": {"action": "hookphuzz_stage1_direct"},
+                    "query_params": {},
+                    "fuzzable_params": [],
+                    "input_params": [],
+                    "export_allowed": False,
+                    "replay_allowed": False,
+                    "block_reason": "no_correlated_runtime_or_declared_or_source_exact_method",
+                    "method_status": "resolved",
+                    "method_source": "ambiguous",
+                    "method_confidence": "runtime_probe",
+                }
+            )
+
+            summary = export_seed_configs(
+                {"suggested_seeds": [item]},
+                output_config_dir=output_dir,
+                replay_only=True,
+            )
+
+            config = json.loads((output_dir / "wp_ajax_hookphuzz_stage1_direct-cb-public.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["skipped"], [])
+            self.assertEqual(config["methods"], ["POST"])
+            self.assertEqual(config["config_type"], "replay_only")
+            self.assertEqual(config["body_params"]["data"], [{"name": "action", "value": "hookphuzz_stage1_direct"}])
+            self.assertEqual(config["body_params"]["fixed"], ["action"])
+            self.assertEqual(config["body_params"]["fuzz"], [])
 
     def test_builds_param_summary_for_generated_configs(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
