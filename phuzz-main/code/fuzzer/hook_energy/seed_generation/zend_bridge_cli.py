@@ -10,11 +10,11 @@ from typing import Any, Mapping, Sequence
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from hook_energy.seed_generation.config_exporter import export_seed_configs
-    from zend_discovery.convergence import advance_convergence_state, materialize_convergence_seeds, merge_enriched_seeds
+    from zend_discovery.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
     from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, run_enrichment
 else:
     from .config_exporter import export_seed_configs
-    from zend_discovery.convergence import advance_convergence_state, materialize_convergence_seeds, merge_enriched_seeds
+    from zend_discovery.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
     from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, run_enrichment
 
 
@@ -96,7 +96,7 @@ def build_enrichment_inputs(
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run offline Zend enrichment for a legacy generated Pass 1 run.")
-    parser.add_argument("--operation", choices=("prepare-registry", "correlate-enrich", "converge-iteration", "verify-pass2"), default="correlate-enrich")
+    parser.add_argument("--operation", choices=("prepare-registry", "correlate-enrich", "converge-iteration", "verify-pass2", "combine-final", "list-targets"), default="correlate-enrich")
     parser.add_argument("--plugin-zip")
     parser.add_argument("--plugin-slug")
     parser.add_argument("--legacy-run-id")
@@ -111,9 +111,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-config-dir")
     parser.add_argument("--generated-config-summary")
     parser.add_argument("--pass2-run-summary")
+    parser.add_argument("--pass2-artifacts-dir")
     parser.add_argument("--convergence-state")
     parser.add_argument("--convergence-state-output")
     parser.add_argument("--convergence-merged-seeds")
+    parser.add_argument("--candidate-key")
+    parser.add_argument("--targets-output")
+    parser.add_argument("--final-seed-report", action="append", default=[])
+    parser.add_argument("--expected-count", type=int)
     return parser
 
 
@@ -132,6 +137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _read_json(Path(args.pass2_run_summary)),
                 _read_json(Path(args.merged_suggested_seeds)),
                 Path(args.zend_events_dir),
+                pass2_artifacts_dir=Path(args.pass2_artifacts_dir) if args.pass2_artifacts_dir else None,
             )
             print(
                 "Zend Pass 2 verification: "
@@ -154,9 +160,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 plugin_slug=args.plugin_slug,
                 legacy_run_id=args.legacy_run_id,
                 known_state=_read_json(Path(args.convergence_state)),
+                candidate_key=args.candidate_key,
             )
             _write_json(Path(args.convergence_state_output), result)
             _write_json(Path(args.convergence_merged_seeds), result["merged_suggested_seeds"])
+            if result["status"] == "REPLAY_FAILED":
+                print(f"Zend convergence iteration: status={result['status']} missing={len(result.get('missing_parameters', []))}")
+                return 2
             export_seed_configs(
                 result["merged_suggested_seeds"],
                 output_config_dir=Path(args.output_config_dir),
@@ -164,6 +174,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 replay_only=True,
             )
             print(f"Zend convergence iteration: status={result['status']} new={len(result['new_parameters'])}")
+            return 0
+        if args.operation == "combine-final":
+            _require(args, "merged_suggested_seeds")
+            combined = combine_final_seed_reports(
+                [Path(item) for item in args.final_seed_report],
+                expected_count=args.expected_count,
+            )
+            _write_json(Path(args.merged_suggested_seeds), combined)
+            print(f"Zend final seed reports combined: total={len(combined['suggested_seeds'])}")
+            return 0
+        if args.operation == "list-targets":
+            _require(args, "raw_suggested_seeds", "plugin_slug", "legacy_run_id", "targets_output")
+            targets = list_convergence_targets(
+                _read_json(Path(args.raw_suggested_seeds)),
+                plugin_slug=args.plugin_slug,
+                legacy_run_id=args.legacy_run_id,
+                generated_summary=_read_json(Path(args.generated_config_summary)) if args.generated_config_summary else None,
+            )
+            _write_json(Path(args.targets_output), {"targets": targets})
+            print(f"Zend convergence targets listed: total={len(targets)}")
             return 0
 
         _require(
@@ -241,8 +271,16 @@ def converge_iteration(
     plugin_slug: str,
     legacy_run_id: str,
     known_state: Mapping[str, Any],
+    candidate_key: str | None = None,
 ) -> dict[str, Any]:
     """Correlate one replay and materialize its direct runtime discoveries."""
+    raw_report, pass_run_summary = _filter_iteration_inputs(
+        raw_report,
+        pass_run_summary,
+        plugin_slug=plugin_slug,
+        legacy_run_id=legacy_run_id,
+        candidate_key=str(candidate_key or ""),
+    )
     raw_for_iteration, uopz_artifacts = build_enrichment_inputs(
         raw_report, pass_run_summary, pass_artifacts_dir,
         plugin_slug=plugin_slug, legacy_run_id=legacy_run_id,
@@ -279,45 +317,80 @@ def converge_iteration(
     if not isinstance(prior, list):
         raise ValueError("convergence state known_parameters must be a list")
     advanced = advance_convergence_state(prior, observed)
+    missing = _missing_known_parameters(prior, observed)
     merged = materialize_convergence_seeds(
         raw_for_iteration,
         plugin_slug=plugin_slug,
         candidate_key=candidate_key,
         known_parameters=advanced["known_parameters"],
     )
+    status = "REPLAY_FAILED" if missing else "CONVERGED" if not advanced["new_parameters"] else "CONTINUE"
     return {
-        "status": "CONVERGED" if not advanced["new_parameters"] else "CONTINUE",
+        "status": status,
         "legacy_run_id": legacy_run_id,
         "candidate_key": candidate_key,
         "request_id": request_id,
         "known_before": prior,
         "observed_parameters": observed,
         "new_parameters": advanced["new_parameters"],
+        "missing_parameters": missing,
         "known_parameters": advanced["known_parameters"],
         "merged_suggested_seeds": merged,
     }
+
+
+def _filter_iteration_inputs(
+    raw_report: Mapping[str, Any],
+    pass_run_summary: Mapping[str, Any],
+    *,
+    plugin_slug: str,
+    legacy_run_id: str,
+    candidate_key: str,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    if not candidate_key:
+        return raw_report, pass_run_summary
+    raw_items = raw_report.get("suggested_seeds", [])
+    rows = pass_run_summary.get("runs", [])
+    if not isinstance(raw_items, list) or not isinstance(rows, list):
+        return raw_report, pass_run_summary
+    selected = [
+        item for item in raw_items
+        if isinstance(item, Mapping)
+        and canonical_identity_id(candidate_from_seed_item(item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)) == candidate_key
+    ]
+    selected_keys = {_seed_key(item) for item in selected}
+    filtered_rows = [row for row in rows if isinstance(row, Mapping) and _run_key(row) in selected_keys]
+    raw_copy = deepcopy(dict(raw_report))
+    summary_copy = deepcopy(dict(pass_run_summary))
+    raw_copy["suggested_seeds"] = selected
+    summary_copy["runs"] = filtered_rows
+    return raw_copy, summary_copy
+
+
+def _missing_known_parameters(
+    known_parameters: list[Mapping[str, Any]],
+    observed_parameters: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    observed = {
+        identity for parameter in observed_parameters
+        if (identity := canonical_runtime_parameter_identity(parameter)) is not None
+    }
+    missing: list[dict[str, Any]] = []
+    for parameter in known_parameters:
+        identity = canonical_runtime_parameter_identity(parameter)
+        if identity is not None and identity not in observed:
+            missing.append(dict(parameter))
+    return missing
 
 
 def verify_pass2_contract(
     pass2_run_summary: Mapping[str, Any],
     merged_seed_report: Mapping[str, Any],
     zend_events_dir: Path,
+    *,
+    pass2_artifacts_dir: Path | None = None,
 ) -> dict[str, int]:
-    expected = {
-        (
-            str(item.get("hook_name") or ""),
-            str(item.get("callback_id") or ""),
-        ): {
-            "callback": str(((item.get("seed") or {}).get("zend_canonical_callback") or "") if isinstance(item.get("seed"), Mapping) else ""),
-            "params": {
-                (str(param.get("name")), _param_source(param), "query" if _param_source(param) == "GET" else "form")
-                for param in (((item.get("seed") or {}).get("input_params") or []) if isinstance(item.get("seed"), Mapping) else [])
-                if isinstance(param, Mapping) and _param_source(param) in {"GET", "POST"} and str(param.get("name"))
-            },
-        }
-        for item in merged_seed_report.get("suggested_seeds", [])
-        if isinstance(item, Mapping)
-    }
+    expected = _expected_pass2_params(merged_seed_report)
     legacy_run_id = str(pass2_run_summary.get("legacy_run_id") or "")
     total = 0
     accepted = 0
@@ -334,27 +407,75 @@ def verify_pass2_contract(
         if not artifact_name or Path(artifact_name).name != artifact_name:
             continue
         zend_path = zend_events_dir / artifact_name
+        uopz_path = pass2_artifacts_dir / artifact_name if pass2_artifacts_dir is not None else None
         if not zend_path.is_file():
             continue
         try:
             zend = _read_json(zend_path)
+            uopz = _read_json(uopz_path) if uopz_path is not None and uopz_path.is_file() else {}
         except (OSError, json.JSONDecodeError):
             continue
         if not isinstance(zend, Mapping):
             continue
+        if not isinstance(uopz, Mapping):
+            uopz = {}
         zend_run_id = str(zend.get("run_id") or "")
         if legacy_run_id and zend_run_id and zend_run_id != legacy_run_id:
             continue
         if str(zend.get("request_id") or "") != Path(artifact_name).stem:
             continue
+        if uopz and str(uopz.get("request_id") or "") != Path(artifact_name).stem:
+            continue
         zend_method = str(zend.get("request_method") or zend.get("method") or "").upper()
         row_method = str(row.get("resolved_method") or "").upper()
         if zend_method and row_method and zend_method != row_method:
             continue
-        observed = _zend_observed_params(zend, canonical_callback)
+        observed = _zend_observed_params(zend, canonical_callback) | _zend_observed_rest_params(
+            zend,
+            uopz,
+            canonical_callback,
+            rest_identity=want.get("rest_identity") if isinstance(want, Mapping) else None,
+        )
         if want_params <= observed:
             accepted += 1
     return {"accepted": accepted, "total": total}
+
+
+def _expected_pass2_params(merged_seed_report: Mapping[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    expected: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in merged_seed_report.get("suggested_seeds", []):
+        if not isinstance(item, Mapping):
+            continue
+        seed = item.get("seed") if isinstance(item.get("seed"), Mapping) else {}
+        params = {
+            (str(param.get("name")), source, _param_location(param, source))
+            for param in (seed.get("input_params") or [])
+            if isinstance(param, Mapping)
+            and (source := _param_source(param)) in {"GET", "POST", "JSON"}
+            and str(param.get("name"))
+        }
+        value = {
+            "callback": str(seed.get("zend_canonical_callback") or ""),
+            "params": params,
+            "rest_identity": _expected_rest_identity(item, seed),
+        }
+        callback_id = str(item.get("callback_id") or "")
+        expected[(str(item.get("hook_name") or ""), callback_id)] = value
+        expected.setdefault((callback_id, callback_id), value)
+    return expected
+
+
+def _expected_rest_identity(item: Mapping[str, Any], seed: Mapping[str, Any]) -> dict[str, Any]:
+    entrypoint_type = str(item.get("entrypoint_type") or seed.get("entrypoint_type") or "").lower()
+    if entrypoint_type not in {"rest", "rest_route", "rest_api", "wp_rest", "wp_rest_route"}:
+        return {}
+    return {
+        "namespace": str(item.get("namespace") or ""),
+        "route_pattern": str(item.get("route_pattern") or item.get("route") or ""),
+        "endpoint_definition_index": item.get("endpoint_definition_index"),
+        "materialized_route": str(item.get("materialized_route") or seed.get("path") or item.get("route") or ""),
+        "method": str(seed.get("resolved_method") or seed.get("method") or "").upper(),
+    }
 
 
 def _zend_observed_params(zend: Mapping[str, Any], canonical_callback: str) -> set[tuple[str, str, str]]:
@@ -394,12 +515,124 @@ def _zend_observed_params(zend: Mapping[str, Any], canonical_callback: str) -> s
     return observed
 
 
+def _zend_observed_rest_params(
+    zend: Mapping[str, Any],
+    uopz: Mapping[str, Any],
+    canonical_callback: str,
+    *,
+    rest_identity: Any = None,
+) -> set[tuple[str, str, str]]:
+    events = zend.get("rest_parameter_events")
+    if not isinstance(events, list):
+        return set()
+    request_params = uopz.get("request_params") if isinstance(uopz.get("request_params"), Mapping) else {}
+    json_params = request_params.get("json_params") if isinstance(request_params, Mapping) else None
+    body_params = request_params.get("body_params") if isinstance(request_params, Mapping) else None
+    observed: set[tuple[str, str, str]] = set()
+    seen_locations: dict[str, set[str]] = {}
+    for event in events:
+        if not isinstance(event, Mapping) or str(event.get("callback") or "") != canonical_callback:
+            continue
+        if isinstance(rest_identity, Mapping) and rest_identity and any(event.get(key) != value for key, value in rest_identity.items()):
+            continue
+        name = event.get("name")
+        location = str(event.get("location") or "")
+        try:
+            observed_count = int(event.get("observed_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not isinstance(name, str)
+            or not name
+            or "[" in name
+            or "]" in name
+            or location not in {"query", "form", "json"}
+            or observed_count < 1
+            or _security_name(name)
+        ):
+            continue
+        if location == "json" and isinstance(json_params, Mapping) and name not in json_params:
+            continue
+        if location == "form" and isinstance(body_params, Mapping) and name not in body_params:
+            continue
+        seen_locations.setdefault(name, set()).add(location)
+        source = {"query": "GET", "form": "POST", "json": "JSON"}[location]
+        observed.add((name, source, location))
+    if any(len(locations) != 1 for locations in seen_locations.values()):
+        return set()
+    return observed
+
+
 def _param_source(param: Mapping[str, Any]) -> str:
     source = str(param.get("source") or "").upper()
     if source:
         return source
     location = str(param.get("location") or "")
-    return {"query": "GET", "form": "POST", "body": "POST"}.get(location, "")
+    return {"query": "GET", "form": "POST", "body": "POST", "json": "JSON"}.get(location, "")
+
+
+def _param_location(param: Mapping[str, Any], source: str) -> str:
+    location = str(param.get("location") or "")
+    if location in {"query", "form", "json"}:
+        return location
+    return {"GET": "query", "POST": "form", "JSON": "json"}.get(source, "")
+
+
+def _security_name(name: str) -> bool:
+    lowered = name.lower()
+    return any(part in lowered for part in ("nonce", "cookie", "secret", "password", "token", "authorization"))
+
+
+def combine_final_seed_reports(paths: Sequence[Path], *, expected_count: int | None = None) -> dict[str, Any]:
+    if expected_count is not None and len(paths) != expected_count:
+        raise ValueError(f"expected {expected_count} final seed reports, got {len(paths)}")
+    combined: dict[str, Any] = {"suggested_seeds": []}
+    for path in paths:
+        payload = _read_json(Path(path))
+        items = payload.get("suggested_seeds") if isinstance(payload, Mapping) else None
+        if not isinstance(items, list):
+            raise ValueError(f"{path} must contain a suggested_seeds array")
+        combined["suggested_seeds"].extend(item for item in items if isinstance(item, Mapping))
+    return combined
+
+
+def list_convergence_targets(
+    raw_report: Mapping[str, Any],
+    *,
+    plugin_slug: str,
+    legacy_run_id: str,
+    generated_summary: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    items = raw_report.get("suggested_seeds", [])
+    if not isinstance(items, list):
+        raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
+    targets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    generated_keys: set[tuple[str, str, str]] | None = None
+    if generated_summary is not None:
+        rows = generated_summary.get("generated")
+        if not isinstance(rows, list):
+            raise ValueError("generated_config_summary.json must contain a generated array")
+        generated_keys = {_run_key(row) for row in rows if isinstance(row, Mapping)}
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        if generated_keys is not None and _seed_key(item) not in generated_keys:
+            continue
+        candidate = candidate_from_seed_item(item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
+        key = canonical_identity_id(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append({
+            "candidate_key": key,
+            "hook_name": str(item.get("hook_name") or ""),
+            "callback_id": str(item.get("callback_id") or ""),
+            "entrypoint_type": str(candidate.get("entrypoint_type") or ""),
+            "method": str(candidate.get("method") or ""),
+            "route": str(candidate.get("materialized_route") or candidate.get("route") or candidate.get("path") or ""),
+        })
+    return targets
 
 
 if __name__ == "__main__":

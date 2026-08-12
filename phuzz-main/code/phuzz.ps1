@@ -16,6 +16,8 @@ param(
     [int]$GeneratedConfigTimeoutSeconds = 30,
     [switch]$UseEntrypointPipeline,
     [switch]$UseZendDiscovery,
+    [ValidateRange(1, 30)]
+    [int]$ZendMaxIterations = 5,
     [ValidateRange(1, 20)]
     [int]$MaxHookDepth = 3,
     [ValidateRange(1, 300)]
@@ -64,6 +66,7 @@ Useful options:
   -GeneratedConfigTimeoutSeconds   Per generated-config run window. Default/max: 30.
   -UseEntrypointPipeline           Opt-in generated mode to the entrypoint pipeline.
   -UseZendDiscovery                Opt-in generated mode to two-pass Zend parameter enrichment.
+  -ZendMaxIterations <count>       Max Zend REST convergence iterations. Default: 5.
   -RecursiveInputFile <path>       Child-hook input artifact. Repeat for multiple files.
   -RecursiveHookCoverageDir <path> Hook coverage dir with requests/ for recursive validation.
   -RecursiveBaseUrl <url>          WordPress base URL for recursive validation. Default: http://localhost:8080.
@@ -715,6 +718,7 @@ switch ($Mode) {
         }
         if ($UseZendDiscovery) {
             $runnerParams["UseZendDiscovery"] = $true
+            $runnerParams["ZendMaxIterations"] = $ZendMaxIterations
         }
     }
     default {

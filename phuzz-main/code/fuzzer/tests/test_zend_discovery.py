@@ -34,7 +34,7 @@ from zend_discovery.convergence import (
     canonical_runtime_parameter_identity,
     materialize_convergence_seeds,
 )
-from hook_energy.seed_generation.zend_bridge_cli import converge_iteration
+from hook_energy.seed_generation.zend_bridge_cli import combine_final_seed_reports, converge_iteration, verify_pass2_contract
 from zend_discovery.source_materializer import materialize_plugin_source
 from zend_discovery.parameter_seeds import build_parameter_seed
 from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
@@ -1356,6 +1356,229 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual(result["request_id"], "request-0")
             self.assertEqual([row["name"] for row in result["new_parameters"]], ["name"])
             self.assertEqual(result["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]["body"]["name"], "FUZZ")
+
+    def test_convergence_iteration_filters_multi_candidate_input_by_candidate_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            first = self.raw_seed_item(callback_id="ajax-public", action="demo_fetch_items")
+            second = self.raw_seed_item(callback_id="ajax-write", action="demo_save_items")
+            first["pass1_request_id"] = "request-first"
+            second["pass1_request_id"] = "request-second"
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            for item, name in ((first, "name"), (second, "title")):
+                artifact_name = f"{item['pass1_request_id']}.json"
+                (uopz_dir / artifact_name).write_text(json.dumps(self.pass1_artifact_for_raw(item)), encoding="utf-8")
+                (zend_dir / artifact_name).write_text(json.dumps(self.zend_artifact_for_raw(item, name=name)), encoding="utf-8")
+            summary = {"legacy_run_id": "legacy-1", "runs": [
+                {
+                    "hook_name": first["hook_name"], "callback_id": first["callback_id"],
+                    "seed_variant_id": "", "callback_reached": True, "matched_artifact": "request-first.json",
+                },
+                {
+                    "hook_name": second["hook_name"], "callback_id": second["callback_id"],
+                    "seed_variant_id": "", "callback_reached": True, "matched_artifact": "request-second.json",
+                },
+            ]}
+            second_key = canonical_identity_id(candidate_from_seed_item(second, plugin_slug="demo-plugin", legacy_run_id="legacy-1"))
+
+            result = converge_iteration(
+                raw_report={"suggested_seeds": [first, second]}, pass_run_summary=summary,
+                pass_artifacts_dir=uopz_dir, zend_events_dir=zend_dir,
+                registry=prepare_callback_registry(self.registry(), "demo-plugin"),
+                plugin_slug="demo-plugin", legacy_run_id="legacy-1", known_state={"known_parameters": []},
+                candidate_key=second_key,
+            )
+
+            self.assertEqual(result["candidate_key"], second_key)
+            self.assertEqual(result["request_id"], "request-second")
+            self.assertEqual([row["name"] for row in result["new_parameters"]], ["title"])
+            self.assertEqual(len(result["merged_suggested_seeds"]["suggested_seeds"]), 1)
+
+    def test_convergence_iteration_does_not_converge_when_known_parameter_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            item = self.raw_seed_item()
+            item["pass1_request_id"] = "request-0"
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            (uopz_dir / "request-0.json").write_text(json.dumps(self.pass1_artifact_for_raw(item)), encoding="utf-8")
+            (zend_dir / "request-0.json").write_text(json.dumps(self.zend_artifact_for_raw(item, name="name")), encoding="utf-8")
+            known = [
+                {
+                    "name": "name", "path": ["name"], "source": "POST", "location": "form",
+                    "helper_depth": 0, "observed_count": 1, "evidence_kind": "zend_runtime",
+                    "fuzzable": True, "canonical_callback": "Demo::fetch",
+                },
+                {
+                    "name": "age", "path": ["age"], "source": "POST", "location": "form",
+                    "helper_depth": 0, "observed_count": 1, "evidence_kind": "zend_runtime",
+                    "fuzzable": True, "canonical_callback": "Demo::fetch",
+                },
+            ]
+            summary = {"legacy_run_id": "legacy-1", "runs": [{
+                "hook_name": item["hook_name"], "callback_id": item["callback_id"],
+                "seed_variant_id": "", "callback_reached": True, "matched_artifact": "request-0.json",
+            }]}
+
+            result = converge_iteration(
+                raw_report={"suggested_seeds": [item]}, pass_run_summary=summary,
+                pass_artifacts_dir=uopz_dir, zend_events_dir=zend_dir,
+                registry=prepare_callback_registry(self.registry(), "demo-plugin"),
+                plugin_slug="demo-plugin", legacy_run_id="legacy-1", known_state={"known_parameters": known},
+            )
+
+            self.assertEqual(result["status"], "REPLAY_FAILED")
+            self.assertEqual([row["name"] for row in result["missing_parameters"]], ["age"])
+
+    def test_pass2_verification_accepts_rest_json_runtime_evidence(self) -> None:
+        raw = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "rest",
+            "namespace": "demo/v1",
+            "route_pattern": "/items",
+            "endpoint_definition_index": 0,
+            "materialized_route": "/wp-json/demo/v1/items",
+            "callback_id": "rest-items",
+            "seed": {
+                "path": "/wp-json/demo/v1/items",
+                "method": "POST",
+                "auth_mode": "nopriv",
+                "headers": {"Content-Type": "application/json"},
+                "zend_canonical_callback": "Demo::list_items",
+                "input_params": [{
+                    "name": "filters", "path": ["filters"], "source": "JSON",
+                    "location": "json", "fuzzable": True, "evidence_kind": "zend_rest_runtime",
+                }],
+            },
+        }
+        candidate = candidate_from_seed_item(raw, plugin_slug="demo-plugin", legacy_run_id="legacy-1")
+        artifact = self.pass1_artifact(candidate, request_params={"json_params": {"filters": "redacted"}})
+        artifact.update({
+            "request_id": "rest-pass2",
+            "canonical_identity_id": canonical_identity_id(candidate),
+            "http_method": "POST",
+            "content_type": "application/json",
+            "hook_coverage": {"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+        })
+        zend = {
+            "schema_version": 4,
+            "run_id": "legacy-1",
+            "request_id": "rest-pass2",
+            "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "rest_parameter_events": [{
+                "callback": "Demo::list_items",
+                "namespace": "demo/v1",
+                "route_pattern": "/items",
+                "endpoint_definition_index": 0,
+                "materialized_route": "/wp-json/demo/v1/items",
+                "method": "POST",
+                "name": "filters",
+                "location": "json",
+                "observed_count": 1,
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            (uopz_dir / "rest-pass2.json").write_text(json.dumps(artifact), encoding="utf-8")
+            (zend_dir / "rest-pass2.json").write_text(json.dumps(zend), encoding="utf-8")
+
+            summary = verify_pass2_contract(
+                {"legacy_run_id": "legacy-1", "runs": [{
+                    "hook_name": "rest-items", "callback_id": "rest-items", "seed_variant_id": "",
+                    "callback_reached": True, "matched_artifact": "rest-pass2.json", "resolved_method": "POST",
+                }]},
+                {"suggested_seeds": [raw]},
+                zend_dir,
+                pass2_artifacts_dir=uopz_dir,
+            )
+
+            self.assertEqual(summary, {"accepted": 1, "total": 1})
+
+    def test_pass2_verification_rejects_rest_event_for_wrong_route(self) -> None:
+        raw = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "rest",
+            "namespace": "demo/v1",
+            "route_pattern": "/items",
+            "endpoint_definition_index": 0,
+            "materialized_route": "/wp-json/demo/v1/items",
+            "callback_id": "rest-items",
+            "seed": {
+                "path": "/wp-json/demo/v1/items",
+                "method": "POST",
+                "auth_mode": "nopriv",
+                "zend_canonical_callback": "Demo::list_items",
+                "input_params": [{
+                    "name": "filters", "path": ["filters"], "source": "JSON",
+                    "location": "json", "fuzzable": True, "evidence_kind": "zend_rest_runtime",
+                }],
+            },
+        }
+        candidate = candidate_from_seed_item(raw, plugin_slug="demo-plugin", legacy_run_id="legacy-1")
+        artifact = self.pass1_artifact(candidate, request_params={"json_params": {"filters": "redacted"}})
+        artifact.update({
+            "request_id": "rest-pass2",
+            "canonical_identity_id": canonical_identity_id(candidate),
+            "http_method": "POST",
+            "hook_coverage": {"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+        })
+        zend = {
+            "schema_version": 4,
+            "run_id": "legacy-1",
+            "request_id": "rest-pass2",
+            "request_method": "POST",
+            "rest_parameter_events": [{
+                "callback": "Demo::list_items",
+                "namespace": "demo/v1",
+                "route_pattern": "/other",
+                "endpoint_definition_index": 0,
+                "materialized_route": "/wp-json/demo/v1/other",
+                "method": "POST",
+                "name": "filters",
+                "location": "json",
+                "observed_count": 1,
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            (uopz_dir / "rest-pass2.json").write_text(json.dumps(artifact), encoding="utf-8")
+            (zend_dir / "rest-pass2.json").write_text(json.dumps(zend), encoding="utf-8")
+
+            summary = verify_pass2_contract(
+                {"legacy_run_id": "legacy-1", "runs": [{
+                    "hook_name": "rest-items", "callback_id": "rest-items", "seed_variant_id": "",
+                    "callback_reached": True, "matched_artifact": "rest-pass2.json", "resolved_method": "POST",
+                }]},
+                {"suggested_seeds": [raw]},
+                zend_dir,
+                pass2_artifacts_dir=uopz_dir,
+            )
+
+            self.assertEqual(summary, {"accepted": 0, "total": 1})
+
+    def test_combine_final_seed_reports_requires_every_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            first = root / "first.json"
+            second = root / "second.json"
+            first.write_text(json.dumps({"suggested_seeds": [self.raw_seed_item()]}), encoding="utf-8")
+            second.write_text(json.dumps({"suggested_seeds": [self.raw_seed_item(callback_id="ajax-write", action="demo_save_items")]}), encoding="utf-8")
+
+            combined = combine_final_seed_reports([first, second], expected_count=2)
+
+            self.assertEqual(len(combined["suggested_seeds"]), 2)
+            with self.assertRaises(ValueError):
+                combine_final_seed_reports([first], expected_count=2)
 
     def test_engine_has_no_legacy_runner_imports(self) -> None:
         engine_source = (FUZZER_DIR / "zend_discovery" / "engine.py").read_text(encoding="utf-8")

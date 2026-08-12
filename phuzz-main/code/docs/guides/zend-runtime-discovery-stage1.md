@@ -44,7 +44,17 @@ Bridge chi tao parameter neu co bang chung dong thoi tu:
 - exact Zend `callback_summaries.callback`
 - Zend parameter la direct top-level `$_GET['name']` hoac `$_POST['name']`
 
-Neu Pass 1 sinh chinh xac mot generated candidate, Phase 2 thay the legacy Pass 2 bang toi da ba replay-only convergence iterations. Moi iteration giu mot `candidate_key` canonical, nhung phai co `request_id` khac nhau. Chi Zend evidence cua matched artifact cung request ID duoc diff vao state; static extraction khong the them parameter. `new_parameters=[]` ghi `CONVERGED`; callback/correlation/replay failure ghi `REPLAY_FAILED`; hash config lap ghi `REPEATED_CONFIG`; sau iteration 2 van co parameter moi ghi `ITERATION_LIMIT`. Zero hoac nhieu hon mot candidate van dung Stage 1 bridge/Pass 2 cu.
+Neu Pass 1 sinh generated candidate, Phase 2 chay REST/Zend convergence theo tung
+`canonical_identity_id`. Moi target co `candidate_key` rieng va state doc lap. Identity
+gom plugin, REST route pattern/materialized route, method, auth variant, callback, va
+endpoint index. Chi Zend evidence cua matched artifact cung request ID duoc diff vao
+state; static extraction khong the them parameter.
+
+`CONVERGED` chi hop le khi replay hien tai duoc correlate, khong co runtime
+parameter moi, va moi runtime parameter da biet deu duoc quan sat lai trong run hien
+tai. Callback/correlation/replay failure ghi `REPLAY_FAILED`; hash config lap ghi
+`REPEATED_CONFIG`; het `-ZendMaxIterations` ma chua hoi tu ghi `ITERATION_LIMIT`.
+Zero generated candidate moi fallback ve legacy bridge cu.
 
 ## Scope Stage 1
 
@@ -57,12 +67,10 @@ Accepted:
 - `observed_count > 0`
 - exact canonical callback
 
-Rejected/fail closed:
+Rejected/fail closed for direct Stage 1:
 
 - `$_REQUEST`
 - `$_COOKIE`
-- REST/schema parameters
-- JSON body parameters
 - nested paths
 - helper-reader propagation
 - method-only evidence
@@ -94,14 +102,20 @@ bridge. This matters for `crm-perks-forms`:
 - The final fuzz config must fuzz `cfx_settings\\[alert_emails\\]`, not parent
   `cfx_settings`.
 
-REST `WP_REST_Request::get_param()` is handled by UOPZ:
+REST `WP_REST_Request::get_param()` is handled by UOPZ/Zend convergence:
 
-- UOPZ records value-free events such as
+- UOPZ records value-free request/callback artifacts.
+- Zend records value-free runtime events such as
   `{"accessor":"WP_REST_Request::get_param","name":"search"}`.
-- `rest_runtime.py` accepts GET/HEAD query evidence only when that name exists
-  in the same UOPZ artifact's `request_params.query_params`.
-- unrelated query keys are not promoted to evidence.
-- form and JSON remain fail closed until dedicated raw snapshots exist.
+- REST evidence is limited to `zend_rest_runtime`.
+- Accepted locations are `REST_QUERY`, `REST_FORM`, and `REST_JSON`.
+- Evidence must pass the same run/request/method/route/callback identity gates as
+  direct Zend evidence.
+- REST schema may guide JSON sentinel shape, but schema-only data cannot create a
+  fuzz parameter.
+- Security-looking parameter names, duplicate same-name multi-location evidence,
+  stale artifacts, wrong request IDs, wrong route/method, and missing callback
+  reachability fail closed.
 
 ## Runtime Evidence Contract
 
@@ -150,6 +164,11 @@ Check:
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/hookphuzz-callback-registry.json
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/zend_convergence_summary.json
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/iterations/<n>/state.json
+fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/targets/<candidate_key>/iterations/<n>/state.json
+fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/targets/<candidate_key>/current/
+fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/targets/<candidate_key>/final/
+fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/current/
+fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/final/
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/pass1-generated_config_summary.json
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/pass1-generated_config_run_summary.json
 fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/logs/pass1-uopz/
@@ -232,7 +251,7 @@ rtk python -c "import json; from pathlib import Path; base=Path('fuzzer/output/s
 
 ## Current Verified Proof
 
-Historical Stage 1 proof (not Phase 2 evidence):
+Historical Stage 1 proof:
 
 ```text
 legacy-20260812T070836Z-3f78d654
@@ -247,6 +266,24 @@ Proof summary:
 - Pass 2 Zend verification: `accepted=1 total=1`
 - forbidden marker scan: no `static_regex`, no `source_exact`, no `submitted`
 
+Current REST convergence implementation proof (2026-08-13):
+
+```powershell
+rtk powershell.exe -ExecutionPolicy Bypass -File phuzz-main/code/phuzz.ps1 -Mode generated -PluginSlug hookphuzz-rest-get-param-fixture -UseZendDiscovery -ZendMaxIterations 5 -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs -DryRun
+rtk python -m unittest fuzzer.tests.test_zend_discovery fuzzer.tests.test_generated_config_runner fuzzer.tests.test_phuzz_wrapper_contract -v
+rtk powershell.exe -NoProfile -Command "[void][System.Management.Automation.Language.Parser]::ParseFile('scripts/wordpress/run-wordpress-phuzz.ps1',[ref]`$null,[ref]`$null); [void][System.Management.Automation.Language.Parser]::ParseFile('phuzz.ps1',[ref]`$null,[ref]`$null); 'parser ok'"
+rtk python -m py_compile fuzzer/hook_energy/seed_generation/zend_bridge_cli.py fuzzer/zend_discovery/convergence.py
+rtk git diff --check -- phuzz-main/code/fuzzer/hook_energy/seed_generation/zend_bridge_cli.py phuzz-main/code/fuzzer/tests/test_generated_config_runner.py phuzz-main/code/fuzzer/tests/test_phuzz_wrapper_contract.py phuzz-main/code/fuzzer/tests/test_zend_discovery.py phuzz-main/code/phuzz.ps1 phuzz-main/code/scripts/wordpress/run-wordpress-phuzz.ps1 phuzz-main/code/docs/guides/zend-runtime-discovery-stage1.md
+```
+
+Result:
+
+- wrapper dry-run exits `0` and delegates `-UseZendDiscovery -ZendMaxIterations 5`
+- unittest scope exits `0`, `Ran 98 tests`, `OK`
+- PowerShell parser check exits `0`
+- Python bytecode compile exits `0`
+- scoped `git diff --check` exits `0`
+
 ## Regression Gate
 
 Before closing a Stage 1 change, run:
@@ -259,4 +296,6 @@ docker compose config -q
 git diff --check
 ```
 
-Do not treat HTTP 200, callback registration, or callback reachability alone as proof. Stage 1 pass requires correlated Zend runtime parameter evidence and Pass 2 re-observation.
+Do not treat HTTP 200, callback registration, schema-only data, or callback
+reachability alone as proof. Zend REST convergence pass requires correlated
+runtime parameter evidence and current replay re-observation.

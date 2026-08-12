@@ -21,6 +21,7 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"recursive\")]", script)
         self.assertIn("[string]$Mode", script)
         self.assertIn("[switch]$UseZendDiscovery", script)
+        self.assertIn("[int]$ZendMaxIterations = 5", script)
         self.assertIn("[switch]$DryRun", script)
         self.assertIn("[switch]$Help", script)
         self.assertIn("[switch]$RunRecursiveConfigs", script)
@@ -59,6 +60,7 @@ class PhuzzWrapperContractTests(unittest.TestCase):
                 "-Mode", "generated",
                 "-PluginSlug", "demo-plugin",
                 "-UseZendDiscovery",
+                "-ZendMaxIterations", "5",
                 "-DryRun",
             ],
             capture_output=True,
@@ -69,6 +71,7 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-RunGeneratedConfigs", result.stdout)
         self.assertIn("-UseZendDiscovery", result.stdout)
+        self.assertIn("-ZendMaxIterations 5", result.stdout)
         self.assertNotIn("-Mode zend-discovery", result.stdout)
 
     def test_guided_wrapper_rejects_zend_discovery_outside_generated_mode(self):

@@ -409,6 +409,7 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("[string]$PluginSlug = \"show-all-comments-in-one-page\"", script)
         self.assertIn("[ValidateRange(1, 30)]", script)
         self.assertIn("[int]$GeneratedConfigTimeoutSeconds = 30", script)
+        self.assertIn("[int]$ZendMaxIterations = 5", script)
         self.assertIn("$GeneratedConfigTimeoutSeconds", script)
         self.assertIn("fuzzer\\configs\\{0}.json", script)
         self.assertIn("fuzzer\\configs\\generated-config\\$PluginSlug", script)
@@ -436,17 +437,23 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("pass1-generated_config_run_summary.json", script)
         self.assertIn("zend_enriched_seeds.json", script)
         self.assertIn("zend_merged_suggested_seeds.json", script)
-        self.assertIn("Copy-Item -LiteralPath $mergedSeedsPath -Destination $finalMergedSuggestedSeeds -Force", script)
+        self.assertIn("--operation\", \"combine-final\"", script)
+        self.assertIn("Move-Item -LiteralPath $combinedTemp -Destination $finalMergedSuggestedSeeds -Force", script)
         self.assertIn("pass2-generated_config_run_summary.json", script)
         self.assertIn("mkdir -p /shared/opcode-events && chown www-data:www-data /shared/opcode-events", script)
         self.assertNotIn("zend-runner-summary", script)
 
-    def test_wordpress_runner_gates_phase2_to_one_candidate_and_preserves_stage1_fallback(self):
+    def test_wordpress_runner_converges_zend_candidates_independently_and_preserves_stage1_fallback(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
         script = script_path.read_text(encoding="utf-8-sig")
 
         self.assertIn("function Invoke-ZendConvergence", script)
-        self.assertIn("Phase 2 requires exactly one generated candidate", script)
+        self.assertIn("foreach ($candidate in @($targets))", script)
+        self.assertIn("--operation list-targets", script)
+        self.assertIn("--candidate-key $targetCandidateKey", script)
+        self.assertIn("$targetCurrentDir", script)
+        self.assertIn("$targetFinalDir", script)
+        self.assertNotIn("$zendCandidateCount -eq 1", script)
         self.assertIn("Invoke-ZendConvergence", script)
         self.assertIn("Invoke-ZendDiscoveryBridge", script)
         self.assertIn("Invoke-ZendPass2Verification", script)
