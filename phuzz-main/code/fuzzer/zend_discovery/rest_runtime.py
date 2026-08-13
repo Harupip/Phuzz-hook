@@ -6,6 +6,7 @@ from typing import Any
 
 
 _LOCATIONS = {"query": "REST_QUERY", "form": "REST_FORM", "json": "REST_JSON"}
+_BUCKET_LOCATIONS = {"GET": "query", "POST": "form", "JSON": "json"}
 _FORBIDDEN_PARAMETER_NAME = re.compile(
     r"(?:nonce|cookie|secret|password|token|authorization)", re.IGNORECASE
 )
@@ -72,10 +73,20 @@ def normalize_rest_parameter_events(
     locations_by_name: dict[str, set[str]] = {}
     seen: set[tuple[str, str]] = set()
     for event in transport_events:
-        if not isinstance(event, Mapping) or any(event.get(key) != value for key, value in expected.items()):
+        if not isinstance(event, Mapping) or str(event.get("callback") or "") != canonical_callback:
             continue
-        name = event.get("name")
-        location = str(event.get("location") or "")
+        if any(key in event and event.get(key) != value for key, value in expected.items() if key != "callback"):
+            continue
+        if event.get("source") == "REST":
+            bucket = str(event.get("bucket") or "").upper()
+            name = event.get("parameter")
+            location = _BUCKET_LOCATIONS.get(bucket, "")
+            path = event.get("path")
+            if isinstance(path, list) and path != [bucket, name]:
+                continue
+        else:
+            name = event.get("name")
+            location = str(event.get("location") or "")
         try:
             observed_count = int(event.get("observed_count") or 0)
         except (TypeError, ValueError):
@@ -93,7 +104,7 @@ def normalize_rest_parameter_events(
         ):
             continue
         seen.add((name, location))
-        accepted_events.append(event)
+        accepted_events.append({**event, "name": name, "location": location})
         locations_by_name.setdefault(name, set()).add(location)
     if any(len(locations) != 1 for locations in locations_by_name.values()):
         return []

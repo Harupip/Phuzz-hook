@@ -41,6 +41,7 @@ static const char *hookphuzz_source_name(hookphuzz_source source)
         case HOOKPHUZZ_SOURCE_POST: return "POST";
         case HOOKPHUZZ_SOURCE_REQUEST: return "REQUEST";
         case HOOKPHUZZ_SOURCE_COOKIE: return "COOKIE";
+        case HOOKPHUZZ_SOURCE_REST: return "REST";
     }
     return "UNKNOWN";
 }
@@ -528,6 +529,31 @@ static int hookphuzz_fetch_handler(zend_execute_data *execute_data)
     return ZEND_USER_OPCODE_DISPATCH;
 }
 
+static int hookphuzz_fetch_obj_r_handler(zend_execute_data *execute_data)
+{
+    const zend_op *opline = execute_data->opline;
+    const zval *property;
+    zval *object = NULL;
+
+    if (!HOOKPHUZZ_PHASE5_G(artifact_enabled)) return ZEND_USER_OPCODE_DISPATCH;
+    if (opline->op2_type != IS_CONST) return ZEND_USER_OPCODE_DISPATCH;
+    property = RT_CONSTANT(opline, opline->op2);
+    if (Z_TYPE_P(property) != IS_STRING || !zend_string_equals_literal(Z_STR_P(property), "params")) {
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+    if (opline->op1_type == IS_UNUSED) {
+        if (Z_TYPE(EX(This)) == IS_OBJECT) object = &EX(This);
+    } else {
+        object = zend_get_zval_ptr(opline, opline->op1_type, &opline->op1, execute_data);
+    }
+    if (object == NULL || Z_TYPE_P(object) != IS_OBJECT || Z_OBJCE_P(object)->name == NULL
+        || !zend_string_equals_literal(Z_OBJCE_P(object)->name, "WP_REST_Request")) {
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+    hookphuzz_set_provenance(execute_data, opline, HOOKPHUZZ_SOURCE_REST, NULL, 0);
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
 static int hookphuzz_fetch_dim_handler(zend_execute_data *execute_data, const char *operation)
 {
     const zend_op *opline = execute_data->opline;
@@ -822,8 +848,29 @@ static void hookphuzz_add_target_loading(zval *document)
 static void hookphuzz_add_rest_parameter_events(zval *document)
 {
     zval rest_events;
+    uint32_t index;
 
     array_init(&rest_events);
+    for (index = 0; index < HOOKPHUZZ_PHASE5_G(event_count); index++) {
+        const hookphuzz_event *event = &HOOKPHUZZ_PHASE5_G(events)[index];
+        zval rest_event, path;
+        if (event->source != HOOKPHUZZ_SOURCE_REST || event->depth != 2
+            || event->path[0].type != IS_STRING || event->path[1].type != IS_STRING
+            || strcmp(event->operation, "read") != 0 || !event->attributed) {
+            continue;
+        }
+        array_init(&rest_event);
+        add_assoc_string(&rest_event, "source", "REST");
+        add_assoc_str(&rest_event, "bucket", zend_string_copy(event->path[0].string_value));
+        add_assoc_str(&rest_event, "parameter", zend_string_copy(event->path[1].string_value));
+        add_assoc_str(&rest_event, "callback", zend_string_copy(event->root_callback));
+        add_assoc_long(&rest_event, "observed_count", 1);
+        array_init_size(&path, 2);
+        add_next_index_str(&path, zend_string_copy(event->path[0].string_value));
+        add_next_index_str(&path, zend_string_copy(event->path[1].string_value));
+        add_assoc_zval(&rest_event, "path", &path);
+        add_next_index_zval(&rest_events, &rest_event);
+    }
     add_assoc_zval(document, "rest_parameter_events", &rest_events);
 }
 
@@ -945,6 +992,7 @@ static void hookphuzz_flush_artifact(void)
 PHP_MINIT_FUNCTION(hookphuzz_opcode)
 {
     if (zend_get_user_opcode_handler(ZEND_FETCH_R) != NULL
+        || zend_get_user_opcode_handler(ZEND_FETCH_OBJ_R) != NULL
         || zend_get_user_opcode_handler(ZEND_FETCH_DIM_R) != NULL
         || zend_get_user_opcode_handler(ZEND_FETCH_IS) != NULL
         || zend_get_user_opcode_handler(ZEND_FETCH_DIM_IS) != NULL
@@ -952,6 +1000,7 @@ PHP_MINIT_FUNCTION(hookphuzz_opcode)
     REGISTER_INI_ENTRIES();
     zend_observer_fcall_register(hookphuzz_observer_init);
     if (zend_set_user_opcode_handler(ZEND_FETCH_R, hookphuzz_fetch_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_FETCH_OBJ_R, hookphuzz_fetch_obj_r_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_FETCH_DIM_R, hookphuzz_fetch_dim_r_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_FETCH_IS, hookphuzz_fetch_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_FETCH_DIM_IS, hookphuzz_fetch_dim_is_handler) != SUCCESS
@@ -962,6 +1011,7 @@ PHP_MINIT_FUNCTION(hookphuzz_opcode)
 PHP_MSHUTDOWN_FUNCTION(hookphuzz_opcode)
 {
     if (zend_get_user_opcode_handler(ZEND_FETCH_R) == hookphuzz_fetch_handler) zend_set_user_opcode_handler(ZEND_FETCH_R, NULL);
+    if (zend_get_user_opcode_handler(ZEND_FETCH_OBJ_R) == hookphuzz_fetch_obj_r_handler) zend_set_user_opcode_handler(ZEND_FETCH_OBJ_R, NULL);
     if (zend_get_user_opcode_handler(ZEND_FETCH_DIM_R) == hookphuzz_fetch_dim_r_handler) zend_set_user_opcode_handler(ZEND_FETCH_DIM_R, NULL);
     if (zend_get_user_opcode_handler(ZEND_FETCH_IS) == hookphuzz_fetch_handler) zend_set_user_opcode_handler(ZEND_FETCH_IS, NULL);
     if (zend_get_user_opcode_handler(ZEND_FETCH_DIM_IS) == hookphuzz_fetch_dim_is_handler) zend_set_user_opcode_handler(ZEND_FETCH_DIM_IS, NULL);
@@ -1036,7 +1086,7 @@ PHP_MINFO_FUNCTION(hookphuzz_opcode)
 {
     php_info_print_table_start();
     php_info_print_table_header(2, "hookphuzz_opcode support", "enabled");
-    php_info_print_table_row(2, "configured user opcodes", "ZEND_FETCH_R, ZEND_FETCH_DIM_R, ZEND_FETCH_IS, ZEND_FETCH_DIM_IS, ZEND_ISSET_ISEMPTY_DIM_OBJ");
+    php_info_print_table_row(2, "configured user opcodes", "ZEND_FETCH_R, ZEND_FETCH_OBJ_R, ZEND_FETCH_DIM_R, ZEND_FETCH_IS, ZEND_FETCH_DIM_IS, ZEND_ISSET_ISEMPTY_DIM_OBJ");
     php_info_print_table_row(2, "artifact output", HOOKPHUZZ_ARTIFACT_DIR);
     php_info_print_table_row(2, "event limit per request", "4096");
     php_info_print_table_end();

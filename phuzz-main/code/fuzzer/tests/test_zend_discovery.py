@@ -154,6 +154,84 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertEqual(evidence[0]["source"], "REST_QUERY")
         self.assertEqual(evidence[0]["canonical_callback"], "Demo::list_items")
 
+    def test_normalize_runtime_evidence_accepts_zend_rest_params_fetch_event(self) -> None:
+        candidate = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "rest",
+            "namespace": "demo/v1",
+            "route_pattern": "/items",
+            "endpoint_definition_index": 0,
+            "materialized_route": "/wp-json/demo/v1/items",
+            "callback_id": "rest-items",
+            "method": "GET",
+            "auth_mode": "nopriv",
+            "legacy_run_id": "legacy-1",
+            "pass1_request_id": "rest-request-zend-fetch",
+        }
+        uopz = self.pass1_artifact(
+            candidate,
+            hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+        )
+        registry = {"schema_version": 1, "callback_map": {"rest-items": "Demo::list_items"}}
+        zend = {
+            "schema_version": 4,
+            "run_id": "legacy-1",
+            "request_id": "rest-request-zend-fetch",
+            "request_method": "GET",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "rest_parameter_events": [{
+                "source": "REST",
+                "bucket": "GET",
+                "parameter": "search",
+                "path": ["GET", "search"],
+                "callback": "Demo::list_items",
+                "observed_count": 1,
+            }],
+        }
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual([(row["name"], row["source"], row["location"]) for row in evidence], [("search", "REST_QUERY", "query")])
+
+    def test_normalize_runtime_evidence_rejects_non_rest_fetch_event_shape(self) -> None:
+        candidate = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "rest",
+            "namespace": "demo/v1",
+            "route_pattern": "/items",
+            "endpoint_definition_index": 0,
+            "materialized_route": "/wp-json/demo/v1/items",
+            "callback_id": "rest-items",
+            "method": "GET",
+            "auth_mode": "nopriv",
+            "legacy_run_id": "legacy-1",
+            "pass1_request_id": "rest-request-zend-control",
+        }
+        uopz = self.pass1_artifact(
+            candidate,
+            hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+        )
+        registry = {"schema_version": 1, "callback_map": {"rest-items": "Demo::list_items"}}
+        base_zend = {
+            "schema_version": 4,
+            "run_id": "legacy-1",
+            "request_id": "rest-request-zend-control",
+            "request_method": "GET",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+        }
+        controls = [
+            {"source": "GET", "bucket": "GET", "parameter": "search", "callback": "Demo::list_items", "observed_count": 1},
+            {"source": "REST", "bucket": "GET", "parameter": "search", "observed_count": 1},
+            {"source": "REST", "bucket": "POST", "parameter": "search", "callback": "Demo::list_items", "observed_count": 1},
+        ]
+
+        for event in controls:
+            with self.subTest(event=event):
+                self.assertEqual(
+                    normalize_runtime_evidence(candidate, uopz, {**base_zend, "rest_parameter_events": [event]}, registry),
+                    [],
+                )
+
     def test_normalize_runtime_evidence_exports_only_uopz_observed_rest_query_parameter(self) -> None:
         candidate = {
             "plugin_slug": "demo-plugin",
@@ -1147,6 +1225,19 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertIn('"rest_parameter_events"', extension)
         self.assertNotIn("phase9", extension.lower())
 
+    def test_active_opcode_extension_tracks_wp_rest_request_params_fetch_obj(self) -> None:
+        extension = (
+            FUZZER_DIR
+            / "zend_discovery"
+            / "extension"
+            / "hookphuzz_opcode.c"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("ZEND_FETCH_OBJ_R", extension)
+        self.assertIn("WP_REST_Request", extension)
+        self.assertIn('"bucket"', extension)
+        self.assertIn('"parameter"', extension)
+
     def test_phase2_fixture_uses_direct_post_dimension_reads(self) -> None:
         fixture = FUZZER_DIR / "tests" / "fixtures" / "hookphuzz-entrypoint-direct-fixture" / "hookphuzz-entrypoint-direct-fixture.php"
         source = fixture.read_text(encoding="utf-8")
@@ -1173,7 +1264,9 @@ class ZendDiscoveryTests(unittest.TestCase):
         source = fixture.read_text(encoding="utf-8")
 
         self.assertIn("get_param('search')", source)
-        self.assertIn("register_rest_route('hookphuzz-rest-get-param/v1', '/search'", source)
+        self.assertIn("$foo->params['GET']['search']", source)
+        self.assertIn("$array['GET']['search']", source)
+        self.assertIn("register_rest_route('hookphuzz/v1', '/probe'", source)
         with zipfile.ZipFile(plugin_zip) as archive:
             self.assertTrue(all("\\" not in entry.filename for entry in archive.infolist()))
             self.assertIn("hookphuzz-rest-get-param-fixture/", archive.namelist())

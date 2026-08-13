@@ -15,7 +15,8 @@ typedef enum {
     HOOKPHUZZ_SOURCE_GET,
     HOOKPHUZZ_SOURCE_POST,
     HOOKPHUZZ_SOURCE_REQUEST,
-    HOOKPHUZZ_SOURCE_COOKIE
+    HOOKPHUZZ_SOURCE_COOKIE,
+    HOOKPHUZZ_SOURCE_REST
 } hookphuzz_source;
 
 typedef struct _hookphuzz_path_key {
