@@ -1,5 +1,67 @@
 # Zend Discovery Agent Handoff
 
+## 2026-08-14 REST Bucket And Precedence Handoff
+
+Current Zend opcode artifacts can now prove REST parameter provenance directly
+from `WP_REST_Request::$params` buckets beyond query-only GET.
+
+Runtime-proved bucket structure for the bundled WordPress 6.1.1 core:
+
+- `URL`
+- `GET`
+- `POST`
+- `FILES`
+- `JSON`
+- `defaults`
+
+Runtime-proved `WP_REST_Request::get_parameter_order()` precedence:
+
+- JSON requests: `JSON`, then `POST`, `GET`, `URL`, `defaults`.
+- Non-JSON body methods `POST`, `PUT`, `PATCH`, `DELETE`: `POST`, then
+  `GET`, `URL`, `defaults`.
+- GET without body: `GET`, then `URL`, `defaults`.
+
+Important implementation detail for future agents:
+
+- The extension still does not hard-code REST getter names or parameter names.
+- `WP_REST_Request::$params` root provenance is created from `FETCH_OBJ_R` and
+  `FETCH_OBJ_IS` against real `WP_REST_Request` objects.
+- Bucket and parameter provenance is carried by generic `FETCH_DIM_R`,
+  `FETCH_DIM_IS`, `ISSET_ISEMPTY_DIM_OBJ`, and `RETURN` propagation.
+- Callback attribution now resolves through the current Zend frame and, when a
+  user opcode fires inside an unobserved child frame, through the nearest active
+  observed ancestor frame.
+- Stale temp-var provenance is cleared when a result is overwritten by
+  non-provenanced property or dimension fetches. This prevents ordinary
+  `$foo->params` objects and normal arrays from inheriting REST state.
+
+Proved artifact-level REST events:
+
+- `REST | GET | search`
+- `REST | POST | email`
+- `REST | JSON | email`
+- `REST | URL | id`
+- `REST | defaults | mode`
+- nested JSON: `REST | JSON | filters[name]`
+- `get_param('id')` selected-bucket matrix:
+  `JSON`, `POST`, `GET`, `URL`, `defaults` as each higher-priority bucket is
+  removed.
+
+Do not confuse these artifact capabilities with config export policy. This
+change does not update config generation, seed generation, convergence,
+fuzzability rules for defaults, or downstream nested-path normalization.
+Those layers must continue to fail closed unless separately updated and
+runtime-proven.
+
+Verification commands used for this handoff:
+
+- `python -m unittest phuzz-main/code/fuzzer/tests/test_zend_discovery.py`
+- `python -m unittest discover -s phuzz-main/code/fuzzer/tests -p "test_*.py"`
+- `docker build -f phuzz-main/code/web/Dockerfile.zend -t hookphuzz-rest-bucket-proof:current .`
+- Docker WordPress runtime proof with request IDs `rbp-final7-*`
+- VLD proof for REST bucket getters and `get_param()` precedence
+- `git diff --check`
+
 ## 2026-08-13 Mainline Handoff
 
 Current committed path is the mainline port of the proved REST and CRM runtime
@@ -8,8 +70,9 @@ work. It is intentionally narrow:
 - Zend C source is owned here under `zend_discovery/extension/`.
 - The extension is named `hookphuzz_opcode`, not `hookphuzz_opcode_phase9`.
 - Runtime registry path is `/shared/hookphuzz-callback-registry.json`.
-- REST `WP_REST_Request::get_param()` observation is produced by UOPZ, not by
-  new C method-call instrumentation.
+- REST `WP_REST_Request::get_param()` selected-bucket observation is produced
+  by Zend opcode provenance on `WP_REST_Request::$params`, not by new
+  method-specific C hooks.
 - CRM generated replay keeps the static nested leaf
   `cfx_settings[alert_emails]` when Zend observes runtime parent
   `cfx_settings`.
@@ -86,7 +149,9 @@ Legacy bridge state:
 
 - Do not import, copy, execute, or depend on `research/hookphuzz-opcode/phase10` through `phase13`.
 - Do not move REST decision logic back into `hook_energy`.
-- Do not claim query/form/json location from method, route, schema, or `WP_REST_Request::get_param()` name alone.
+- Do not claim query/form/json/url/default location from method, route, schema,
+  or `WP_REST_Request::get_param()` name alone. Require current-run selected
+  bucket provenance.
 - Keep `legacy_run_id` as batch identity.
 - Keep `X-Fuzzer-Covid` as fresh per-request identity.
 - Export fuzz configs only after current-run callback, request/run, route, and method correlation.
@@ -107,10 +172,20 @@ Accepted REST evidence is value-free and must include:
 - parameter `name`
 - proven `location`
 
-Allowed locations:
+Currently proven Zend artifact buckets:
+
+- `GET`
+- `POST`
+- `JSON`
+- `URL`
+- `defaults`
+
+Current config-export locations remain narrower than artifact support:
 
 - `GET` and `HEAD`: query only.
 - `POST`: query, form, or json.
+- `URL`, `defaults`, and nested paths are evidence only until their downstream
+  semantics are implemented and separately tested.
 
 Blocked cases:
 
@@ -118,22 +193,19 @@ Blocked cases:
 - wrong callback, route, endpoint index, or method
 - duplicate key across multiple locations
 - ambiguous location
-- nested path/key shape
 - auth/security-looking parameter names
 - schema-only proof
-- `get_param` name-only proof unless it is correlated with the same UOPZ
-  request artifact and the exact name exists in raw `query_params`
+- `get_param` name-only proof without selected bucket provenance
 
-Current accepted REST `get_param()` scope:
+Current Zend REST `get_param()` artifact scope:
 
-- GET/HEAD query only.
-- UOPZ event must be value-free:
-  `{"accessor":"WP_REST_Request::get_param","name":"search"}`.
-- `rest_runtime.py` joins that event with
-  `uopz_artifact.request_params.query_params`.
-- unrelated raw query keys stay excluded.
-- missing event, duplicate event, missing snapshot key, nested/security-looking
-  name, form, and JSON still fail closed.
+- Direct `get_param()` can emit the bucket actually returned by WordPress
+  precedence, not every bucket checked along the way.
+- Intermediate core probes can exist with `callback_context.attributed=false`;
+  only callback-attributed terminal `rest_parameter_events` should be treated as
+  selected evidence.
+- Negative controls with ordinary `$foo->params` objects and normal arrays must
+  emit zero REST events.
 
 ## Seed Materialization
 
@@ -185,6 +257,7 @@ Current CF7 REST status: `BLOCKED`, because there is no fresh authenticated call
 
 1. Make legacy generated seed export select first-class CF7 REST route candidates instead of only the `rest_api_init` closure row.
 2. Add current-run artifact test for `rest_route:contact-form-7/v1/contact-forms` route metadata from UOPZ registration.
-3. Extend REST runtime only after adding raw snapshots for form/JSON; GET/query is the only accepted `get_param()` scope now.
+3. Extend downstream config/export handling for URL, defaults, and nested REST
+   paths only after separate runtime proof and policy decisions.
 4. Re-run `-Mode generated -PluginSlug contact-form-7 -UseZendDiscovery` with bounded timeouts.
 5. Report PASS only if Pass 2 re-observes the same correlated REST parameter evidence with fresh request ids.

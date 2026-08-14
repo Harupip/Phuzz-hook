@@ -1238,6 +1238,27 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertIn('"bucket"', extension)
         self.assertIn('"parameter"', extension)
 
+    def test_active_opcode_extension_propagates_provenance_across_function_returns(self) -> None:
+        extension = (
+            FUZZER_DIR
+            / "zend_discovery"
+            / "extension"
+            / "hookphuzz_opcode.c"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("ZEND_RETURN", extension)
+        self.assertIn("ZEND_RETURN_BY_REF", extension)
+        self.assertIn("prev_execute_data", extension)
+        self.assertIn("hookphuzz_propagate_return_provenance", extension)
+        self.assertIn("hookphuzz_clear_provenance_for_result", extension)
+        self.assertIn("hookphuzz_clear_provenance_for_opline_result", extension)
+        self.assertIn("hookphuzz_release_provenance();", extension)
+        self.assertIn("if (provenance == NULL)", extension)
+        self.assertIn("cursor = execute_data == NULL ? NULL : execute_data->prev_execute_data", extension)
+        self.assertIn("frame = &HOOKPHUZZ_G(contexts)[HOOKPHUZZ_G(context_count) - 1]", extension)
+        self.assertNotIn("get_query_params", extension)
+        self.assertNotIn("get_param", extension)
+
     def test_phase2_fixture_uses_direct_post_dimension_reads(self) -> None:
         fixture = FUZZER_DIR / "tests" / "fixtures" / "hookphuzz-entrypoint-direct-fixture" / "hookphuzz-entrypoint-direct-fixture.php"
         source = fixture.read_text(encoding="utf-8")
@@ -1264,6 +1285,9 @@ class ZendDiscoveryTests(unittest.TestCase):
         source = fixture.read_text(encoding="utf-8")
 
         self.assertIn("get_param('search')", source)
+        self.assertIn("get_query_params()['search']", source)
+        self.assertIn("get_param('filters')['name']", source)
+        self.assertIn("normal_array()['GET']['search']", source)
         self.assertIn("$foo->params['GET']['search']", source)
         self.assertIn("$array['GET']['search']", source)
         self.assertIn("register_rest_route('hookphuzz/v1', '/probe'", source)
