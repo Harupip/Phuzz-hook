@@ -1550,6 +1550,57 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual(result["status"], "REPLAY_FAILED")
             self.assertEqual([row["name"] for row in result["missing_parameters"]], ["age"])
 
+    def test_pass2_verification_accepts_nested_form_leaf_when_zend_observes_parent(self) -> None:
+        raw = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "ajax_authenticated",
+            "callback_id": "cb-1",
+            "hook_name": "wp_ajax_save_settings",
+            "seed": {
+                "path": "/wp-admin/admin-ajax.php",
+                "method": "POST",
+                "auth_mode": "authenticated",
+                "zend_canonical_callback": "Demo::save_settings",
+                "input_params": [{
+                    "name": "settings[email]",
+                    "path": ["settings[email]"],
+                    "source": "POST",
+                    "location": "form",
+                    "fuzzable": True,
+                    "evidence_kind": "zend_runtime",
+                }],
+            },
+        }
+        zend = {
+            "schema_version": 4,
+            "run_id": "legacy-1",
+            "request_id": "ajax-pass2",
+            "method": "POST",
+            "callback_summaries": [{
+                "callback": "Demo::save_settings",
+                "unique_parameters": [{
+                    "source": "POST",
+                    "path": ["settings"],
+                    "helper_depth": 0,
+                    "observed_count": 1,
+                }],
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zend_dir = Path(tmp_dir)
+            (zend_dir / "ajax-pass2.json").write_text(json.dumps(zend), encoding="utf-8")
+
+            summary = verify_pass2_contract(
+                {"legacy_run_id": "legacy-1", "runs": [{
+                    "hook_name": "wp_ajax_save_settings", "callback_id": "cb-1", "seed_variant_id": "",
+                    "callback_reached": True, "matched_artifact": "ajax-pass2.json", "resolved_method": "POST",
+                }]},
+                {"suggested_seeds": [raw]},
+                zend_dir,
+            )
+
+            self.assertEqual(summary, {"accepted": 1, "total": 1})
+
     def test_pass2_verification_accepts_rest_json_runtime_evidence(self) -> None:
         raw = {
             "plugin_slug": "demo-plugin",

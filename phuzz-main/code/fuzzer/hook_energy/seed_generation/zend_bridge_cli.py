@@ -436,9 +436,37 @@ def verify_pass2_contract(
             canonical_callback,
             rest_identity=want.get("rest_identity") if isinstance(want, Mapping) else None,
         )
-        if want_params <= observed:
+        if _expected_params_observed(want_params, observed):
             accepted += 1
     return {"accepted": accepted, "total": total}
+
+
+def _expected_params_observed(
+    want_params: set[tuple[str, str, str]],
+    observed: set[tuple[str, str, str]],
+) -> bool:
+    return all(_expected_param_observed(param, observed) for param in want_params)
+
+
+def _expected_param_observed(
+    param: tuple[str, str, str],
+    observed: set[tuple[str, str, str]],
+) -> bool:
+    if param in observed:
+        return True
+    name, source, location = param
+    if source == "POST" and location == "form":
+        parent = _bracket_parent_name(name)
+        if parent and (parent, source, location) in observed:
+            return True
+    return False
+
+
+def _bracket_parent_name(name: str) -> str:
+    bracket = name.find("[")
+    if bracket <= 0 or not name.endswith("]"):
+        return ""
+    return name[:bracket]
 
 
 def _expected_pass2_params(merged_seed_report: Mapping[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
