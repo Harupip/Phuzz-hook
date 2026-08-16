@@ -1,5 +1,112 @@
 # Zend Discovery Agent Handoff
 
+## 2026-08-17 Real Plugin Counterexample Handoff
+
+Stop adding synthetic REST fixtures for now. The current direction is real
+plugin counterexample testing.
+
+### CRM milestone
+
+`crm-perks-forms` is `PASS_WITH_FIX`.
+
+Fresh proof:
+
+- run ID: `legacy-20260817T004522Z-9309b5d7`
+- convergence: `CONVERGED`
+- final replay: `callback_reached=1 total=1`
+- Pass 2 verifier: `accepted=1 total=1`
+
+The CRM failure boundary was `J Pass2 verification`. The generic primitive is:
+
+- A nested POST form leaf such as `cfx_settings[alert_emails]` can be accepted
+  when the generated config expects the leaf and current Zend runtime observes
+  the parent `cfx_settings`.
+
+This is implemented by the committed generic verifier fix, not by a
+CRM-specific exception.
+
+### Booking Calendar root cause
+
+`booking-calendar` 3.2.36 did not initially reach Zend. The failure was before
+Zend, in the generated Pass 1 runner:
+
+- Pass 1 had a mixed batch: `6/9 callback_reached`,
+  `3/9 registered_not_executed`.
+- `generated_config_runner.py` treated the whole batch as failed unless every
+  generated config reached its callback.
+- `run-wordpress-phuzz.ps1` threw on that nonzero exit before
+  `Invoke-ZendConvergence`, so the 6 reachable candidates never entered Zend.
+
+There was also an auth/session routing issue:
+
+- The 3 non-reaching rows were `wp_ajax_nopriv_*` callbacks.
+- They were replayed in an authenticated context, so WordPress selected the
+  authenticated `wp_ajax_*` twin action instead of the expected
+  `wp_ajax_nopriv_*` callback.
+- This is an auth/session mismatch, not a Zend failure.
+
+### Implemented resolution
+
+The generated Pass 1 runner now has an opt-in Zend mode:
+
+- `--allow-partial-callback-reach`
+- success requires no `process_failed`, no `runner_error`, and at least one
+  `callback_reached`
+- old all-callbacks-reached behavior remains the default
+- `run-wordpress-phuzz.ps1` enables this only under `-UseZendDiscovery`
+
+Zend convergence target selection now uses the Pass 1 run summary and includes
+only rows where `callback_reached=true`. Rows such as
+`registered_not_executed` stay visible in the summary but are not sent into
+Zend convergence.
+
+Auth routing now preserves `auth_mode` into generated runner rows. For
+`auth_mode=unauth-capable` or `wp_ajax_nopriv_*`, the runner passes
+`HOOKPHUZZ_DISABLE_AUTH_COOKIES=1`, and the fuzzer skips login cookie injection
+and strips WordPress auth cookies before preparing the request.
+
+Windows runner hardening needed for these real plugin runs:
+
+- Zend convergence uses short target directory names such as `t0`, `t1`, ...
+  instead of 64-byte candidate hashes in deep paths.
+- snapshot temp paths use short `.tmp` / `.old` suffixes.
+- hashing uses a .NET SHA256 helper instead of assuming `Get-FileHash` exists.
+
+### Booking Calendar current result
+
+Fresh booking run:
+
+- run ID: `legacy-20260817T004926Z-bc54222e`
+- Pass 1: `callback_reached=6`, `registered_not_executed=3`, `total=9`
+- Zend target count: 6
+- all 6 Zend targets reached `CONVERGED` in 2 iterations
+
+Current first failing boundary is `G replay/reachability`, after Zend
+convergence:
+
+- final combined replay timed out on
+  `wp_ajax_wpdevart_add_extra_field_item-a60774eb65ebb5d3bbcbee86098e4220268786ab-post`
+  with `-GeneratedConfigTimeoutSeconds 8`
+- the timeout cleanup command `docker rm -f ...` also timed out, so
+  `final-generated_config_run_summary.json` was not written
+
+Do not expand REST synthetic fixtures for this. The next investigation should
+stay on this real plugin boundary:
+
+1. Rerun the final replay with a larger generated-config timeout to separate
+   slow callback execution from a true reachability regression.
+2. Make timeout cleanup fail closed by recording a `window_elapsed` row even if
+   Docker cleanup times out.
+3. If the candidate still does not reach after a sane timeout, classify it under
+   `G replay/reachability` or `H auth/nonce` using the exact final replay
+   artifact.
+
+Verification already run for the current committed fix:
+
+- `rtk python -m unittest phuzz-main/code/fuzzer/tests/test_generated_config_runner.py`
+- `rtk python -m unittest phuzz-main/code/fuzzer/tests/test_zend_discovery.py`
+- `rtk git diff --check`
+
 ## 2026-08-14 REST Bucket And Precedence Handoff
 
 Current Zend opcode artifacts can now prove REST parameter provenance directly
