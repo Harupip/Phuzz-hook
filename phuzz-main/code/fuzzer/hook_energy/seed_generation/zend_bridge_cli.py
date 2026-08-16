@@ -185,11 +185,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Zend final seed reports combined: total={len(combined['suggested_seeds'])}")
             return 0
         if args.operation == "list-targets":
-            _require(args, "raw_suggested_seeds", "plugin_slug", "legacy_run_id", "targets_output")
+            _require(args, "raw_suggested_seeds", "plugin_slug", "legacy_run_id", "pass1_run_summary", "targets_output")
             targets = list_convergence_targets(
                 _read_json(Path(args.raw_suggested_seeds)),
                 plugin_slug=args.plugin_slug,
                 legacy_run_id=args.legacy_run_id,
+                pass_run_summary=_read_json(Path(args.pass1_run_summary)),
                 generated_summary=_read_json(Path(args.generated_config_summary)) if args.generated_config_summary else None,
             )
             _write_json(Path(args.targets_output), {"targets": targets})
@@ -359,7 +360,10 @@ def _filter_iteration_inputs(
         and canonical_identity_id(candidate_from_seed_item(item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)) == candidate_key
     ]
     selected_keys = {_seed_key(item) for item in selected}
-    filtered_rows = [row for row in rows if isinstance(row, Mapping) and _run_key(row) in selected_keys]
+    filtered_rows = [
+        row for row in rows
+        if isinstance(row, Mapping) and row.get("callback_reached") is True and _run_key(row) in selected_keys
+    ]
     raw_copy = deepcopy(dict(raw_report))
     summary_copy = deepcopy(dict(pass_run_summary))
     raw_copy["suggested_seeds"] = selected
@@ -629,6 +633,7 @@ def list_convergence_targets(
     *,
     plugin_slug: str,
     legacy_run_id: str,
+    pass_run_summary: Mapping[str, Any] | None = None,
     generated_summary: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     items = raw_report.get("suggested_seeds", [])
@@ -642,10 +647,22 @@ def list_convergence_targets(
         if not isinstance(rows, list):
             raise ValueError("generated_config_summary.json must contain a generated array")
         generated_keys = {_run_key(row) for row in rows if isinstance(row, Mapping)}
+    reached_keys: set[tuple[str, str, str]] | None = None
+    if pass_run_summary is not None:
+        rows = pass_run_summary.get("runs")
+        if not isinstance(rows, list):
+            raise ValueError("generated_config_run_summary.json must contain a runs array")
+        reached_keys = {
+            _run_key(row)
+            for row in rows
+            if isinstance(row, Mapping) and row.get("callback_reached") is True
+        }
     for item in items:
         if not isinstance(item, Mapping):
             continue
         if generated_keys is not None and _seed_key(item) not in generated_keys:
+            continue
+        if reached_keys is not None and _seed_key(item) not in reached_keys:
             continue
         candidate = candidate_from_seed_item(item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
         key = canonical_identity_id(candidate)

@@ -43,10 +43,12 @@ def completed(returncode):
     return subprocess.CompletedProcess(["docker"], returncode, "", "")
 
 
-def generated_config(slug="generated-hooks/one", hook_name="wp_ajax_nopriv_demo", callback_id="cb-one", entrypoint_type=None):
+def generated_config(slug="generated-hooks/one", hook_name="wp_ajax_nopriv_demo", callback_id="cb-one", entrypoint_type=None, auth_mode=None):
     row = {"config_slug": slug, "hook_name": hook_name, "callback_id": callback_id}
     if entrypoint_type:
         row["entrypoint_type"] = entrypoint_type
+    if auth_mode:
+        row["auth_mode"] = auth_mode
     return row
 
 
@@ -104,6 +106,7 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                                 "method_confidence": "route_declared",
                                 "route_declared_methods": ["PATCH"],
                                 "seed_variant_id": "rest-patch",
+                                "auth_mode": "unauth-capable",
                             },
                         ]
                     }
@@ -126,6 +129,7 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                         "method_confidence": "route_declared",
                         "route_declared_methods": ["PATCH"],
                         "seed_variant_id": "rest-patch",
+                        "auth_mode": "unauth-capable",
                     },
                 ],
             )
@@ -193,6 +197,38 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         for command in runner.commands:
             self.assertIn("-e", command)
             self.assertIn("HOOKPHUZZ_LEGACY_RUN_ID=legacy-123", command)
+
+    def test_unauth_capable_config_disables_auth_cookies(self):
+        runner = FakeRunner([completed(0), completed(0)])
+        artifacts = FakeArtifacts([set(), set(), set(), set()], {})
+
+        run_generated_configs(
+            [
+                generated_config(auth_mode="unauth-capable"),
+                generated_config("generated-hooks/auth", "wp_ajax_demo", "cb-auth", auth_mode="authenticated"),
+            ],
+            timeout_seconds=5,
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=artifacts.load,
+        )
+
+        self.assertIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES=1", runner.commands[0])
+        self.assertNotIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES=1", runner.commands[1])
+
+    def test_nopriv_hook_disables_auth_cookies_without_auth_mode(self):
+        runner = FakeRunner([completed(0)])
+        artifacts = FakeArtifacts([set(), set()], {})
+
+        run_generated_configs(
+            [generated_config(hook_name="wp_ajax_nopriv_demo")],
+            timeout_seconds=5,
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=artifacts.load,
+        )
+
+        self.assertIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES=1", runner.commands[0])
 
     def test_stop_on_vuln_exit_is_recorded_as_vuln_found_not_failed(self):
         runner = FakeRunner([completed(57)])
@@ -368,6 +404,71 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
             self.assertEqual(validation['summary']['total'], 0)
             self.assertEqual(validation['validations'], [])
 
+    def test_main_allows_partial_callback_reach_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "generated_config_summary.json"
+            output = root / "generated_config_run_summary.json"
+            source.write_text(json.dumps({"generated": [generated_config(str(index)) for index in range(9)]}), encoding="utf-8")
+            report = {
+                "runs": [],
+                "counts": {
+                    "total": 9,
+                    "process_failed": 0,
+                    "runner_error": 0,
+                    "callback_reached": 6,
+                    "vuln_found": 0,
+                },
+            }
+
+            with patch("hook_energy.seed_generation.generated_config_runner.run_generated_configs", return_value=report):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = main(
+                        [
+                            "--generated-config-summary",
+                            str(source),
+                            "--output-file",
+                            str(output),
+                            "--timeout-seconds",
+                            "5",
+                            "--allow-partial-callback-reach",
+                        ]
+                    )
+
+            self.assertEqual(result, 0)
+
+    def test_main_requires_all_callbacks_without_partial_flag(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "generated_config_summary.json"
+            output = root / "generated_config_run_summary.json"
+            source.write_text(json.dumps({"generated": [generated_config(str(index)) for index in range(9)]}), encoding="utf-8")
+            report = {
+                "runs": [],
+                "counts": {
+                    "total": 9,
+                    "process_failed": 0,
+                    "runner_error": 0,
+                    "callback_reached": 6,
+                    "vuln_found": 0,
+                },
+            }
+
+            with patch("hook_energy.seed_generation.generated_config_runner.run_generated_configs", return_value=report):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = main(
+                        [
+                            "--generated-config-summary",
+                            str(source),
+                            "--output-file",
+                            str(output),
+                            "--timeout-seconds",
+                            "5",
+                        ]
+                    )
+
+            self.assertEqual(result, 1)
+
     def test_main_returns_two_for_malformed_summary(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             source = Path(tmp_dir) / "generated_config_summary.json"
@@ -428,6 +529,7 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("--output-file", script)
         self.assertIn("--timeout-seconds", script)
         self.assertIn("--legacy-run-id", script)
+        self.assertIn("--allow-partial-callback-reach", script)
 
     def test_wordpress_runner_has_legacy_owned_zend_two_pass_bridge(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
@@ -449,17 +551,30 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
 
         self.assertIn("function Invoke-ZendConvergence", script)
         self.assertIn("foreach ($candidate in @($targets))", script)
+        self.assertIn('$targetDirName = "t$targetIndex"', script)
+        self.assertIn('Add-Member -NotePropertyName "target_dir_name"', script)
         self.assertIn("--operation list-targets", script)
         self.assertIn("--candidate-key $targetCandidateKey", script)
+        self.assertIn("function Get-HookPhuzzFileSha256", script)
+        self.assertIn("Get-HookPhuzzFileSha256 -LiteralPath $configPath", script)
         self.assertIn("$targetCurrentDir", script)
         self.assertIn("$targetFinalDir", script)
         self.assertNotIn("$zendCandidateCount -eq 1", script)
         self.assertIn("Invoke-ZendConvergence", script)
         self.assertIn("Invoke-ZendDiscoveryBridge", script)
         self.assertIn("Invoke-ZendPass2Verification", script)
+        self.assertIn("--pass1-run-summary $InitialRunSummary", script)
         self.assertIn("candidate_key", script)
         self.assertIn("REPLAY_FAILED", script)
         self.assertIn("REPEATED_CONFIG", script)
+
+    def test_fuzzer_can_disable_wordpress_auth_cookies_for_nopriv_replay(self):
+        fuzzer_path = FUZZER_DIR / "fuzzer.py"
+        source = fuzzer_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES", source)
+        self.assertIn("wordpress_logged_in_", source)
+        self.assertIn("wordpress_sec_", source)
 
     def test_zend_artifact_copy_uses_only_callback_matched_request(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"

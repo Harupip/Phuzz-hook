@@ -34,7 +34,7 @@ from zend_discovery.convergence import (
     canonical_runtime_parameter_identity,
     materialize_convergence_seeds,
 )
-from hook_energy.seed_generation.zend_bridge_cli import combine_final_seed_reports, converge_iteration, verify_pass2_contract
+from hook_energy.seed_generation.zend_bridge_cli import combine_final_seed_reports, converge_iteration, list_convergence_targets, verify_pass2_contract
 from zend_discovery.source_materializer import materialize_plugin_source
 from zend_discovery.parameter_seeds import build_parameter_seed
 from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
@@ -1512,6 +1512,30 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual(result["request_id"], "request-second")
             self.assertEqual([row["name"] for row in result["new_parameters"]], ["title"])
             self.assertEqual(len(result["merged_suggested_seeds"]["suggested_seeds"]), 1)
+
+    def test_convergence_targets_include_only_callback_reached_rows(self) -> None:
+        first = self.raw_seed_item(callback_id="ajax-public", action="demo_fetch_items")
+        second = self.raw_seed_item(callback_id="ajax-write", action="demo_save_items")
+        run_summary = {"runs": [
+            {
+                "hook_name": first["hook_name"], "callback_id": first["callback_id"],
+                "seed_variant_id": "", "callback_reached": True,
+            },
+            {
+                "hook_name": second["hook_name"], "callback_id": second["callback_id"],
+                "seed_variant_id": "", "callback_reached": False,
+                "validation_status": "registered_not_executed",
+            },
+        ]}
+
+        targets = list_convergence_targets(
+            {"suggested_seeds": [first, second]},
+            plugin_slug="demo-plugin",
+            legacy_run_id="legacy-1",
+            pass_run_summary=run_summary,
+        )
+
+        self.assertEqual([row["callback_id"] for row in targets], ["ajax-public"])
 
     def test_convergence_iteration_does_not_converge_when_known_parameter_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

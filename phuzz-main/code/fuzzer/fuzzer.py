@@ -238,7 +238,7 @@ class Fuzzer:
         # Make sure that 'print_timestamps' is set
         self.config['print_timestamps'] = self.config.get('print_timestamps', False)
 
-        if "login" in self.config and self.config["login"]:
+        if "login" in self.config and self.config["login"] and not self._disable_auth_cookies():
             login_cookies = self.login()
             for k,v in login_cookies.items():
                 if 'cookies' in self.config and 'login' in self.config['cookies']:
@@ -514,6 +514,8 @@ class Fuzzer:
         the_params = {**query, **candidate.fuzz_params['query_params'], **candidate.fixed_params['query_params']}
         the_body_params = {**candidate.fuzz_params['body_params'], **candidate.fixed_params['body_params']}
         the_cookies = {**candidate.fuzz_params['cookies'], **candidate.fixed_params['cookies']} # self._urlencode_dict()
+        if self._disable_auth_cookies():
+            the_cookies = self._without_auth_cookies(the_cookies)
         the_headers = {**candidate.fuzz_params['headers'], **candidate.fixed_params['headers']}
         the_headers["X-Fuzzer-Covid"] = candidate.coverage_id
         the_headers["X-HookPhuzz-Request-ID"] = candidate.coverage_id
@@ -558,6 +560,15 @@ class Fuzzer:
         prepared = req.prepare()
 
         return prepared
+
+    def _disable_auth_cookies(self):
+        return os.environ.get("HOOKPHUZZ_DISABLE_AUTH_COOKIES", "") == "1"
+
+    def _without_auth_cookies(self, cookies):
+        return {
+            name: value for name, value in cookies.items()
+            if not str(name).startswith(("wordpress_logged_in_", "wordpress_sec_"))
+        }
 
     def run(self):
         self.load_request_data()

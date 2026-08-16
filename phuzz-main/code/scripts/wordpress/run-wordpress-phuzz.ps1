@@ -62,6 +62,22 @@ function Invoke-Compose {
     }
 }
 
+function Get-HookPhuzzFileSha256 {
+    param([string]$LiteralPath)
+
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return (($sha.ComputeHash($stream) | ForEach-Object { $_.ToString("x2") }) -join "").ToUpperInvariant()
+        } finally {
+            $sha.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function New-PluginOverrideFile {
     param(
         [string]$PluginSlug,
@@ -553,8 +569,14 @@ function Publish-ZendDirectorySnapshot {
     }
     $parent = Split-Path -Parent $TargetDir
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
-    $tempDir = "$TargetDir.tmp.$([guid]::NewGuid().ToString('N'))"
-    $oldDir = "$TargetDir.old.$([guid]::NewGuid().ToString('N'))"
+    $tempDir = "$TargetDir.tmp"
+    $oldDir = "$TargetDir.old"
+    if (Test-Path -LiteralPath $tempDir) {
+        Remove-Item -LiteralPath $tempDir -Recurse -Force
+    }
+    if (Test-Path -LiteralPath $oldDir) {
+        Remove-Item -LiteralPath $oldDir -Recurse -Force
+    }
     Copy-Item -LiteralPath $SourceDir -Destination $tempDir -Recurse -Force
     try {
         if (Test-Path -LiteralPath $TargetDir) {
@@ -586,9 +608,13 @@ function Publish-ZendAggregateTargetState {
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     foreach ($target in @($Targets)) {
         $candidateKey = [string]$target.candidate_key
-        $source = Join-Path (Join-Path (Join-Path (Split-Path -Parent $OutputDir) "targets") $candidateKey) $SnapshotName
+        $targetDirName = [string]$target.target_dir_name
+        if (-not $targetDirName) {
+            $targetDirName = $candidateKey
+        }
+        $source = Join-Path (Join-Path (Join-Path (Split-Path -Parent $OutputDir) "targets") $targetDirName) $SnapshotName
         if (Test-Path -LiteralPath $source) {
-            Copy-Item -LiteralPath $source -Destination (Join-Path $stage $candidateKey) -Recurse -Force
+            Copy-Item -LiteralPath $source -Destination (Join-Path $stage $targetDirName) -Recurse -Force
         }
     }
     Publish-ZendDirectorySnapshot -SourceDir $stage -TargetDir $OutputDir
@@ -629,6 +655,7 @@ function Invoke-ZendConvergence {
         --plugin-slug $PluginSlug `
         --legacy-run-id $LegacyRunId `
         --raw-suggested-seeds $rawSuggestedSeeds `
+        --pass1-run-summary $InitialRunSummary `
         --generated-config-summary $initialConfigSummary `
         --targets-output $targetsPath
     if ($LASTEXITCODE -ne 0) {
@@ -641,12 +668,16 @@ function Invoke-ZendConvergence {
     }
 
     try {
+        $targetIndex = 0
         foreach ($candidate in @($targets)) {
             $targetCandidateKey = [string]$candidate.candidate_key
             if (-not $targetCandidateKey) {
                 throw "REPLAY_FAILED: Zend convergence target is missing candidate_key"
             }
-            $targetDir = Join-Path $targetsDir $targetCandidateKey
+            $targetDirName = "t$targetIndex"
+            $targetIndex += 1
+            $candidate | Add-Member -NotePropertyName "target_dir_name" -NotePropertyValue $targetDirName -Force
+            $targetDir = Join-Path $targetsDir $targetDirName
             $targetIterationsDir = Join-Path $targetDir "iterations"
             $targetCurrentDir = Join-Path $targetDir "current"
             $targetFinalDir = Join-Path $targetDir "final"
@@ -733,7 +764,7 @@ function Invoke-ZendConvergence {
                     throw "REPLAY_FAILED: Phase 2 requires exactly one generated candidate per target"
                 }
                 $configPath = [string]$replaySummary.generated[0].config_path
-                $configHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
+                $configHash = Get-HookPhuzzFileSha256 -LiteralPath $configPath
                 if (-not $seenConfigHashes.Add($configHash)) {
                     throw "REPEATED_CONFIG: canonical generated config hash repeated"
                 }
@@ -908,6 +939,9 @@ try {
             if ($legacyRunId) {
                 $generatedArgs += @("--legacy-run-id", $legacyRunId)
             }
+            if ($UseZendDiscovery) {
+                $generatedArgs += @("--allow-partial-callback-reach")
+            }
             $generatedProcess = Start-Process `
                 -FilePath "python" `
                 -ArgumentList $generatedArgs `
@@ -930,6 +964,9 @@ try {
             if ($legacyRunId) {
                 $generatedArgs += @("--legacy-run-id", $legacyRunId)
             }
+            if ($UseZendDiscovery) {
+                $generatedArgs += @("--allow-partial-callback-reach")
+            }
             python @generatedArgs
             $generatedExitCode = $LASTEXITCODE
         }
@@ -941,7 +978,7 @@ try {
         }
 
         if ($UseZendDiscovery) {
-            $zendCandidateCount = @((Get-Content -LiteralPath $generatedConfigSummary -Raw | ConvertFrom-Json).generated).Count
+            $zendCandidateCount = @((Get-Content -LiteralPath $generatedRunSummary -Raw | ConvertFrom-Json).runs | Where-Object { $_.callback_reached -eq $true }).Count
             if ($zendCandidateCount -gt 0) {
                 $convergence = Invoke-ZendConvergence `
                     -ScriptRoot $scriptRoot `
