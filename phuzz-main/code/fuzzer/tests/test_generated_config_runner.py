@@ -1,9 +1,11 @@
 import contextlib
+import importlib.util
 import io
 import json
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -50,6 +52,64 @@ def generated_config(slug="generated-hooks/one", hook_name="wp_ajax_nopriv_demo"
     if auth_mode:
         row["auth_mode"] = auth_mode
     return row
+
+
+def fake_candidate():
+    return types.SimpleNamespace(
+        http_target="http://web/wp-admin/admin-ajax.php",
+        http_method="POST",
+        coverage_id="request-1",
+        fixed_params={
+            "headers": {},
+            "cookies": {
+                "wordpress_logged_in_site": "auth",
+                "wordpress_sec_site": "secure",
+                "plain": "keep",
+            },
+            "query_params": {},
+            "body_params": {"action": "demo"},
+        },
+        fuzz_params={"headers": {}, "cookies": {}, "query_params": {}, "body_params": {}},
+    )
+
+
+def load_fuzzer_with_fake_requests():
+    class FakeRequest:
+        def __init__(self, *, method, url, params=None, cookies=None, headers=None, data=None, json=None):
+            self.method = method
+            self.url = url
+            self.params = params or {}
+            self.cookies = cookies or {}
+            self.headers = headers or {}
+            self.data = data
+            self.json = json
+
+        def prepare(self):
+            return types.SimpleNamespace(
+                method=self.method,
+                url=self.url,
+                params=self.params,
+                cookies=self.cookies,
+                headers=self.headers,
+                data=self.data,
+                json=self.json,
+            )
+
+    fake_requests = types.SimpleNamespace(Request=FakeRequest, Session=lambda: object())
+    module_name = "hookphuzz_fuzzer_auth_test"
+    fuzzer_path = FUZZER_DIR / "fuzzer.py"
+    old_path = list(sys.path)
+    sys.modules.pop(module_name, None)
+    try:
+        sys.path.insert(0, str(FUZZER_DIR))
+        with patch.dict(sys.modules, {"requests": fake_requests}):
+            spec = importlib.util.spec_from_file_location(module_name, fuzzer_path)
+            module = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(module)
+            return module
+    finally:
+        sys.path[:] = old_path
 
 
 class FakeArtifacts:
@@ -198,11 +258,11 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
             self.assertIn("-e", command)
             self.assertIn("HOOKPHUZZ_LEGACY_RUN_ID=legacy-123", command)
 
-    def test_unauth_capable_config_disables_auth_cookies(self):
+    def test_unauth_capable_config_preserves_auth_mode_without_runner_env(self):
         runner = FakeRunner([completed(0), completed(0)])
         artifacts = FakeArtifacts([set(), set(), set(), set()], {})
 
-        run_generated_configs(
+        report = run_generated_configs(
             [
                 generated_config(auth_mode="unauth-capable"),
                 generated_config("generated-hooks/auth", "wp_ajax_demo", "cb-auth", auth_mode="authenticated"),
@@ -213,10 +273,11 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
             load_artifact=artifacts.load,
         )
 
-        self.assertIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES=1", runner.commands[0])
+        self.assertEqual([row["auth_mode"] for row in report["runs"]], ["unauth-capable", "authenticated"])
         self.assertNotIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES=1", runner.commands[1])
+        self.assertNotIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES=1", runner.commands[0])
 
-    def test_nopriv_hook_disables_auth_cookies_without_auth_mode(self):
+    def test_nopriv_hook_without_auth_mode_uses_legacy_runner_command(self):
         runner = FakeRunner([completed(0)])
         artifacts = FakeArtifacts([set(), set()], {})
 
@@ -228,7 +289,26 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
             load_artifact=artifacts.load,
         )
 
-        self.assertIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES=1", runner.commands[0])
+        self.assertNotIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES=1", runner.commands[0])
+
+    def test_generated_replays_route_auth_from_config_metadata(self):
+        module = load_fuzzer_with_fake_requests()
+        cases = [
+            ({"metadata": {"auth_mode": "authenticated", "hook_name": "wp_ajax_demo"}}, True),
+            ({"metadata": {"auth_mode": "unauth-capable", "hook_name": "wp_ajax_nopriv_demo"}}, False),
+            ({"metadata": {"hook_name": "wp_ajax_nopriv_demo"}}, False),
+            ({"metadata": {"hook_name": "wp_ajax_demo"}}, True),
+        ]
+
+        for config, keeps_auth_cookie in cases:
+            with self.subTest(config=config):
+                fuzzer = object.__new__(module.Fuzzer)
+                fuzzer.config = config
+                prepared = fuzzer.prepare_request(fake_candidate())
+
+                self.assertEqual("wordpress_logged_in_site" in prepared.cookies, keeps_auth_cookie)
+                self.assertEqual("wordpress_sec_site" in prepared.cookies, keeps_auth_cookie)
+                self.assertEqual(prepared.cookies["plain"], "keep")
 
     def test_stop_on_vuln_exit_is_recorded_as_vuln_found_not_failed(self):
         runner = FakeRunner([completed(57)])
@@ -568,11 +648,12 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("REPLAY_FAILED", script)
         self.assertIn("REPEATED_CONFIG", script)
 
-    def test_fuzzer_can_disable_wordpress_auth_cookies_for_nopriv_replay(self):
+    def test_fuzzer_routes_auth_from_config_metadata(self):
         fuzzer_path = FUZZER_DIR / "fuzzer.py"
         source = fuzzer_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES", source)
+        self.assertIn('metadata.get("auth_mode")', source)
+        self.assertIn('metadata.get("hook_name")', source)
         self.assertIn("wordpress_logged_in_", source)
         self.assertIn("wordpress_sec_", source)
 

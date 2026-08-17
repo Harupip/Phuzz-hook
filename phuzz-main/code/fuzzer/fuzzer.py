@@ -562,7 +562,16 @@ class Fuzzer:
         return prepared
 
     def _disable_auth_cookies(self):
-        return os.environ.get("HOOKPHUZZ_DISABLE_AUTH_COOKIES", "") == "1"
+        metadata = self.config.get("metadata") if isinstance(self.config, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        auth_mode = str(metadata.get("auth_mode") or self.config.get("auth_mode") or "").strip().lower()
+        if auth_mode in {"unauth-capable", "unauthenticated", "nopriv", "public"}:
+            return True
+        if auth_mode in {"authenticated", "auth"}:
+            return False
+        hook_name = str(metadata.get("hook_name") or self.config.get("hook_name") or "")
+        return hook_name.startswith("wp_ajax_nopriv_")
 
     def _without_auth_cookies(self, cookies):
         return {

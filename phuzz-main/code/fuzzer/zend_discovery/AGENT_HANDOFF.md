@@ -1,5 +1,33 @@
 # Zend Discovery Agent Handoff
 
+## 2026-08-17 First-Class Replay Auth Routing
+
+Generated replay auth is now config-driven. The temporary
+`HOOKPHUZZ_DISABLE_AUTH_COOKIES=1` runner primitive has been replaced by
+per-config metadata:
+
+- generated configs carry `metadata.auth_mode`
+- generated summaries and runner rows preserve `auth_mode`
+- `Fuzzer.prepare_request()` decides cookie/session handling from config
+  metadata
+- `authenticated` keeps existing login/auth cookies
+- `unauthenticated`, `unauth-capable`, `nopriv`, `public`, and
+  `wp_ajax_nopriv_*` strip WordPress auth cookies and skip login-cookie
+  injection
+- configs without `auth_mode` and without a `wp_ajax_nopriv_*` hook preserve
+  legacy behavior
+
+Fresh Booking Calendar proof with the config-driven auth primitive:
+
+- run ID: `legacy-20260817T233258Z-05b271c6`
+- Pass 1: `callback_reached=6`, `registered_not_executed=3`, `total=9`
+- Zend convergence: `CONVERGED`, `targets=6`
+- final replay: `callback_reached=6`, `total=6`
+- Pass 2 verifier: `accepted=6 total=6`
+
+The 3 non-reaching Pass 1 rows remain visible in the summary and are not sent
+into Zend convergence. This is expected for the mixed generated batch.
+
 ## 2026-08-17 Real Plugin Counterexample Handoff
 
 Stop adding synthetic REST fixtures for now. The current direction is real

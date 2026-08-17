@@ -129,8 +129,6 @@ def run_generated_configs(
         ]
         if legacy_run_id:
             command += ["-e", f"HOOKPHUZZ_LEGACY_RUN_ID={legacy_run_id}"]
-        if _disable_auth_cookies(config):
-            command += ["-e", "HOOKPHUZZ_DISABLE_AUTH_COOKIES=1"]
         command.append(service)
         try:
             result = run_command(
@@ -351,12 +349,6 @@ def _failure_category(process_status: str, validation_status: str) -> str | None
 
 def _method_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
     return {field: value.get(field) for field in METHOD_PROVENANCE_FIELDS if field in value}
-
-
-def _disable_auth_cookies(config: Mapping[str, Any]) -> bool:
-    auth_mode = str(config.get("auth_mode") or "").strip().lower()
-    hook_name = str(config.get("hook_name") or "")
-    return auth_mode in {"unauth-capable", "unauthenticated", "nopriv", "public"} or hook_name.startswith("wp_ajax_nopriv_")
 
 
 def _matched_artifact(config: Mapping[str, Any], artifacts: Sequence[tuple[str, Any]]) -> str | None:
