@@ -10,7 +10,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.generator import LiveHookSeedGenerator
+from hook_energy.seed_generation.static_generator import StaticSeedGenerator as LiveHookSeedGenerator
 
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "hook_input_callbacks.php"

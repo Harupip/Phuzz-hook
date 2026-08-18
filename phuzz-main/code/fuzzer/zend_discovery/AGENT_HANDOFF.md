@@ -1,32 +1,44 @@
 # Zend Discovery Agent Handoff
 
-## 2026-08-17 First-Class Replay Auth Routing
+## 2026-08-19 Runtime REQUEST and artifact retention update
 
-Generated replay auth is now config-driven. The temporary
-`HOOKPHUZZ_DISABLE_AUTH_COOKIES=1` runner primitive has been replaced by
-per-config metadata:
+The runtime boundary now accepts a direct correlated `$_REQUEST['name']` read
+only when it can resolve the name to one existing transport:
 
-- generated configs carry `metadata.auth_mode`
-- generated summaries and runner rows preserve `auth_mode`
-- `Fuzzer.prepare_request()` decides cookie/session handling from config
-  metadata
-- `authenticated` keeps existing login/auth cookies
-- `unauthenticated`, `unauth-capable`, `nopriv`, `public`, and
-  `wp_ajax_nopriv_*` strip WordPress auth cookies and skip login-cookie
-  injection
-- configs without `auth_mode` and without a `wp_ajax_nopriv_*` hook preserve
-  legacy behavior
+- exact `query_params` membership -> `GET/query`
+- exact `body_params` membership -> `POST/form`
+- otherwise GET -> `GET/query`
+- otherwise form-encoded or multipart POST -> `POST/form`
+- ambiguous, JSON-only, unsupported, or uncorrelated evidence -> reject
 
-Fresh Booking Calendar proof with the config-driven auth primitive:
+Pass 2 applies the same resolver, so no new `REQUEST` source is introduced into
+convergence or config generation.
 
-- run ID: `legacy-20260817T233258Z-05b271c6`
-- Pass 1: `callback_reached=6`, `registered_not_executed=3`, `total=9`
-- Zend convergence: `CONVERGED`, `targets=6`
-- final replay: `callback_reached=6`, `total=6`
-- Pass 2 verifier: `accepted=6 total=6`
+Artifact retention runs only after convergence, final config generation, final
+replay, and Pass 2 verification. `PASS`, `SUCCESS`, `CONVERGED`, and
+`PASS_PARTIAL_AUTH_EXPECTED` prune current-run registry/Pass 1/targets/
+iterations/logs/current artifacts while retaining the convergence summary,
+final artifacts, final replay summary, and usable generated configs. Failure,
+timeout, replay failure, or convergence failure preserves the entire run tree.
+`-KeepDebugArtifacts` preserves all artifacts even after success. Cleanup is
+validated against the exact current plugin/date run directory; it does not use
+a broad `zend-bridge/*` deletion.
 
-The 3 non-reaching Pass 1 rows remain visible in the summary and are not sent
-into Zend convergence. This is expected for the mixed generated batch.
+The public run-directory name is `<plugin-slug>-<UTC timestamp>`. The existing
+`legacy_run_id` field and `--legacy-run-id` argument remain compatibility names
+inside the runtime contract only.
+
+Latest local Docker attempt:
+
+- run ID: `show-all-comments-in-one-page-20260819T000546Z`
+- Pass 1: `callback_reached=1`, `expected_auth_skip=1`
+- Zend: iteration 0 observed all three `REQUEST` names; iteration 1 omitted
+  `post_id`
+- terminal status: `REPLAY_FAILED` during convergence
+- retention: full failed run tree preserved
+
+Do not cite this run as a Zend PASS; the remaining issue is fresh runtime
+evidence/convergence, not HTTP status or the transport resolver.
 
 ## 2026-08-17 Real Plugin Counterexample Handoff
 
@@ -276,8 +288,8 @@ Implemented pieces:
 
 Legacy bridge state:
 
-- `hook_energy/seed_generation/zend_bridge.py` is a compatibility re-export only.
-- `hook_energy/seed_generation/zend_bridge_cli.py` still owns CLI orchestration around legacy generated runs.
+- `hook_energy/seed_generation/zend_runtime/bridge.py` is the Zend convergence compatibility re-export.
+- `hook_energy/seed_generation/zend_runtime/bridge_cli.py` owns Zend CLI orchestration.
 - `scripts/wordpress/run-wordpress-phuzz.ps1` still owns Docker lifecycle, Pass 1/Pass 2 replay, config export, and artifact collection.
 
 ## Required Boundaries

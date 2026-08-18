@@ -56,6 +56,39 @@ def canonical_identity_id(candidate: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def resolve_request_transport(
+    name: str,
+    *,
+    request_method: str,
+    request_params: Mapping[str, Any],
+    headers: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    """Resolve a value-free REQUEST read to one canonical HTTP transport."""
+    query_params = request_params.get("query_params") if isinstance(request_params, Mapping) else None
+    body_params = request_params.get("body_params") if isinstance(request_params, Mapping) else None
+    in_query = isinstance(query_params, Mapping) and name in query_params
+    in_body = isinstance(body_params, Mapping) and name in body_params
+    if in_query and in_body:
+        return None
+    if in_query:
+        return ("GET", "query")
+    if in_body:
+        return ("POST", "form")
+
+    method = str(request_method or "").upper()
+    if method == "GET":
+        return ("GET", "query")
+    if method == "POST":
+        content_type = ""
+        for key, value in headers.items() if isinstance(headers, Mapping) else ():
+            if str(key).lower() == "content-type":
+                content_type = str(value or "").split(";", 1)[0].strip().lower()
+                break
+        if content_type in {"application/x-www-form-urlencoded", "multipart/form-data"}:
+            return ("POST", "form")
+    return None
+
+
 def correlate_pass1_artifact(
     candidate: Mapping[str, Any],
     artifact: Mapping[str, Any],
@@ -149,8 +182,7 @@ def normalize_runtime_evidence(
         except (TypeError, ValueError):
             continue
         if (
-            source not in {"GET", "POST"}
-            or not isinstance(path, list)
+            not isinstance(path, list)
             or len(path) != 1
             or not isinstance(path[0], str)
             or not path[0]
@@ -159,12 +191,36 @@ def normalize_runtime_evidence(
             or path[0] in fixed
         ):
             continue
+        location = {"GET": "query", "POST": "form"}.get(source)
+        if source == "REQUEST":
+            request_params = uopz_artifact.get("request_params")
+            request_params = request_params if isinstance(request_params, Mapping) else {}
+            request_headers = uopz_artifact.get("headers")
+            if not isinstance(request_headers, Mapping):
+                request_headers = request_params.get("headers")
+            request_headers = dict(request_headers) if isinstance(request_headers, Mapping) else {}
+            content_type = uopz_artifact.get("content_type") or uopz_artifact.get("request_content_type")
+            if not content_type:
+                content_type = request_params.get("content_type")
+            if content_type and not any(str(key).lower() == "content-type" for key in request_headers):
+                request_headers["Content-Type"] = content_type
+            resolved = resolve_request_transport(
+                path[0],
+                request_method=zend_method or str(identity["resolved_method"]),
+                request_params=request_params,
+                headers=request_headers,
+            )
+            if resolved is None:
+                continue
+            source, location = resolved
+        elif source not in {"GET", "POST"}:
+            continue
         normalized.append(
             {
                 "name": path[0],
                 "path": [path[0]],
                 "source": source,
-                "location": "query" if source == "GET" else "form",
+                "location": location,
                 "helper_depth": 0,
                 "observed_count": observed_count,
                 "evidence_kind": "zend_runtime",
@@ -326,17 +382,20 @@ def read_plugin_metadata(plugin_zip: Path, plugin_slug: str) -> dict[str, str]:
     if not zipfile.is_zipfile(plugin_zip):
         raise ValueError("PLUGIN_ZIP_INVALID")
     with zipfile.ZipFile(plugin_zip) as archive:
-        php_files = [name for name in archive.namelist() if name.startswith(f"{plugin_slug}/") and name.endswith(".php")]
+        php_files = sorted(
+            (name for name in archive.namelist() if name.startswith(f"{plugin_slug}/") and name.endswith(".php")),
+            key=lambda value: (len(Path(value).parts), value),
+        )
         main_file = next((name for name in php_files if Path(name).name == f"{plugin_slug}.php"), None)
+        if main_file is None and php_files:
+            main_file = php_files[0]
         if main_file is None:
             raise ValueError("PLUGIN_MAIN_FILE_MISSING")
         text = archive.read(main_file).decode("utf-8", errors="replace")
     version = re.search(r"^\s*\*?\s*Version:\s*(.+?)\s*$", text, re.MULTILINE | re.IGNORECASE)
-    if version is None:
-        raise ValueError("PLUGIN_VERSION_MISSING")
     return {
         "slug": plugin_slug,
-        "version": version.group(1).strip(),
+        "version": version.group(1).strip() if version is not None else "",
         "main_file": main_file,
         "sha256": hashlib.sha256(plugin_zip.read_bytes()).hexdigest(),
     }

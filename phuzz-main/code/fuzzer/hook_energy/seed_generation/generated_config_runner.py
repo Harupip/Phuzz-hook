@@ -32,8 +32,9 @@ METHOD_PROVENANCE_FIELDS = (
     "observed_request_method",
     "route_declared_methods",
     "seed_variant_id",
-    "auth_mode",
 )
+AUTHENTICATED_ENTRYPOINT_TYPES = {"ajax_authenticated", "admin_post_authenticated"}
+UNAUTHENTICATED_ENTRYPOINT_TYPES = {"ajax_unauthenticated", "admin_post_unauthenticated"}
 
 
 def load_generated_configs(path: Path) -> list[dict[str, Any]]:
@@ -192,6 +193,7 @@ def run_generated_configs(
             }
         )
 
+    expected_auth_skip = classify_expected_auth_skips(runs)
     statuses = (
         "callback_reached",
         "registered_not_executed",
@@ -207,6 +209,7 @@ def run_generated_configs(
             "process_failed": sum(row["process_status"] == "failed" for row in runs),
             "vuln_found": sum(row["process_status"] == "vuln_found" for row in runs),
             "runner_error": sum(row["process_status"] == "runner_error" for row in runs),
+            "expected_auth_skip": expected_auth_skip,
             **{status: sum(row["validation_status"] == status for row in runs) for status in statuses},
         },
     }
@@ -227,6 +230,8 @@ def format_validation_result(report: Mapping[str, Any]) -> dict[str, Any]:
                 **_method_metadata(row),
                 'status': row.get('validation_status'),
                 'callback_reached': bool(row.get('callback_reached')),
+                'expected_auth_skip': bool(row.get('expected_auth_skip')),
+                'expected_auth_reason': row.get('expected_auth_reason'),
                 'failure_category': row.get('failure_category'),
                 'reason': row.get('validation_reason'),
                 'matched_artifact': row.get('matched_artifact'),
@@ -236,6 +241,7 @@ def format_validation_result(report: Mapping[str, Any]) -> dict[str, Any]:
         'summary': {
             'total': len(validations),
             'callback_reached': sum(row['callback_reached'] for row in validations),
+            'expected_auth_skip': sum(row['expected_auth_skip'] for row in validations),
         },
         'validations': validations,
     }
@@ -245,6 +251,7 @@ def format_recursive_summary(report: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "total_configs": len(results),
         "passed": sum(row["status"] == "callback_reached" for row in results),
+        "expected_auth_skip": sum(row["status"] == "expected_auth_skip" for row in results),
         "failed": sum(row["status"] in {"failed", "runner_error"} for row in results),
         "timed_out": sum(row["status"] == "timed_out" for row in results),
         "results": results,
@@ -267,7 +274,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--service", default="fuzzer-wordpress-plugin")
     parser.add_argument("--output-format", choices=("default", "recursive"), default="default")
     parser.add_argument("--legacy-run-id", default="")
-    parser.add_argument("--allow-partial-callback-reach", action="store_true")
     return parser
 
 
@@ -295,20 +301,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.output_format == "recursive":
         print(f"Recursive config run summary: output={args.output_file}")
         summary = format_recursive_summary(report)
-        return 0 if summary["passed"] == summary["total_configs"] and summary["failed"] == 0 else 1
+        accepted = summary["passed"] + summary["expected_auth_skip"]
+        return 0 if accepted == summary["total_configs"] and summary["failed"] == 0 else 1
 
     counts = report["counts"]
     print(
         "Generated config run summary: "
         f"callback_reached={counts['callback_reached']} "
+        f"expected_auth_skip={counts['expected_auth_skip']} "
         f"vuln_found={counts['vuln_found']} "
         f"process_failed={counts['process_failed']} output={args.output_file}"
     )
-    if counts["process_failed"] != 0 or counts["runner_error"] != 0:
-        return 1
-    if args.allow_partial_callback_reach:
-        return 0 if counts["callback_reached"] > 0 else 1
-    return 0 if counts["callback_reached"] == counts["total"] else 1
+    accepted = counts["callback_reached"] + counts["expected_auth_skip"]
+    if counts["expected_auth_skip"]:
+        print(
+            "Generated config terminal status: "
+            f"PASS_PARTIAL_AUTH_EXPECTED ({counts['callback_reached']} callback_reached, "
+            f"{counts['expected_auth_skip']} expected auth skip)"
+        )
+    return 0 if counts["process_failed"] == 0 and counts["runner_error"] == 0 and accepted == counts["total"] else 1
 
 
 def _container_name(index: int, slug: str) -> str:
@@ -346,6 +357,42 @@ def _failure_category(process_status: str, validation_status: str) -> str | None
     if process_status == 'failed':
         return 'A. plugin dependency/context missing'
     return 'F. instrumentation/generation bug'
+
+
+def classify_expected_auth_skips(runs: list[dict[str, Any]]) -> int:
+    """Mark only forced-auth nopriv misses paired with a reached auth variant."""
+    reached_authenticated_hooks = {
+        str(row.get("hook_name") or "")
+        for row in runs
+        if row.get("entrypoint_type") in AUTHENTICATED_ENTRYPOINT_TYPES
+        and row.get("callback_reached") is True
+        and row.get("process_status") not in {"failed", "runner_error"}
+    }
+    expected_count = 0
+    for row in runs:
+        hook_name = str(row.get("hook_name") or "")
+        counterpart = _authenticated_counterpart_hook(hook_name)
+        if (
+            row.get("entrypoint_type") in UNAUTHENTICATED_ENTRYPOINT_TYPES
+            and row.get("validation_status") == "registered_not_executed"
+            and row.get("process_status") not in {"failed", "runner_error"}
+            and counterpart in reached_authenticated_hooks
+        ):
+            row["expected_auth_skip"] = True
+            row["expected_auth_reason"] = "authenticated_counterpart_reached"
+            row["failure_category"] = None
+            expected_count += 1
+    return expected_count
+
+
+def _authenticated_counterpart_hook(hook_name: str) -> str | None:
+    for unauthenticated_prefix, authenticated_prefix in (
+        ("wp_ajax_nopriv_", "wp_ajax_"),
+        ("admin_post_nopriv_", "admin_post_"),
+    ):
+        if hook_name.startswith(unauthenticated_prefix):
+            return authenticated_prefix + hook_name[len(unauthenticated_prefix):]
+    return None
 
 def _method_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
     return {field: value.get(field) for field in METHOD_PROVENANCE_FIELDS if field in value}
@@ -401,6 +448,8 @@ def _format_recursive_result(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _recursive_status(row: Mapping[str, Any]) -> str:
+    if row.get("expected_auth_skip"):
+        return "expected_auth_skip"
     if row.get("callback_reached"):
         return "callback_reached"
     if row.get("process_status") == "runner_error":

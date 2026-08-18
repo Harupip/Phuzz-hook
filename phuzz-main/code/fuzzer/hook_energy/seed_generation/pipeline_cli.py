@@ -31,6 +31,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host-source-root")
     parser.add_argument("--source-root")
     parser.add_argument("--unresolved-source-reason")
+    parser.add_argument("--runtime-parameters-only", action="store_true")
     parser.add_argument("--run-generated-configs", action="store_true")
     parser.add_argument("--timeout-seconds", type=int, default=30)
     parser.add_argument("--service", default="fuzzer-wordpress-plugin")
@@ -52,6 +53,7 @@ def main() -> int:
         host_source_root=args.host_source_root,
         source_root=args.source_root,
         unresolved_source_reason=args.unresolved_source_reason,
+        runtime_parameters_only=args.runtime_parameters_only,
     )
     if args.run_generated_configs:
         summary_path = output_dir / "generated_config_summary.json"

@@ -24,6 +24,14 @@ class InputSignatureExtractor:
         r"\b(?:check_ajax_referer|check_admin_referer)\s*\(\s*(['\"])[^'\"]+\1\s*,\s*(?P<quote>['\"])(?P<name>[A-Za-z0-9_\-]+)(?P=quote)",
         re.IGNORECASE,
     )
+    REST_GET_PARAM_PATTERN = re.compile(
+        r"->\s*get_param\s*\(\s*(?P<quote>['\"])(?P<name>[A-Za-z0-9_\-]+)(?P=quote)\s*\)",
+        re.IGNORECASE,
+    )
+    REST_BUCKET_ACCESSOR_PATTERN = re.compile(
+        r"->\s*(?P<accessor>get_query_params|get_body_params|get_json_params)\s*\(\s*\)\s*(?P<chain>(?:\[\s*['\"][A-Za-z0-9_\-]+['\"]\s*\])+) ",
+        re.IGNORECASE | re.VERBOSE,
+    )
     JSON_BODY_ASSIGNMENT_PATTERN = re.compile(
         r"\$(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*json_decode\s*\(\s*file_get_contents\s*\(\s*['\"]php://input['\"]\s*\)",
         re.IGNORECASE,
@@ -118,6 +126,34 @@ class InputSignatureExtractor:
                     confidence="wordpress_nonce_helper",
                     role="security_nonce",
                     fuzzable=False,
+                )
+            for match in self.REST_GET_PARAM_PATTERN.finditer(line):
+                self._append_match(
+                    results,
+                    seen,
+                    "REQUEST",
+                    match.group("name"),
+                    match.group(0),
+                    line_number,
+                    confidence="static_rest_accessor",
+                )
+            for match in self.REST_BUCKET_ACCESSOR_PATTERN.finditer(line):
+                name = self._name_from_chain(match.group("chain"))
+                if not name:
+                    continue
+                source = {
+                    "get_query_params": "GET",
+                    "get_body_params": "POST",
+                    "get_json_params": "BODY_JSON",
+                }[match.group("accessor").lower()]
+                self._append_match(
+                    results,
+                    seen,
+                    source,
+                    name,
+                    match.group(0),
+                    line_number,
+                    confidence="static_rest_accessor",
                 )
             for var_name in json_body_vars:
                 key_pattern = re.compile(self.ARRAY_KEY_PATTERN_TEMPLATE.format(var=re.escape(var_name)))

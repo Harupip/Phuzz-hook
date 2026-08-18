@@ -6,6 +6,7 @@ param(
     [switch]$RunGeneratedConfigs,
     [switch]$UseEntrypointPipeline,
     [switch]$UseZendDiscovery,
+    [switch]$KeepDebugArtifacts,
     [ValidatePattern('^[a-zA-Z0-9_./-]+$')]
     [string]$BootstrapConfigSlug = "",
     [ValidateRange(1, 86400)]
@@ -59,22 +60,6 @@ function Invoke-Compose {
     & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] @AdditionalArgs
     if ($LASTEXITCODE -ne 0) {
         throw "docker compose command failed: $($AdditionalArgs -join ' ')"
-    }
-}
-
-function Get-HookPhuzzFileSha256 {
-    param([string]$LiteralPath)
-
-    $stream = [System.IO.File]::OpenRead($LiteralPath)
-    try {
-        $sha = [System.Security.Cryptography.SHA256]::Create()
-        try {
-            return (($sha.ComputeHash($stream) | ForEach-Object { $_.ToString("x2") }) -join "").ToUpperInvariant()
-        } finally {
-            $sha.Dispose()
-        }
-    } finally {
-        $stream.Dispose()
     }
 }
 
@@ -154,6 +139,22 @@ function Wait-ForWebReady {
     throw "Timed out waiting for $Url to return HTTP 200 within $TimeoutSeconds seconds."
 }
 
+function Invoke-ZendRestRouteBootstrap {
+    param([string]$Url)
+
+    try {
+        $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 20
+        if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
+            Write-Host "Zend REST route bootstrap completed: $Url status=$($response.StatusCode)"
+            return
+        }
+    } catch {
+        throw "Zend REST route bootstrap failed for ${Url}: $($_.Exception.Message)"
+    }
+
+    throw "Zend REST route bootstrap failed for ${Url}: unexpected HTTP status $($response.StatusCode)"
+}
+
 function Export-LiveSeedSuggestions {
     param(
         [string]$ScriptRoot,
@@ -173,6 +174,7 @@ function Export-LiveSeedSuggestions {
     $coverageSnapshot = Join-Path ([System.IO.Path]::GetTempPath()) "phuzz-live-total-coverage.json"
     $outputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
     $exportCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\export_cli.py"
+    $zendRuntimeExportCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_runtime\export_cli.py"
     $pipelineCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\pipeline_cli.py"
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     $snapshotReady = $false
@@ -234,19 +236,26 @@ function Export-LiveSeedSuggestions {
         if ($UseEntrypointPipeline) {
             $outputConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-config\$PluginSlug"
             Write-Host "Running entrypoint pipeline into $outputDir"
-            python $pipelineCli `
-                --coverage-file $coverageSnapshot `
-                --plugin-slug $PluginSlug `
-                --output-dir $outputDir `
-                --output-config-dir $outputConfigDir `
-                --minimal-artifacts `
-                @sourceArgs
+            $pipelineArgs = @(
+                $pipelineCli,
+                "--coverage-file", $coverageSnapshot,
+                "--plugin-slug", $PluginSlug,
+                "--output-dir", $outputDir,
+                "--output-config-dir", $outputConfigDir,
+                "--minimal-artifacts"
+            )
+            if ($RuntimeParametersOnly) {
+                $pipelineArgs += "--runtime-parameters-only"
+            } else {
+                $pipelineArgs += $sourceArgs
+            }
+            python @pipelineArgs
         } else {
             Write-Host "Exporting hook_gap_report.json and suggested_seeds.* to $outputDir"
-            $exportArgs = @($exportCli, "--coverage-file", $coverageSnapshot, "--output-dir", $outputDir)
             if ($RuntimeParametersOnly) {
-                $exportArgs += "--runtime-parameters-only"
+                $exportArgs = @($zendRuntimeExportCli, "--coverage-file", $coverageSnapshot, "--output-dir", $outputDir)
             } else {
+                $exportArgs = @($exportCli, "--coverage-file", $coverageSnapshot, "--output-dir", $outputDir)
                 $exportArgs += $sourceArgs
             }
             python @exportArgs
@@ -272,7 +281,8 @@ function Convert-LiveSeedSuggestionsToConfigs {
         [string]$OutputConfigDir = "",
         [string]$SummaryPath = "",
         [string]$SuggestedSeeds = "",
-        [switch]$ReplayOnly
+        [switch]$ReplayOnly,
+        [switch]$RestRouteFallback
     )
 
     $seedOutputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
@@ -298,6 +308,9 @@ function Convert-LiveSeedSuggestionsToConfigs {
     )
     if ($ReplayOnly) {
         $configArgs += "--replay-only"
+    }
+    if ($RestRouteFallback) {
+        $configArgs += "--rest-route-fallback"
     }
     python @configArgs
 }
@@ -454,7 +467,7 @@ function Initialize-ZendCallbackRegistry {
     $bridgeWorkDir = Join-Path (Join-Path $SeedOutputDir "zend-bridge") $LegacyRunId
     $registryPath = Join-Path $bridgeWorkDir "hookphuzz-callback-registry.json"
     $coverageSnapshot = Join-Path $SeedOutputDir "runtime_coverage_snapshot.json"
-    $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_bridge_cli.py"
+    $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_runtime\bridge_cli.py"
 
     python $bridgeCli `
         --operation prepare-registry `
@@ -500,7 +513,7 @@ function Invoke-ZendDiscoveryBridge {
     $mergedSuggestedSeeds = Join-Path $SeedOutputDir "zend_merged_suggested_seeds.json"
     $outputConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-config\$PluginSlug"
     $finalConfigSummary = Join-Path $SeedOutputDir "generated_config_summary.json"
-    $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_bridge_cli.py"
+    $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_runtime\bridge_cli.py"
 
     Copy-GeneratedRequestArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $Pass1RunSummary -OutputDir $pass1ArtifactsDir
     Copy-ZendOpcodeArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $Pass1RunSummary -OutputDir $zendEventsDir
@@ -542,7 +555,7 @@ function Invoke-ZendPass2Verification {
     $pass2ArtifactsDir = Join-Path $logsDir "pass2-uopz"
     $pass2ZendEventsDir = Join-Path $logsDir "pass2-zend"
     $mergedSuggestedSeeds = Join-Path $SeedOutputDir "zend_merged_suggested_seeds.json"
-    $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_bridge_cli.py"
+    $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_runtime\bridge_cli.py"
 
     Copy-GeneratedRequestArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $Pass2RunSummary -OutputDir $pass2ArtifactsDir
     Copy-ZendOpcodeArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $Pass2RunSummary -OutputDir $pass2ZendEventsDir
@@ -558,6 +571,40 @@ function Invoke-ZendPass2Verification {
     }
 }
 
+function Invoke-ZendArtifactRetention {
+    param(
+        [string]$ScriptRoot,
+        [string]$SeedOutputDir,
+        [string]$LegacyRunId,
+        [string]$TerminalStatus,
+        [string]$FinalConfigSummary,
+        [string]$FinalRunSummary,
+        [string]$ZendDiscoveryRunDir,
+        [switch]$KeepDebugArtifacts
+    )
+
+    $retentionCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_runtime\artifact_retention.py"
+    $runDir = Join-Path (Join-Path $SeedOutputDir "zend-bridge") $LegacyRunId
+    $retentionArgs = @(
+        $retentionCli,
+        "--run-dir", $runDir,
+        "--terminal-status", $TerminalStatus,
+        "--seed-output-dir", $SeedOutputDir,
+        "--merged-suggested-seeds", (Join-Path $SeedOutputDir "zend_merged_suggested_seeds.json"),
+        "--final-config-summary", $FinalConfigSummary,
+        "--final-run-summary", $FinalRunSummary,
+        "--zend-discovery-run-dir", $ZendDiscoveryRunDir
+    )
+    if ($KeepDebugArtifacts) {
+        $retentionArgs += "--keep-debug-artifacts"
+    }
+
+    python @retentionArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Zend artifact retention failed. Debug artifacts were not safely finalized."
+    }
+}
+
 function Publish-ZendDirectorySnapshot {
     param(
         [string]$SourceDir,
@@ -569,8 +616,8 @@ function Publish-ZendDirectorySnapshot {
     }
     $parent = Split-Path -Parent $TargetDir
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
-    $tempDir = "$TargetDir.tmp"
-    $oldDir = "$TargetDir.old"
+    $tempDir = "$TargetDir.t"
+    $oldDir = "$TargetDir.o"
     if (Test-Path -LiteralPath $tempDir) {
         Remove-Item -LiteralPath $tempDir -Recurse -Force
     }
@@ -597,6 +644,15 @@ function Publish-ZendDirectorySnapshot {
     }
 }
 
+function Get-ZendTargetDirectoryName {
+    param([string]$CandidateKey)
+
+    if ($CandidateKey.Length -gt 16) {
+        return $CandidateKey.Substring(0, 16)
+    }
+    return $CandidateKey
+}
+
 function Publish-ZendAggregateTargetState {
     param(
         [object[]]$Targets,
@@ -604,17 +660,17 @@ function Publish-ZendAggregateTargetState {
         [string]$OutputDir
     )
 
-    $stage = Join-Path (Split-Path -Parent $OutputDir) ("$SnapshotName.tmp.$([guid]::NewGuid().ToString('N'))")
+    $stage = Join-Path (Split-Path -Parent $OutputDir) ("$SnapshotName-t")
+    if (Test-Path -LiteralPath $stage) {
+        Remove-Item -LiteralPath $stage -Recurse -Force
+    }
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     foreach ($target in @($Targets)) {
         $candidateKey = [string]$target.candidate_key
-        $targetDirName = [string]$target.target_dir_name
-        if (-not $targetDirName) {
-            $targetDirName = $candidateKey
-        }
-        $source = Join-Path (Join-Path (Join-Path (Split-Path -Parent $OutputDir) "targets") $targetDirName) $SnapshotName
+        $targetDirectoryName = if ($target.target_directory) { [string]$target.target_directory } else { Get-ZendTargetDirectoryName -CandidateKey $candidateKey }
+        $source = Join-Path (Join-Path (Join-Path (Split-Path -Parent $OutputDir) "targets") $targetDirectoryName) $SnapshotName
         if (Test-Path -LiteralPath $source) {
-            Copy-Item -LiteralPath $source -Destination (Join-Path $stage $targetDirName) -Recurse -Force
+            Copy-Item -LiteralPath $source -Destination (Join-Path $stage $targetDirectoryName) -Recurse -Force
         }
     }
     Publish-ZendDirectorySnapshot -SourceDir $stage -TargetDir $OutputDir
@@ -640,7 +696,7 @@ function Invoke-ZendConvergence {
     $historyPath = Join-Path $bridgeWorkDir "zend_convergence_summary.json"
     $rawSuggestedSeeds = Join-Path $SeedOutputDir "suggested_seeds.json"
     $registry = Join-Path $bridgeWorkDir "hookphuzz-callback-registry.json"
-    $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_bridge_cli.py"
+    $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_runtime\bridge_cli.py"
     $generatedConfigRunner = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\generated_config_runner.py"
     $finalConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-config\$PluginSlug"
     $finalConfigSummary = Join-Path $SeedOutputDir "generated_config_summary.json"
@@ -655,8 +711,8 @@ function Invoke-ZendConvergence {
         --plugin-slug $PluginSlug `
         --legacy-run-id $LegacyRunId `
         --raw-suggested-seeds $rawSuggestedSeeds `
-        --pass1-run-summary $InitialRunSummary `
         --generated-config-summary $initialConfigSummary `
+        --pass1-run-summary $InitialRunSummary `
         --targets-output $targetsPath
     if ($LASTEXITCODE -ne 0) {
         throw "REPLAY_FAILED: Zend convergence target listing failed."
@@ -668,21 +724,19 @@ function Invoke-ZendConvergence {
     }
 
     try {
-        $targetIndex = 0
         foreach ($candidate in @($targets)) {
             $targetCandidateKey = [string]$candidate.candidate_key
             if (-not $targetCandidateKey) {
                 throw "REPLAY_FAILED: Zend convergence target is missing candidate_key"
             }
-            $targetDirName = "t$targetIndex"
-            $targetIndex += 1
-            $candidate | Add-Member -NotePropertyName "target_dir_name" -NotePropertyValue $targetDirName -Force
-            $targetDir = Join-Path $targetsDir $targetDirName
-            $targetIterationsDir = Join-Path $targetDir "iterations"
-            $targetCurrentDir = Join-Path $targetDir "current"
-            $targetFinalDir = Join-Path $targetDir "final"
-            $statePath = Join-Path $targetDir "zend_convergence_state.json"
-            $targetHistoryPath = Join-Path $targetDir "zend_convergence_summary.json"
+            $targetDirectoryName = Get-ZendTargetDirectoryName -CandidateKey $targetCandidateKey
+            $candidate | Add-Member -NotePropertyName "target_directory" -NotePropertyValue $targetDirectoryName -Force
+            $targetDir = Join-Path $targetsDir $targetDirectoryName
+            $targetIterationsDir = Join-Path $targetDir "i"
+            $targetCurrentDir = Join-Path $targetDir "cur"
+            $targetFinalDir = Join-Path $targetDir "fin"
+            $statePath = Join-Path $targetDir "state.json"
+            $targetHistoryPath = Join-Path $targetDir "summary.json"
             $targetHistory = @()
             $seenRequestIds = New-Object System.Collections.Generic.HashSet[string]
             $seenConfigHashes = New-Object System.Collections.Generic.HashSet[string]
@@ -697,9 +751,9 @@ function Invoke-ZendConvergence {
                 $uopzDir = Join-Path $iterationDir "uopz"
                 $zendDir = Join-Path $iterationDir "zend"
                 $nextStatePath = Join-Path $iterationDir "state.json"
-                $mergedSeedsPath = Join-Path $iterationDir "merged_suggested_seeds.json"
-                $replayConfigDir = Join-Path $iterationDir "replay-configs"
-                $replayConfigSummary = Join-Path $iterationDir "generated_config_summary.json"
+                $mergedSeedsPath = Join-Path $iterationDir "seeds.json"
+                $replayConfigDir = Join-Path $iterationDir "cfg"
+                $replayConfigSummary = Join-Path $iterationDir "cfg.json"
                 New-Item -ItemType Directory -Path $iterationDir -Force | Out-Null
                 Copy-GeneratedRequestArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $currentRunSummary -OutputDir $uopzDir
                 Copy-ZendOpcodeArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $currentRunSummary -OutputDir $zendDir
@@ -752,7 +806,7 @@ function Invoke-ZendConvergence {
 
                 if ($state.status -eq "CONVERGED") {
                     Publish-ZendDirectorySnapshot -SourceDir $iterationDir -TargetDir $targetFinalDir
-                    $finalSeedReports += (Join-Path $targetFinalDir "merged_suggested_seeds.json")
+                    $finalSeedReports += (Join-Path $targetFinalDir "seeds.json")
                     $converged = $true
                     break
                 }
@@ -764,13 +818,13 @@ function Invoke-ZendConvergence {
                     throw "REPLAY_FAILED: Phase 2 requires exactly one generated candidate per target"
                 }
                 $configPath = [string]$replaySummary.generated[0].config_path
-                $configHash = Get-HookPhuzzFileSha256 -LiteralPath $configPath
+                $configHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
                 if (-not $seenConfigHashes.Add($configHash)) {
                     throw "REPEATED_CONFIG: canonical generated config hash repeated"
                 }
                 $currentSeeds = $mergedSeedsPath
                 $statePath = $nextStatePath
-                $currentRunSummary = Join-Path $iterationDir "next-generated_config_run_summary.json"
+                $currentRunSummary = Join-Path $iterationDir "run.json"
                 python $generatedConfigRunner `
                     --generated-config-summary $replayConfigSummary `
                     --output-file $currentRunSummary `
@@ -786,6 +840,7 @@ function Invoke-ZendConvergence {
             }
             $targetResults += [pscustomobject]@{
                 candidate_key = $targetCandidateKey
+                target_directory = $targetDirectoryName
                 status = "CONVERGED"
                 current = $targetCurrentDir
                 final = $targetFinalDir
@@ -815,7 +870,8 @@ function Invoke-ZendConvergence {
             -PluginSlug $PluginSlug `
             -SuggestedSeeds $finalMergedSuggestedSeeds `
             -OutputConfigDir $finalConfigDir `
-            -SummaryPath $finalConfigSummary
+            -SummaryPath $finalConfigSummary `
+            -RestRouteFallback
         $finalRunSummary = Join-Path $bridgeWorkDir "final-generated_config_run_summary.json"
         python $generatedConfigRunner `
             --generated-config-summary $finalConfigSummary `
@@ -848,7 +904,8 @@ Push-Location $scriptRoot
 $overridePath = $null
 $legacyRunId = ""
 if ($UseZendDiscovery) {
-    $legacyRunId = "legacy-" + (Get-Date -Format "yyyyMMddTHHmmssZ") + "-" + [guid]::NewGuid().ToString("N").Substring(0, 8)
+    $safePluginSlug = ($PluginSlug -replace "[^A-Za-z0-9._-]", "-").Trim("-")
+    $legacyRunId = $safePluginSlug + "-" + (Get-Date -Format "yyyyMMddTHHmmssZ")
 }
 try {
     Write-Host "Using WordPress plugin: $PluginSlug"
@@ -889,7 +946,11 @@ try {
     Write-Host "Starting fuzzer container"
     Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", $fuzzerService, "--build")
 
-    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug -UseEntrypointPipeline:$UseEntrypointPipeline -RuntimeParametersOnly:$false
+    if ($UseZendDiscovery) {
+        Invoke-ZendRestRouteBootstrap -Url "http://localhost:8080/?rest_route=/"
+    }
+
+    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug -UseEntrypointPipeline:$UseEntrypointPipeline -RuntimeParametersOnly:$UseZendDiscovery
     if (-not $UseEntrypointPipeline) {
         Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug
     }
@@ -898,6 +959,11 @@ try {
         $seedOutputDir = Join-Path $scriptRoot "fuzzer\output\seed_generation"
         $generatedConfigSummary = Join-Path $seedOutputDir "generated_config_summary.json"
         $generatedRunSummary = Join-Path $seedOutputDir "generated_config_run_summary.json"
+        $zendRetentionReady = $false
+        $zendTerminalStatus = ""
+        $zendAuthPartialExpected = $false
+        $zendFinalConfigSummary = ""
+        $zendFinalRunSummary = ""
         if ($UseZendDiscovery) {
             $bridgeWorkDir = Join-Path (Join-Path $seedOutputDir "zend-bridge") $legacyRunId
             $pass1ConfigDir = Join-Path $bridgeWorkDir "pass1-configs"
@@ -914,7 +980,8 @@ try {
                 -PluginSlug $PluginSlug `
                 -OutputConfigDir $pass1ConfigDir `
                 -SummaryPath $generatedConfigSummary `
-                -ReplayOnly
+                -ReplayOnly `
+                -RestRouteFallback
         }
         $generatedConfigRunner = Join-Path $scriptRoot "fuzzer\hook_energy\seed_generation\generated_config_runner.py"
         $generatedRunnerLog = $null
@@ -939,9 +1006,6 @@ try {
             if ($legacyRunId) {
                 $generatedArgs += @("--legacy-run-id", $legacyRunId)
             }
-            if ($UseZendDiscovery) {
-                $generatedArgs += @("--allow-partial-callback-reach")
-            }
             $generatedProcess = Start-Process `
                 -FilePath "python" `
                 -ArgumentList $generatedArgs `
@@ -964,9 +1028,6 @@ try {
             if ($legacyRunId) {
                 $generatedArgs += @("--legacy-run-id", $legacyRunId)
             }
-            if ($UseZendDiscovery) {
-                $generatedArgs += @("--allow-partial-callback-reach")
-            }
             python @generatedArgs
             $generatedExitCode = $LASTEXITCODE
         }
@@ -976,9 +1037,13 @@ try {
         if ($generatedExitCode -ne 0) {
             throw "Generated hook config batch failed. See $generatedRunSummary"
         }
+        if ($UseZendDiscovery) {
+            $pass1RunSummary = Get-Content -LiteralPath $generatedRunSummary -Raw | ConvertFrom-Json
+            $zendAuthPartialExpected = [int]$pass1RunSummary.counts.expected_auth_skip -gt 0
+        }
 
         if ($UseZendDiscovery) {
-            $zendCandidateCount = @((Get-Content -LiteralPath $generatedRunSummary -Raw | ConvertFrom-Json).runs | Where-Object { $_.callback_reached -eq $true }).Count
+            $zendCandidateCount = @((Get-Content -LiteralPath $generatedConfigSummary -Raw | ConvertFrom-Json).generated).Count
             if ($zendCandidateCount -gt 0) {
                 $convergence = Invoke-ZendConvergence `
                     -ScriptRoot $scriptRoot `
@@ -991,6 +1056,10 @@ try {
                     -ComposeArgs $composeArgs
                 $generatedConfigSummary = $convergence.ConfigSummary
                 $generatedRunSummary = $convergence.RunSummary
+                $zendRetentionReady = $true
+                $zendTerminalStatus = if ($zendAuthPartialExpected) { "PASS_PARTIAL_AUTH_EXPECTED" } else { "PASS" }
+                $zendFinalConfigSummary = $generatedConfigSummary
+                $zendFinalRunSummary = $generatedRunSummary
                 Write-Host "Zend convergence summary: $($convergence.HistoryPath)"
             } else {
                 Invoke-ZendDiscoveryBridge `
@@ -1020,6 +1089,18 @@ try {
                     -Pass2RunSummary $generatedRunSummary `
                     -ComposeArgs $composeArgs
             }
+        }
+
+        if ($UseZendDiscovery -and $zendRetentionReady) {
+            Invoke-ZendArtifactRetention `
+                -ScriptRoot $scriptRoot `
+                -SeedOutputDir $seedOutputDir `
+                -LegacyRunId $legacyRunId `
+                -TerminalStatus $zendTerminalStatus `
+                -FinalConfigSummary $zendFinalConfigSummary `
+                -FinalRunSummary $zendFinalRunSummary `
+                -ZendDiscoveryRunDir (Join-Path (Join-Path $scriptRoot "fuzzer\output\zend-discovery") $legacyRunId) `
+                -KeepDebugArtifacts:$KeepDebugArtifacts
         }
 
         Write-Host "Generated config run summary: $generatedRunSummary"

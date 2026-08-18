@@ -19,6 +19,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--summary", required=True, help="Path to write generated/skipped summary JSON.")
     parser.add_argument("--target-base", default="http://web", help="Base URL used for generated PHUZZ targets.")
     parser.add_argument("--replay-only", action="store_true", help="Write replay-only configs with no fuzz fields.")
+    parser.add_argument(
+        "--rest-route-fallback",
+        action="store_true",
+        help="Materialize REST targets as ?rest_route= paths for WordPress installs without pretty permalinks.",
+    )
     return parser
 
 
@@ -33,6 +38,7 @@ def main() -> int:
         summary_path=Path(args.summary),
         target_base=args.target_base,
         replay_only=args.replay_only,
+        rest_route_fallback=args.rest_route_fallback,
     )
     print(f"Seed config export summary: generated={len(summary['generated'])} skipped={len(summary['skipped'])}")
     for item in summary["generated"]:

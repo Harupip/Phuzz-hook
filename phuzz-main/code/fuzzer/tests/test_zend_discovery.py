@@ -34,7 +34,12 @@ from zend_discovery.convergence import (
     canonical_runtime_parameter_identity,
     materialize_convergence_seeds,
 )
-from hook_energy.seed_generation.zend_bridge_cli import combine_final_seed_reports, converge_iteration, list_convergence_targets, verify_pass2_contract
+from hook_energy.seed_generation.zend_runtime.bridge_cli import (
+    combine_final_seed_reports,
+    converge_iteration,
+    list_convergence_targets,
+    verify_pass2_contract,
+)
 from zend_discovery.source_materializer import materialize_plugin_source
 from zend_discovery.parameter_seeds import build_parameter_seed
 from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
@@ -103,6 +108,107 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual(row["callback_id"], "ajax-public")
             self.assertEqual(row["canonical_callback"], "Demo::fetch")
             self.assertEqual(row["request_method"], "POST")
+
+    def test_normalize_runtime_evidence_maps_request_to_post_form(self) -> None:
+        candidate = self.pass1_candidate()
+        uopz = self.pass1_artifact(
+            candidate,
+            request_params={
+                "body_params": {},
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+            },
+        )
+        registry = {
+            "schema_version": 1,
+            "callback_map": {"ajax-public": "Demo::fetch"},
+        }
+        zend = {
+            "schema_version": 3,
+            "run_id": "legacy-1",
+            "request_id": "pass1-1",
+            "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{
+                "callback": "Demo::fetch",
+                "unique_parameters": [{
+                    "source": "REQUEST", "path": ["post_type"],
+                    "helper_depth": 0, "observed_count": 1,
+                }],
+            }],
+        }
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual(
+            [(row["name"], row["source"], row["location"], row["fuzzable"]) for row in evidence],
+            [("post_type", "POST", "form", True)],
+        )
+
+    def test_normalize_runtime_evidence_maps_request_to_get_query(self) -> None:
+        candidate = self.pass1_candidate()
+        candidate["method"] = "GET"
+        uopz = self.pass1_artifact(
+            candidate,
+            request_params={"query_params": {"post_type": "redacted"}},
+        )
+        registry = {
+            "schema_version": 1,
+            "callback_map": {"ajax-public": "Demo::fetch"},
+        }
+        zend = {
+            "schema_version": 3,
+            "run_id": "legacy-1",
+            "request_id": "pass1-1",
+            "request_method": "GET",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{
+                "callback": "Demo::fetch",
+                "unique_parameters": [{
+                    "source": "REQUEST", "path": ["post_type"],
+                    "helper_depth": 0, "observed_count": 1,
+                }],
+            }],
+        }
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual(
+            [(row["name"], row["source"], row["location"], row["fuzzable"]) for row in evidence],
+            [("post_type", "GET", "query", True)],
+        )
+
+    def test_normalize_runtime_evidence_rejects_ambiguous_request_transport(self) -> None:
+        candidate = self.pass1_candidate()
+        uopz = self.pass1_artifact(
+            candidate,
+            content_type="application/x-www-form-urlencoded",
+            request_params={
+                "query_params": {"post_type": "redacted"},
+                "body_params": {"post_type": "redacted"},
+            },
+        )
+        registry = {
+            "schema_version": 1,
+            "callback_map": {"ajax-public": "Demo::fetch"},
+        }
+        zend = {
+            "schema_version": 3,
+            "run_id": "legacy-1",
+            "request_id": "pass1-1",
+            "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{
+                "callback": "Demo::fetch",
+                "unique_parameters": [{
+                    "source": "REQUEST", "path": ["post_type"],
+                    "helper_depth": 0, "observed_count": 1,
+                }],
+            }],
+        }
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual(evidence, [])
 
     def test_normalize_runtime_evidence_exports_rest_parameter_only_with_exact_runtime_transport_proof(self) -> None:
         candidate = {
@@ -192,6 +298,95 @@ class ZendDiscoveryTests(unittest.TestCase):
         evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
 
         self.assertEqual([(row["name"], row["source"], row["location"]) for row in evidence], [("search", "REST_QUERY", "query")])
+
+    def test_normalize_runtime_evidence_canonicalizes_rest_bucket_paths(self) -> None:
+        cases = [
+            ("GET", "GET", ["GET", "search"], "search", "REST_QUERY", "query"),
+            ("GET", "GET", ["GET", "filters", "name"], "filters[name]", "REST_QUERY", "query"),
+            ("POST", "JSON", ["JSON", "user", "profile", "name"], "user[profile][name]", "REST_JSON", "json"),
+            ("POST", "POST", ["POST", "settings", "email"], "settings[email]", "REST_FORM", "form"),
+            ("GET", "URL", ["URL", "id"], "id", "REST_URL", "path"),
+        ]
+
+        for method, bucket, path, name, source, location in cases:
+            with self.subTest(bucket=bucket, path=path):
+                candidate = self.rest_candidate(method=method, request_id=f"rest-{bucket.lower()}-{name}")
+                uopz = self.pass1_artifact(
+                    candidate,
+                    hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+                )
+                registry = {"schema_version": 1, "callback_map": {"rest-items": "Demo::list_items"}}
+                zend = self.rest_zend_artifact(candidate, {
+                    "source": "REST",
+                    "bucket": bucket,
+                    "parameter": path[1],
+                    "path": path,
+                    "callback": "Demo::list_items",
+                    "observed_count": 1,
+                })
+
+                evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+                self.assertEqual(
+                    [(row["name"], row["path"], row["source"], row["location"], row["fuzzable"]) for row in evidence],
+                    [(name, [name], source, location, True)],
+                )
+
+    def test_normalize_runtime_evidence_keeps_defaults_observable_but_not_fuzzable(self) -> None:
+        candidate = self.rest_candidate(method="GET", request_id="rest-defaults-only")
+        uopz = self.pass1_artifact(
+            candidate,
+            hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+        )
+        registry = {"schema_version": 1, "callback_map": {"rest-items": "Demo::list_items"}}
+        zend = self.rest_zend_artifact(candidate, {
+            "source": "REST",
+            "bucket": "defaults",
+            "parameter": "mode",
+            "path": ["defaults", "mode"],
+            "callback": "Demo::list_items",
+            "observed_count": 1,
+        })
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual(
+            [(row["name"], row["source"], row["location"], row["observable"], row["fuzzable"]) for row in evidence],
+            [("mode", "REST_DEFAULT", "defaults", True, False)],
+        )
+
+    def test_normalize_runtime_evidence_fuzzes_http_parameter_also_seen_in_defaults(self) -> None:
+        candidate = self.rest_candidate(method="GET", request_id="rest-defaults-plus-get")
+        uopz = self.pass1_artifact(
+            candidate,
+            hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+        )
+        registry = {"schema_version": 1, "callback_map": {"rest-items": "Demo::list_items"}}
+        zend = self.rest_zend_artifact(candidate, [
+            {
+                "source": "REST",
+                "bucket": "defaults",
+                "parameter": "mode",
+                "path": ["defaults", "mode"],
+                "callback": "Demo::list_items",
+                "observed_count": 1,
+            },
+            {
+                "source": "REST",
+                "bucket": "GET",
+                "parameter": "mode",
+                "path": ["GET", "mode"],
+                "callback": "Demo::list_items",
+                "observed_count": 1,
+            },
+        ])
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        by_location = {row["location"]: row for row in evidence}
+        self.assertFalse(by_location["defaults"]["fuzzable"])
+        self.assertTrue(by_location["query"]["fuzzable"])
+        self.assertEqual(by_location["query"]["name"], "mode")
 
     def test_normalize_runtime_evidence_rejects_non_rest_fetch_event_shape(self) -> None:
         candidate = {
@@ -490,6 +685,31 @@ class ZendDiscoveryTests(unittest.TestCase):
         }
         artifact.update(updates)
         return artifact
+
+    def rest_candidate(self, *, method: str = "GET", request_id: str = "rest-request") -> dict:
+        return {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "rest",
+            "namespace": "demo/v1",
+            "route_pattern": "/items",
+            "endpoint_definition_index": 0,
+            "materialized_route": "/wp-json/demo/v1/items",
+            "callback_id": "rest-items",
+            "method": method,
+            "auth_mode": "nopriv",
+            "legacy_run_id": "legacy-1",
+            "pass1_request_id": request_id,
+        }
+
+    def rest_zend_artifact(self, candidate: dict, events: dict | list[dict]) -> dict:
+        return {
+            "schema_version": 4,
+            "run_id": candidate["legacy_run_id"],
+            "request_id": candidate["pass1_request_id"],
+            "request_method": candidate["method"].upper(),
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "rest_parameter_events": events if isinstance(events, list) else [events],
+        }
 
     def test_canonical_identity_is_deterministic_and_excludes_callback_display(self) -> None:
         candidate = self.pass1_candidate()
@@ -842,6 +1062,35 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual(metadata["slug"], "demo-plugin")
             self.assertEqual(metadata["version"], "1.2.3")
             self.assertEqual(metadata["main_file"], "demo-plugin/demo-plugin.php")
+            self.assertEqual(metadata["sha256"], hashlib.sha256(plugin.read_bytes()).hexdigest())
+
+    def test_zip_metadata_accepts_wordpress_main_file_with_non_slug_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            plugin = Path(tmp_dir) / "show-all-comments-in-one-page.zip"
+            with zipfile.ZipFile(plugin, "w") as archive:
+                archive.writestr(
+                    "show-all-comments-in-one-page/bt-comments.php",
+                    "<?php\n/**\n * Plugin Name: BT Comments\n * Version: 7.0.0\n */\n",
+                )
+
+            metadata = read_plugin_metadata(plugin, "show-all-comments-in-one-page")
+
+            self.assertEqual(metadata["main_file"], "show-all-comments-in-one-page/bt-comments.php")
+            self.assertEqual(metadata["version"], "7.0.0")
+
+    def test_zip_metadata_does_not_require_wordpress_plugin_header(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            plugin = Path(tmp_dir) / "show-all-comments-in-one-page.zip"
+            with zipfile.ZipFile(plugin, "w") as archive:
+                archive.writestr(
+                    "show-all-comments-in-one-page/bt-comments.php",
+                    "<?php\nfunction bt_comments_bootstrap() {}\n",
+                )
+
+            metadata = read_plugin_metadata(plugin, "show-all-comments-in-one-page")
+
+            self.assertEqual(metadata["main_file"], "show-all-comments-in-one-page/bt-comments.php")
+            self.assertEqual(metadata["version"], "")
             self.assertEqual(metadata["sha256"], hashlib.sha256(plugin.read_bytes()).hexdigest())
 
     def test_materialize_plugin_source_rejects_zip_traversal(self) -> None:
@@ -1287,10 +1536,17 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertIn("get_param('search')", source)
         self.assertIn("get_query_params()['search']", source)
         self.assertIn("get_param('filters')['name']", source)
+        self.assertIn("params['POST']['email']", source)
+        self.assertIn("params['JSON']['name']", source)
+        self.assertIn("params['URL']['id']", source)
+        self.assertIn("get_param('mode')", source)
         self.assertIn("normal_array()['GET']['search']", source)
         self.assertIn("$foo->params['GET']['search']", source)
         self.assertIn("$array['GET']['search']", source)
         self.assertIn("register_rest_route('hookphuzz/v1', '/probe'", source)
+        self.assertIn("register_rest_route('hookphuzz/v1', '/form'", source)
+        self.assertIn("register_rest_route('hookphuzz/v1', '/json'", source)
+        self.assertIn("register_rest_route('hookphuzz/v1', '/item/(?P<id>\\\\d+)'", source)
         with zipfile.ZipFile(plugin_zip) as archive:
             self.assertTrue(all("\\" not in entry.filename for entry in archive.infolist()))
             self.assertIn("hookphuzz-rest-get-param-fixture/", archive.namelist())
@@ -1338,6 +1594,19 @@ class ZendDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(result["new_parameters"], [])
         self.assertEqual(result["known_parameters"], [])
+
+    def test_convergence_state_prunes_nested_runtime_parent_when_leaf_is_observed(self) -> None:
+        parent = {
+            "name": "filters", "path": ["filters"], "source": "REST_QUERY", "location": "query",
+            "helper_depth": 0, "observed_count": 1, "evidence_kind": "zend_rest_runtime",
+            "fuzzable": True, "canonical_callback": "Demo::list_items",
+        }
+        leaf = {**parent, "name": "filters[name]", "path": ["filters[name]"]}
+
+        result = advance_convergence_state([], [parent, leaf])
+
+        self.assertEqual([item["name"] for item in result["new_parameters"]], ["filters[name]"])
+        self.assertEqual([item["name"] for item in result["known_parameters"]], ["filters[name]"])
 
     def test_convergence_materializes_rest_json_parameter_with_json_content_type(self) -> None:
         raw = {
@@ -1417,6 +1686,126 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertEqual(seed["body"]["term"], "FUZZ")
         self.assertNotIn("Content-Type", seed["headers"])
         self.assertEqual([param["source"] for param in seed["input_params"]], ["GET", "POST"])
+
+    def test_convergence_materializes_request_runtime_form_parameter_without_static_input(self) -> None:
+        raw = self.raw_seed_item()
+        candidate_key = canonical_identity_id(candidate_from_seed_item(raw, plugin_slug="demo-plugin"))
+        parameter = {
+            "name": "post_type", "path": ["post_type"], "source": "POST", "location": "form",
+            "helper_depth": 0, "observed_count": 1, "evidence_kind": "zend_runtime",
+            "fuzzable": True, "canonical_callback": "Demo::fetch",
+        }
+
+        result = materialize_convergence_seeds(
+            {"suggested_seeds": [raw]},
+            plugin_slug="demo-plugin",
+            candidate_key=candidate_key,
+            known_parameters=[parameter],
+        )
+
+        seed = result["suggested_seeds"][0]["seed"]
+        self.assertEqual(seed["body"]["post_type"], "FUZZ")
+        self.assertEqual(seed["fuzzable_params"], ["post_type"])
+        self.assertEqual(seed["input_params"], [{
+            "name": "post_type",
+            "path": ["post_type"],
+            "source": "POST",
+            "location": "form",
+            "fuzzable": True,
+            "evidence_kind": "zend_runtime",
+        }])
+
+    def test_convergence_materializes_nested_rest_query_leaf_without_parent(self) -> None:
+        raw = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "rest",
+            "namespace": "demo/v1",
+            "route_pattern": "/items",
+            "endpoint_definition_index": 0,
+            "materialized_route": "/wp-json/demo/v1/items",
+            "callback_id": "rest-items",
+            "seed": {
+                "path": "/wp-json/demo/v1/items",
+                "method": "GET",
+                "auth_mode": "nopriv",
+                "body": {},
+                "query_params": {"filters": "FUZZ"},
+                "headers": {},
+                "fixed_params": [],
+            },
+        }
+        candidate_key = canonical_identity_id(candidate_from_seed_item(raw, plugin_slug="demo-plugin"))
+        parent = {
+            "name": "filters", "path": ["filters"], "source": "REST_QUERY", "location": "query",
+            "helper_depth": 0, "observed_count": 1, "evidence_kind": "zend_rest_runtime",
+            "fuzzable": True, "canonical_callback": "Demo::list_items",
+        }
+        leaf = {**parent, "name": "filters[name]", "path": ["filters[name]"]}
+
+        result = materialize_convergence_seeds(
+            {"suggested_seeds": [raw]},
+            plugin_slug="demo-plugin",
+            candidate_key=candidate_key,
+            known_parameters=[parent, leaf],
+        )
+
+        seed = result["suggested_seeds"][0]["seed"]
+        self.assertEqual(seed["query_params"], {"filters[name]": "FUZZ"})
+        self.assertEqual(seed["fuzzable_params"], ["filters[name]"])
+        self.assertEqual(seed["input_params"], [{
+            "name": "filters[name]",
+            "path": ["filters[name]"],
+            "source": "GET",
+            "location": "query",
+            "fuzzable": True,
+            "evidence_kind": "zend_rest_runtime",
+        }])
+
+    def test_convergence_keeps_rest_url_parameter_in_path_not_query(self) -> None:
+        raw = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "rest",
+            "namespace": "demo/v1",
+            "route_pattern": "/item/(?P<id>\\d+)",
+            "endpoint_definition_index": 0,
+            "materialized_route": "/wp-json/demo/v1/item/1",
+            "callback_id": "rest-item",
+            "seed": {
+                "path": "/wp-json/demo/v1/item/1",
+                "method": "GET",
+                "auth_mode": "nopriv",
+                "body": {},
+                "query_params": {},
+                "headers": {},
+                "fixed_params": [],
+            },
+        }
+        candidate_key = canonical_identity_id(candidate_from_seed_item(raw, plugin_slug="demo-plugin"))
+        parameter = {
+            "name": "id", "path": ["id"], "source": "REST_URL", "location": "path",
+            "helper_depth": 0, "observed_count": 1, "evidence_kind": "zend_rest_runtime",
+            "fuzzable": True, "canonical_callback": "Demo::get_item",
+        }
+
+        result = materialize_convergence_seeds(
+            {"suggested_seeds": [raw]},
+            plugin_slug="demo-plugin",
+            candidate_key=candidate_key,
+            known_parameters=[parameter],
+        )
+
+        seed = result["suggested_seeds"][0]["seed"]
+        self.assertEqual(seed["path"], "/wp-json/demo/v1/item/1")
+        self.assertEqual(seed["query_params"], {})
+        self.assertEqual(seed["body"], {})
+        self.assertEqual(seed["input_params"], [{
+            "name": "id",
+            "path": ["id"],
+            "source": "URL",
+            "location": "path",
+            "fuzzable": True,
+            "evidence_kind": "zend_rest_runtime",
+        }])
 
     def test_convergence_materializes_only_known_runtime_parameters_into_seed(self) -> None:
         raw = self.raw_seed_item()
@@ -1513,30 +1902,6 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual([row["name"] for row in result["new_parameters"]], ["title"])
             self.assertEqual(len(result["merged_suggested_seeds"]["suggested_seeds"]), 1)
 
-    def test_convergence_targets_include_only_callback_reached_rows(self) -> None:
-        first = self.raw_seed_item(callback_id="ajax-public", action="demo_fetch_items")
-        second = self.raw_seed_item(callback_id="ajax-write", action="demo_save_items")
-        run_summary = {"runs": [
-            {
-                "hook_name": first["hook_name"], "callback_id": first["callback_id"],
-                "seed_variant_id": "", "callback_reached": True,
-            },
-            {
-                "hook_name": second["hook_name"], "callback_id": second["callback_id"],
-                "seed_variant_id": "", "callback_reached": False,
-                "validation_status": "registered_not_executed",
-            },
-        ]}
-
-        targets = list_convergence_targets(
-            {"suggested_seeds": [first, second]},
-            plugin_slug="demo-plugin",
-            legacy_run_id="legacy-1",
-            pass_run_summary=run_summary,
-        )
-
-        self.assertEqual([row["callback_id"] for row in targets], ["ajax-public"])
-
     def test_convergence_iteration_does_not_converge_when_known_parameter_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -1625,6 +1990,48 @@ class ZendDiscoveryTests(unittest.TestCase):
 
             self.assertEqual(summary, {"accepted": 1, "total": 1})
 
+    def test_pass2_verification_accepts_request_transport_mapping(self) -> None:
+        raw = self.raw_seed_item()
+        raw["seed"]["zend_canonical_callback"] = "Demo::fetch"
+        raw["seed"]["input_params"] = [{
+            "name": "post_type",
+            "path": ["post_type"],
+            "source": "POST",
+            "location": "form",
+            "fuzzable": True,
+            "evidence_kind": "zend_runtime",
+        }]
+        uopz = self.pass1_artifact_for_raw(raw)
+        uopz.update({
+            "request_id": "ajax-pass2",
+            "request_params": {
+                "body_params": {},
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+            },
+        })
+        zend = self.zend_artifact_for_raw(raw, source="REQUEST", name="post_type")
+        zend["request_id"] = "ajax-pass2"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            (uopz_dir / "ajax-pass2.json").write_text(json.dumps(uopz), encoding="utf-8")
+            (zend_dir / "ajax-pass2.json").write_text(json.dumps(zend), encoding="utf-8")
+
+            summary = verify_pass2_contract(
+                {"legacy_run_id": "legacy-1", "runs": [{
+                    "hook_name": raw["hook_name"], "callback_id": raw["callback_id"], "seed_variant_id": "",
+                    "callback_reached": True, "matched_artifact": "ajax-pass2.json", "resolved_method": "POST",
+                }]},
+                {"suggested_seeds": [raw]},
+                zend_dir,
+                pass2_artifacts_dir=uopz_dir,
+            )
+
+            self.assertEqual(summary, {"accepted": 1, "total": 1})
+
     def test_pass2_verification_accepts_rest_json_runtime_evidence(self) -> None:
         raw = {
             "plugin_slug": "demo-plugin",
@@ -1685,6 +2092,136 @@ class ZendDiscoveryTests(unittest.TestCase):
                 {"legacy_run_id": "legacy-1", "runs": [{
                     "hook_name": "rest-items", "callback_id": "rest-items", "seed_variant_id": "",
                     "callback_reached": True, "matched_artifact": "rest-pass2.json", "resolved_method": "POST",
+                }]},
+                {"suggested_seeds": [raw]},
+                zend_dir,
+                pass2_artifacts_dir=uopz_dir,
+            )
+
+            self.assertEqual(summary, {"accepted": 1, "total": 1})
+
+    def test_pass2_verification_accepts_raw_zend_rest_event_when_uopz_matches_route(self) -> None:
+        raw = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "rest",
+            "namespace": "demo/v1",
+            "route_pattern": "/items",
+            "materialized_route": "/wp-json/demo/v1/items",
+            "callback_id": "rest-items",
+            "seed": {
+                "path": "/wp-json/demo/v1/items",
+                "method": "GET",
+                "auth_mode": "nopriv",
+                "zend_canonical_callback": "Demo::list_items",
+                "input_params": [{
+                    "name": "search", "path": ["search"], "source": "GET",
+                    "location": "query", "fuzzable": True, "evidence_kind": "zend_rest_runtime",
+                }],
+            },
+        }
+        candidate = candidate_from_seed_item(raw, plugin_slug="demo-plugin", legacy_run_id="legacy-1")
+        artifact = self.pass1_artifact(
+            candidate,
+            request_params={"query_params": {"rest_route": "/demo/v1/items", "search": "fuzz"}},
+        )
+        artifact.update({
+            "request_id": "rest-pass2",
+            "canonical_identity_id": canonical_identity_id(candidate),
+            "endpoint": "REST:/demo/v1/items",
+            "http_method": "GET",
+            "hook_coverage": {"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+        })
+        zend = {
+            "schema_version": 4,
+            "run_id": "legacy-1",
+            "request_id": "rest-pass2",
+            "method": "GET",
+            "rest_parameter_events": [{
+                "source": "REST",
+                "bucket": "GET",
+                "parameter": "search",
+                "callback": "Demo::list_items",
+                "observed_count": 1,
+                "path": ["GET", "search"],
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            (uopz_dir / "rest-pass2.json").write_text(json.dumps(artifact), encoding="utf-8")
+            (zend_dir / "rest-pass2.json").write_text(json.dumps(zend), encoding="utf-8")
+
+            summary = verify_pass2_contract(
+                {"legacy_run_id": "legacy-1", "runs": [{
+                    "hook_name": "rest-items", "callback_id": "rest-items", "seed_variant_id": "",
+                    "callback_reached": True, "matched_artifact": "rest-pass2.json", "resolved_method": "GET",
+                }]},
+                {"suggested_seeds": [raw]},
+                zend_dir,
+                pass2_artifacts_dir=uopz_dir,
+            )
+
+            self.assertEqual(summary, {"accepted": 1, "total": 1})
+
+    def test_pass2_verification_accepts_rest_url_runtime_evidence(self) -> None:
+        raw = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "rest",
+            "namespace": "demo/v1",
+            "route_pattern": "/item/(?P<id>\\d+)",
+            "materialized_route": "/wp-json/demo/v1/item/1",
+            "callback_id": "rest-item",
+            "seed": {
+                "path": "/wp-json/demo/v1/item/1",
+                "method": "GET",
+                "auth_mode": "nopriv",
+                "zend_canonical_callback": "Demo::get_item",
+                "input_params": [{
+                    "name": "id", "path": ["id"], "source": "URL",
+                    "location": "path", "fuzzable": True, "evidence_kind": "zend_rest_runtime",
+                }],
+            },
+        }
+        candidate = candidate_from_seed_item(raw, plugin_slug="demo-plugin", legacy_run_id="legacy-1")
+        artifact = self.pass1_artifact(
+            candidate,
+            request_params={"query_params": {"rest_route": "/demo/v1/item/1"}},
+        )
+        artifact.update({
+            "request_id": "rest-pass2",
+            "canonical_identity_id": canonical_identity_id(candidate),
+            "endpoint": "REST:/demo/v1/item/1",
+            "http_method": "GET",
+            "hook_coverage": {"executed_callbacks": {"rest-item": {"callback_id": "rest-item"}}},
+        })
+        zend = {
+            "schema_version": 4,
+            "run_id": "legacy-1",
+            "request_id": "rest-pass2",
+            "method": "GET",
+            "rest_parameter_events": [{
+                "source": "REST",
+                "bucket": "URL",
+                "parameter": "id",
+                "callback": "Demo::get_item",
+                "observed_count": 1,
+                "path": ["URL", "id"],
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            (uopz_dir / "rest-pass2.json").write_text(json.dumps(artifact), encoding="utf-8")
+            (zend_dir / "rest-pass2.json").write_text(json.dumps(zend), encoding="utf-8")
+
+            summary = verify_pass2_contract(
+                {"legacy_run_id": "legacy-1", "runs": [{
+                    "hook_name": "rest-item", "callback_id": "rest-item", "seed_variant_id": "",
+                    "callback_reached": True, "matched_artifact": "rest-pass2.json", "resolved_method": "GET",
                 }]},
                 {"suggested_seeds": [raw]},
                 zend_dir,
@@ -1772,6 +2309,36 @@ class ZendDiscoveryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 combine_final_seed_reports([first], expected_count=2)
 
+    def test_list_convergence_targets_excludes_expected_auth_skip(self) -> None:
+        nopriv = self.raw_seed_item(callback_id="ajax-nopriv", action="demo_save_items")
+        authenticated = {
+            **nopriv,
+            "hook_name": "wp_ajax_demo_save_items",
+            "callback_id": "ajax-auth",
+        }
+        targets = list_convergence_targets(
+            {"suggested_seeds": [nopriv, authenticated]},
+            plugin_slug="demo-plugin",
+            legacy_run_id="legacy-1",
+            generated_summary={
+                "generated": [
+                    {"hook_name": nopriv["hook_name"], "callback_id": nopriv["callback_id"]},
+                    {"hook_name": authenticated["hook_name"], "callback_id": authenticated["callback_id"]},
+                ]
+            },
+            pass1_run_summary={
+                "runs": [
+                    {
+                        "hook_name": nopriv["hook_name"],
+                        "callback_id": nopriv["callback_id"],
+                        "expected_auth_skip": True,
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual([target["callback_id"] for target in targets], ["ajax-auth"])
+
     def test_engine_has_no_legacy_runner_imports(self) -> None:
         engine_source = (FUZZER_DIR / "zend_discovery" / "engine.py").read_text(encoding="utf-8")
 
@@ -1780,7 +2347,7 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertNotIn("run_discovery", engine_source)
 
     def test_legacy_zend_bridge_is_only_compatibility_reexports(self) -> None:
-        bridge_source = (FUZZER_DIR / "hook_energy" / "seed_generation" / "zend_bridge.py").read_text(encoding="utf-8")
+        bridge_source = (FUZZER_DIR / "hook_energy" / "seed_generation" / "zend_runtime" / "bridge.py").read_text(encoding="utf-8")
 
         self.assertIn("from zend_discovery.convergence import", bridge_source)
         self.assertNotIn("def materialize_convergence_seeds", bridge_source)

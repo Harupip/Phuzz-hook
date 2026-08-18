@@ -8,14 +8,16 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from hook_energy.seed_generation.config_exporter import export_seed_configs
     from zend_discovery.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, run_enrichment
+    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, run_enrichment
+    from zend_discovery.rest_runtime import canonical_rest_parameter_name
 else:
-    from .config_exporter import export_seed_configs
+    from ..config_exporter import export_seed_configs
     from zend_discovery.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, run_enrichment
+    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, run_enrichment
+    from zend_discovery.rest_runtime import canonical_rest_parameter_name
 
 
 def _read_json(path: Path) -> Any:
@@ -95,7 +97,7 @@ def build_enrichment_inputs(
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run offline Zend enrichment for a legacy generated Pass 1 run.")
+    parser = argparse.ArgumentParser(description="Run offline Zend enrichment for a generated Pass 1 run.")
     parser.add_argument("--operation", choices=("prepare-registry", "correlate-enrich", "converge-iteration", "verify-pass2", "combine-final", "list-targets"), default="correlate-enrich")
     parser.add_argument("--plugin-zip")
     parser.add_argument("--plugin-slug")
@@ -172,6 +174,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_config_dir=Path(args.output_config_dir),
                 summary_path=Path(args.generated_config_summary),
                 replay_only=True,
+                rest_route_fallback=True,
             )
             print(f"Zend convergence iteration: status={result['status']} new={len(result['new_parameters'])}")
             return 0
@@ -185,13 +188,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Zend final seed reports combined: total={len(combined['suggested_seeds'])}")
             return 0
         if args.operation == "list-targets":
-            _require(args, "raw_suggested_seeds", "plugin_slug", "legacy_run_id", "pass1_run_summary", "targets_output")
+            _require(args, "raw_suggested_seeds", "plugin_slug", "legacy_run_id", "targets_output")
             targets = list_convergence_targets(
                 _read_json(Path(args.raw_suggested_seeds)),
                 plugin_slug=args.plugin_slug,
                 legacy_run_id=args.legacy_run_id,
-                pass_run_summary=_read_json(Path(args.pass1_run_summary)),
                 generated_summary=_read_json(Path(args.generated_config_summary)) if args.generated_config_summary else None,
+                pass1_run_summary=_read_json(Path(args.pass1_run_summary)) if args.pass1_run_summary else None,
             )
             _write_json(Path(args.targets_output), {"targets": targets})
             print(f"Zend convergence targets listed: total={len(targets)}")
@@ -243,6 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             merged,
             output_config_dir=Path(args.output_config_dir),
             summary_path=Path(args.generated_config_summary),
+            rest_route_fallback=True,
         )
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         print(str(exc), file=sys.stderr)
@@ -360,10 +364,7 @@ def _filter_iteration_inputs(
         and canonical_identity_id(candidate_from_seed_item(item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)) == candidate_key
     ]
     selected_keys = {_seed_key(item) for item in selected}
-    filtered_rows = [
-        row for row in rows
-        if isinstance(row, Mapping) and row.get("callback_reached") is True and _run_key(row) in selected_keys
-    ]
+    filtered_rows = [row for row in rows if isinstance(row, Mapping) and _run_key(row) in selected_keys]
     raw_copy = deepcopy(dict(raw_report))
     summary_copy = deepcopy(dict(pass_run_summary))
     raw_copy["suggested_seeds"] = selected
@@ -434,7 +435,7 @@ def verify_pass2_contract(
         row_method = str(row.get("resolved_method") or "").upper()
         if zend_method and row_method and zend_method != row_method:
             continue
-        observed = _zend_observed_params(zend, canonical_callback) | _zend_observed_rest_params(
+        observed = _zend_observed_params(zend, uopz, canonical_callback) | _zend_observed_rest_params(
             zend,
             uopz,
             canonical_callback,
@@ -483,7 +484,7 @@ def _expected_pass2_params(merged_seed_report: Mapping[str, Any]) -> dict[tuple[
             (str(param.get("name")), source, _param_location(param, source))
             for param in (seed.get("input_params") or [])
             if isinstance(param, Mapping)
-            and (source := _param_source(param)) in {"GET", "POST", "JSON"}
+            and (source := _param_source(param)) in {"GET", "POST", "JSON", "URL"}
             and str(param.get("name"))
         }
         value = {
@@ -510,7 +511,11 @@ def _expected_rest_identity(item: Mapping[str, Any], seed: Mapping[str, Any]) ->
     }
 
 
-def _zend_observed_params(zend: Mapping[str, Any], canonical_callback: str) -> set[tuple[str, str, str]]:
+def _zend_observed_params(
+    zend: Mapping[str, Any],
+    uopz: Mapping[str, Any],
+    canonical_callback: str,
+) -> set[tuple[str, str, str]]:
     summaries = zend.get("callback_summaries")
     if not isinstance(summaries, list):
         return set()
@@ -535,15 +540,37 @@ def _zend_observed_params(zend: Mapping[str, Any], canonical_callback: str) -> s
         except (TypeError, ValueError):
             continue
         if (
-            source not in {"GET", "POST"}
-            or not isinstance(path, list)
+            not isinstance(path, list)
             or len(path) != 1
             or not isinstance(path[0], str)
             or helper_depth != 0
             or observed_count < 1
         ):
             continue
-        observed.add((path[0], source, "query" if source == "GET" else "form"))
+        location = {"GET": "query", "POST": "form"}.get(source)
+        if source == "REQUEST":
+            request_params = uopz.get("request_params") if isinstance(uopz.get("request_params"), Mapping) else {}
+            request_headers = uopz.get("headers")
+            if not isinstance(request_headers, Mapping):
+                request_headers = request_params.get("headers")
+            request_headers = dict(request_headers) if isinstance(request_headers, Mapping) else {}
+            content_type = uopz.get("content_type") or uopz.get("request_content_type")
+            if not content_type:
+                content_type = request_params.get("content_type")
+            if content_type and not any(str(key).lower() == "content-type" for key in request_headers):
+                request_headers["Content-Type"] = content_type
+            resolved = resolve_request_transport(
+                path[0],
+                request_method=str(zend.get("request_method") or zend.get("method") or ""),
+                request_params=request_params,
+                headers=request_headers,
+            )
+            if resolved is None:
+                continue
+            source, location = resolved
+        elif source not in {"GET", "POST"}:
+            continue
+        observed.add((path[0], source, location))
     return observed
 
 
@@ -562,13 +589,19 @@ def _zend_observed_rest_params(
     body_params = request_params.get("body_params") if isinstance(request_params, Mapping) else None
     observed: set[tuple[str, str, str]] = set()
     seen_locations: dict[str, set[str]] = {}
+    bucket_locations = {"GET": "query", "POST": "form", "JSON": "json", "URL": "path"}
     for event in events:
         if not isinstance(event, Mapping) or str(event.get("callback") or "") != canonical_callback:
             continue
-        if isinstance(rest_identity, Mapping) and rest_identity and any(event.get(key) != value for key, value in rest_identity.items()):
+        if not _rest_runtime_identity_matches(event, uopz, rest_identity):
             continue
-        name = event.get("name")
-        location = str(event.get("location") or "")
+        if event.get("source") == "REST":
+            bucket = str(event.get("bucket") or "").upper()
+            name = canonical_rest_parameter_name(bucket, event.get("path"), event.get("parameter"))
+            location = bucket_locations.get(bucket, "")
+        else:
+            name = event.get("name")
+            location = str(event.get("location") or "")
         try:
             observed_count = int(event.get("observed_count") or 0)
         except (TypeError, ValueError):
@@ -576,9 +609,7 @@ def _zend_observed_rest_params(
         if (
             not isinstance(name, str)
             or not name
-            or "[" in name
-            or "]" in name
-            or location not in {"query", "form", "json"}
+            or location not in {"query", "form", "json", "path"}
             or observed_count < 1
             or _security_name(name)
         ):
@@ -588,11 +619,32 @@ def _zend_observed_rest_params(
         if location == "form" and isinstance(body_params, Mapping) and name not in body_params:
             continue
         seen_locations.setdefault(name, set()).add(location)
-        source = {"query": "GET", "form": "POST", "json": "JSON"}[location]
+        source = {"query": "GET", "form": "POST", "json": "JSON", "path": "URL"}[location]
         observed.add((name, source, location))
     if any(len(locations) != 1 for locations in seen_locations.values()):
         return set()
     return observed
+
+
+def _rest_runtime_identity_matches(event: Mapping[str, Any], uopz: Mapping[str, Any], rest_identity: Any) -> bool:
+    if not isinstance(rest_identity, Mapping) or not rest_identity:
+        return True
+    comparable = {
+        key: value
+        for key, value in rest_identity.items()
+        if event.get(key) not in (None, "")
+    }
+    if comparable:
+        return all(event.get(key) == value for key, value in comparable.items())
+    route = str(rest_identity.get("materialized_route") or "")
+    if route.startswith("/wp-json/"):
+        route = route[len("/wp-json") :]
+    endpoint = str(uopz.get("endpoint") or "")
+    if route and endpoint and endpoint != "REST:" + route:
+        return False
+    method = str(rest_identity.get("method") or "").upper()
+    uopz_method = str(uopz.get("http_method") or uopz.get("method") or uopz.get("request_method") or "").upper()
+    return not (method and uopz_method and method != uopz_method)
 
 
 def _param_source(param: Mapping[str, Any]) -> str:
@@ -600,14 +652,14 @@ def _param_source(param: Mapping[str, Any]) -> str:
     if source:
         return source
     location = str(param.get("location") or "")
-    return {"query": "GET", "form": "POST", "body": "POST", "json": "JSON"}.get(location, "")
+    return {"query": "GET", "form": "POST", "body": "POST", "json": "JSON", "path": "URL"}.get(location, "")
 
 
 def _param_location(param: Mapping[str, Any], source: str) -> str:
     location = str(param.get("location") or "")
-    if location in {"query", "form", "json"}:
+    if location in {"query", "form", "json", "path"}:
         return location
-    return {"GET": "query", "POST": "form", "JSON": "json"}.get(source, "")
+    return {"GET": "query", "POST": "form", "JSON": "json", "URL": "path"}.get(source, "")
 
 
 def _security_name(name: str) -> bool:
@@ -633,8 +685,8 @@ def list_convergence_targets(
     *,
     plugin_slug: str,
     legacy_run_id: str,
-    pass_run_summary: Mapping[str, Any] | None = None,
     generated_summary: Mapping[str, Any] | None = None,
+    pass1_run_summary: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     items = raw_report.get("suggested_seeds", [])
     if not isinstance(items, list):
@@ -642,27 +694,27 @@ def list_convergence_targets(
     targets: list[dict[str, Any]] = []
     seen: set[str] = set()
     generated_keys: set[tuple[str, str, str]] | None = None
+    expected_auth_skip_keys: set[tuple[str, str, str]] = set()
     if generated_summary is not None:
         rows = generated_summary.get("generated")
         if not isinstance(rows, list):
             raise ValueError("generated_config_summary.json must contain a generated array")
         generated_keys = {_run_key(row) for row in rows if isinstance(row, Mapping)}
-    reached_keys: set[tuple[str, str, str]] | None = None
-    if pass_run_summary is not None:
-        rows = pass_run_summary.get("runs")
+    if pass1_run_summary is not None:
+        rows = pass1_run_summary.get("runs")
         if not isinstance(rows, list):
-            raise ValueError("generated_config_run_summary.json must contain a runs array")
-        reached_keys = {
+            raise ValueError("pass1-generated_config_run_summary.json must contain a runs array")
+        expected_auth_skip_keys = {
             _run_key(row)
             for row in rows
-            if isinstance(row, Mapping) and row.get("callback_reached") is True
+            if isinstance(row, Mapping) and row.get("expected_auth_skip") is True
         }
     for item in items:
         if not isinstance(item, Mapping):
             continue
         if generated_keys is not None and _seed_key(item) not in generated_keys:
             continue
-        if reached_keys is not None and _seed_key(item) not in reached_keys:
+        if _seed_key(item) in expected_auth_skip_keys:
             continue
         candidate = candidate_from_seed_item(item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
         key = canonical_identity_id(candidate)

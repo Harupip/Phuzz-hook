@@ -470,7 +470,7 @@ sys.exit(2)
                 str(CODE_DIR / "phuzz.ps1"),
                 "-DryRun",
             ],
-            input="3\n\nn\n",
+            input="3\nn\n\nn\n",
             capture_output=True,
             text=True,
             timeout=30,
@@ -479,6 +479,29 @@ sys.exit(2)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Force plugin download", result.stdout)
         self.assertIn("-RunGeneratedConfigs", result.stdout)
+        self.assertNotIn("-UseZendDiscovery", result.stdout)
+
+    def test_guided_wrapper_interactive_generated_mode_can_enable_zend_discovery(self):
+        script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-DryRun",
+            ],
+            input="3\ny\n\nn\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Enable Zend Discovery (two-pass parameter discovery)", script)
+        self.assertIn("-RunGeneratedConfigs", result.stdout)
+        self.assertIn("-UseZendDiscovery", result.stdout)
 
     def test_guided_wrapper_generated_mode_lists_plugins_without_manual_config(self):
         plugin_zip = CODE_DIR / "web" / "applications" / "wordpress" / "_plugins" / "zzzz-generated-only.zip"
@@ -495,7 +518,7 @@ sys.exit(2)
                     str(CODE_DIR / "phuzz.ps1"),
                     "-DryRun",
                 ],
-                input="3\n\nn\n",
+                input="3\nn\n\nn\n",
                 capture_output=True,
                 text=True,
                 timeout=30,

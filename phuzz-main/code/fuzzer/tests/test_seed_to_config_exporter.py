@@ -17,7 +17,7 @@ from hook_energy.seed_generation.config_exporter import (
     build_config_for_seed_item,
     export_seed_configs,
 )
-from hook_energy.seed_generation.zend_bridge import merge_enriched_seeds
+from hook_energy.seed_generation.zend_runtime.bridge import merge_enriched_seeds
 from zend_discovery.engine import canonical_identity, canonical_identity_id, candidate_from_seed_item
 
 
@@ -595,6 +595,20 @@ class SeedToConfigExporterTests(unittest.TestCase):
         self.assertEqual(config["query_params"]["fuzz"], ["term"])
         self.assertNotIn("body_params", config)
         self.assertNotIn("action", json.dumps(config))
+
+    def test_rest_route_fallback_materializes_query_rest_route_target_only_when_requested(self):
+        _, default_config = build_config_for_seed_item(build_rest_seed_item(), target_base="http://web")
+        _, fallback_config = build_config_for_seed_item(
+            build_rest_seed_item(),
+            target_base="http://web",
+            rest_route_fallback=True,
+        )
+
+        self.assertEqual(default_config["target"], "http://web/wp-json/demo/v1/items")
+        self.assertEqual(fallback_config["target"], "http://web/?rest_route=/demo/v1/items")
+        self.assertEqual(fallback_config["methods"], ["GET"])
+        self.assertEqual(fallback_config["query_params"]["fuzz"], ["term"])
+        self.assertNotIn("body_params", fallback_config)
 
     def test_post_rest_seed_fuzzes_body_params(self):
         _, config = build_config_for_seed_item(build_rest_seed_item(method="POST", fuzzable_params=["title"]))

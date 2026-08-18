@@ -16,6 +16,7 @@ param(
     [int]$GeneratedConfigTimeoutSeconds = 30,
     [switch]$UseEntrypointPipeline,
     [switch]$UseZendDiscovery,
+    [switch]$KeepDebugArtifacts,
     [ValidateRange(1, 30)]
     [int]$ZendMaxIterations = 5,
     [ValidateRange(1, 20)]
@@ -65,7 +66,8 @@ Useful options:
   -SeedWaitSeconds <seconds>       Wait window for live hook coverage snapshot. Default: 45.
   -GeneratedConfigTimeoutSeconds   Per generated-config run window. Default/max: 30.
   -UseEntrypointPipeline           Opt-in generated mode to the entrypoint pipeline.
-  -UseZendDiscovery                Opt-in generated mode to two-pass Zend parameter enrichment.
+  -UseZendDiscovery                Opt-in generated mode to runtime-only two-pass Zend parameter discovery.
+  -KeepDebugArtifacts              Keep Zend intermediate artifacts after a successful run.
   -ZendMaxIterations <count>       Max Zend REST convergence iterations. Default: 5.
   -RecursiveInputFile <path>       Child-hook input artifact. Repeat for multiple files.
   -RecursiveHookCoverageDir <path> Hook coverage dir with requests/ for recursive validation.
@@ -98,6 +100,7 @@ function Read-MenuMode {
     Write-Host "  1) default     - Start WordPress PHUZZ with existing behavior"
     Write-Host "  2) seed-config - Start web, export hook seeds, generate PHUZZ configs"
     Write-Host "  3) generated   - Generate configs, then run them sequentially"
+    Write-Host "                 (optional Zend Discovery prompt follows)"
     Write-Host "  4) recursive   - Generate recursive child-hook seeds/configs from request artifacts"
 
     $choice = (Read-Host "Select [1-4]").Trim()
@@ -657,6 +660,12 @@ if ($interactive) {
     $Mode = Read-MenuMode
 }
 
+if ($interactive -and $Mode -eq "generated") {
+    $UseZendDiscovery = Read-YesNo `
+        -Prompt "Enable Zend Discovery (two-pass parameter discovery)" `
+        -Default $false
+}
+
 if ($UseEntrypointPipeline -and $Mode -ne "generated") {
     throw "-UseEntrypointPipeline is only supported with -Mode generated."
 }
@@ -719,6 +728,9 @@ switch ($Mode) {
         if ($UseZendDiscovery) {
             $runnerParams["UseZendDiscovery"] = $true
             $runnerParams["ZendMaxIterations"] = $ZendMaxIterations
+        }
+        if ($KeepDebugArtifacts) {
+            $runnerParams["KeepDebugArtifacts"] = $true
         }
     }
     default {

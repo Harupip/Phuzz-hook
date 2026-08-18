@@ -10,7 +10,8 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.generator import LiveHookSeedGenerator
+from hook_energy.seed_generation.static_generator import StaticSeedGenerator
+from hook_energy.seed_generation.zend_runtime.candidate_generator import ZendRuntimeSeedGenerator
 
 
 def build_live_coverage_payload() -> dict:
@@ -100,16 +101,21 @@ def build_live_coverage_payload() -> dict:
     }
 
 
-class LiveHookSeedGeneratorTests(unittest.TestCase):
-    def test_runtime_parameters_only_skips_extractor_and_builds_post_action_probe(self) -> None:
-        class RaisingExtractor:
-            def extract(self, _callback: dict) -> dict:
-                raise AssertionError("runtime-only generation must not inspect static parameters")
+class SeedGeneratorTests(unittest.TestCase):
+    def test_zend_runtime_generator_is_source_free(self) -> None:
+        runtime_source = (
+            Path(__file__).resolve().parents[1]
+            / "hook_energy"
+            / "seed_generation"
+            / "zend_runtime"
+            / "candidate_generator.py"
+        ).read_text(encoding="utf-8")
 
-        _, seed_report = LiveHookSeedGenerator(
-            input_extractor=RaisingExtractor(),
-            runtime_parameters_only=True,
-        ).build_reports(build_live_coverage_payload())
+        self.assertNotIn("InputSignatureExtractor", runtime_source)
+        self.assertNotIn("SourcePathResolver", runtime_source)
+
+    def test_zend_runtime_generator_skips_source_extraction_and_builds_post_action_probe(self) -> None:
+        _, seed_report = ZendRuntimeSeedGenerator().build_reports(build_live_coverage_payload())
 
         item = next(
             row for row in seed_report["suggested_seeds"]
@@ -121,7 +127,7 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
         self.assertEqual(item["seed"]["input_params"], [])
 
     def test_generator_derives_direct_http_seed_and_manual_only_entries(self) -> None:
-        generator = LiveHookSeedGenerator()
+        generator = StaticSeedGenerator()
 
         gap_report, seed_report = generator.build_reports(build_live_coverage_payload())
 
@@ -147,7 +153,7 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
         self.assertNotIn("seed", manual_only)
 
     def test_generator_writes_seed_artifacts_without_import_queues(self) -> None:
-        generator = LiveHookSeedGenerator()
+        generator = StaticSeedGenerator()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             output_dir = Path(tmp_dir)
@@ -187,7 +193,7 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
             callback["start_line"] = 2
             callback["end_line"] = 6
 
-            gap_report, seed_report = LiveHookSeedGenerator().build_reports(payload)
+            gap_report, seed_report = StaticSeedGenerator().build_reports(payload)
 
         callback_row = next(
             item for item in gap_report["callbacks"] if item["hook_name"] == "wp_ajax_nopriv_sac_post_type_call"
@@ -248,7 +254,7 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
                 }
             }
 
-            _, seed_report = LiveHookSeedGenerator().build_reports(payload)
+            _, seed_report = StaticSeedGenerator().build_reports(payload)
 
         seed = next(item["seed"] for item in seed_report["suggested_seeds"] if item["seed"]["method"] == "POST")
         self.assertEqual(seed["body"]["action"], "vx_form_save_api_settings")
@@ -260,7 +266,7 @@ class LiveHookSeedGeneratorTests(unittest.TestCase):
         self.assertEqual(seed["fuzzable_params"], ["cfx_settings[alert_emails]"])
 
     def test_generator_prioritizes_nopriv_over_authenticated_hooks(self) -> None:
-        generator = LiveHookSeedGenerator()
+        generator = StaticSeedGenerator()
 
         auth_priority, auth_rank, _ = generator._classify_seed_priority("wp_ajax_demo", True)
         nopriv_priority, nopriv_rank, _ = generator._classify_seed_priority("wp_ajax_nopriv_demo", True)

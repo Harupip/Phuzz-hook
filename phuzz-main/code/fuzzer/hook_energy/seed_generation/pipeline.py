@@ -7,7 +7,8 @@ from typing import Any
 
 from ..rest_routes import materialize_rest_route
 from .config_exporter import export_seed_configs
-from .generator import LiveHookSeedGenerator
+from .static_generator import StaticSeedGenerator
+from .zend_runtime.candidate_generator import ZendRuntimeSeedGenerator
 
 
 LOCATION_CANDIDATES = ["query", "form", "json"]
@@ -26,15 +27,20 @@ def run_entrypoint_pipeline(
     host_source_root: str | Path | None = None,
     source_root: str | Path | None = None,
     unresolved_source_reason: str | None = None,
+    runtime_parameters_only: bool = False,
 ) -> dict[str, Any]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    generator = LiveHookSeedGenerator(
-        container_source_root=container_source_root,
-        host_source_root=host_source_root,
-        source_root=source_root,
-        unresolved_source_reason=unresolved_source_reason,
+    generator = (
+        ZendRuntimeSeedGenerator()
+        if runtime_parameters_only
+        else StaticSeedGenerator(
+            container_source_root=container_source_root,
+            host_source_root=host_source_root,
+            source_root=source_root,
+            unresolved_source_reason=unresolved_source_reason,
+        )
     )
     gap_report, seed_report = generator.build_reports(dict(coverage_payload))
     registered = _registered_callbacks(coverage_payload)

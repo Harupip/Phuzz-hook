@@ -31,13 +31,13 @@ Khi Pass 1 request chay, web container Zend target ghi raw opcode event vao:
 Runner copy raw UOPZ va Zend logs ve:
 
 ```text
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/logs/pass1-uopz/
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/logs/pass1-zend/
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/logs/pass1-uopz/
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/logs/pass1-zend/
 ```
 
 Bridge chi tao parameter neu co bang chung dong thoi tu:
 
-- same `legacy_run_id` trong UOPZ evidence
+- same internal run-correlation field (`legacy_run_id`) trong UOPZ evidence
 - same `request_id`
 - same target plugin
 - expected callback da execute trong UOPZ artifact
@@ -54,7 +54,7 @@ state; static extraction khong the them parameter.
 parameter moi, va moi runtime parameter da biet deu duoc quan sat lai trong run hien
 tai. Callback/correlation/replay failure ghi `REPLAY_FAILED`; hash config lap ghi
 `REPEATED_CONFIG`; het `-ZendMaxIterations` ma chua hoi tu ghi `ITERATION_LIMIT`.
-Zero generated candidate moi fallback ve legacy bridge cu.
+Zero generated candidate moi fallback ve bridge hien tai, khong chay convergence.
 
 ## Scope Stage 1
 
@@ -62,6 +62,8 @@ Accepted:
 
 - direct `$_GET['x']`
 - direct `$_POST['y']`
+- correlated direct `$_REQUEST['x']` when the current request resolves it to
+  exactly one existing `GET/query` or `POST/form` transport
 - top-level path exactly one string key
 - `helper_depth == 0`
 - `observed_count > 0`
@@ -69,12 +71,14 @@ Accepted:
 
 Rejected/fail closed for direct Stage 1:
 
-- `$_REQUEST`
+- direct `$_REQUEST` without a resolver-approved transport
 - `$_COOKIE`
 - nested paths
 - helper-reader propagation
 - method-only evidence
-- UOPZ `request_params`
+- ambiguous `$_REQUEST` transport (the name exists in both query and body)
+- JSON-only or unsupported request transport for `$_REQUEST`
+- UOPZ `request_params` without a matching Zend read and callback correlation
 - stale/missing Zend artifacts
 - HTTP 200 without matching callback and Zend parameter event
 - callback reached without matching Zend parameter event
@@ -86,10 +90,24 @@ GET and POST source map independently of HTTP request method:
 
 Example: a POST request that reads `$_GET['x']` still creates a query parameter `x`.
 
+`$_REQUEST` does not create a new downstream source. The runtime boundary maps it
+to the existing canonical contract using this order:
+
+1. If the name exists in exactly one correlated `query_params` or `body_params`
+   bucket, use `GET/query` or `POST/form`.
+2. Otherwise, use `GET/query` for a GET request.
+3. Otherwise, use `POST/form` only for a POST request with
+   `application/x-www-form-urlencoded` or `multipart/form-data`.
+4. Reject ambiguity, JSON-only requests, unsupported methods, and missing
+   transport evidence.
+
+Pass 2 applies the same mapping to raw Zend `REQUEST` events, so final
+verification compares the existing `(name, source, location)` identity.
+
 ## Mainline CRM And REST Addendum
 
-The current mainline keeps Stage 1 direct Zend evidence narrow, but the legacy
-generated flow may still carry source/helper seed information into the Zend
+The current mainline keeps Stage 1 direct Zend evidence narrow, but the
+compatibility generated flow may still carry source/helper seed information into the Zend
 bridge. This matters for `crm-perks-forms`:
 
 - UOPZ/coverage registers callback `cfx_form_admin_pages->save_api_settings`.
@@ -123,7 +141,7 @@ The generator consumes only normalized value-free evidence. Example:
 
 ```json
 {
-  "run_id": "legacy-...",
+  "run_id": "<plugin>-YYYYMMDDTHHmmssZ",
   "request_id": "1786493341-...",
   "plugin_slug": "hookphuzz-entrypoint-direct-fixture",
   "callback_id": "add59b...",
@@ -155,30 +173,34 @@ Fixed platform fields still come from explicit WordPress rules. For AJAX Stage 1
 Given:
 
 ```text
-<legacy_run_id>
+<plugin_run_id>
 ```
+
+The public run-directory name is `<plugin-slug>-<UTC timestamp>`. Existing
+`legacy_run_id` JSON fields and `--legacy-run-id` CLI arguments are retained as
+compatibility identifiers; they do not change the directory naming policy.
 
 Check:
 
 ```text
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/hookphuzz-callback-registry.json
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/zend_convergence_summary.json
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/iterations/<n>/state.json
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/targets/<candidate_key>/iterations/<n>/state.json
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/targets/<candidate_key>/current/
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/targets/<candidate_key>/final/
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/current/
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/final/
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/pass1-generated_config_summary.json
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/pass1-generated_config_run_summary.json
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/logs/pass1-uopz/
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/logs/pass1-zend/
-fuzzer/output/zend-discovery/<legacy_run_id>/zend_enriched_seeds.json
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/hookphuzz-callback-registry.json
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/zend_convergence_summary.json
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/iterations/<n>/state.json
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/targets/<candidate_key>/iterations/<n>/state.json
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/targets/<candidate_key>/current/
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/targets/<candidate_key>/final/
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/current/
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/final/
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/pass1-generated_config_summary.json
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/pass1-generated_config_run_summary.json
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/logs/pass1-uopz/
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/logs/pass1-zend/
+fuzzer/output/zend-discovery/<plugin_run_id>/zend_enriched_seeds.json
 fuzzer/output/seed_generation/zend_merged_suggested_seeds.json
 fuzzer/output/seed_generation/generated_config_summary.json
 fuzzer/output/seed_generation/pass2-generated_config_run_summary.json
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/logs/pass2-uopz/
-fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/logs/pass2-zend/
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/logs/pass2-uopz/
+fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/logs/pass2-zend/
 ```
 
 The final config is written under:
@@ -186,6 +208,33 @@ The final config is written under:
 ```text
 fuzzer/configs/generated-config/<plugin-slug>/
 ```
+
+### Artifact retention
+
+Trong khi run dang chay, tat ca registry, Pass 1, target, iteration, log va
+snapshot trung gian van duoc giu de debug. Retention chi chay sau khi da ghi
+convergence summary, final config va final replay/Pass 2 summary.
+
+Voi terminal status `PASS`, `SUCCESS`, `CONVERGED` hoac
+`PASS_PARTIAL_AUTH_EXPECTED`, runner giu:
+
+- `zend-bridge/<plugin_run_id>/zend_convergence_summary.json`
+- `zend-bridge/<plugin_run_id>/final/`
+- `zend-bridge/<plugin_run_id>/final-generated_config_run_summary.json`
+- final generated configs trong `fuzzer/configs/generated-config/<plugin-slug>/`
+- final `generated_config_summary.json`, `hook_gap_report.json` va
+  `zend_merged_suggested_seeds.json` neu cac file nay thuoc current seed output
+
+Runner prune chi subtree current `<plugin_run_id>` va exact current-run
+`zend-discovery/<plugin_run_id>`. Cac file nhu registry, `pass1-configs/`,
+`targets/`, `iterations/`, logs, `current/`, Pass 1 summaries va
+`final-generated_config_summary.json` bi xoa sau success. `suggested_seeds.json`
+chi bi xoa khi noi dung da merge hoan toan vao
+`zend_merged_suggested_seeds.json`.
+
+Neu status la `FAIL`, `TIMEOUT`, `EXCEPTION`, `REPLAY_FAILED`,
+`REPEATED_CONFIG` hoac `ITERATION_LIMIT`, runner khong prune gi. Co the dung
+`-KeepDebugArtifacts` de giu toan bo intermediate ngay ca khi run success.
 
 ## Known Passing Fixture
 
@@ -209,7 +258,7 @@ Expected result:
 - iteration 0 is action-only and discovers POST `name`
 - iteration 1 sends nonempty `name` and discovers POST `age`
 - iteration 2 sends both and converges with no new parameter
-- all three request IDs differ, share one `legacy_run_id`, and one canonical candidate key
+- all three request IDs differ, share one internal `legacy_run_id`, and one canonical candidate key
 - final generated config has fixed `action` and fuzzable POST `name`, `age`
 
 ## Known Passing CRM Command
@@ -230,7 +279,7 @@ rtk powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\wordpress\run-
 Required PASS checks:
 
 - command exits `0`
-- `fuzzer/output/seed_generation/zend-bridge/<legacy_run_id>/zend_convergence_summary.json`
+- `fuzzer/output/seed_generation/zend-bridge/<plugin_run_id>/zend_convergence_summary.json`
   has `status=CONVERGED`
 - convergence iterations contain fresh request IDs
 - Pass 1 and Pass 2 run summaries both have `callback_reached=1`
@@ -272,8 +321,8 @@ Current REST convergence implementation proof (2026-08-13):
 rtk powershell.exe -ExecutionPolicy Bypass -File phuzz-main/code/phuzz.ps1 -Mode generated -PluginSlug hookphuzz-rest-get-param-fixture -UseZendDiscovery -ZendMaxIterations 5 -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs -DryRun
 rtk python -m unittest fuzzer.tests.test_zend_discovery fuzzer.tests.test_generated_config_runner fuzzer.tests.test_phuzz_wrapper_contract -v
 rtk powershell.exe -NoProfile -Command "[void][System.Management.Automation.Language.Parser]::ParseFile('scripts/wordpress/run-wordpress-phuzz.ps1',[ref]`$null,[ref]`$null); [void][System.Management.Automation.Language.Parser]::ParseFile('phuzz.ps1',[ref]`$null,[ref]`$null); 'parser ok'"
-rtk python -m py_compile fuzzer/hook_energy/seed_generation/zend_bridge_cli.py fuzzer/zend_discovery/convergence.py
-rtk git diff --check -- phuzz-main/code/fuzzer/hook_energy/seed_generation/zend_bridge_cli.py phuzz-main/code/fuzzer/tests/test_generated_config_runner.py phuzz-main/code/fuzzer/tests/test_phuzz_wrapper_contract.py phuzz-main/code/fuzzer/tests/test_zend_discovery.py phuzz-main/code/phuzz.ps1 phuzz-main/code/scripts/wordpress/run-wordpress-phuzz.ps1 phuzz-main/code/docs/guides/zend-runtime-discovery-stage1.md
+rtk python -m py_compile fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py fuzzer/zend_discovery/convergence.py
+rtk git diff --check -- phuzz-main/code/fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py phuzz-main/code/fuzzer/tests/test_generated_config_runner.py phuzz-main/code/fuzzer/tests/test_phuzz_wrapper_contract.py phuzz-main/code/fuzzer/tests/test_zend_discovery.py phuzz-main/code/phuzz.ps1 phuzz-main/code/scripts/wordpress/run-wordpress-phuzz.ps1 phuzz-main/code/docs/guides/zend-runtime-discovery-stage1.md
 ```
 
 Result:

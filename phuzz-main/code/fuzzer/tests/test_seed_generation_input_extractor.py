@@ -118,6 +118,38 @@ class InputSignatureExtractorTests(unittest.TestCase):
         self.assertIn("cfx_settings", by_name)
         self.assertEqual(by_name["cfx_settings[alert_emails]"]["source"], "POST")
 
+    def test_extracts_wordpress_rest_request_accessors_for_initial_replay(self) -> None:
+        source = textwrap.dedent(
+            """\
+            <?php
+            function rest_probe(WP_REST_Request $request) {
+                $search = $request->get_param('search');
+                $page = $request->get_query_params()["page"];
+                $email = $request->get_body_params()['email'];
+                $name = $request->get_json_params()['name'];
+            }
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_file = Path(tmp_dir) / "rest.php"
+            source_file.write_text(source, encoding="utf-8")
+
+            result = InputSignatureExtractor().extract(
+                {
+                    "source_file": str(source_file),
+                    "start_line": 2,
+                    "end_line": 8,
+                    "function_name": "rest_probe",
+                }
+            )
+
+        extracted = {(item["source"], item["name"], item["confidence"]) for item in result["input_params"]}
+        self.assertIn(("REQUEST", "search", "static_rest_accessor"), extracted)
+        self.assertIn(("GET", "page", "static_rest_accessor"), extracted)
+        self.assertIn(("POST", "email", "static_rest_accessor"), extracted)
+        self.assertIn(("BODY_JSON", "name", "static_rest_accessor"), extracted)
+
 
 if __name__ == "__main__":
     unittest.main()

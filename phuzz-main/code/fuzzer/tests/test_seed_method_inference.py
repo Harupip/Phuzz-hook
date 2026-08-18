@@ -18,7 +18,7 @@ if str(FUZZER_DIR) not in sys.path:
 from candidate import Candidate
 from hook_energy.method_resolution import normalize_http_methods, resolve_http_methods
 from hook_energy.seed_generation.config_exporter import SeedConfigSkip, build_config_for_seed_item
-from hook_energy.seed_generation.generator import LiveHookSeedGenerator
+from hook_energy.seed_generation.static_generator import StaticSeedGenerator as LiveHookSeedGenerator
 from hook_energy.seed_generation.importer import HookSeedImporter
 from hook_energy.seed_validator import build_validation_request
 

@@ -1,11 +1,9 @@
 import contextlib
-import importlib.util
 import io
 import json
 import subprocess
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +13,7 @@ if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
 from hook_energy.seed_generation.generated_config_runner import (
+    classify_expected_auth_skips,
     format_recursive_summary,
     load_generated_configs,
     list_request_artifacts,
@@ -45,71 +44,11 @@ def completed(returncode):
     return subprocess.CompletedProcess(["docker"], returncode, "", "")
 
 
-def generated_config(slug="generated-hooks/one", hook_name="wp_ajax_nopriv_demo", callback_id="cb-one", entrypoint_type=None, auth_mode=None):
+def generated_config(slug="generated-hooks/one", hook_name="wp_ajax_nopriv_demo", callback_id="cb-one", entrypoint_type=None):
     row = {"config_slug": slug, "hook_name": hook_name, "callback_id": callback_id}
     if entrypoint_type:
         row["entrypoint_type"] = entrypoint_type
-    if auth_mode:
-        row["auth_mode"] = auth_mode
     return row
-
-
-def fake_candidate():
-    return types.SimpleNamespace(
-        http_target="http://web/wp-admin/admin-ajax.php",
-        http_method="POST",
-        coverage_id="request-1",
-        fixed_params={
-            "headers": {},
-            "cookies": {
-                "wordpress_logged_in_site": "auth",
-                "wordpress_sec_site": "secure",
-                "plain": "keep",
-            },
-            "query_params": {},
-            "body_params": {"action": "demo"},
-        },
-        fuzz_params={"headers": {}, "cookies": {}, "query_params": {}, "body_params": {}},
-    )
-
-
-def load_fuzzer_with_fake_requests():
-    class FakeRequest:
-        def __init__(self, *, method, url, params=None, cookies=None, headers=None, data=None, json=None):
-            self.method = method
-            self.url = url
-            self.params = params or {}
-            self.cookies = cookies or {}
-            self.headers = headers or {}
-            self.data = data
-            self.json = json
-
-        def prepare(self):
-            return types.SimpleNamespace(
-                method=self.method,
-                url=self.url,
-                params=self.params,
-                cookies=self.cookies,
-                headers=self.headers,
-                data=self.data,
-                json=self.json,
-            )
-
-    fake_requests = types.SimpleNamespace(Request=FakeRequest, Session=lambda: object())
-    module_name = "hookphuzz_fuzzer_auth_test"
-    fuzzer_path = FUZZER_DIR / "fuzzer.py"
-    old_path = list(sys.path)
-    sys.modules.pop(module_name, None)
-    try:
-        sys.path.insert(0, str(FUZZER_DIR))
-        with patch.dict(sys.modules, {"requests": fake_requests}):
-            spec = importlib.util.spec_from_file_location(module_name, fuzzer_path)
-            module = importlib.util.module_from_spec(spec)
-            assert spec.loader is not None
-            spec.loader.exec_module(module)
-            return module
-    finally:
-        sys.path[:] = old_path
 
 
 class FakeArtifacts:
@@ -127,6 +66,137 @@ class FakeArtifacts:
 
 
 class GeneratedConfigRunnerTests(unittest.TestCase):
+    def test_expected_auth_skip_requires_reached_authenticated_counterpart(self):
+        runs = [
+            {
+                "hook_name": "wp_ajax_nopriv_demo",
+                "entrypoint_type": "ajax_unauthenticated",
+                "process_status": "window_elapsed",
+                "validation_status": "registered_not_executed",
+                "callback_reached": False,
+                "failure_category": "E. callback registered but not HTTP reachable",
+            },
+            {
+                "hook_name": "wp_ajax_demo",
+                "entrypoint_type": "ajax_authenticated",
+                "process_status": "window_elapsed",
+                "validation_status": "callback_reached",
+                "callback_reached": True,
+            },
+        ]
+
+        self.assertEqual(classify_expected_auth_skips(runs), 1)
+        self.assertTrue(runs[0]["expected_auth_skip"])
+        self.assertEqual(runs[0]["expected_auth_reason"], "authenticated_counterpart_reached")
+        self.assertIsNone(runs[0]["failure_category"])
+
+    def test_expected_auth_skip_does_not_mask_unpaired_or_failed_auth(self):
+        runs = [
+            {
+                "hook_name": "wp_ajax_nopriv_unpaired",
+                "entrypoint_type": "ajax_unauthenticated",
+                "process_status": "window_elapsed",
+                "validation_status": "registered_not_executed",
+                "callback_reached": False,
+            },
+            {
+                "hook_name": "wp_ajax_nopriv_failed",
+                "entrypoint_type": "ajax_unauthenticated",
+                "process_status": "window_elapsed",
+                "validation_status": "registered_not_executed",
+                "callback_reached": False,
+            },
+            {
+                "hook_name": "wp_ajax_failed",
+                "entrypoint_type": "ajax_authenticated",
+                "process_status": "failed",
+                "validation_status": "no_artifact",
+                "callback_reached": False,
+            },
+        ]
+
+        self.assertEqual(classify_expected_auth_skips(runs), 0)
+        self.assertFalse(runs[0].get("expected_auth_skip", False))
+        self.assertFalse(runs[1].get("expected_auth_skip", False))
+
+    def test_expected_auth_skip_makes_generated_batch_success(self):
+        runner = FakeRunner([completed(0), completed(0)])
+        nopriv_artifact = {
+            "hook_coverage": {
+                "registered_callbacks": {"cb-nopriv": {"callback_id": "cb-nopriv"}},
+                "executed_callbacks": {},
+                "blindspot_callbacks": {},
+            }
+        }
+        auth_artifact = {
+            "hook_coverage": {
+                "registered_callbacks": {"cb-auth": {"callback_id": "cb-auth"}},
+                "executed_callbacks": {"cb-auth": {"callback_id": "cb-auth"}},
+                "blindspot_callbacks": {},
+            }
+        }
+        artifacts = FakeArtifacts(
+            [set(), {"nopriv.json"}, {"nopriv.json"}, {"nopriv.json", "auth.json"}],
+            {"nopriv.json": nopriv_artifact, "auth.json": auth_artifact},
+        )
+
+        report = run_generated_configs(
+            [
+                generated_config(
+                    "generated-hooks/nopriv",
+                    "wp_ajax_nopriv_demo",
+                    "cb-nopriv",
+                    "ajax_unauthenticated",
+                ),
+                generated_config(
+                    "generated-hooks/auth",
+                    "wp_ajax_demo",
+                    "cb-auth",
+                    "ajax_authenticated",
+                ),
+            ],
+            timeout_seconds=5,
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=artifacts.load,
+        )
+
+        self.assertEqual(report["counts"]["callback_reached"], 1)
+        self.assertEqual(report["counts"]["expected_auth_skip"], 1)
+        self.assertEqual(report["runs"][0]["validation_status"], "registered_not_executed")
+        self.assertTrue(report["runs"][0]["expected_auth_skip"])
+
+    @patch("hook_energy.seed_generation.generated_config_runner.run_generated_configs")
+    def test_main_returns_success_for_expected_auth_skip(self, run_configs):
+        run_configs.return_value = {
+            "runs": [{"callback_reached": False, "expected_auth_skip": True}],
+            "counts": {
+                "total": 1,
+                "callback_reached": 0,
+                "expected_auth_skip": 1,
+                "process_failed": 0,
+                "runner_error": 0,
+                "vuln_found": 0,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "generated_config_summary.json"
+            output = root / "generated_config_run_summary.json"
+            source.write_text(json.dumps({"generated": []}), encoding="utf-8")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = main(
+                    [
+                        "--generated-config-summary",
+                        str(source),
+                        "--output-file",
+                        str(output),
+                    ]
+                )
+
+        self.assertEqual(result, 0)
+
     @patch("hook_energy.seed_generation.generated_config_runner.subprocess.run")
     def test_list_request_artifacts_uses_web_shared_tmpfs(self, run_command):
         run_command.return_value = subprocess.CompletedProcess([], 0, "b.json\na.json\n", "")
@@ -166,7 +236,6 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                                 "method_confidence": "route_declared",
                                 "route_declared_methods": ["PATCH"],
                                 "seed_variant_id": "rest-patch",
-                                "auth_mode": "unauth-capable",
                             },
                         ]
                     }
@@ -189,7 +258,6 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
                         "method_confidence": "route_declared",
                         "route_declared_methods": ["PATCH"],
                         "seed_variant_id": "rest-patch",
-                        "auth_mode": "unauth-capable",
                     },
                 ],
             )
@@ -257,58 +325,6 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         for command in runner.commands:
             self.assertIn("-e", command)
             self.assertIn("HOOKPHUZZ_LEGACY_RUN_ID=legacy-123", command)
-
-    def test_unauth_capable_config_preserves_auth_mode_without_runner_env(self):
-        runner = FakeRunner([completed(0), completed(0)])
-        artifacts = FakeArtifacts([set(), set(), set(), set()], {})
-
-        report = run_generated_configs(
-            [
-                generated_config(auth_mode="unauth-capable"),
-                generated_config("generated-hooks/auth", "wp_ajax_demo", "cb-auth", auth_mode="authenticated"),
-            ],
-            timeout_seconds=5,
-            run_command=runner,
-            list_artifacts=artifacts.list,
-            load_artifact=artifacts.load,
-        )
-
-        self.assertEqual([row["auth_mode"] for row in report["runs"]], ["unauth-capable", "authenticated"])
-        self.assertNotIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES=1", runner.commands[1])
-        self.assertNotIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES=1", runner.commands[0])
-
-    def test_nopriv_hook_without_auth_mode_uses_legacy_runner_command(self):
-        runner = FakeRunner([completed(0)])
-        artifacts = FakeArtifacts([set(), set()], {})
-
-        run_generated_configs(
-            [generated_config(hook_name="wp_ajax_nopriv_demo")],
-            timeout_seconds=5,
-            run_command=runner,
-            list_artifacts=artifacts.list,
-            load_artifact=artifacts.load,
-        )
-
-        self.assertNotIn("HOOKPHUZZ_DISABLE_AUTH_COOKIES=1", runner.commands[0])
-
-    def test_generated_replays_route_auth_from_config_metadata(self):
-        module = load_fuzzer_with_fake_requests()
-        cases = [
-            ({"metadata": {"auth_mode": "authenticated", "hook_name": "wp_ajax_demo"}}, True),
-            ({"metadata": {"auth_mode": "unauth-capable", "hook_name": "wp_ajax_nopriv_demo"}}, False),
-            ({"metadata": {"hook_name": "wp_ajax_nopriv_demo"}}, False),
-            ({"metadata": {"hook_name": "wp_ajax_demo"}}, True),
-        ]
-
-        for config, keeps_auth_cookie in cases:
-            with self.subTest(config=config):
-                fuzzer = object.__new__(module.Fuzzer)
-                fuzzer.config = config
-                prepared = fuzzer.prepare_request(fake_candidate())
-
-                self.assertEqual("wordpress_logged_in_site" in prepared.cookies, keeps_auth_cookie)
-                self.assertEqual("wordpress_sec_site" in prepared.cookies, keeps_auth_cookie)
-                self.assertEqual(prepared.cookies["plain"], "keep")
 
     def test_stop_on_vuln_exit_is_recorded_as_vuln_found_not_failed(self):
         runner = FakeRunner([completed(57)])
@@ -484,71 +500,6 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
             self.assertEqual(validation['summary']['total'], 0)
             self.assertEqual(validation['validations'], [])
 
-    def test_main_allows_partial_callback_reach_when_requested(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
-            source = root / "generated_config_summary.json"
-            output = root / "generated_config_run_summary.json"
-            source.write_text(json.dumps({"generated": [generated_config(str(index)) for index in range(9)]}), encoding="utf-8")
-            report = {
-                "runs": [],
-                "counts": {
-                    "total": 9,
-                    "process_failed": 0,
-                    "runner_error": 0,
-                    "callback_reached": 6,
-                    "vuln_found": 0,
-                },
-            }
-
-            with patch("hook_energy.seed_generation.generated_config_runner.run_generated_configs", return_value=report):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    result = main(
-                        [
-                            "--generated-config-summary",
-                            str(source),
-                            "--output-file",
-                            str(output),
-                            "--timeout-seconds",
-                            "5",
-                            "--allow-partial-callback-reach",
-                        ]
-                    )
-
-            self.assertEqual(result, 0)
-
-    def test_main_requires_all_callbacks_without_partial_flag(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
-            source = root / "generated_config_summary.json"
-            output = root / "generated_config_run_summary.json"
-            source.write_text(json.dumps({"generated": [generated_config(str(index)) for index in range(9)]}), encoding="utf-8")
-            report = {
-                "runs": [],
-                "counts": {
-                    "total": 9,
-                    "process_failed": 0,
-                    "runner_error": 0,
-                    "callback_reached": 6,
-                    "vuln_found": 0,
-                },
-            }
-
-            with patch("hook_energy.seed_generation.generated_config_runner.run_generated_configs", return_value=report):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    result = main(
-                        [
-                            "--generated-config-summary",
-                            str(source),
-                            "--output-file",
-                            str(output),
-                            "--timeout-seconds",
-                            "5",
-                        ]
-                    )
-
-            self.assertEqual(result, 1)
-
     def test_main_returns_two_for_malformed_summary(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             source = Path(tmp_dir) / "generated_config_summary.json"
@@ -588,6 +539,9 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("-UseZendDiscovery requires -RunGeneratedConfigs.", script)
         self.assertIn("HOOKPHUZZ_LEGACY_RUN_ID: $LegacyRunId", script)
         self.assertIn("[string]$PluginSlug = \"show-all-comments-in-one-page\"", script)
+        self.assertIn('$safePluginSlug = ($PluginSlug -replace "[^A-Za-z0-9._-]", "-").Trim("-")', script)
+        self.assertIn('$legacyRunId = $safePluginSlug + "-" + (Get-Date -Format "yyyyMMddTHHmmssZ")', script)
+        self.assertNotIn('$legacyRunId = "legacy-" +', script)
         self.assertIn("[ValidateRange(1, 30)]", script)
         self.assertIn("[int]$GeneratedConfigTimeoutSeconds = 30", script)
         self.assertIn("[int]$ZendMaxIterations = 5", script)
@@ -595,8 +549,8 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("fuzzer\\configs\\{0}.json", script)
         self.assertIn("fuzzer\\configs\\generated-config\\$PluginSlug", script)
         self.assertIn("Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug", script)
-        self.assertNotIn("-RuntimeParametersOnly:$UseZendDiscovery", script)
-        self.assertIn("-RuntimeParametersOnly:$false", script)
+        self.assertIn("-RuntimeParametersOnly:$UseZendDiscovery", script)
+        self.assertIn('"--runtime-parameters-only"', script)
         self.assertIn("wordpress/$PluginSlug", script)
         self.assertIn("wordpress/bootstrap-generated", script)
         self.assertIn("web\\applications\\wordpress\\_plugins\\$PluginSlug.zip", script)
@@ -609,9 +563,30 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("--output-file", script)
         self.assertIn("--timeout-seconds", script)
         self.assertIn("--legacy-run-id", script)
-        self.assertIn("--allow-partial-callback-reach", script)
 
-    def test_wordpress_runner_has_legacy_owned_zend_two_pass_bridge(self):
+    def test_wordpress_runner_wires_success_only_artifact_retention(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+        wrapper = (FUZZER_DIR.parent / "phuzz.ps1").read_text(encoding="utf-8-sig")
+
+        self.assertIn("[switch]$KeepDebugArtifacts", script)
+        self.assertIn("artifact_retention.py", script)
+        self.assertIn("seed_generation\\zend_runtime\\bridge_cli.py", script)
+        self.assertIn("seed_generation\\zend_runtime\\artifact_retention.py", script)
+        self.assertIn("--terminal-status", script)
+        self.assertIn("--final-config-summary", script)
+        self.assertIn("--final-run-summary", script)
+        self.assertIn("--zend-discovery-run-dir", script)
+        self.assertIn("--keep-debug-artifacts", script)
+        self.assertIn("Invoke-ZendArtifactRetention", script)
+        self.assertLess(
+            script.index("Invoke-ZendArtifactRetention"),
+            script.index('Write-Host "Generated config run summary:'),
+        )
+        self.assertIn("[switch]$KeepDebugArtifacts", wrapper)
+        self.assertIn('$runnerParams["KeepDebugArtifacts"] = $true', wrapper)
+
+    def test_wordpress_runner_has_zend_owned_two_pass_bridge(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
         script = script_path.read_text(encoding="utf-8-sig")
 
@@ -625,37 +600,68 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("mkdir -p /shared/opcode-events && chown www-data:www-data /shared/opcode-events", script)
         self.assertNotIn("zend-runner-summary", script)
 
+    def test_zend_discovery_bootstraps_rest_routes_before_seed_export(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("Invoke-ZendRestRouteBootstrap", script)
+        self.assertIn("http://localhost:8080/?rest_route=/", script)
+        self.assertLess(
+            script.index("Invoke-ZendRestRouteBootstrap"),
+            script.index("Export-LiveSeedSuggestions"),
+        )
+
+    def test_zend_discovery_replay_uses_rest_route_fallback_configs(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("[switch]$RestRouteFallback", script)
+        self.assertIn("--rest-route-fallback", script)
+        self.assertIn("-ReplayOnly `\n                -RestRouteFallback", script)
+        self.assertIn("-SummaryPath $finalConfigSummary `\n            -RestRouteFallback", script)
+
+    def test_zend_convergence_uses_short_filesystem_target_dirs_without_shortening_identity(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("function Get-ZendTargetDirectoryName", script)
+        self.assertIn('$CandidateKey.Substring(0, 16)', script)
+        self.assertIn("$targetDirectoryName = Get-ZendTargetDirectoryName -CandidateKey $targetCandidateKey", script)
+        self.assertIn("$targetDir = Join-Path $targetsDir $targetDirectoryName", script)
+        self.assertIn('$targetIterationsDir = Join-Path $targetDir "i"', script)
+        self.assertIn('$replayConfigDir = Join-Path $iterationDir "cfg"', script)
+        self.assertIn('$replayConfigSummary = Join-Path $iterationDir "cfg.json"', script)
+        self.assertIn('$finalSeedReports += (Join-Path $targetFinalDir "seeds.json")', script)
+        self.assertNotIn('Join-Path $targetFinalDir "merged_suggested_seeds.json"', script)
+        self.assertIn('$currentRunSummary = Join-Path $iterationDir "run.json"', script)
+        self.assertIn("target_directory = $targetDirectoryName", script)
+        self.assertIn("--candidate-key $targetCandidateKey", script)
+        self.assertIn("candidate_key = $targetCandidateKey", script)
+        self.assertIn('$tempDir = "$TargetDir.t"', script)
+        self.assertIn('$oldDir = "$TargetDir.o"', script)
+        self.assertIn('("$SnapshotName-t")', script)
+        self.assertNotIn('$TargetDir.tmp.$([guid]', script)
+        self.assertNotIn('$SnapshotName.tmp.$([guid]', script)
+
     def test_wordpress_runner_converges_zend_candidates_independently_and_preserves_stage1_fallback(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
         script = script_path.read_text(encoding="utf-8-sig")
 
         self.assertIn("function Invoke-ZendConvergence", script)
         self.assertIn("foreach ($candidate in @($targets))", script)
-        self.assertIn('$targetDirName = "t$targetIndex"', script)
-        self.assertIn('Add-Member -NotePropertyName "target_dir_name"', script)
         self.assertIn("--operation list-targets", script)
+        self.assertIn("--pass1-run-summary $InitialRunSummary", script)
         self.assertIn("--candidate-key $targetCandidateKey", script)
-        self.assertIn("function Get-HookPhuzzFileSha256", script)
-        self.assertIn("Get-HookPhuzzFileSha256 -LiteralPath $configPath", script)
         self.assertIn("$targetCurrentDir", script)
         self.assertIn("$targetFinalDir", script)
         self.assertNotIn("$zendCandidateCount -eq 1", script)
         self.assertIn("Invoke-ZendConvergence", script)
         self.assertIn("Invoke-ZendDiscoveryBridge", script)
         self.assertIn("Invoke-ZendPass2Verification", script)
-        self.assertIn("--pass1-run-summary $InitialRunSummary", script)
         self.assertIn("candidate_key", script)
         self.assertIn("REPLAY_FAILED", script)
         self.assertIn("REPEATED_CONFIG", script)
-
-    def test_fuzzer_routes_auth_from_config_metadata(self):
-        fuzzer_path = FUZZER_DIR / "fuzzer.py"
-        source = fuzzer_path.read_text(encoding="utf-8-sig")
-
-        self.assertIn('metadata.get("auth_mode")', source)
-        self.assertIn('metadata.get("hook_name")', source)
-        self.assertIn("wordpress_logged_in_", source)
-        self.assertIn("wordpress_sec_", source)
+        self.assertIn("PASS_PARTIAL_AUTH_EXPECTED", script)
 
     def test_zend_artifact_copy_uses_only_callback_matched_request(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"

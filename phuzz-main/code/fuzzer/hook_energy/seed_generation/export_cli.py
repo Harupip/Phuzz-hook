@@ -7,9 +7,9 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from hook_energy.seed_generation.generator import LiveHookSeedGenerator
+    from hook_energy.seed_generation.static_generator import StaticSeedGenerator
 else:
-    from .generator import LiveHookSeedGenerator
+    from .static_generator import StaticSeedGenerator
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -20,7 +20,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host-source-root", help="Host source root mapped from --container-source-root.")
     parser.add_argument("--source-root", help="Host plugin source root or extracted ZIP root for suffix-based mapping.")
     parser.add_argument("--unresolved-source-reason", help="Reason to record when callback source cannot be resolved.")
-    parser.add_argument("--runtime-parameters-only", action="store_true", help="Build replay probes without static parameter discovery.")
     return parser
 
 
@@ -30,12 +29,11 @@ def main() -> int:
     output_dir = Path(args.output_dir)
 
     payload = json.loads(coverage_file.read_text(encoding="utf-8-sig"))
-    generator = LiveHookSeedGenerator(
+    generator = StaticSeedGenerator(
         container_source_root=args.container_source_root,
         host_source_root=args.host_source_root,
         source_root=args.source_root,
         unresolved_source_reason=args.unresolved_source_reason,
-        runtime_parameters_only=args.runtime_parameters_only,
     )
     gap_report, seed_report = generator.write_artifacts(payload, output_dir)
 
