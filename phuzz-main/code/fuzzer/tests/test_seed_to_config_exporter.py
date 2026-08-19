@@ -610,6 +610,20 @@ class SeedToConfigExporterTests(unittest.TestCase):
         self.assertEqual(fallback_config["query_params"]["fuzz"], ["term"])
         self.assertNotIn("body_params", fallback_config)
 
+    def test_export_seed_configs_accepts_rest_route_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "configs"
+            summary = export_seed_configs(
+                {"suggested_seeds": [build_rest_seed_item()]},
+                output_config_dir=output_dir,
+                rest_route_fallback=True,
+            )
+
+            self.assertEqual(len(summary["generated"]), 1)
+            config_path = output_dir / "rest_route_demo_v1_items-cb-rest.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(config["target"], "http://web/?rest_route=/demo/v1/items")
+
     def test_post_rest_seed_fuzzes_body_params(self):
         _, config = build_config_for_seed_item(build_rest_seed_item(method="POST", fuzzable_params=["title"]))
 

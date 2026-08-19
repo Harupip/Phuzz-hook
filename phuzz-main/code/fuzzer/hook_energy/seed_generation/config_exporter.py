@@ -18,6 +18,9 @@ def build_config_for_seed_item(
     *,
     target_base: str = "http://web",
     replay_only: bool = False,
+    # TEMP MERGE-BACKPORT (2026-08-19): seed_to_config_cli.py and bridge_cli.py
+    # already pass this flag. Compare with the upstream exporter when merging.
+    rest_route_fallback: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     seed = seed_item.get("seed")
     if not isinstance(seed, Mapping):
@@ -39,12 +42,18 @@ def build_config_for_seed_item(
     if not methods or not path or not isinstance(body, Mapping):
         raise SeedConfigSkip("malformed_seed")
 
+    entrypoint_type = _entrypoint_type_for_seed(seed_item, seed, path)
+    target = _join_target(target_base, path)
+    if rest_route_fallback and entrypoint_type == "rest_route":
+        route_path = path.lstrip("/")
+        if route_path.startswith("wp-json/"):
+            route_path = route_path[len("wp-json/") :]
+        target = target_base.rstrip("/") + "/?rest_route=/" + route_path
     config: dict[str, Any] = {
-        "target": _join_target(target_base, path),
+        "target": target,
         "methods": methods,
         "print_timestamps": True,
     }
-    entrypoint_type = _entrypoint_type_for_seed(seed_item, seed, path)
     if entrypoint_type:
         config["entrypoint_type"] = entrypoint_type
 
@@ -94,6 +103,9 @@ def export_seed_configs(
     target_base: str = "http://web",
     write_param_summary: bool = True,
     replay_only: bool = False,
+    # TEMP MERGE-BACKPORT (2026-08-19): keeps exporter API aligned with its CLI
+    # callers; compare against the merged implementation before changing.
+    rest_route_fallback: bool = False,
 ) -> dict[str, list[dict[str, str]]]:
     output_dir = Path(output_config_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +123,12 @@ def export_seed_configs(
         hook_name = str(item.get("hook_name", ""))
         callback_id = str(item.get("callback_id", ""))
         try:
-            file_slug, config = build_config_for_seed_item(item, target_base=target_base, replay_only=replay_only)
+            file_slug, config = build_config_for_seed_item(
+                item,
+                target_base=target_base,
+                replay_only=replay_only,
+                rest_route_fallback=rest_route_fallback,
+            )
         except SeedConfigSkip as exc:
             summary["skipped"].append(_skipped_row(item, hook_name, callback_id, exc.reason))
             continue

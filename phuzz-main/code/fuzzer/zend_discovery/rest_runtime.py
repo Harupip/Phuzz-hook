@@ -15,6 +15,26 @@ _METHOD_LOCATIONS = {
     "HEAD": {"query"},
     "POST": set(_LOCATIONS),
 }
+# TEMP MERGE-BACKPORT (2026-08-19): bridge_cli.py imports this helper, but the
+# current branch was missing the corresponding Zend REST normalization change.
+# Compare with the upstream/merged rest_runtime.py before replacing or removing.
+_CANONICAL_BUCKETS = {"GET", "POST", "JSON", "URL", "DEFAULTS"}
+
+
+def canonical_rest_parameter_name(bucket: str, path: Any, parameter: Any) -> str:
+    """Return a fail-closed bracket-notation name for one REST bucket path."""
+    bucket_name = str(bucket or "").strip().upper()
+    if bucket_name not in _CANONICAL_BUCKETS or not isinstance(path, list) or len(path) < 2:
+        return ""
+    if str(path[0] or "").strip().upper() != bucket_name:
+        return ""
+
+    segments = [str(item).strip() for item in path[1:]]
+    if any(not item for item in segments):
+        return ""
+    if not isinstance(parameter, str) or parameter.strip() != segments[0]:
+        return ""
+    return segments[0] + "".join(f"[{item}]" for item in segments[1:])
 
 
 def normalize_rest_parameter_events(
