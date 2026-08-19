@@ -830,6 +830,7 @@ function Invoke-ZendConvergence {
                     --output-file $currentRunSummary `
                     --timeout-seconds $TimeoutSeconds `
                     --service $fuzzerService `
+                    --stop-on-callback `
                     --legacy-run-id $LegacyRunId
                 if ($LASTEXITCODE -ne 0) {
                     throw "REPLAY_FAILED: generated convergence replay failed. See $currentRunSummary"
@@ -1027,6 +1028,9 @@ try {
             )
             if ($legacyRunId) {
                 $generatedArgs += @("--legacy-run-id", $legacyRunId)
+            }
+            if ($UseZendDiscovery) {
+                $generatedArgs += "--stop-on-callback"
             }
             python @generatedArgs
             $generatedExitCode = $LASTEXITCODE

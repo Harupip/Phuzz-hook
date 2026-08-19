@@ -17,6 +17,7 @@ from hook_energy.seed_generation.generated_config_runner import (
     format_recursive_summary,
     load_generated_configs,
     list_request_artifacts,
+    list_zend_artifacts,
     load_request_artifact,
     main,
     run_generated_configs,
@@ -38,6 +39,20 @@ class FakeRunner:
         if isinstance(result, Exception):
             raise result
         return result
+
+
+class FakeProcess:
+    def __init__(self):
+        self.returncode = None
+        self.wait_calls = []
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        self.returncode = 0
+        return self.returncode
 
 
 def completed(returncode):
@@ -66,6 +81,112 @@ class FakeArtifacts:
 
 
 class GeneratedConfigRunnerTests(unittest.TestCase):
+    def test_stop_on_callback_waits_for_200_and_matching_zend_artifact(self):
+        process = FakeProcess()
+        runner = FakeRunner([])
+        request_payload = {
+            "response": {"status_code": 200},
+            "hook_coverage": {
+                "registered_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                "executed_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                "blindspot_callbacks": {},
+            },
+        }
+        request_artifacts = FakeArtifacts(
+            [set(), {"request-one.json"}, {"request-one.json"}, {"request-one.json"}],
+            {"request-one.json": request_payload},
+        )
+        zend_artifacts = FakeArtifacts(
+            [set(), {"request-one.json"}],
+            {},
+        )
+
+        report = run_generated_configs(
+            [generated_config()],
+            timeout_seconds=30,
+            stop_on_callback=True,
+            process_factory=lambda *args, **kwargs: process,
+            list_artifacts=request_artifacts.list,
+            load_artifact=request_artifacts.load,
+            list_zend_artifacts=zend_artifacts.list,
+            poll_interval_seconds=0,
+            run_command=runner,
+        )
+
+        row = report["runs"][0]
+        self.assertEqual(row["process_status"], "stopped_on_callback")
+        self.assertEqual(row["validation_status"], "callback_reached")
+        self.assertEqual(row["matched_artifact"], "request-one.json")
+        self.assertEqual(runner.commands[0][:3], ["docker", "rm", "-f"])
+        self.assertEqual(process.wait_calls, [30])
+
+    def test_stop_on_callback_does_not_treat_http_200_alone_as_ready(self):
+        process = FakeProcess()
+        process.returncode = 0
+        runner = FakeRunner([])
+        request_payload = {
+            "response": {"status_code": 200},
+            "hook_coverage": {
+                "registered_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                "executed_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                "blindspot_callbacks": {},
+            },
+        }
+        request_artifacts = FakeArtifacts(
+            [set(), {"request-one.json"}, {"request-one.json"}],
+            {"request-one.json": request_payload},
+        )
+        zend_artifacts = FakeArtifacts([set(), set()], {})
+
+        report = run_generated_configs(
+            [generated_config()],
+            timeout_seconds=30,
+            stop_on_callback=True,
+            process_factory=lambda *args, **kwargs: process,
+            list_artifacts=request_artifacts.list,
+            load_artifact=request_artifacts.load,
+            list_zend_artifacts=zend_artifacts.list,
+            poll_interval_seconds=0,
+            run_command=runner,
+        )
+
+        self.assertEqual(report["runs"][0]["process_status"], "exited")
+        self.assertEqual(process.wait_calls, [])
+
+    def test_stop_on_callback_stops_after_completed_200_without_expected_callback(self):
+        process = FakeProcess()
+        runner = FakeRunner([])
+        request_payload = {
+            "response": {"status_code": 200},
+            "hook_coverage": {
+                "registered_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                "executed_callbacks": {},
+                "blindspot_callbacks": {},
+            },
+        }
+        request_names = [set(), {"request-one.json"}]
+
+        def list_requests():
+            return request_names.pop(0) if request_names else {"request-one.json"}
+
+        report = run_generated_configs(
+            [generated_config()],
+            timeout_seconds=0.001,
+            stop_on_callback=True,
+            process_factory=lambda *args, **kwargs: process,
+            list_artifacts=list_requests,
+            load_artifact=lambda name: request_payload,
+            list_zend_artifacts=lambda: set(),
+            poll_interval_seconds=0,
+            run_command=runner,
+        )
+
+        row = report["runs"][0]
+        self.assertEqual(row["process_status"], "stopped_on_request")
+        self.assertEqual(row["stop_reason"], "request_completed")
+        self.assertEqual(row["validation_status"], "registered_not_executed")
+        self.assertEqual(row["requests_created"], 1)
+
     def test_expected_auth_skip_requires_reached_authenticated_counterpart(self):
         runs = [
             {
@@ -206,6 +327,15 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertEqual(command[:6], ["docker", "compose", "exec", "-T", "web", "sh"])
         self.assertIn("/shared-tmpfs/hook-coverage/requests", command[-1])
         self.assertEqual(run_command.call_args.kwargs["timeout"], 30)
+
+    @patch("hook_energy.seed_generation.generated_config_runner.subprocess.run")
+    def test_list_zend_artifacts_uses_web_shared_tmpfs(self, run_command):
+        run_command.return_value = subprocess.CompletedProcess([], 0, "b.json\na.json\n", "")
+
+        self.assertEqual(list_zend_artifacts(), {"a.json", "b.json"})
+        command = run_command.call_args.args[0]
+        self.assertEqual(command[:6], ["docker", "compose", "exec", "-T", "web", "sh"])
+        self.assertIn("/shared/opcode-events", command[-1])
 
     @patch("hook_energy.seed_generation.generated_config_runner.subprocess.run")
     def test_load_request_artifact_reads_json_from_web(self, run_command):
@@ -563,6 +693,7 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("--output-file", script)
         self.assertIn("--timeout-seconds", script)
         self.assertIn("--legacy-run-id", script)
+        self.assertIn("--stop-on-callback", script)
 
     def test_wordpress_runner_wires_success_only_artifact_retention(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
