@@ -20,7 +20,9 @@ from hook_energy.seed_validator import evaluate_artifact_payloads
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
+ProcessFactory = Callable[..., Any]
 REQUESTS_DIR = "/shared-tmpfs/hook-coverage/requests"
+ZEND_ARTIFACTS_DIR = "/shared/opcode-events"
 STOP_ON_VULN_EXIT_CODE = 1337 % 256
 METHOD_PROVENANCE_FIELDS = (
     "resolved_method",
@@ -94,6 +96,19 @@ def load_request_artifact(name: str) -> Any:
     return json.loads(result.stdout)
 
 
+def list_zend_artifacts() -> set[str]:
+    result = subprocess.run(
+        ["docker", "compose", "exec", "-T", "web", "sh", "-lc", f"find {ZEND_ARTIFACTS_DIR} -maxdepth 1 -type f -printf '%f\\n'"],
+        timeout=30,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Could not list Zend opcode artifacts")
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
 def run_generated_configs(
     generated_configs: Sequence[Mapping[str, str]],
     *,
@@ -103,9 +118,15 @@ def run_generated_configs(
     run_command: CommandRunner = subprocess.run,
     list_artifacts: ArtifactLister = list_request_artifacts,
     load_artifact: ArtifactLoader = load_request_artifact,
+    stop_on_callback: bool = False,
+    process_factory: ProcessFactory = subprocess.Popen,
+    list_zend_artifacts: ArtifactLister = list_zend_artifacts,
+    poll_interval_seconds: float = 0.1,
 ) -> dict[str, Any]:
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
+    if poll_interval_seconds < 0:
+        raise ValueError("poll_interval_seconds must not be negative")
 
     runs: list[dict[str, Any]] = []
     for index, config in enumerate(generated_configs, start=1):
@@ -131,19 +152,30 @@ def run_generated_configs(
         if legacy_run_id:
             command += ["-e", f"HOOKPHUZZ_LEGACY_RUN_ID={legacy_run_id}"]
         command.append(service)
+        stop_reason = None
         try:
-            result = run_command(
-                command,
-                timeout=timeout_seconds,
-                check=False,
-            )
-            exit_code: int | None = result.returncode
-            if result.returncode == 0:
-                process_status = "exited"
-            elif result.returncode == STOP_ON_VULN_EXIT_CODE:
-                process_status = "vuln_found"
+            if stop_on_callback:
+                process_status, exit_code, stop_reason = _run_until_callback(
+                    command,
+                    container_name=container_name,
+                    config=config,
+                    artifacts_before=artifacts_before,
+                    timeout_seconds=timeout_seconds,
+                    process_factory=process_factory,
+                    run_command=run_command,
+                    list_artifacts=list_artifacts,
+                    load_artifact=load_artifact,
+                    list_zend_artifacts=list_zend_artifacts,
+                    poll_interval_seconds=poll_interval_seconds,
+                )
             else:
-                process_status = "failed"
+                result = run_command(
+                    command,
+                    timeout=timeout_seconds,
+                    check=False,
+                )
+                exit_code = result.returncode
+                process_status = _process_status(result.returncode)
         except subprocess.TimeoutExpired:
             run_command(
                 ["docker", "rm", "-f", container_name],
@@ -180,6 +212,7 @@ def run_generated_configs(
                 "entrypoint_type": config.get("entrypoint_type"),
                 **_method_metadata(config),
                 "process_status": process_status,
+                "stop_reason": stop_reason,
                 "validation_status": validation["status"],
                 "validation_reason": validation["reason"],
                 "callback_reached": validation["expected_callback_reached"],
@@ -203,6 +236,7 @@ def run_generated_configs(
     )
     report = {
         "timeout_seconds": timeout_seconds,
+        "stop_on_callback": stop_on_callback,
         "runs": runs,
         "counts": {
             "total": len(runs),
@@ -274,6 +308,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--service", default="fuzzer-wordpress-plugin")
     parser.add_argument("--output-format", choices=("default", "recursive"), default="default")
     parser.add_argument("--legacy-run-id", default="")
+    parser.add_argument("--stop-on-callback", action="store_true")
     return parser
 
 
@@ -287,6 +322,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             service=args.service,
             legacy_run_id=args.legacy_run_id,
+            stop_on_callback=args.stop_on_callback,
         )
         report["generated_config_summary"] = str(source_path)
         output_report = format_recursive_summary(report) if args.output_format == "recursive" else report
@@ -325,6 +361,100 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _container_name(index: int, slug: str) -> str:
     safe_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", slug).strip(".-") or "config"
     return f"hookphuzz-generated-{index}-{safe_slug}"[:120]
+
+
+def _process_status(returncode: int) -> str:
+    if returncode == 0:
+        return "exited"
+    if returncode == STOP_ON_VULN_EXIT_CODE:
+        return "vuln_found"
+    return "failed"
+
+
+def _run_until_callback(
+    command: Sequence[str],
+    *,
+    container_name: str,
+    config: Mapping[str, str],
+    artifacts_before: set[str],
+    timeout_seconds: int,
+    process_factory: ProcessFactory,
+    run_command: CommandRunner,
+    list_artifacts: ArtifactLister,
+    load_artifact: ArtifactLoader,
+    list_zend_artifacts: ArtifactLister,
+    poll_interval_seconds: float,
+) -> tuple[str, int | None, str | None]:
+    process = process_factory(command)
+    deadline = time.monotonic() + timeout_seconds
+    candidate = {"hook_name": config["hook_name"], "callback_id": config["callback_id"]}
+
+    try:
+        while True:
+            new_artifacts = sorted(list_artifacts() - artifacts_before)
+            for name in new_artifacts:
+                payload = load_artifact(name)
+                if not _request_artifact_is_ready(payload):
+                    continue
+                if _callback_artifact_is_ready(candidate, payload):
+                    try:
+                        zend_names = list_zend_artifacts()
+                    except Exception:
+                        zend_names = set()
+                    if Path(name).stem in {Path(item).stem for item in zend_names}:
+                        _terminate_process(process, container_name, run_command)
+                        return "stopped_on_callback", None, "callback_reached"
+                    continue
+                _terminate_process(process, container_name, run_command)
+                return "stopped_on_request", None, "request_completed"
+
+            returncode = process.poll()
+            if returncode is not None:
+                return _process_status(returncode), returncode, None
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process(process, container_name, run_command)
+                return "window_elapsed", None, "timeout"
+            if poll_interval_seconds:
+                time.sleep(min(poll_interval_seconds, remaining))
+    except Exception:
+        _terminate_process(process, container_name, run_command)
+        raise
+
+
+def _terminate_process(process: Any, container_name: str, run_command: CommandRunner) -> None:
+    run_command(
+        ["docker", "rm", "-f", container_name],
+        timeout=30,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=30)
+
+
+def _callback_artifact_is_ready(candidate: Mapping[str, str], payload: Any) -> bool:
+    if not _request_artifact_is_ready(payload):
+        return False
+    validation = evaluate_artifact_payloads(candidate, [payload])
+    return bool(validation["expected_callback_reached"])
+
+
+def _request_artifact_is_ready(payload: Any) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    response = payload.get("response")
+    if not isinstance(response, Mapping):
+        return False
+    try:
+        return int(response.get("status_code")) == 200
+    except (TypeError, ValueError):
+        return False
 
 
 def _runtime_config_slug(config: Mapping[str, str]) -> str:
