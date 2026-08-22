@@ -294,7 +294,7 @@ Legacy bridge state:
 
 ## Required Boundaries
 
-- Do not import, copy, execute, or depend on `research/hookphuzz-opcode/phase10` through `phase13`.
+- Do not import, copy, execute, or depend on archived Phase 10 through Phase 13 research artifacts.
 - Do not move REST decision logic back into `hook_energy`.
 - Do not claim query/form/json/url/default location from method, route, schema,
   or `WP_REST_Request::get_param()` name alone. Require current-run selected

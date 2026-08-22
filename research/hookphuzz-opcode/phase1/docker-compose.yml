@@ -1,8 +1,0 @@
-services:
-  phase1:
-    build:
-      context: .
-    working_dir: /workspace
-    volumes:
-      - .:/workspace
-    command: ["bash", "/workspace/run.sh", "--inside"]

@@ -394,19 +394,18 @@ def _run_until_callback(
             new_artifacts = sorted(list_artifacts() - artifacts_before)
             for name in new_artifacts:
                 payload = load_artifact(name)
-                if not _request_artifact_is_ready(payload):
-                    continue
-                if _callback_artifact_is_ready(candidate, payload):
-                    try:
-                        zend_names = list_zend_artifacts()
-                    except Exception:
-                        zend_names = set()
-                    if Path(name).stem in {Path(item).stem for item in zend_names}:
-                        _terminate_process(process, container_name, run_command)
-                        return "stopped_on_callback", None, "callback_reached"
+                stop_reason = _stop_reason_for_request_artifact(
+                    candidate,
+                    name,
+                    payload,
+                    list_zend_artifacts,
+                )
+                if stop_reason is None:
                     continue
                 _terminate_process(process, container_name, run_command)
-                return "stopped_on_request", None, "request_completed"
+                if stop_reason == "callback_reached":
+                    return "stopped_on_callback", None, stop_reason
+                return "stopped_on_request", None, stop_reason
 
             returncode = process.poll()
             if returncode is not None:
@@ -421,6 +420,27 @@ def _run_until_callback(
     except Exception:
         _terminate_process(process, container_name, run_command)
         raise
+
+
+def _stop_reason_for_request_artifact(
+    candidate: Mapping[str, str],
+    name: str,
+    payload: Any,
+    list_zend_artifacts: ArtifactLister,
+) -> str | None:
+    if not _request_artifact_is_ready(payload):
+        return None
+    if not _callback_artifact_is_ready(candidate, payload):
+        return "request_completed"
+    return "callback_reached" if _zend_artifact_matches_request(name, list_zend_artifacts) else None
+
+
+def _zend_artifact_matches_request(name: str, list_zend_artifacts: ArtifactLister) -> bool:
+    try:
+        zend_names = list_zend_artifacts()
+    except Exception:
+        return False
+    return Path(name).stem in {Path(item).stem for item in zend_names}
 
 
 def _terminate_process(process: Any, container_name: str, run_command: CommandRunner) -> None:

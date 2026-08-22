@@ -81,7 +81,7 @@ class FakeArtifacts:
 
 
 class GeneratedConfigRunnerTests(unittest.TestCase):
-    def test_stop_on_callback_waits_for_200_and_matching_zend_artifact(self):
+    def test_zend_callback_mode_stops_when_callback_and_zend_artifact_match(self):
         process = FakeProcess()
         runner = FakeRunner([])
         request_payload = {
@@ -120,7 +120,7 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertEqual(runner.commands[0][:3], ["docker", "rm", "-f"])
         self.assertEqual(process.wait_calls, [30])
 
-    def test_stop_on_callback_does_not_treat_http_200_alone_as_ready(self):
+    def test_zend_callback_mode_does_not_stop_without_matching_zend_artifact(self):
         process = FakeProcess()
         process.returncode = 0
         runner = FakeRunner([])
@@ -152,6 +152,37 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
 
         self.assertEqual(report["runs"][0]["process_status"], "exited")
         self.assertEqual(process.wait_calls, [])
+
+    def test_final_replay_uses_default_full_length_runner(self):
+        runner = FakeRunner([completed(0)])
+        request_payload = {
+            "response": {"status_code": 200},
+            "hook_coverage": {
+                "registered_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                "executed_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                "blindspot_callbacks": {},
+            },
+        }
+        request_artifacts = FakeArtifacts(
+            [set(), {"request-one.json"}],
+            {"request-one.json": request_payload},
+        )
+
+        report = run_generated_configs(
+            [generated_config()],
+            timeout_seconds=30,
+            process_factory=lambda *args, **kwargs: self.fail("final replay must not poll for callbacks"),
+            list_artifacts=request_artifacts.list,
+            load_artifact=request_artifacts.load,
+            run_command=runner,
+        )
+
+        row = report["runs"][0]
+        self.assertFalse(report["stop_on_callback"])
+        self.assertEqual(row["process_status"], "exited")
+        self.assertIsNone(row["stop_reason"])
+        self.assertEqual(row["validation_status"], "callback_reached")
+        self.assertFalse(any(command[:3] == ["docker", "rm", "-f"] for command in runner.commands))
 
     def test_stop_on_callback_stops_after_completed_200_without_expected_callback(self):
         process = FakeProcess()

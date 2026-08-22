@@ -1,9 +1,0 @@
-[
-  {"source":"POST","key":"outer","path":["outer"],"access_context":"isset"},
-  {"source":"POST","key":"inner","path":["inner"],"access_context":"isset"},
-  {"source":"POST","key":"outer","path":["outer"],"access_context":"isset"},
-  {"source":"POST","key":"inner","path":["inner"],"access_context":"isset"},
-  {"source":"POST","key":"recur","path":["recur"],"access_context":"isset"},
-  {"source":"POST","key":"recur","path":["recur"],"access_context":"isset"},
-  {"source":"POST","key":"recur","path":["recur"],"access_context":"isset"}
-]
