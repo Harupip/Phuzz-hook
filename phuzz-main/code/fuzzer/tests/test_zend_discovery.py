@@ -42,6 +42,7 @@ from hook_energy.seed_generation.zend_runtime.bridge_cli import (
 )
 from zend_discovery.source_materializer import materialize_plugin_source
 from zend_discovery.parameter_seeds import build_parameter_seed
+from zend_discovery.rest_runtime import canonical_rest_parameter_name
 from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
 
 
@@ -54,6 +55,17 @@ class StaticExtractor:
 
 
 class ZendDiscoveryTests(unittest.TestCase):
+    def test_canonical_rest_parameter_name_uses_bracket_notation_for_bucket_paths(self) -> None:
+        cases = [
+            ("GET", ["GET", "search"], "search", "search"),
+            ("GET", ["GET", "filters", "name"], "filters", "filters[name]"),
+            ("JSON", ["JSON", "user", "profile", "name"], "user", "user[profile][name]"),
+            ("URL", ["URL", "id"], "id", "id"),
+        ]
+        for bucket, path, parameter, expected in cases:
+            with self.subTest(bucket=bucket, path=path):
+                self.assertEqual(canonical_rest_parameter_name(bucket, path, parameter), expected)
+
     def test_normalize_runtime_evidence_maps_direct_get_and_post_independently_of_request_method(self) -> None:
         candidate = self.pass1_candidate()
         uopz = self.pass1_artifact(candidate)
