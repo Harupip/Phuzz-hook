@@ -1,5 +1,55 @@
 # Zend Discovery Agent Handoff
 
+## 2026-08-24 Runtime CmpLog vertical slice
+
+The current CmpLog implementation is runtime-only and additive to the existing
+Zend discovery, callback correlation, generated-config runner, convergence, and
+PHUZZ flow. The detailed contract is in
+`../hook_energy/seed_generation/zend_runtime/README.md`.
+
+Current path:
+
+```text
+HTTP request
+  -> Zend parameter provenance
+  -> request-local comparison_events in the existing Zend artifact
+  -> Fuzzer artifact ingestion/normalization
+  -> parameter-specific ff_mutate() candidate
+  -> normal replay and callback/branch verification
+```
+
+Important implementation boundaries for future agents:
+
+- `comparison_events` is an optional additive artifact field. Existing Zend
+  artifact fields and consumers must continue to work when it is absent or
+  empty.
+- `Fuzzer._ingest_cmplog_hints()` reads the artifact before mutation. The
+  mutator consumes only normalized hints; `Fuzzer.ff_mutate()` must not read
+  Zend files directly.
+- A hint is valid only when one comparison operand carries established
+  request-input provenance and the opposite operand is a bounded scalar.
+  Hints remain tied to the same source, nested path, request ID, and callback.
+- CmpLog is an additional deterministic mutation source. It does not replace
+  normal or byte-level PHUZZ mutations and does not create a global dictionary.
+- Do not add static PHP source scanning, regex extraction, plugin-specific
+  constants, or hybrid static/runtime inference to this path.
+- Do not treat nonce/password/auth comparisons, empty()/isset()/type checks,
+  unrelated constant comparisons, or uncorrelated values as fuzz hints.
+
+PHP 8.2.10 fixture evidence:
+
+- `==`, `!=`, `===`, and `!==` produced the corresponding `IS_*` comparison
+  events and preserved request provenance.
+- The switch fixture disassembled to `SWITCH_STRING` with a jump table before
+  optimization. In the active runtime artifact, the useful switch case
+  observations surfaced as `IS_EQUAL` events, so the implementation does not
+  assume that every string switch exposes a standalone `SWITCH_STRING` event.
+
+The generic fixture and Python normalization/mutator tests pass. The first
+LearnPress attempt did not produce a current-run runtime event for the target
+route/parameter, so LearnPress remains unproven; do not hard-code its known
+case strings or report a plugin POC pass.
+
 ## 2026-08-19 Runtime REQUEST and artifact retention update
 
 The runtime boundary now accepts a direct correlated `$_REQUEST['name']` read

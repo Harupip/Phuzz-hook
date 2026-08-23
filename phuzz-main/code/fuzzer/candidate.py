@@ -8,7 +8,7 @@ from utils import fuzz_open
 
 
 class Candidate:
-    def __init__(self,  parent=None, score=0, priority=0, http_target="", http_method="GET", fixed_params={}, fuzz_params={}, fuzz_weights={}, fuzzer_id=-1, is_initial_candidate=False, mutated_param_type=None, mutated_param_name=None):
+    def __init__(self,  parent=None, score=0, priority=0, http_target="", http_method="GET", fixed_params={}, fuzz_params={}, fuzz_weights={}, fuzzer_id=-1, is_initial_candidate=False, mutated_param_type=None, mutated_param_name=None, mutation_source="normal", cmplog_hint=None):
         self.coverage_id = str(int(time.time())) + "-" + str(uuid4())
         self.parent = parent
         self.score = score
@@ -53,6 +53,8 @@ class Candidate:
         self.is_initial_candidate = is_initial_candidate
         self.mutated_param_type=mutated_param_type
         self.mutated_param_name=mutated_param_name
+        self.mutation_source = mutation_source
+        self.cmplog_hint = cmplog_hint or {}
         self.base_energy = 0            # `base_energy` = original PHUZZ queue energy before hook feedback is blended in.
         self.final_energy = 0           # `final_energy` = integer scheduler budget after PHUZZ energy and hook feedback are blended.
         self.hook_request_id = ""
@@ -94,6 +96,8 @@ class Candidate:
             'is_initial_candidate': self.is_initial_candidate,
             'mutated_param_type': self.mutated_param_type,
             'mutated_param_name': self.mutated_param_name,
+            'mutation_source': self.mutation_source,
+            'cmplog_hint': self.cmplog_hint,
             'base_energy': self.base_energy,
             'final_energy': self.final_energy,
             'hook_request_id': self.hook_request_id,

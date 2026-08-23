@@ -4,8 +4,10 @@
 extern zend_module_entry hookphuzz_opcode_module_entry;
 #define phpext_hookphuzz_opcode_ptr &hookphuzz_opcode_module_entry
 
-#define PHP_HOOKPHUZZ_OPCODE_VERSION "0.8.0"
+#define PHP_HOOKPHUZZ_OPCODE_VERSION "0.9.0"
 #define HOOKPHUZZ_OPCODE_MAX_EVENTS 4096
+#define HOOKPHUZZ_CMPLOG_MAX_EVENTS 1024
+#define HOOKPHUZZ_CMPLOG_MAX_VALUE_BYTES 256
 #define HOOKPHUZZ_MAX_REGISTRY_BYTES (1024 * 1024)
 #define HOOKPHUZZ_MAX_TARGETS 256
 #define HOOKPHUZZ_MAX_CALLBACK_BYTES 255
@@ -48,6 +50,21 @@ typedef struct _hookphuzz_event {
     const char *operation;
 } hookphuzz_event;
 
+typedef struct _hookphuzz_comparison_event {
+    hookphuzz_source source;
+    uint32_t depth;
+    hookphuzz_path_key *path;
+    const char *opcode;
+    const char *provenance_operand;
+    zend_string *runtime_value;
+    zend_string *comparison_value;
+    zend_string *root_callback;
+    zend_string *current_function;
+    zend_bool attributed;
+    uint32_t callback_depth;
+    zend_long line;
+} hookphuzz_comparison_event;
+
 typedef struct _hookphuzz_context_frame {
     const zend_execute_data *execute_data;
     zend_string *root_callback;
@@ -59,6 +76,9 @@ ZEND_BEGIN_MODULE_GLOBALS(hookphuzz_opcode)
     zend_long dropped_event_count;
     uint32_t event_count;
     hookphuzz_event *events;
+    zend_long dropped_comparison_event_count;
+    uint32_t comparison_event_count;
+    hookphuzz_comparison_event *comparison_events;
     uint32_t provenance_count;
     hookphuzz_provenance *provenance;
     zend_string *request_id;

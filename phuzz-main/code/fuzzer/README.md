@@ -29,13 +29,24 @@ Here, scoring formulas to rate candidates can be implemented. For now, PHUZZ onl
 
 Runtime hook seed generation lives under `hook_energy/seed_generation/`. It exports `hook_gap_report.json`, `suggested_seeds.json`, and `suggested_seeds.md` from a UOPZ `total_coverage.json` snapshot.
 
-The exporter maps direct WordPress HTTP hooks such as `wp_ajax_*`, `wp_ajax_nopriv_*`, `admin_post_*`, and `admin_post_nopriv_*` to replayable PHUZZ seed templates. It also scans callback source for request-controlled inputs and injects discovered params as `FUZZ`, while keeping `action` fixed.
+The default/non-Zend exporter maps direct WordPress HTTP hooks such as `wp_ajax_*`, `wp_ajax_nopriv_*`, `admin_post_*`, and `admin_post_nopriv_*` to replayable PHUZZ seed templates. That legacy path may scan callback source for request-controlled inputs and inject discovered params as `FUZZ`, while keeping `action` fixed; do not copy that behavior into the runtime-only `-UseZendDiscovery` or CmpLog path.
 
 These are discovery artifacts, not automatic inserts into PHUZZ's live `Candidate` queue. `seed_to_config_cli.py` converts unauth-capable and authenticated suggestions into `configs/generated-config/<plugin>/*.json`. Authenticated configs rely on the existing WordPress UOPZ overrides for login, capability, and nonce checks; the converter does not run login automation. See `../docs/guides/hook-aware-seed-generation.md` for commands, output shape, and validation boundary.
 
 `hook_energy/evaluation_report.py` builds an offline JSON and Markdown summary from existing generated-config, validation, and fuzzing artifacts. It does not rerun discovery or fuzzing; it writes `output/evaluation/hookphuzz_evaluation_summary.json` and `.md` for review.
 
 The UOPZ hook registry also records multi-stage registration metadata when one callback registers another hook. These fields include `registered_inside_callback`, `parent_callback`, `hook_level`, `parent_hook_name`, and `parent_callback_id`. The classifier and validator preserve this metadata so replay can report child hooks discovered at runtime. `hook_energy/recursive_child_hook_seeds.py` can turn replay-discovered direct HTTP child hooks into recursive seed/config artifacts, but it still does not insert them into PHUZZ's live `Candidate` queue. See `../docs/guides/multistage-hook-discovery-metadata.md`.
+
+### Runtime CmpLog feedback
+
+The opt-in Zend path adds request-linked PHP comparison operands as
+parameter-specific deterministic mutations. Zend writes optional
+`comparison_events` into the existing request artifact; Python normalizes them
+before `Fuzzer.ff_mutate()`, and the mutator receives only normalized hints.
+This is additive to normal PHUZZ mutations and does not create a global
+dictionary. See `zend_discovery/AGENT_HANDOFF.md` and
+`hook_energy/seed_generation/zend_runtime/README.md` for the current contract,
+opcode evidence, limits, and fail-closed rules.
 
 ## VulnCheck
 

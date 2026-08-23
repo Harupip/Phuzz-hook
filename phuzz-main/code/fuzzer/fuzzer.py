@@ -24,6 +24,10 @@ from candidate import Candidate
 from mutator import DefaultMutator, EmptyQueueMutator, SingleMutator
 from scoring import DefaultScoringFormula
 from utils import fuzz_open
+from hook_energy.seed_generation.zend_runtime.cmplog import (
+    apply_cmplog_hint,
+    normalize_comparison_events,
+)
 
 #def print(*args, **kwargs):
 #    pass
@@ -44,6 +48,10 @@ class Fuzzer:
         self.seen_mutations = set()
         self.trace_requests = os.environ.get("PHUZZ_TRACE_REQUESTS", "0") == "1"
         self.request_counter = 0
+        self.cmplog_enabled = os.environ.get("HOOKPHUZZ_CMPLOG", "0") == "1"
+        self.cmplog_hints = []
+        self._cmplog_hint_keys = set()
+        self.cmplog_seen_artifacts = set()
 
         self.session = requests.Session()
         self.login_script = None
@@ -142,6 +150,8 @@ class Fuzzer:
         elif candidate.is_initial_candidate:
             parts.append("candidate=initial")
 
+        parts.append(f"mutation_source={getattr(candidate, 'mutation_source', 'normal')}")
+
         if response is not None:
             parts.append(f"status={response.status_code}")
             parts.append(f"bytes={len(response.text)}")
@@ -150,6 +160,28 @@ class Fuzzer:
             parts.append(f"error={self._short_repr(str(error))}")
 
         print(" ".join(parts))
+
+    def _ingest_cmplog_hints(self, candidate):
+        """Normalize one completed Zend artifact before the next mutation."""
+        if not self.cmplog_enabled:
+            return
+        artifact_path = os.path.join(
+            "/shared", "opcode-events", f"{candidate.coverage_id}.json"
+        )
+        if artifact_path in self.cmplog_seen_artifacts or not os.path.exists(artifact_path):
+            return
+        self.cmplog_seen_artifacts.add(artifact_path)
+        try:
+            with fuzz_open(artifact_path, "r") as artifact_file:
+                artifact = json.load(artifact_file)
+        except (OSError, ValueError):
+            return
+        for hint in normalize_comparison_events(artifact, candidate.fuzz_params):
+            hint_key = json.dumps(hint, sort_keys=True, default=str)
+            if hint_key in self._cmplog_hint_keys:
+                continue
+            self._cmplog_hint_keys.add(hint_key)
+            self.cmplog_hints.append(hint)
 
     def save_output_vulnerable(self):
         with open(
@@ -602,6 +634,26 @@ class Fuzzer:
 
     def ff_mutate(self, c):
 
+        while self.cmplog_hints:
+            hint = self.cmplog_hints.pop(0)
+            applied = apply_cmplog_hint(c.fuzz_params, hint)
+            if applied is None:
+                continue
+            return Candidate(
+                parent=c,
+                priority=self.scoring_formula.calculate_priority(c),
+                http_target=c.http_target,
+                http_method=c.http_method,
+                fixed_params=copy.deepcopy(c.fixed_params),
+                fuzz_params=applied["fuzz_params"],
+                fuzz_weights=copy.deepcopy(c.fuzz_weights),
+                fuzzer_id=self.fuzzer_id,
+                mutated_param_type=applied["mutated_param_type"],
+                mutated_param_name=applied["mutated_param_name"],
+                mutation_source=applied["mutation_source"],
+                cmplog_hint=applied["cmplog_hint"],
+            )
+
         mutator = SingleMutator()
 
         choice_keys = list(filter(lambda x: c.fuzz_params[x], c.fuzz_params))
@@ -782,6 +834,7 @@ class Fuzzer:
         # Send initial requests first
         for c in self.generate_initial_candidates():
             self.ff_send_request(c)
+            self._ingest_cmplog_hints(c)
             counter += 1
             self.ff_get_coverage(c)
             self.calculate_score(c)
@@ -833,6 +886,7 @@ class Fuzzer:
                     continue
 
                 self.ff_send_request(mutated_candidate)
+                self._ingest_cmplog_hints(mutated_candidate)
                 counter += 1
 
                 if counter % 100 == 0:

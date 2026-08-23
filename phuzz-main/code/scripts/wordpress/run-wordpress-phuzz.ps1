@@ -98,6 +98,13 @@ function New-PluginOverrideFile {
     if ($LegacyRunId) {
         $content += "      HOOKPHUZZ_LEGACY_RUN_ID: $LegacyRunId"
     }
+    if ($UseZendDiscovery) {
+        $content += @(
+            "      HOOKPHUZZ_CMPLOG: 1"
+            "    volumes:"
+            "      - shared-tmpfs:/shared"
+        )
+    }
     Set-Content -LiteralPath $path -Value $content -Encoding ASCII
     return $path
 }

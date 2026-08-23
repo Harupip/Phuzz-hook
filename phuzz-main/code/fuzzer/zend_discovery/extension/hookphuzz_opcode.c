@@ -398,6 +398,23 @@ static void hookphuzz_release_events(void)
     HOOKPHUZZ_G(event_count) = 0;
 }
 
+static void hookphuzz_release_comparison_events(void)
+{
+    uint32_t index;
+
+    for (index = 0; index < HOOKPHUZZ_G(comparison_event_count); index++) {
+        hookphuzz_comparison_event *event = &HOOKPHUZZ_G(comparison_events)[index];
+        hookphuzz_release_path(event->path, event->depth);
+        if (event->runtime_value != NULL) zend_string_release(event->runtime_value);
+        if (event->comparison_value != NULL) zend_string_release(event->comparison_value);
+        if (event->root_callback != NULL) zend_string_release(event->root_callback);
+        if (event->current_function != NULL) zend_string_release(event->current_function);
+    }
+    if (HOOKPHUZZ_G(comparison_events) != NULL) efree(HOOKPHUZZ_G(comparison_events));
+    HOOKPHUZZ_G(comparison_events) = NULL;
+    HOOKPHUZZ_G(comparison_event_count) = 0;
+}
+
 static void hookphuzz_release_provenance(void)
 {
     uint32_t index;
@@ -502,7 +519,7 @@ static void hookphuzz_clear_provenance_for_result(const zend_execute_data *frame
 static void hookphuzz_set_provenance(const zend_execute_data *frame, const zend_op *opline,
     hookphuzz_source source, hookphuzz_path_key *path, uint32_t depth)
 {
-    if (opline->result_type != IS_TMP_VAR && opline->result_type != IS_VAR) {
+    if (opline->result_type != IS_TMP_VAR && opline->result_type != IS_VAR && opline->result_type != IS_CV) {
         hookphuzz_release_path(path, depth);
         return;
     }
@@ -511,7 +528,7 @@ static void hookphuzz_set_provenance(const zend_execute_data *frame, const zend_
 
 static void hookphuzz_clear_provenance_for_opline_result(const zend_execute_data *frame, const zend_op *opline)
 {
-    if (opline->result_type == IS_TMP_VAR || opline->result_type == IS_VAR) {
+    if (opline->result_type == IS_TMP_VAR || opline->result_type == IS_VAR || opline->result_type == IS_CV) {
         hookphuzz_clear_provenance_for_result(frame, opline->result.var);
     }
 }
@@ -519,8 +536,241 @@ static void hookphuzz_clear_provenance_for_opline_result(const zend_execute_data
 static hookphuzz_provenance *hookphuzz_find_operand_provenance(const zend_execute_data *frame,
     zend_uchar operand_type, const znode_op *operand)
 {
-    if (operand_type != IS_TMP_VAR && operand_type != IS_VAR) return NULL;
+    if (operand_type != IS_TMP_VAR && operand_type != IS_VAR && operand_type != IS_CV) return NULL;
     return hookphuzz_find_provenance(frame, operand->var);
+}
+
+static zval *hookphuzz_operand_zval(zend_execute_data *execute_data, const zend_op *opline,
+    zend_uchar operand_type, const znode_op *operand)
+{
+    if (operand_type == IS_CONST) return (zval *) RT_CONSTANT(opline, *operand);
+    if (operand_type == IS_TMP_VAR || operand_type == IS_VAR || operand_type == IS_CV) {
+        return zend_get_zval_ptr(opline, operand_type, operand, execute_data);
+    }
+    return NULL;
+}
+
+static zend_string *hookphuzz_scalar_copy(const zval *value)
+{
+    if (value == NULL) return NULL;
+    while (Z_TYPE_P(value) == IS_REFERENCE) value = Z_REFVAL_P(value);
+    switch (Z_TYPE_P(value)) {
+        case IS_STRING:
+            if (Z_STRLEN_P(value) > HOOKPHUZZ_CMPLOG_MAX_VALUE_BYTES) return NULL;
+            return zend_string_copy(Z_STR_P(value));
+        case IS_LONG:
+            return strpprintf(0, "%ld", (long) Z_LVAL_P(value));
+        case IS_TRUE:
+            return zend_string_init("true", sizeof("true") - 1, 0);
+        case IS_FALSE:
+            return zend_string_init("false", sizeof("false") - 1, 0);
+        case IS_DOUBLE:
+            return strpprintf(0, "%.17g", Z_DVAL_P(value));
+        default:
+            return NULL;
+    }
+}
+
+static zend_bool hookphuzz_contains_ci(const zend_string *value, const char *needle)
+{
+    size_t value_length, needle_length, index, needle_index;
+
+    if (value == NULL || needle == NULL) return 0;
+    value_length = ZSTR_LEN(value);
+    needle_length = strlen(needle);
+    if (needle_length == 0 || needle_length > value_length) return 0;
+    for (index = 0; index + needle_length <= value_length; index++) {
+        for (needle_index = 0; needle_index < needle_length; needle_index++) {
+            if (tolower((unsigned char) ZSTR_VAL(value)[index + needle_index])
+                != tolower((unsigned char) needle[needle_index])) break;
+        }
+        if (needle_index == needle_length) return 1;
+    }
+    return 0;
+}
+
+static zend_bool hookphuzz_sensitive_path(const hookphuzz_provenance *provenance)
+{
+    const zend_string *last;
+
+    if (provenance == NULL || provenance->depth == 0) return 1;
+    last = provenance->path[provenance->depth - 1].string_value;
+    if (last == NULL) return 0;
+    return hookphuzz_contains_ci(last, "nonce")
+        || hookphuzz_contains_ci(last, "password")
+        || hookphuzz_contains_ci(last, "secret")
+        || hookphuzz_contains_ci(last, "token")
+        || hookphuzz_contains_ci(last, "authorization")
+        || hookphuzz_contains_ci(last, "auth");
+}
+
+static const char *hookphuzz_comparison_opcode_name(zend_uchar opcode)
+{
+    switch (opcode) {
+        case ZEND_IS_EQUAL: return "IS_EQUAL";
+        case ZEND_IS_NOT_EQUAL: return "IS_NOT_EQUAL";
+        case ZEND_IS_IDENTICAL: return "IS_IDENTICAL";
+        case ZEND_IS_NOT_IDENTICAL: return "IS_NOT_IDENTICAL";
+    }
+    return NULL;
+}
+
+static zend_bool hookphuzz_same_string(const zend_string *left, const zend_string *right)
+{
+    return left != NULL && right != NULL && ZSTR_LEN(left) == ZSTR_LEN(right)
+        && memcmp(ZSTR_VAL(left), ZSTR_VAL(right), ZSTR_LEN(left)) == 0;
+}
+
+static zend_bool hookphuzz_same_comparison_path(const hookphuzz_comparison_event *event,
+    const hookphuzz_provenance *provenance)
+{
+    uint32_t index;
+
+    if (event->source != provenance->source || event->depth != provenance->depth) return 0;
+    for (index = 0; index < event->depth; index++) {
+        if (event->path[index].type != provenance->path[index].type
+            || event->path[index].int_value != provenance->path[index].int_value) return 0;
+        if (event->path[index].type == IS_STRING
+            && !hookphuzz_same_string(event->path[index].string_value, provenance->path[index].string_value)) return 0;
+    }
+    return 1;
+}
+
+static void hookphuzz_record_comparison_event(const zend_execute_data *execute_data, const zend_op *opline,
+    const hookphuzz_provenance *provenance, const zval *runtime_value, const zval *comparison_value,
+    const char *opcode, const char *provenance_operand)
+{
+    hookphuzz_context_frame *context;
+    zend_string *runtime_copy, *comparison_copy;
+    hookphuzz_comparison_event *event;
+    uint32_t index;
+
+    context = hookphuzz_find_context(execute_data);
+    if (context == NULL || hookphuzz_sensitive_path(provenance)) return;
+    runtime_copy = hookphuzz_scalar_copy(runtime_value);
+    comparison_copy = hookphuzz_scalar_copy(comparison_value);
+    if (runtime_copy == NULL || comparison_copy == NULL) {
+        if (runtime_copy != NULL) zend_string_release(runtime_copy);
+        if (comparison_copy != NULL) zend_string_release(comparison_copy);
+        return;
+    }
+    if (hookphuzz_same_string(runtime_copy, comparison_copy)) {
+        zend_string_release(runtime_copy);
+        zend_string_release(comparison_copy);
+        return;
+    }
+    for (index = 0; index < HOOKPHUZZ_G(comparison_event_count); index++) {
+        event = &HOOKPHUZZ_G(comparison_events)[index];
+        if (event->opcode == opcode && event->provenance_operand == provenance_operand
+            && hookphuzz_same_string(event->runtime_value, runtime_copy)
+            && hookphuzz_same_string(event->comparison_value, comparison_copy)
+            && hookphuzz_same_string(event->root_callback, context->root_callback)
+            && hookphuzz_same_comparison_path(event, provenance)) {
+            zend_string_release(runtime_copy);
+            zend_string_release(comparison_copy);
+            return;
+        }
+    }
+    if (HOOKPHUZZ_G(comparison_event_count) == HOOKPHUZZ_CMPLOG_MAX_EVENTS) {
+        HOOKPHUZZ_G(dropped_comparison_event_count)++;
+        zend_string_release(runtime_copy);
+        zend_string_release(comparison_copy);
+        return;
+    }
+    if (HOOKPHUZZ_G(comparison_events) == NULL) {
+        HOOKPHUZZ_G(comparison_events) = ecalloc(HOOKPHUZZ_CMPLOG_MAX_EVENTS, sizeof(hookphuzz_comparison_event));
+    }
+    event = &HOOKPHUZZ_G(comparison_events)[HOOKPHUZZ_G(comparison_event_count)++];
+    event->source = provenance->source;
+    event->depth = provenance->depth;
+    event->path = hookphuzz_copy_path(provenance->path, provenance->depth);
+    event->opcode = opcode;
+    event->provenance_operand = provenance_operand;
+    event->runtime_value = runtime_copy;
+    event->comparison_value = comparison_copy;
+    event->root_callback = zend_string_copy(context->root_callback);
+    event->current_function = zend_string_copy(context->current_function);
+    event->attributed = 1;
+    event->callback_depth = context->depth;
+    event->line = opline->lineno;
+}
+
+static int hookphuzz_copy_provenance_handler(zend_execute_data *execute_data)
+{
+    const zend_op *opline = execute_data->opline;
+    zend_uchar source_type = opline->op1_type;
+    const znode_op *source_operand = &opline->op1;
+    hookphuzz_provenance *provenance;
+
+    if (!HOOKPHUZZ_PHASE5_G(artifact_enabled)) return ZEND_USER_OPCODE_DISPATCH;
+    if (opline->opcode == ZEND_ASSIGN) {
+        source_type = opline->op2_type;
+        source_operand = &opline->op2;
+    }
+    provenance = hookphuzz_find_operand_provenance(execute_data, source_type, source_operand);
+    if (provenance != NULL) {
+        hookphuzz_set_provenance(execute_data, opline, provenance->source,
+            hookphuzz_copy_path(provenance->path, provenance->depth), provenance->depth);
+        if (opline->opcode == ZEND_ASSIGN
+            && (opline->op1_type == IS_TMP_VAR || opline->op1_type == IS_VAR || opline->op1_type == IS_CV)) {
+            hookphuzz_set_provenance_for_result(execute_data, opline->op1.var, provenance->source,
+                hookphuzz_copy_path(provenance->path, provenance->depth), provenance->depth);
+        }
+    } else {
+        hookphuzz_clear_provenance_for_opline_result(execute_data, opline);
+        if (opline->opcode == ZEND_ASSIGN
+            && (opline->op1_type == IS_TMP_VAR || opline->op1_type == IS_VAR || opline->op1_type == IS_CV)) {
+            hookphuzz_clear_provenance_for_result(execute_data, opline->op1.var);
+        }
+    }
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
+static int hookphuzz_comparison_handler(zend_execute_data *execute_data)
+{
+    const zend_op *opline = execute_data->opline;
+    const char *opcode = hookphuzz_comparison_opcode_name(opline->opcode);
+    hookphuzz_provenance *left_provenance, *right_provenance;
+    zval *left, *right;
+
+    if (!HOOKPHUZZ_PHASE5_G(artifact_enabled) || opcode == NULL) return ZEND_USER_OPCODE_DISPATCH;
+    left_provenance = hookphuzz_find_operand_provenance(execute_data, opline->op1_type, &opline->op1);
+    right_provenance = hookphuzz_find_operand_provenance(execute_data, opline->op2_type, &opline->op2);
+    if ((left_provenance == NULL) == (right_provenance == NULL)) return ZEND_USER_OPCODE_DISPATCH;
+    left = hookphuzz_operand_zval(execute_data, opline, opline->op1_type, &opline->op1);
+    right = hookphuzz_operand_zval(execute_data, opline, opline->op2_type, &opline->op2);
+    if (left == NULL || right == NULL) return ZEND_USER_OPCODE_DISPATCH;
+    if (left_provenance != NULL) {
+        hookphuzz_record_comparison_event(execute_data, opline, left_provenance, left, right, opcode, "op1");
+    } else {
+        hookphuzz_record_comparison_event(execute_data, opline, right_provenance, right, left, opcode, "op2");
+    }
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
+static int hookphuzz_switch_string_handler(zend_execute_data *execute_data)
+{
+    const zend_op *opline = execute_data->opline;
+    hookphuzz_provenance *provenance;
+    zval *value, *jump_table;
+    zend_string *key;
+    zval *jump;
+
+    if (!HOOKPHUZZ_PHASE5_G(artifact_enabled)) return ZEND_USER_OPCODE_DISPATCH;
+    provenance = hookphuzz_find_operand_provenance(execute_data, opline->op1_type, &opline->op1);
+    if (provenance == NULL) return ZEND_USER_OPCODE_DISPATCH;
+    value = hookphuzz_operand_zval(execute_data, opline, opline->op1_type, &opline->op1);
+    jump_table = (zval *) RT_CONSTANT(opline, opline->op2);
+    if (value == NULL || jump_table == NULL || Z_TYPE_P(jump_table) != IS_ARRAY) return ZEND_USER_OPCODE_DISPATCH;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(jump_table), key, jump) {
+        zval target;
+        (void) jump;
+        if (key == NULL) continue;
+        ZVAL_STR(&target, key);
+        hookphuzz_record_comparison_event(execute_data, opline, provenance, value, &target,
+            "SWITCH_STRING", "op1");
+    } ZEND_HASH_FOREACH_END();
+    return ZEND_USER_OPCODE_DISPATCH;
 }
 
 static zend_bool hookphuzz_is_call_result_opcode(zend_uchar opcode)
@@ -997,6 +1247,47 @@ static void hookphuzz_add_rest_parameter_events(zval *document)
     add_assoc_zval(document, "rest_parameter_events", &rest_events);
 }
 
+static void hookphuzz_add_comparison_events(zval *document)
+{
+    zval comparison_events;
+    uint32_t index, path_index;
+
+    if (HOOKPHUZZ_G(comparison_event_count) == 0) return;
+    array_init_size(&comparison_events, HOOKPHUZZ_G(comparison_event_count));
+    for (index = 0; index < HOOKPHUZZ_G(comparison_event_count); index++) {
+        const hookphuzz_comparison_event *event = &HOOKPHUZZ_G(comparison_events)[index];
+        zval comparison, path, context;
+
+        array_init(&comparison);
+        add_assoc_str(&comparison, "request_id", zend_string_copy(HOOKPHUZZ_PHASE5_G(request_id)));
+        if (event->root_callback != NULL) add_assoc_str(&comparison, "callback", zend_string_copy(event->root_callback));
+        else add_assoc_null(&comparison, "callback");
+        add_assoc_string(&comparison, "opcode", (char *) event->opcode);
+        add_assoc_string(&comparison, "source", (char *) hookphuzz_source_name(event->source));
+        array_init_size(&path, event->depth);
+        for (path_index = 0; path_index < event->depth; path_index++) {
+            if (event->path[path_index].type == IS_STRING) {
+                add_next_index_str(&path, zend_string_copy(event->path[path_index].string_value));
+            } else {
+                add_next_index_long(&path, event->path[path_index].int_value);
+            }
+        }
+        add_assoc_zval(&comparison, "path", &path);
+        add_assoc_str(&comparison, "runtime_value", zend_string_copy(event->runtime_value));
+        add_assoc_str(&comparison, "comparison_value", zend_string_copy(event->comparison_value));
+        add_assoc_string(&comparison, "provenance_operand", (char *) event->provenance_operand);
+        add_assoc_long(&comparison, "line", event->line);
+        array_init(&context);
+        add_assoc_bool(&context, "attributed", event->attributed);
+        if (event->current_function != NULL) add_assoc_str(&context, "current_function", zend_string_copy(event->current_function));
+        else add_assoc_null(&context, "current_function");
+        add_assoc_long(&context, "depth", event->callback_depth);
+        add_assoc_zval(&comparison, "callback_context", &context);
+        add_next_index_zval(&comparison_events, &comparison);
+    }
+    add_assoc_zval(document, "comparison_events", &comparison_events);
+}
+
 static zend_result hookphuzz_encode_artifact(smart_str *json)
 {
     zval document, events;
@@ -1058,6 +1349,7 @@ static zend_result hookphuzz_encode_artifact(smart_str *json)
     hookphuzz_add_target_loading(&document);
     hookphuzz_add_summaries(&document);
     hookphuzz_add_rest_parameter_events(&document);
+    hookphuzz_add_comparison_events(&document);
     php_json_encode(json, &document, PHP_JSON_UNESCAPED_SLASHES);
     zval_ptr_dtor(&document);
     smart_str_0(json);
@@ -1121,7 +1413,17 @@ PHP_MINIT_FUNCTION(hookphuzz_opcode)
         || zend_get_user_opcode_handler(ZEND_FETCH_DIM_IS) != NULL
         || zend_get_user_opcode_handler(ZEND_ISSET_ISEMPTY_DIM_OBJ) != NULL
         || zend_get_user_opcode_handler(ZEND_RETURN) != NULL
-        || zend_get_user_opcode_handler(ZEND_RETURN_BY_REF) != NULL) return FAILURE;
+        || zend_get_user_opcode_handler(ZEND_RETURN_BY_REF) != NULL
+        || zend_get_user_opcode_handler(ZEND_COALESCE) != NULL
+        || zend_get_user_opcode_handler(ZEND_QM_ASSIGN) != NULL
+        || zend_get_user_opcode_handler(ZEND_CAST) != NULL
+        || zend_get_user_opcode_handler(ZEND_ASSIGN) != NULL
+        || zend_get_user_opcode_handler(ZEND_JMP_SET) != NULL
+        || zend_get_user_opcode_handler(ZEND_IS_EQUAL) != NULL
+        || zend_get_user_opcode_handler(ZEND_IS_NOT_EQUAL) != NULL
+        || zend_get_user_opcode_handler(ZEND_IS_IDENTICAL) != NULL
+        || zend_get_user_opcode_handler(ZEND_IS_NOT_IDENTICAL) != NULL
+        || zend_get_user_opcode_handler(ZEND_SWITCH_STRING) != NULL) return FAILURE;
     REGISTER_INI_ENTRIES();
     zend_observer_fcall_register(hookphuzz_observer_init);
     if (zend_set_user_opcode_handler(ZEND_FETCH_R, hookphuzz_fetch_handler) != SUCCESS
@@ -1131,7 +1433,17 @@ PHP_MINIT_FUNCTION(hookphuzz_opcode)
         || zend_set_user_opcode_handler(ZEND_FETCH_DIM_IS, hookphuzz_fetch_dim_is_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_ISSET_ISEMPTY_DIM_OBJ, hookphuzz_isempty_dim_obj_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_RETURN, hookphuzz_return_handler) != SUCCESS
-        || zend_set_user_opcode_handler(ZEND_RETURN_BY_REF, hookphuzz_return_handler) != SUCCESS) return FAILURE;
+        || zend_set_user_opcode_handler(ZEND_RETURN_BY_REF, hookphuzz_return_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_COALESCE, hookphuzz_copy_provenance_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_QM_ASSIGN, hookphuzz_copy_provenance_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_CAST, hookphuzz_copy_provenance_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_ASSIGN, hookphuzz_copy_provenance_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_JMP_SET, hookphuzz_copy_provenance_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_IS_EQUAL, hookphuzz_comparison_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_IS_NOT_EQUAL, hookphuzz_comparison_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_IS_IDENTICAL, hookphuzz_comparison_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_IS_NOT_IDENTICAL, hookphuzz_comparison_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_SWITCH_STRING, hookphuzz_switch_string_handler) != SUCCESS) return FAILURE;
     return SUCCESS;
 }
 
@@ -1145,6 +1457,16 @@ PHP_MSHUTDOWN_FUNCTION(hookphuzz_opcode)
     if (zend_get_user_opcode_handler(ZEND_ISSET_ISEMPTY_DIM_OBJ) == hookphuzz_isempty_dim_obj_handler) zend_set_user_opcode_handler(ZEND_ISSET_ISEMPTY_DIM_OBJ, NULL);
     if (zend_get_user_opcode_handler(ZEND_RETURN) == hookphuzz_return_handler) zend_set_user_opcode_handler(ZEND_RETURN, NULL);
     if (zend_get_user_opcode_handler(ZEND_RETURN_BY_REF) == hookphuzz_return_handler) zend_set_user_opcode_handler(ZEND_RETURN_BY_REF, NULL);
+    if (zend_get_user_opcode_handler(ZEND_COALESCE) == hookphuzz_copy_provenance_handler) zend_set_user_opcode_handler(ZEND_COALESCE, NULL);
+    if (zend_get_user_opcode_handler(ZEND_QM_ASSIGN) == hookphuzz_copy_provenance_handler) zend_set_user_opcode_handler(ZEND_QM_ASSIGN, NULL);
+    if (zend_get_user_opcode_handler(ZEND_CAST) == hookphuzz_copy_provenance_handler) zend_set_user_opcode_handler(ZEND_CAST, NULL);
+    if (zend_get_user_opcode_handler(ZEND_ASSIGN) == hookphuzz_copy_provenance_handler) zend_set_user_opcode_handler(ZEND_ASSIGN, NULL);
+    if (zend_get_user_opcode_handler(ZEND_JMP_SET) == hookphuzz_copy_provenance_handler) zend_set_user_opcode_handler(ZEND_JMP_SET, NULL);
+    if (zend_get_user_opcode_handler(ZEND_IS_EQUAL) == hookphuzz_comparison_handler) zend_set_user_opcode_handler(ZEND_IS_EQUAL, NULL);
+    if (zend_get_user_opcode_handler(ZEND_IS_NOT_EQUAL) == hookphuzz_comparison_handler) zend_set_user_opcode_handler(ZEND_IS_NOT_EQUAL, NULL);
+    if (zend_get_user_opcode_handler(ZEND_IS_IDENTICAL) == hookphuzz_comparison_handler) zend_set_user_opcode_handler(ZEND_IS_IDENTICAL, NULL);
+    if (zend_get_user_opcode_handler(ZEND_IS_NOT_IDENTICAL) == hookphuzz_comparison_handler) zend_set_user_opcode_handler(ZEND_IS_NOT_IDENTICAL, NULL);
+    if (zend_get_user_opcode_handler(ZEND_SWITCH_STRING) == hookphuzz_switch_string_handler) zend_set_user_opcode_handler(ZEND_SWITCH_STRING, NULL);
     UNREGISTER_INI_ENTRIES();
     return SUCCESS;
 }
@@ -1159,6 +1481,9 @@ PHP_RINIT_FUNCTION(hookphuzz_opcode)
     HOOKPHUZZ_PHASE5_G(dropped_event_count) = 0;
     HOOKPHUZZ_PHASE5_G(event_count) = 0;
     HOOKPHUZZ_PHASE5_G(events) = NULL;
+    HOOKPHUZZ_G(dropped_comparison_event_count) = 0;
+    HOOKPHUZZ_G(comparison_event_count) = 0;
+    HOOKPHUZZ_G(comparison_events) = NULL;
     HOOKPHUZZ_PHASE5_G(provenance_count) = 0;
     HOOKPHUZZ_PHASE5_G(provenance) = NULL;
     HOOKPHUZZ_PHASE5_G(request_id) = NULL;
@@ -1203,6 +1528,7 @@ PHP_RSHUTDOWN_FUNCTION(hookphuzz_opcode)
 {
     if (HOOKPHUZZ_PHASE5_G(artifact_enabled) && !HOOKPHUZZ_PHASE5_G(artifact_flushed)) hookphuzz_flush_artifact();
     hookphuzz_release_events();
+    hookphuzz_release_comparison_events();
     hookphuzz_release_provenance();
     hookphuzz_release_contexts();
     hookphuzz_release_targets();
@@ -1215,7 +1541,7 @@ PHP_MINFO_FUNCTION(hookphuzz_opcode)
 {
     php_info_print_table_start();
     php_info_print_table_header(2, "hookphuzz_opcode support", "enabled");
-    php_info_print_table_row(2, "configured user opcodes", "ZEND_FETCH_R, ZEND_FETCH_OBJ_R, ZEND_FETCH_DIM_R, ZEND_FETCH_IS, ZEND_FETCH_DIM_IS, ZEND_ISSET_ISEMPTY_DIM_OBJ, ZEND_RETURN, ZEND_RETURN_BY_REF");
+    php_info_print_table_row(2, "configured user opcodes", "ZEND_FETCH_R, ZEND_FETCH_OBJ_R, ZEND_FETCH_DIM_R, ZEND_FETCH_IS, ZEND_FETCH_DIM_IS, ZEND_ISSET_ISEMPTY_DIM_OBJ, ZEND_RETURN, ZEND_RETURN_BY_REF, ZEND_COALESCE, ZEND_QM_ASSIGN, ZEND_CAST, ZEND_ASSIGN, ZEND_JMP_SET, ZEND_IS_EQUAL, ZEND_IS_NOT_EQUAL, ZEND_IS_IDENTICAL, ZEND_IS_NOT_IDENTICAL, ZEND_SWITCH_STRING");
     php_info_print_table_row(2, "artifact output", HOOKPHUZZ_ARTIFACT_DIR);
     php_info_print_table_row(2, "event limit per request", "4096");
     php_info_print_table_end();
