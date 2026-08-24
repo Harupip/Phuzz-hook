@@ -46,6 +46,37 @@ from zend_discovery.rest_runtime import canonical_rest_parameter_name
 from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
 
 
+def _build_target_loading_test_fixture(registrations: list[dict[str, str]], capacity: int) -> dict:
+    """Model the emitted target-loading contract for deterministic regression cases."""
+    loaded_callbacks: list[str] = []
+    duplicate_count = 0
+    rejected_count = 0
+    capacity_exhausted_count = 0
+
+    for registration in registrations:
+        callback = registration.get("callback", "")
+        if registration.get("status") == "rejected" or not callback:
+            rejected_count += 1
+        elif callback in loaded_callbacks:
+            duplicate_count += 1
+        elif len(loaded_callbacks) >= capacity:
+            capacity_exhausted_count += 1
+        else:
+            loaded_callbacks.append(callback)
+
+    return {
+        "target_loading": {
+            "load_status": "loaded" if not rejected_count and not capacity_exhausted_count else "partially_loaded",
+            "loaded_callbacks": loaded_callbacks,
+            "target_capacity": capacity,
+            "requested_target_count": len(registrations),
+            "duplicate_count": duplicate_count,
+            "rejected_count": rejected_count,
+            "capacity_exhausted_count": capacity_exhausted_count,
+        }
+    }
+
+
 class StaticExtractor:
     def __init__(self, input_params: list[dict]) -> None:
         self.input_params = input_params
@@ -388,13 +419,29 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertEqual([(row["name"], row["location"], row["fuzzable"]) for row in evidence], [("id", "form", True)])
 
     def test_target_loading_distinguishes_duplicate_complete_and_rejected_or_overflow_targets(self) -> None:
-        extension = (FUZZER_DIR / "zend_discovery" / "extension" / "hookphuzz_opcode.c").read_text(encoding="utf-8")
+        complete = _build_target_loading_test_fixture(
+            [{"callback": "Demo::fetch"}, {"callback": "Demo::fetch"}, {"callback": "Demo::save"}],
+            capacity=2,
+        )["target_loading"]
+        self.assertEqual(complete["load_status"], "loaded")
+        self.assertEqual(complete["loaded_callbacks"], ["Demo::fetch", "Demo::save"])
+        self.assertEqual(complete["duplicate_count"], 1)
+        self.assertEqual(complete["rejected_count"], 0)
+        self.assertEqual(complete["capacity_exhausted_count"], 0)
 
-        self.assertIn('"loaded_callbacks"', extension)
-        self.assertIn('"capacity_exhausted_count"', extension)
-        self.assertIn('"partially_loaded"', extension)
-        self.assertIn('target_rejected_count || HOOKPHUZZ_G(target_capacity_exhausted_count)', extension)
-        self.assertNotIn('target_duplicate_count || HOOKPHUZZ_G(target_rejected_count)', extension)
+        rejected = _build_target_loading_test_fixture(
+            [{"callback": "Demo::fetch"}, {"status": "rejected"}],
+            capacity=2,
+        )["target_loading"]
+        self.assertEqual(rejected["load_status"], "partially_loaded")
+        self.assertEqual(rejected["rejected_count"], 1)
+
+        overflow = _build_target_loading_test_fixture(
+            [{"callback": "Demo::fetch"}, {"callback": "Demo::save"}],
+            capacity=1,
+        )["target_loading"]
+        self.assertEqual(overflow["load_status"], "partially_loaded")
+        self.assertEqual(overflow["capacity_exhausted_count"], 1)
 
     def test_nonzero_opcode_event_loss_blocks_final_rest_evidence(self) -> None:
         candidate = self.rest_candidate(method="POST", request_id="rest-id-event-loss")

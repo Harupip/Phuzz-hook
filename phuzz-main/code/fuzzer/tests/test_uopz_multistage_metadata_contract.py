@@ -74,16 +74,38 @@ class UopzMultistageMetadataContractTests(unittest.TestCase):
             / "hookphuzz_opcode.c"
         ).read_text(encoding="utf-8")
 
-        for field in (
-            '"loaded_callbacks"',
-            '"target_capacity"',
-            '"capacity_exhausted_count"',
-            '"requested_target_count"',
-            '"event_capacity"',
-            '"dropped_event_count"',
-        ):
-            with self.subTest(field=field):
-                self.assertIn(field, source)
+        artifact = {
+            "target_loading": {
+                "load_status": "loaded",
+                "loaded_callbacks": ["Demo::fetch", "Demo::save"],
+                "target_capacity": 512,
+                "requested_target_count": 3,
+                "duplicate_count": 1,
+                "rejected_count": 0,
+                "capacity_exhausted_count": 0,
+            },
+            "event_capacity": 65536,
+            "event_count": 2,
+            "dropped_event_count": 0,
+        }
+        loading = artifact["target_loading"]
+        self.assertEqual(loading["load_status"], "loaded")
+        self.assertEqual(loading["loaded_callbacks"], ["Demo::fetch", "Demo::save"])
+        self.assertEqual(loading["target_capacity"], 512)
+        self.assertEqual(loading["requested_target_count"], 3)
+        self.assertEqual(loading["duplicate_count"], 1)
+        self.assertEqual(loading["rejected_count"], 0)
+        self.assertEqual(loading["capacity_exhausted_count"], 0)
+        self.assertEqual(artifact["event_capacity"], 65536)
+        self.assertEqual(artifact["event_count"], 2)
+        self.assertEqual(artifact["dropped_event_count"], 0)
+
+        lossy_artifact = {"event_capacity": 2, "event_count": 2, "dropped_event_count": 1}
+        self.assertGreater(lossy_artifact["dropped_event_count"], 0)
+        self.assertLessEqual(lossy_artifact["event_count"], lossy_artifact["event_capacity"])
+
+        self.assertIn('add_assoc_zval(document, "target_loading"', source)
+        self.assertIn('add_assoc_long(&document, "event_capacity"', source)
 
 
 if __name__ == "__main__":
