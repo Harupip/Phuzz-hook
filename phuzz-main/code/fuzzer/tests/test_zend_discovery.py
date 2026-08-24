@@ -26,6 +26,7 @@ from zend_discovery.engine import (
     normalize_runtime_evidence,
     prepare_callback_registry,
     read_plugin_metadata,
+    rest_runtime_block_reason,
     run_enrichment,
     select_auto_probes,
 )
@@ -253,7 +254,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             "run_id": "legacy-1",
             "request_id": "rest-request-1",
             "request_method": "GET",
-            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "target_loading": {"load_status": "loaded", "file_target_count": 1, "loaded_callbacks": ["Demo::list_items"]},
             "rest_parameter_events": [{
                 "callback": "Demo::list_items",
                 "namespace": "demo/v1",
@@ -299,7 +300,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             "run_id": "legacy-1",
             "request_id": "rest-request-zend-fetch",
             "request_method": "GET",
-            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "target_loading": {"load_status": "loaded", "file_target_count": 1, "loaded_callbacks": ["Demo::list_items"]},
             "rest_parameter_events": [{
                 "source": "REST",
                 "bucket": "GET",
@@ -441,6 +442,32 @@ class ZendDiscoveryTests(unittest.TestCase):
                     self.assertEqual([(row["name"], row["location"], row["fuzzable"]) for row in evidence], [("id", "form", True)])
                 else:
                     self.assertEqual(evidence, [])
+
+    def test_rest_runtime_block_reason_is_deterministic_for_loading_and_event_loss(self) -> None:
+        incomplete = {
+            "target_loading": {
+                "load_status": "loaded",
+                "file_target_count": 1,
+                "loaded_callbacks": [],
+            }
+        }
+        self.assertEqual(
+            rest_runtime_block_reason(incomplete, "Demo::list_items"),
+            "zend_target_callback_not_loaded",
+        )
+
+        lossy = {
+            "target_loading": {
+                "load_status": "loaded",
+                "file_target_count": 1,
+                "loaded_callbacks": ["Demo::list_items"],
+            },
+            "dropped_event_count": 1,
+        }
+        self.assertEqual(
+            rest_runtime_block_reason(lossy, "Demo::list_items"),
+            "zend_event_buffer_overflow",
+        )
 
     def test_json_rest_artifact_contract_accepts_complete_and_rejects_lossy_evidence(self) -> None:
         candidate = self.rest_candidate(method="POST", request_id="rest-id-json-contract")
@@ -634,7 +661,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             "run_id": "legacy-1",
             "request_id": "rest-request-zend-control",
             "request_method": "GET",
-            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "target_loading": {"load_status": "loaded", "file_target_count": 1, "loaded_callbacks": ["Demo::list_items"]},
         }
         controls = [
             {"source": "GET", "bucket": "GET", "parameter": "search", "callback": "Demo::list_items", "observed_count": 1},
@@ -675,7 +702,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             "run_id": "legacy-1",
             "request_id": "rest-request-uopz-1",
             "request_method": "GET",
-            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "target_loading": {"load_status": "loaded", "file_target_count": 1, "loaded_callbacks": ["Demo::list_items"]},
             "rest_parameter_events": [],
         }
 
@@ -711,7 +738,7 @@ class ZendDiscoveryTests(unittest.TestCase):
         registry = {"schema_version": 1, "callback_map": {"rest-items": "Demo::list_items"}}
         zend = {
             "schema_version": 4, "run_id": "legacy-1", "request_id": "rest-request-uopz-reject",
-            "request_method": "GET", "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "request_method": "GET", "target_loading": {"load_status": "loaded", "file_target_count": 1, "loaded_callbacks": ["Demo::list_items"]},
             "rest_parameter_events": [],
         }
         cases = [
@@ -768,7 +795,7 @@ class ZendDiscoveryTests(unittest.TestCase):
         registry = {"schema_version": 1, "callback_map": {"rest-items": "Demo::list_items"}}
         zend = {
             "run_id": "legacy-1", "request_id": "rest-request-2", "request_method": "POST",
-            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "target_loading": {"load_status": "loaded", "file_target_count": 1, "loaded_callbacks": ["Demo::list_items"]},
             "rest_parameter_events": [
                 {"callback": "Demo::list_items", "namespace": "demo/v1", "route_pattern": "/items", "endpoint_definition_index": 0, "materialized_route": "/wp-json/demo/v1/items", "method": "POST", "name": "both", "location": "ambiguous", "observed_count": 1},
                 {"callback": "Demo::list_items", "namespace": "demo/v1", "route_pattern": "/other", "endpoint_definition_index": 0, "materialized_route": "/wp-json/demo/v1/other", "method": "POST", "name": "wrong", "location": "form", "observed_count": 1},
@@ -810,7 +837,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             "run_id": "legacy-1",
             "request_id": "rest-request-3",
             "request_method": "POST",
-            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "target_loading": {"load_status": "loaded", "file_target_count": 1, "loaded_callbacks": ["Demo::list_items"]},
             "rest_parameter_events": [
                 {**base, "location": "query"},
                 {**base, "location": "form"},
@@ -929,7 +956,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             "run_id": candidate["legacy_run_id"],
             "request_id": candidate["pass1_request_id"],
             "request_method": candidate["method"].upper(),
-            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "target_loading": {"load_status": "loaded", "file_target_count": 1, "loaded_callbacks": ["Demo::list_items"]},
             "rest_parameter_events": events if isinstance(events, list) else [events],
         }
 
@@ -2695,7 +2722,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             "run_id": "legacy-1",
             "request_id": "rest-pass2",
             "request_method": "POST",
-            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "target_loading": {"load_status": "loaded", "file_target_count": 1, "loaded_callbacks": ["Demo::list_items"]},
             "rest_parameter_events": [{
                 "callback": "Demo::list_items",
                 "namespace": "demo/v1",

@@ -22,6 +22,13 @@ READ_ACTION = re.compile(r"(?:get|list|fetch|search|load|view)", re.IGNORECASE)
 PERSISTENCE_FORBIDDEN_KEY = re.compile(r"(?:authorization|cookie|password|secret|token|pass2)", re.IGNORECASE)
 
 
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def canonical_identity(candidate: Mapping[str, Any]) -> dict[str, Any]:
     entrypoint_type = str(candidate.get("entrypoint_type") or candidate.get("kind") or "").lower()
     if entrypoint_type in {"ajax", "admin-post", "admin_post"}:
@@ -119,6 +126,33 @@ def correlate_pass1_artifact(
     return artifact if isinstance(artifact, dict) else dict(artifact)
 
 
+def rest_runtime_block_reason(
+    zend_artifact: Mapping[str, Any],
+    canonical_callback: str,
+) -> str:
+    """Return the stable reason a REST Zend artifact cannot prove runtime input."""
+    loading = zend_artifact.get("target_loading")
+    if not isinstance(loading, Mapping):
+        return "zend_target_loading_incomplete"
+    if loading.get("load_status") not in {"loaded", "partially_loaded"}:
+        return "zend_target_loading_incomplete"
+    try:
+        file_target_count = int(loading.get("file_target_count") or 0)
+        rejected_count = int(loading.get("rejected_count") or 0)
+        capacity_exhausted_count = int(loading.get("capacity_exhausted_count") or 0)
+        dropped_event_count = int(zend_artifact.get("dropped_event_count") or 0)
+    except (TypeError, ValueError):
+        return "zend_target_loading_incomplete"
+    loaded_callbacks = loading.get("loaded_callbacks")
+    if file_target_count < 1 or not isinstance(loaded_callbacks, list) or canonical_callback not in loaded_callbacks:
+        return "zend_target_callback_not_loaded"
+    if rejected_count > 0 or capacity_exhausted_count > 0:
+        return "zend_target_loading_partial"
+    if dropped_event_count > 0:
+        return "zend_event_buffer_overflow"
+    return ""
+
+
 def normalize_runtime_evidence(
     candidate: Mapping[str, Any],
     uopz_artifact: Mapping[str, Any],
@@ -143,7 +177,7 @@ def normalize_runtime_evidence(
         or not canonical_callback
         or str(zend_artifact.get("request_id") or "") != str(candidate.get("pass1_request_id") or "")
         or loading.get("load_status") not in {"loaded", "partially_loaded"}
-        or int(loading.get("file_target_count") or 0) < 1
+        or _safe_int(loading.get("file_target_count")) < 1
     ):
         return []
     zend_run_id = str(zend_artifact.get("run_id") or "")
@@ -154,6 +188,8 @@ def normalize_runtime_evidence(
         return []
     fixed = candidate.get("fixed_bootstrap") if isinstance(candidate.get("fixed_bootstrap"), Mapping) else {}
     if identity["entrypoint_type"] == "rest":
+        if rest_runtime_block_reason(zend_artifact, canonical_callback):
+            return []
         return normalize_rest_parameter_events(
             candidate,
             zend_artifact,
@@ -577,6 +613,11 @@ def _enriched_record(
             proof_artifact = artifact
             break
     zend = next((item for item in zend_artifacts if str(item.get("request_id") or "") == str(candidate["pass1_request_id"])), {})
+    runtime_block_reason = (
+        rest_runtime_block_reason(zend, canonical_callback)
+        if identity["entrypoint_type"] == "rest"
+        else ""
+    )
     parameters = normalize_runtime_evidence(candidate, proof_artifact, zend, runtime_registry)
     fuzzable_parameters = [
         {"name": str(row["name"]), "location": str(row["location"])}
@@ -594,6 +635,7 @@ def _enriched_record(
         "auth_variant": identity["auth_variant"],
         "entrypoint_type": identity["entrypoint_type"],
         "parameters": parameters,
+        "runtime_block_reason": runtime_block_reason or None,
         "provenance": {
             "pass1": {
                 "legacy_run_id": candidate["legacy_run_id"],
@@ -622,10 +664,12 @@ def _enriched_record(
             "method_confidence": "runtime_observed",
             "method_source": "runtime_observed",
             "fixed_bootstrap": _fixed_bootstrap(raw_item),
+            "runtime_block_reason": runtime_block_reason or None,
             "gates": {
                 "accepted_pass1_proof": proof is not None,
                 "probe_replay_allowed": proof is not None,
                 "final_fuzz_export_allowed": bool(proof is not None and fuzzable_params),
+                "runtime_block_reason": runtime_block_reason or None,
             },
         },
     }

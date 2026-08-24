@@ -11,12 +11,12 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from hook_energy.seed_generation.config_exporter import export_seed_configs
     from zend_discovery.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, run_enrichment
+    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment
     from zend_discovery.rest_runtime import canonical_rest_parameter_name
 else:
     from ..config_exporter import export_seed_configs
     from zend_discovery.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, run_enrichment
+    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment
     from zend_discovery.rest_runtime import canonical_rest_parameter_name
 
 
@@ -351,6 +351,13 @@ def converge_iteration(
     )
     candidate_key = _candidate_iteration_key(raw_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
     base_candidate_key = _candidate_base_key(raw_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
+    callback_map = registry.get("callback_map") if isinstance(registry.get("callback_map"), Mapping) else {}
+    canonical_callback = str(callback_map.get(candidate.get("callback_id")) or "")
+    runtime_block_reason = (
+        rest_runtime_block_reason(zend, canonical_callback)
+        if candidate.get("entrypoint_type") == "rest"
+        else ""
+    )
     observed = normalize_runtime_evidence(candidate, uopz, zend, registry)
     prior = known_state.get("known_parameters", [])
     if not isinstance(prior, list):
@@ -371,6 +378,7 @@ def converge_iteration(
         "request_id": request_id,
         "known_before": prior,
         "observed_parameters": observed,
+        "runtime_block_reason": runtime_block_reason or None,
         "new_parameters": advanced["new_parameters"],
         "missing_parameters": missing,
         "known_parameters": advanced["known_parameters"],

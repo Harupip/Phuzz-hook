@@ -5,14 +5,26 @@ import re
 from typing import Any
 
 
-_LOCATIONS = {"query": "REST_QUERY", "form": "REST_FORM", "json": "REST_JSON"}
-_BUCKET_LOCATIONS = {"GET": "query", "POST": "form", "JSON": "json"}
+_LOCATIONS = {
+    "query": "REST_QUERY",
+    "form": "REST_FORM",
+    "json": "REST_JSON",
+    "path": "REST_URL",
+    "defaults": "REST_DEFAULT",
+}
+_BUCKET_LOCATIONS = {
+    "GET": "query",
+    "POST": "form",
+    "JSON": "json",
+    "URL": "path",
+    "DEFAULTS": "defaults",
+}
 _FORBIDDEN_PARAMETER_NAME = re.compile(
     r"(?:nonce|cookie|secret|password|token|authorization)", re.IGNORECASE
 )
 _METHOD_LOCATIONS = {
-    "GET": {"query"},
-    "HEAD": {"query"},
+    "GET": {"query", "path", "defaults"},
+    "HEAD": {"query", "path", "defaults"},
     "POST": set(_LOCATIONS),
 }
 # TEMP MERGE-BACKPORT (2026-08-19): bridge_cli.py imports this helper, but the
@@ -72,7 +84,7 @@ def normalize_rest_parameter_events(
                 if not isinstance(event, Mapping) or event.get("accessor") != "WP_REST_Request::get_param":
                     continue
                 name = event.get("name")
-                if isinstance(name, str) and name in query_params:
+                if isinstance(name, str) and "[" not in name and "]" not in name and name in query_params:
                     if name in observed:
                         duplicate_observation = True
                         break
@@ -97,12 +109,12 @@ def normalize_rest_parameter_events(
             continue
         if any(key in event and event.get(key) != value for key, value in expected.items() if key != "callback"):
             continue
-        if event.get("source") == "REST":
+        if str(event.get("source") or "").upper() == "REST":
             bucket = str(event.get("bucket") or "").upper()
-            name = event.get("parameter")
             location = _BUCKET_LOCATIONS.get(bucket, "")
             path = event.get("path")
-            if isinstance(path, list) and path != [bucket, name]:
+            name = canonical_rest_parameter_name(bucket, path, event.get("parameter"))
+            if not name:
                 continue
         else:
             name = event.get("name")
@@ -114,8 +126,6 @@ def normalize_rest_parameter_events(
         if (
             not isinstance(name, str)
             or not name
-            or "[" in name
-            or "]" in name
             or _FORBIDDEN_PARAMETER_NAME.search(name)
             or location not in allowed_locations
             or observed_count < 1
@@ -125,7 +135,8 @@ def normalize_rest_parameter_events(
             continue
         seen.add((name, location))
         accepted_events.append({**event, "name": name, "location": location})
-        locations_by_name.setdefault(name, set()).add(location)
+        if location != "defaults":
+            locations_by_name.setdefault(name, set()).add(location)
     if any(len(locations) != 1 for locations in locations_by_name.values()):
         return []
 
@@ -133,8 +144,7 @@ def normalize_rest_parameter_events(
     for event in accepted_events:
         name = str(event["name"])
         location = str(event.get("location") or "")
-        normalized.append(
-            {
+        row = {
                 "name": name,
                 "path": [name],
                 "source": _LOCATIONS[location],
@@ -142,7 +152,7 @@ def normalize_rest_parameter_events(
                 "helper_depth": 0,
                 "observed_count": int(event.get("observed_count") or 0),
                 "evidence_kind": "zend_rest_runtime",
-                "fuzzable": True,
+                "fuzzable": location != "defaults",
                 "run_id": str(candidate.get("legacy_run_id") or ""),
                 "request_id": str(candidate.get("pass1_request_id") or ""),
                 "plugin_slug": str(candidate.get("plugin_slug") or ""),
@@ -154,5 +164,7 @@ def normalize_rest_parameter_events(
                 "endpoint_definition_index": expected["endpoint_definition_index"],
                 "request_method": method,
             }
-        )
+        if location == "defaults":
+            row["observable"] = True
+        normalized.append(row)
     return sorted(normalized, key=lambda item: (item["location"], item["name"]))

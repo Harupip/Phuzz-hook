@@ -369,6 +369,13 @@ Accepted REST evidence is value-free and must include:
 - parameter `name`
 - proven `location`
 
+The Zend request artifact is complete only when `target_loading.loaded_callbacks`
+contains the exact `canonical_callback`, `file_target_count >= 1`,
+`rejected_count == 0`, and `capacity_exhausted_count == 0`. A partial registry
+or a non-zero file target count without callback membership is insufficient.
+Any relevant `dropped_event_count > 0` blocks REST enrichment with the stable
+reason `zend_event_buffer_overflow`.
+
 Currently proven Zend artifact buckets:
 
 - `GET`
@@ -393,6 +400,9 @@ Blocked cases:
 - auth/security-looking parameter names
 - schema-only proof
 - `get_param` name-only proof without selected bucket provenance
+- missing exact target callback membership (`zend_target_callback_not_loaded`)
+- rejected or capacity-exhausted Zend targets (`zend_target_loading_partial`)
+- dropped Zend events (`zend_event_buffer_overflow`)
 
 Current Zend REST `get_param()` artifact scope:
 
@@ -412,6 +422,14 @@ REST materialization rules:
 - form evidence writes `seed.body[name] = "FUZZ"`.
 - json evidence writes `seed.body[name] = "FUZZ"` and sets `Content-Type: application/json`.
 - generated `input_params` use `GET`, `POST`, or `JSON` source according to proven location.
+
+An isolated schema probe is replay-only: its typed sentinel is retained only
+in memory for the probe request and is redacted from persisted suggested-seed
+reports. It may become a final fuzz seed only after a fresh, callback-attributed
+Zend event is correlated to the exact request/run/route/method identity. Without
+that runtime proof, keep the original value fixed with `config_type=replay_only`
+and `fuzzing_ready=false`; HTTP success or callback registration alone is not
+proof.
 
 ## Verification Already Run
 
