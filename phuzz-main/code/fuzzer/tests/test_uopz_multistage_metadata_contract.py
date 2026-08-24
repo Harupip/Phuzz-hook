@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -74,20 +75,22 @@ class UopzMultistageMetadataContractTests(unittest.TestCase):
             / "hookphuzz_opcode.c"
         ).read_text(encoding="utf-8")
 
-        artifact = {
-            "target_loading": {
-                "load_status": "loaded",
-                "loaded_callbacks": ["Demo::fetch", "Demo::save"],
-                "target_capacity": 512,
-                "requested_target_count": 3,
-                "duplicate_count": 1,
-                "rejected_count": 0,
-                "capacity_exhausted_count": 0,
-            },
-            "event_capacity": 65536,
-            "event_count": 2,
-            "dropped_event_count": 0,
-        }
+        artifact_json = """{
+          "target_loading": {
+            "load_status": "loaded",
+            "loaded_callbacks": ["Demo::fetch", "Demo::save"],
+            "target_capacity": 512,
+            "requested_target_count": 3,
+            "duplicate_count": 1,
+            "rejected_count": 0,
+            "capacity_exhausted_count": 0
+          },
+          "event_capacity": 65536,
+          "event_count": 2,
+          "dropped_event_count": 0
+        }"""
+        artifact = json.loads(artifact_json)
+        artifact = json.loads(json.dumps(artifact))
         loading = artifact["target_loading"]
         self.assertEqual(loading["load_status"], "loaded")
         self.assertEqual(loading["loaded_callbacks"], ["Demo::fetch", "Demo::save"])
@@ -100,7 +103,9 @@ class UopzMultistageMetadataContractTests(unittest.TestCase):
         self.assertEqual(artifact["event_count"], 2)
         self.assertEqual(artifact["dropped_event_count"], 0)
 
-        lossy_artifact = {"event_capacity": 2, "event_count": 2, "dropped_event_count": 1}
+        lossy_artifact = json.loads(
+            '{"event_capacity": 2, "event_count": 2, "dropped_event_count": 1}'
+        )
         self.assertGreater(lossy_artifact["dropped_event_count"], 0)
         self.assertLessEqual(lossy_artifact["event_count"], lossy_artifact["event_capacity"])
 

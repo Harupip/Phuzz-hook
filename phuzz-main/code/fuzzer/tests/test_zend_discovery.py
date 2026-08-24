@@ -46,37 +46,6 @@ from zend_discovery.rest_runtime import canonical_rest_parameter_name
 from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
 
 
-def _build_target_loading_test_fixture(registrations: list[dict[str, str]], capacity: int) -> dict:
-    """Model the emitted target-loading contract for deterministic regression cases."""
-    loaded_callbacks: list[str] = []
-    duplicate_count = 0
-    rejected_count = 0
-    capacity_exhausted_count = 0
-
-    for registration in registrations:
-        callback = registration.get("callback", "")
-        if registration.get("status") == "rejected" or not callback:
-            rejected_count += 1
-        elif callback in loaded_callbacks:
-            duplicate_count += 1
-        elif len(loaded_callbacks) >= capacity:
-            capacity_exhausted_count += 1
-        else:
-            loaded_callbacks.append(callback)
-
-    return {
-        "target_loading": {
-            "load_status": "loaded" if not rejected_count and not capacity_exhausted_count else "partially_loaded",
-            "loaded_callbacks": loaded_callbacks,
-            "target_capacity": capacity,
-            "requested_target_count": len(registrations),
-            "duplicate_count": duplicate_count,
-            "rejected_count": rejected_count,
-            "capacity_exhausted_count": capacity_exhausted_count,
-        }
-    }
-
-
 class StaticExtractor:
     def __init__(self, input_params: list[dict]) -> None:
         self.input_params = input_params
@@ -419,29 +388,56 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertEqual([(row["name"], row["location"], row["fuzzable"]) for row in evidence], [("id", "form", True)])
 
     def test_target_loading_distinguishes_duplicate_complete_and_rejected_or_overflow_targets(self) -> None:
-        complete = _build_target_loading_test_fixture(
-            [{"callback": "Demo::fetch"}, {"callback": "Demo::fetch"}, {"callback": "Demo::save"}],
-            capacity=2,
-        )["target_loading"]
-        self.assertEqual(complete["load_status"], "loaded")
-        self.assertEqual(complete["loaded_callbacks"], ["Demo::fetch", "Demo::save"])
-        self.assertEqual(complete["duplicate_count"], 1)
-        self.assertEqual(complete["rejected_count"], 0)
-        self.assertEqual(complete["capacity_exhausted_count"], 0)
+        candidate = self.rest_candidate(method="POST", request_id="rest-id-target-loading")
+        canonical_callback = "Demo::list_items"
+        uopz = self.pass1_artifact(
+            candidate,
+            hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+        )
+        registry = {"schema_version": 1, "callback_map": {"rest-items": canonical_callback}}
+        event = {
+            "source": "REST",
+            "bucket": "POST",
+            "parameter": "id",
+            "path": ["POST", "id"],
+            "callback": canonical_callback,
+            "namespace": "demo/v1",
+            "route_pattern": "/items",
+            "endpoint_definition_index": 0,
+            "materialized_route": "/wp-json/demo/v1/items",
+            "method": "POST",
+            "observed_count": 1,
+        }
+        cases = [
+            (
+                "duplicates_are_complete",
+                {"load_status": "loaded", "loaded_callbacks": [canonical_callback], "duplicate_count": 1,
+                 "rejected_count": 0, "capacity_exhausted_count": 0},
+                True,
+            ),
+            (
+                "rejected_is_partial",
+                {"load_status": "partially_loaded", "loaded_callbacks": [canonical_callback], "duplicate_count": 0,
+                 "rejected_count": 1, "capacity_exhausted_count": 0},
+                False,
+            ),
+            (
+                "overflow_is_partial",
+                {"load_status": "partially_loaded", "loaded_callbacks": [canonical_callback], "duplicate_count": 0,
+                 "rejected_count": 0, "capacity_exhausted_count": 1},
+                False,
+            ),
+        ]
 
-        rejected = _build_target_loading_test_fixture(
-            [{"callback": "Demo::fetch"}, {"status": "rejected"}],
-            capacity=2,
-        )["target_loading"]
-        self.assertEqual(rejected["load_status"], "partially_loaded")
-        self.assertEqual(rejected["rejected_count"], 1)
-
-        overflow = _build_target_loading_test_fixture(
-            [{"callback": "Demo::fetch"}, {"callback": "Demo::save"}],
-            capacity=1,
-        )["target_loading"]
-        self.assertEqual(overflow["load_status"], "partially_loaded")
-        self.assertEqual(overflow["capacity_exhausted_count"], 1)
+        for name, target_loading, should_accept in cases:
+            with self.subTest(name=name):
+                zend = self.rest_zend_artifact(candidate, event)
+                zend["target_loading"].update(target_loading)
+                evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+                if should_accept:
+                    self.assertEqual([(row["name"], row["location"], row["fuzzable"]) for row in evidence], [("id", "form", True)])
+                else:
+                    self.assertEqual(evidence, [])
 
     def test_nonzero_opcode_event_loss_blocks_final_rest_evidence(self) -> None:
         candidate = self.rest_candidate(method="POST", request_id="rest-id-event-loss")
