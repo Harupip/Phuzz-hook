@@ -75,6 +75,16 @@ def _candidate_iteration_key(
     return canonical_identity_id(candidate) + _variant_suffix(seed_item)
 
 
+def _candidate_base_key(
+    seed_item: Mapping[str, Any],
+    *,
+    plugin_slug: str,
+    legacy_run_id: str,
+) -> str:
+    candidate = candidate_from_seed_item(seed_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
+    return canonical_identity_id(candidate)
+
+
 def build_enrichment_inputs(
     raw_report: Mapping[str, Any],
     pass1_run_summary: Mapping[str, Any],
@@ -184,7 +194,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 candidate_key=args.candidate_key,
             )
             _write_json(Path(args.convergence_state_output), result)
-            _write_json(Path(args.convergence_merged_seeds), result["merged_suggested_seeds"])
+            _write_json(Path(args.convergence_merged_seeds), _redacted_probe_seed_report(result["merged_suggested_seeds"]))
             if result["status"] == "REPLAY_FAILED":
                 print(f"Zend convergence iteration: status={result['status']} missing={len(result.get('missing_parameters', []))}")
                 return 2
@@ -203,7 +213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 [Path(item) for item in args.final_seed_report],
                 expected_count=args.expected_count,
             )
-            _write_json(Path(args.merged_suggested_seeds), combined)
+            _write_json(Path(args.merged_suggested_seeds), _redacted_probe_seed_report(combined))
             print(f"Zend final seed reports combined: total={len(combined['suggested_seeds'])}")
             return 0
         if args.operation == "list-targets":
@@ -260,7 +270,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         enriched_path = Path(args.zend_output_root) / args.legacy_run_id / "zend_enriched_seeds.json"
         merged = merge_enriched_seeds(raw_for_enrichment, _read_json(enriched_path))
-        _write_json(Path(args.merged_suggested_seeds), merged)
+        _write_json(Path(args.merged_suggested_seeds), _redacted_probe_seed_report(merged))
         config_summary = export_seed_configs(
             merged,
             output_config_dir=Path(args.output_config_dir),
@@ -334,8 +344,13 @@ def converge_iteration(
     raw_item = raw_items[0]
     if not isinstance(raw_item, Mapping):
         raise RuntimeError("REPLAY_FAILED: generated candidate is invalid")
-    candidate = candidate_from_seed_item(raw_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
+    candidate = candidate_from_seed_item(
+        _normalization_seed_item(raw_item),
+        plugin_slug=plugin_slug,
+        legacy_run_id=legacy_run_id,
+    )
     candidate_key = _candidate_iteration_key(raw_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
+    base_candidate_key = _candidate_base_key(raw_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
     observed = normalize_runtime_evidence(candidate, uopz, zend, registry)
     prior = known_state.get("known_parameters", [])
     if not isinstance(prior, list):
@@ -345,7 +360,7 @@ def converge_iteration(
     merged = materialize_convergence_seeds(
         raw_for_iteration,
         plugin_slug=plugin_slug,
-        candidate_key=candidate_key,
+        candidate_key=base_candidate_key,
         known_parameters=advanced["known_parameters"],
     )
     status = "REPLAY_FAILED" if missing else "CONVERGED" if not advanced["new_parameters"] else "CONTINUE"
@@ -361,6 +376,23 @@ def converge_iteration(
         "known_parameters": advanced["known_parameters"],
         "merged_suggested_seeds": merged,
     }
+
+
+def _normalization_seed_item(seed_item: Mapping[str, Any]) -> Mapping[str, Any]:
+    seed = seed_item.get("seed")
+    probe = seed_item.get("probe_request")
+    if not isinstance(seed, Mapping) or not seed.get("probe_variant") or not isinstance(probe, Mapping):
+        return seed_item
+    parameter = str(probe.get("parameter") or "")
+    fixed = seed.get("fixed_params")
+    if not parameter or not isinstance(fixed, list):
+        return seed_item
+    normalized = deepcopy(dict(seed_item))
+    normalized_seed = normalized.get("seed")
+    if not isinstance(normalized_seed, dict):
+        return seed_item
+    normalized_seed["fixed_params"] = [name for name in fixed if str(name) != parameter]
+    return normalized
 
 
 def _filter_iteration_inputs(
@@ -696,7 +728,76 @@ def combine_final_seed_reports(paths: Sequence[Path], *, expected_count: int | N
         if not isinstance(items, list):
             raise ValueError(f"{path} must contain a suggested_seeds array")
         combined["suggested_seeds"].extend(item for item in items if isinstance(item, Mapping))
-    return combined
+    return _block_ambiguous_probe_locations(combined)
+
+
+def _redacted_probe_seed_report(seed_report: Mapping[str, Any]) -> dict[str, Any]:
+    report = deepcopy(dict(seed_report))
+    items = report.get("suggested_seeds")
+    if not isinstance(items, list):
+        return report
+    redacted: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        row = deepcopy(dict(item))
+        seed = row.get("seed")
+        if isinstance(seed, dict) and seed.get("probe_variant"):
+            seed["body"] = _redact_probe_mapping(seed.get("body"))
+            seed["query_params"] = _redact_probe_mapping(seed.get("query_params"))
+        redacted.append(row)
+    report["suggested_seeds"] = redacted
+    return report
+
+
+def _redact_probe_mapping(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): "redacted" for key in value.keys()}
+    return value
+
+
+def _block_ambiguous_probe_locations(seed_report: Mapping[str, Any]) -> dict[str, Any]:
+    report = deepcopy(dict(seed_report))
+    items = report.get("suggested_seeds")
+    if not isinstance(items, list):
+        return report
+    grouped: dict[tuple[str, str], dict[str, set[str]]] = {}
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        seed = item.get("seed")
+        if not isinstance(seed, Mapping) or not seed.get("probe_variant"):
+            continue
+        key = (str(item.get("hook_name") or ""), str(item.get("callback_id") or ""))
+        for param in seed.get("input_params", []):
+            if not isinstance(param, Mapping) or param.get("fuzzable") is False:
+                continue
+            name = str(param.get("name") or "")
+            location = str(param.get("location") or "")
+            if not name or location not in {"form", "json"}:
+                continue
+            grouped.setdefault(key, {}).setdefault(name, set()).add(location)
+    ambiguous = {
+        key for key, names in grouped.items()
+        if any(locations == {"form", "json"} for locations in names.values())
+    }
+    if not ambiguous:
+        return report
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        seed = item.get("seed")
+        key = (str(item.get("hook_name") or ""), str(item.get("callback_id") or ""))
+        if key not in ambiguous or not isinstance(seed, dict):
+            continue
+        seed["export_allowed"] = False
+        seed["replay_allowed"] = True
+        seed["block_reason"] = "ambiguous_runtime_probe_location"
+        item["generation_status"] = "ambiguous_runtime_probe_location"
+        item["generated_reason"] = "ambiguous_runtime_probe_location"
+        item["fuzzing_ready"] = False
+        item["missing_requirements"] = ["unique_runtime_bucket_location"]
+    return report
 
 
 def list_convergence_targets(

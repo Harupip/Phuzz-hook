@@ -305,6 +305,12 @@ class SeedGeneratorTests(unittest.TestCase):
 
         seed = next(item["seed"] for item in seed_report["suggested_seeds"] if item["seed"]["method"] == "POST")
         self.assertEqual(seed["body"]["action"], "vx_form_save_api_settings")
+        self.assertEqual(seed["body"]["vx_nonce"], "fuzz")
+        self.assertEqual(seed["body"]["cfx_settings[alert_emails]"], "FUZZ")
+        self.assertNotIn("cfx_settings", seed["body"])
+        self.assertIn("vx_nonce", seed["fixed_params"])
+        self.assertNotIn("vx_nonce", seed["fuzzable_params"])
+        self.assertEqual(seed["fuzzable_params"], ["cfx_settings[alert_emails]"])
 
     def test_rest_post_schema_only_id_generates_isolated_replay_only_probe_configs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -366,8 +372,11 @@ class SeedGeneratorTests(unittest.TestCase):
 
             config_summary_text = (root / "pipeline" / "generated_config_summary.json").read_text(encoding="utf-8")
             param_summary_text = (root / "pipeline" / "generated_param_summary.json").read_text(encoding="utf-8")
+            suggested_text = (root / "pipeline" / "suggested_seeds.json").read_text(encoding="utf-8")
             self.assertNotIn("\"candidate_value\": \"probe\"", config_summary_text)
             self.assertNotIn("\"candidate_value\": \"probe\"", param_summary_text)
+            self.assertNotIn("\"candidate_value\": \"probe\"", suggested_text)
+            self.assertNotIn("\"slug\": \"probe\"", suggested_text)
 
     def test_generator_prioritizes_nopriv_over_authenticated_hooks(self) -> None:
         generator = StaticSeedGenerator()

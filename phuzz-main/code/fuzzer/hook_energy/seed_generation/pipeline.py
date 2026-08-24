@@ -60,7 +60,10 @@ def run_entrypoint_pipeline(
         )
     else:
         (output_path / "hook_gap_report.json").write_text(json.dumps(gap_report, indent=2), encoding="utf-8")
-        (output_path / "suggested_seeds.json").write_text(json.dumps(seed_report, indent=2), encoding="utf-8")
+        (output_path / "suggested_seeds.json").write_text(
+            json.dumps(_redacted_probe_seed_report(seed_report), indent=2),
+            encoding="utf-8",
+        )
 
     config_dir = Path(output_config_dir) if output_config_dir is not None else output_path / "configs"
     config_summary_path = output_path / "generated_config_summary.json"
@@ -436,6 +439,31 @@ def _clone_probe_seed_item(
         "candidate_value_redacted": bool(probe.get("candidate_value_redacted")),
     }
     return item
+
+
+def _redacted_probe_seed_report(seed_report: Mapping[str, Any]) -> dict[str, Any]:
+    report = deepcopy(dict(seed_report))
+    items = report.get("suggested_seeds")
+    if not isinstance(items, list):
+        return report
+    redacted: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        row = deepcopy(dict(item))
+        seed = row.get("seed")
+        if isinstance(seed, dict) and seed.get("probe_variant"):
+            seed["body"] = _redact_probe_mapping(seed.get("body"))
+            seed["query_params"] = _redact_probe_mapping(seed.get("query_params"))
+        redacted.append(row)
+    report["suggested_seeds"] = redacted
+    return report
+
+
+def _redact_probe_mapping(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): "redacted" for key in value.keys()}
+    return value
 
 
 def _pipeline_summary(

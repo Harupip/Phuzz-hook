@@ -169,3 +169,62 @@ Output:
 
 Concerns:
 - `phuzz-main.code.fuzzer.tests.test_zend_discovery` as a full-file suite currently contains unrelated failures outside the Task 4 bridge surface. I did not use that full-file result as Task 4 evidence. The bridge verification above is scoped to the exact probe-variant and convergence-target paths changed here.
+
+## Task 4 fix round 1 final
+
+Date: 2026-08-24
+
+Changed files:
+- `phuzz-main/code/fuzzer/hook_energy/seed_generation/pipeline.py`
+- `phuzz-main/code/fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py`
+- `phuzz-main/code/fuzzer/tests/test_seed_generation_live_export.py`
+- `phuzz-main/code/fuzzer/tests/test_zend_discovery.py`
+
+Design decisions:
+- Kept the convergence key fix bridge-local: variant-aware filtering still narrows to one replay target, then the bridge passes the unsuffixed canonical identity into `materialize_convergence_seeds(...)`.
+- Kept probe redaction at persistence boundaries. In-memory convergence/merge results retain replay semantics; persisted `suggested_seeds.json` and merged bridge artifacts are redacted.
+- Added a fail-closed ambiguity gate in the bridge merge path only. If the same base REST probe parameter becomes fuzzable in both form and json variants, final export is blocked with deterministic replay-only metadata.
+- Did not relax REST runtime matching. The remaining convergence test issue was fixture alignment with the existing fail-closed identity gate: the synthetic probe candidate needed `endpoint_definition_index=0`, exact `target_loading.loaded_callbacks=["Demo::list_items"]`, and an event method consistent with the POST replay.
+- Kept the bridge offline-only. No Docker/HTTP/export-runner coupling was introduced.
+
+Commands:
+
+`rtk python -m unittest phuzz-main.code.fuzzer.tests.test_zend_discovery.ZendDiscoveryTests.test_rest_parameter_policy_retains_array_access_name_only_but_blocks_export phuzz-main.code.fuzzer.tests.test_zend_discovery.ZendDiscoveryTests.test_build_enrichment_inputs_and_targets_keep_rest_probe_variants_separate phuzz-main.code.fuzzer.tests.test_zend_discovery.ZendDiscoveryTests.test_convergence_iteration_uses_only_the_matched_current_request phuzz-main.code.fuzzer.tests.test_zend_discovery.ZendDiscoveryTests.test_convergence_iteration_filters_multi_candidate_input_by_candidate_key phuzz-main.code.fuzzer.tests.test_zend_discovery.ZendDiscoveryTests.test_convergence_iteration_accepts_variant_key_and_callback_reached_application_error phuzz-main.code.fuzzer.tests.test_zend_discovery.ZendDiscoveryTests.test_combine_final_seed_reports_blocks_ambiguous_rest_probe_locations_and_redacts_probe_values phuzz-main.code.fuzzer.tests.test_zend_discovery.ZendDiscoveryTests.test_combine_final_seed_reports_requires_every_target`
+
+Output:
+```text
+.......
+----------------------------------------------------------------------
+Ran 7 tests in 0.053s
+
+OK
+Zend final seed reports combined: total=2
+```
+
+`rtk python -m unittest phuzz-main.code.fuzzer.tests.test_entrypoint_pipeline phuzz-main.code.fuzzer.tests.test_seed_to_config_exporter phuzz-main.code.fuzzer.tests.test_seed_generation_live_export`
+
+Output:
+```text
+.......................................
+----------------------------------------------------------------------
+Ran 39 tests in 0.337s
+
+OK
+```
+
+`rtk git diff --check`
+
+Output:
+```text
+[no output]
+```
+
+Fresh artifact/redaction evidence:
+- `test_rest_probe_metadata_is_redacted_and_final_seed_stays_blocked_without_runtime_proof` now asserts persisted `suggested_seeds.json` omits raw `candidate_value` fields and raw sentinel pairs such as `"slug": "probe"`.
+- `test_combine_final_seed_reports_blocks_ambiguous_rest_probe_locations_and_redacts_probe_values` now proves the split behavior:
+  - in-memory `combine_final_seed_reports(...)` output keeps replay values (`{"id": 1}`) so convergence/materialization can still work,
+  - persisted `--operation combine-final` output redacts the same probe values to `{"id": "redacted"}`.
+- `test_convergence_iteration_accepts_variant_key_and_callback_reached_application_error` now proves exact request identity survives a probe convergence path and that callback-reached application error (`status_code=500`, `validation_status="application_error"`) still yields discovery evidence rather than a parameter-discovery failure.
+
+Concerns:
+- No remaining Task 4 blockers from this fix round.

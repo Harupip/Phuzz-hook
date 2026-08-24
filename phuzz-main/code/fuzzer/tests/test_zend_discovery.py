@@ -39,6 +39,7 @@ from hook_energy.seed_generation.zend_runtime.bridge_cli import (
     combine_final_seed_reports,
     converge_iteration,
     list_convergence_targets,
+    main,
     verify_pass2_contract,
 )
 from hook_energy.seed_generation.pipeline import _rest_parameter_policy
@@ -2248,6 +2249,7 @@ class ZendDiscoveryTests(unittest.TestCase):
                 "callback_id": "rest-items",
                 "route": "/learnpress/v1/items",
                 "namespace": "learnpress/v1",
+                "endpoint_definition_index": 0,
                 "seed": {
                     "seed_variant_id": "rest_probe_form_id",
                     "method": "POST",
@@ -2320,6 +2322,213 @@ class ZendDiscoveryTests(unittest.TestCase):
             )
             self.assertEqual(len(targets), 2)
             self.assertNotEqual(targets[0]["candidate_key"], targets[1]["candidate_key"])
+
+    def test_convergence_iteration_accepts_variant_key_and_callback_reached_application_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            probe = {
+                "plugin_slug": "demo-plugin",
+                "entrypoint_type": "rest_route",
+                "hook_name": "rest_route:learnpress/v1/items",
+                "callback_id": "rest-items",
+                "route": "/learnpress/v1/items",
+                "namespace": "learnpress/v1",
+                "endpoint_definition_index": 0,
+                "probe_request": {
+                    "parameter": "id",
+                    "location": "form",
+                    "content_type": "application/x-www-form-urlencoded",
+                    "schema_type": "integer",
+                    "candidate_value_redacted": True,
+                },
+                "seed": {
+                    "seed_variant_id": "rest_probe_form_id",
+                    "probe_variant": True,
+                    "method": "POST",
+                    "resolved_method": "POST",
+                    "method_status": "resolved",
+                    "path": "/wp-json/learnpress/v1/items",
+                    "body": {"id": "redacted"},
+                    "query_params": {},
+                    "fixed_params": ["id"],
+                    "fuzzable_params": [],
+                    "auth_mode": "unauth-capable",
+                },
+            }
+            candidate_key = canonical_identity_id(candidate_from_seed_item(probe, plugin_slug="demo-plugin", legacy_run_id="legacy-1")) + "::rest_probe_form_id"
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            uopz = {
+                "legacy_run_id": "legacy-1",
+                "request_id": "request-form",
+                "target_plugin": "demo-plugin",
+                "canonical_identity_id": canonical_identity_id(candidate_from_seed_item(probe, plugin_slug="demo-plugin", legacy_run_id="legacy-1")),
+                "callback_id": "rest-items",
+                "http_method": "POST",
+                "auth_variant": canonical_identity(candidate_from_seed_item(probe, plugin_slug="demo-plugin", legacy_run_id="legacy-1"))["auth_variant"],
+                "compat_request_id_matches": True,
+                "hook_coverage": {"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+                "request_params": {"body_params": {"id": "redacted"}},
+            }
+            zend = {
+                "schema_version": 3,
+                "run_id": "legacy-1",
+                "request_id": "request-form",
+                "request_method": "POST",
+                "target_loading": {
+                    "load_status": "loaded",
+                    "file_target_count": 1,
+                    "loaded_callbacks": ["Demo::list_items"],
+                    "duplicate_count": 1,
+                    "rejected_count": 0,
+                    "capacity_exhausted_count": 0,
+                },
+                "rest_parameter_events": [
+                    {
+                        "callback": "Demo::list_items",
+                        "source": "REST",
+                        "bucket": "POST",
+                        "path": ["POST", "id"],
+                        "parameter": "id",
+                        "observed_count": 1,
+                        "namespace": "learnpress/v1",
+                        "route_pattern": "/learnpress/v1/items",
+                        "materialized_route": "/wp-json/learnpress/v1/items",
+                        "endpoint_definition_index": 0,
+                        "method": "POST",
+                    }
+                ],
+            }
+            (uopz_dir / "request-form.json").write_text(json.dumps(uopz), encoding="utf-8")
+            (zend_dir / "request-form.json").write_text(json.dumps(zend), encoding="utf-8")
+            pass_summary = {
+                "legacy_run_id": "legacy-1",
+                "runs": [
+                    {
+                        "hook_name": probe["hook_name"],
+                        "callback_id": probe["callback_id"],
+                        "seed_variant_id": "rest_probe_form_id",
+                        "callback_reached": True,
+                        "matched_artifact": "request-form.json",
+                        "status_code": 500,
+                        "validation_status": "application_error",
+                    }
+                ],
+            }
+
+            result = converge_iteration(
+                raw_report={"suggested_seeds": [probe]},
+                pass_run_summary=pass_summary,
+                pass_artifacts_dir=uopz_dir,
+                zend_events_dir=zend_dir,
+                registry={
+                    "schema_version": 1,
+                    "callback_map": {"rest-items": "Demo::list_items"},
+                    "registrations": [
+                        {
+                            "callback": "Demo::list_items",
+                            "canonical_callback": "Demo::list_items",
+                            "callback_type": "static_method",
+                        }
+                    ],
+                },
+                plugin_slug="demo-plugin",
+                legacy_run_id="legacy-1",
+                known_state={"known_parameters": []},
+                candidate_key=candidate_key,
+            )
+
+            self.assertEqual(result["candidate_key"], candidate_key)
+            self.assertIn(result["status"], {"CONTINUE", "CONVERGED"})
+            self.assertEqual(result["request_id"], "request-form")
+            merged_seed = result["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]
+            self.assertEqual(merged_seed["body"]["id"], "FUZZ")
+            self.assertEqual(merged_seed["fuzzable_params"], ["id"])
+
+    def test_combine_final_seed_reports_blocks_ambiguous_rest_probe_locations_and_redacts_probe_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            shared = {
+                "plugin_slug": "demo-plugin",
+                "entrypoint_type": "rest_route",
+                "hook_name": "rest_route:learnpress/v1/items",
+                "callback_id": "rest-items",
+                "route": "/learnpress/v1/items",
+                "namespace": "learnpress/v1",
+                "generation_status": "rest_schema_parameter_probe",
+                "generated_reason": "rest_schema_parameter_probe",
+                "missing_requirements": ["callback_attributed_runtime_bucket_evidence"],
+            }
+            form = {
+                **shared,
+                "probe_request": {
+                    "parameter": "id",
+                    "location": "form",
+                    "content_type": "application/x-www-form-urlencoded",
+                    "schema_type": "integer",
+                    "candidate_value_redacted": True,
+                },
+                "seed": {
+                    "seed_variant_id": "rest_probe_form_id",
+                    "probe_variant": True,
+                    "method": "POST",
+                    "resolved_method": "POST",
+                    "method_status": "resolved",
+                    "path": "/wp-json/learnpress/v1/items",
+                    "body": {"id": 1},
+                    "query_params": {},
+                    "headers": {},
+                    "fixed_params": ["id"],
+                    "fuzzable_params": ["id"],
+                    "input_params": [{"name": "id", "location": "form", "source": "POST", "fuzzable": True}],
+                    "auth_mode": "unauth-capable",
+                    "export_allowed": True,
+                    "replay_allowed": True,
+                },
+            }
+            jsn = json.loads(json.dumps(form))
+            jsn["probe_request"]["location"] = "json"
+            jsn["probe_request"]["content_type"] = "application/json"
+            jsn["seed"]["seed_variant_id"] = "rest_probe_json_id"
+            jsn["seed"]["body"] = {"id": 1}
+            jsn["seed"]["headers"] = {"Content-Type": "application/json"}
+            jsn["seed"]["input_params"] = [{"name": "id", "location": "json", "source": "JSON", "fuzzable": True}]
+            first = root / "first.json"
+            second = root / "second.json"
+            first.write_text(json.dumps({"suggested_seeds": [form]}), encoding="utf-8")
+            second.write_text(json.dumps({"suggested_seeds": [jsn]}), encoding="utf-8")
+
+            combined = combine_final_seed_reports([first, second], expected_count=2)
+
+            self.assertEqual(len(combined["suggested_seeds"]), 2)
+            blocked_reasons = {item["seed"]["block_reason"] for item in combined["suggested_seeds"]}
+            self.assertEqual(blocked_reasons, {"ambiguous_runtime_probe_location"})
+            self.assertTrue(all(item["seed"]["export_allowed"] is False for item in combined["suggested_seeds"]))
+            self.assertTrue(all(item["seed"]["replay_allowed"] is True for item in combined["suggested_seeds"]))
+
+            self.assertEqual({item["seed"]["body"]["id"] for item in combined["suggested_seeds"]}, {1})
+
+            merged_path = root / "merged.json"
+            self.assertEqual(
+                main(
+                    [
+                        "--operation",
+                        "combine-final",
+                        "--final-seed-report",
+                        str(first),
+                        "--final-seed-report",
+                        str(second),
+                        "--expected-count",
+                        "2",
+                        "--merged-suggested-seeds",
+                        str(merged_path),
+                    ]
+                ),
+                0,
+            )
+            persisted = json.loads(merged_path.read_text(encoding="utf-8"))
+            self.assertEqual({item["seed"]["body"]["id"] for item in persisted["suggested_seeds"]}, {"redacted"})
 
     def test_convergence_iteration_does_not_converge_when_known_parameter_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
