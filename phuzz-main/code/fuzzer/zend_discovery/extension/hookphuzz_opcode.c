@@ -34,6 +34,13 @@ PHP_INI_BEGIN()
         target_callbacks_file_ini, zend_hookphuzz_opcode_globals, hookphuzz_opcode_globals)
 PHP_INI_END()
 
+typedef enum {
+    HOOKPHUZZ_TARGET_ADDED,
+    HOOKPHUZZ_TARGET_DUPLICATE,
+    HOOKPHUZZ_TARGET_INVALID,
+    HOOKPHUZZ_TARGET_CAPACITY_EXHAUSTED
+} hookphuzz_target_add_result;
+
 static const char *hookphuzz_source_name(hookphuzz_source source)
 {
     switch (source) {
@@ -175,19 +182,19 @@ static zend_bool hookphuzz_valid_callback_name(const zend_string *name)
     return separators <= 1 && value[0] != ':' && value[ZSTR_LEN(name) - 1] != ':';
 }
 
-static zend_bool hookphuzz_add_target(const zend_string *name)
+static hookphuzz_target_add_result hookphuzz_add_target(const zend_string *name)
 {
     uint32_t index;
 
-    if (!hookphuzz_valid_callback_name(name)) return 0;
+    if (!hookphuzz_valid_callback_name(name)) return HOOKPHUZZ_TARGET_INVALID;
     for (index = 0; index < HOOKPHUZZ_G(target_callback_count); index++) {
-        if (zend_string_equals_ci(name, HOOKPHUZZ_G(target_callbacks)[index])) return 0;
+        if (zend_string_equals_ci(name, HOOKPHUZZ_G(target_callbacks)[index])) return HOOKPHUZZ_TARGET_DUPLICATE;
     }
-    if (HOOKPHUZZ_G(target_callback_count) == HOOKPHUZZ_MAX_TARGETS) return 0;
+    if (HOOKPHUZZ_G(target_callback_count) == HOOKPHUZZ_MAX_TARGETS) return HOOKPHUZZ_TARGET_CAPACITY_EXHAUSTED;
     HOOKPHUZZ_G(target_callbacks) = erealloc(HOOKPHUZZ_G(target_callbacks),
         sizeof(zend_string *) * (HOOKPHUZZ_G(target_callback_count) + 1));
     HOOKPHUZZ_G(target_callbacks)[HOOKPHUZZ_G(target_callback_count)++] = zend_string_copy((zend_string *) name);
-    return 1;
+    return HOOKPHUZZ_TARGET_ADDED;
 }
 
 static void hookphuzz_parse_targets(void)
@@ -204,7 +211,21 @@ static void hookphuzz_parse_targets(void)
         while (end > start && isspace((unsigned char) end[-1])) end--;
         if (end > start) {
             zend_string *name = zend_string_init(start, end - start, 0);
-            if (hookphuzz_add_target(name)) HOOKPHUZZ_G(static_target_count)++;
+            HOOKPHUZZ_G(requested_target_count)++;
+            switch (hookphuzz_add_target(name)) {
+                case HOOKPHUZZ_TARGET_ADDED:
+                    HOOKPHUZZ_G(static_target_count)++;
+                    break;
+                case HOOKPHUZZ_TARGET_DUPLICATE:
+                    HOOKPHUZZ_G(target_duplicate_count)++;
+                    break;
+                case HOOKPHUZZ_TARGET_INVALID:
+                    HOOKPHUZZ_G(target_rejected_count)++;
+                    break;
+                case HOOKPHUZZ_TARGET_CAPACITY_EXHAUSTED:
+                    HOOKPHUZZ_G(target_capacity_exhausted_count)++;
+                    break;
+            }
             zend_string_release(name);
         }
     }
@@ -272,6 +293,7 @@ static void hookphuzz_load_file_targets(void)
     HOOKPHUZZ_G(registry_schema_version) = 1;
     ZEND_HASH_FOREACH_VAL(registrations_hash, registration) {
         zval *canonical, *type, *callback;
+        HOOKPHUZZ_G(requested_target_count)++;
         registration_hash = hookphuzz_json_hash(registration);
         if (registration_hash == NULL) { HOOKPHUZZ_G(target_rejected_count)++; continue; }
         canonical = zend_hash_str_find(registration_hash, ZEND_STRL("canonical_callback"));
@@ -284,12 +306,23 @@ static void hookphuzz_load_file_targets(void)
                 && strcmp(Z_STRVAL_P(type), "object_method") != 0)) {
             HOOKPHUZZ_G(target_rejected_count)++; continue;
         }
-        if (hookphuzz_add_target(Z_STR_P(canonical))) HOOKPHUZZ_G(file_target_count)++;
-        else if (hookphuzz_valid_callback_name(Z_STR_P(canonical))) HOOKPHUZZ_G(target_duplicate_count)++;
-        else HOOKPHUZZ_G(target_rejected_count)++;
+        switch (hookphuzz_add_target(Z_STR_P(canonical))) {
+            case HOOKPHUZZ_TARGET_ADDED:
+                HOOKPHUZZ_G(file_target_count)++;
+                break;
+            case HOOKPHUZZ_TARGET_DUPLICATE:
+                HOOKPHUZZ_G(target_duplicate_count)++;
+                break;
+            case HOOKPHUZZ_TARGET_INVALID:
+                HOOKPHUZZ_G(target_rejected_count)++;
+                break;
+            case HOOKPHUZZ_TARGET_CAPACITY_EXHAUSTED:
+                HOOKPHUZZ_G(target_capacity_exhausted_count)++;
+                break;
+        }
     } ZEND_HASH_FOREACH_END();
     zval_ptr_dtor(&document);
-    hookphuzz_set_target_status((HOOKPHUZZ_G(target_duplicate_count) || HOOKPHUZZ_G(target_rejected_count))
+    hookphuzz_set_target_status((HOOKPHUZZ_G(target_rejected_count) || HOOKPHUZZ_G(target_capacity_exhausted_count))
         ? "partially_loaded" : "loaded");
 }
 
@@ -1177,11 +1210,15 @@ static void hookphuzz_add_summaries(zval *document)
 
 static void hookphuzz_add_target_loading(zval *document)
 {
-    zval loading;
+    zval loading, loaded_callbacks;
+    uint32_t index;
+
     array_init(&loading);
     add_assoc_long(&loading, "static_target_count", HOOKPHUZZ_G(static_target_count));
     add_assoc_long(&loading, "file_target_count", HOOKPHUZZ_G(file_target_count));
     add_assoc_long(&loading, "effective_target_count", HOOKPHUZZ_G(target_callback_count));
+    add_assoc_long(&loading, "target_capacity", HOOKPHUZZ_MAX_TARGETS);
+    add_assoc_long(&loading, "requested_target_count", HOOKPHUZZ_G(requested_target_count));
     add_assoc_string(&loading, "load_status", HOOKPHUZZ_G(target_load_status) == NULL ? "disabled"
         : ZSTR_VAL(HOOKPHUZZ_G(target_load_status)));
     if (HOOKPHUZZ_G(registry_schema_version) > 0) {
@@ -1189,6 +1226,12 @@ static void hookphuzz_add_target_loading(zval *document)
     } else add_assoc_null(&loading, "registry_schema_version");
     add_assoc_long(&loading, "duplicate_count", HOOKPHUZZ_G(target_duplicate_count));
     add_assoc_long(&loading, "rejected_count", HOOKPHUZZ_G(target_rejected_count));
+    add_assoc_long(&loading, "capacity_exhausted_count", HOOKPHUZZ_G(target_capacity_exhausted_count));
+    array_init_size(&loaded_callbacks, HOOKPHUZZ_G(target_callback_count));
+    for (index = 0; index < HOOKPHUZZ_G(target_callback_count); index++) {
+        add_next_index_str(&loaded_callbacks, zend_string_copy(HOOKPHUZZ_G(target_callbacks)[index]));
+    }
+    add_assoc_zval(&loading, "loaded_callbacks", &loaded_callbacks);
     add_assoc_zval(document, "target_loading", &loading);
 }
 
@@ -1307,6 +1350,7 @@ static zend_result hookphuzz_encode_artifact(smart_str *json)
         zend_string *run_id = hookphuzz_run_id_from_server();
         if (run_id != NULL) add_assoc_str(&document, "run_id", run_id);
     }
+    add_assoc_long(&document, "event_capacity", HOOKPHUZZ_OPCODE_PHASE5_MAX_EVENTS);
     add_assoc_long(&document, "event_count", HOOKPHUZZ_PHASE5_G(event_count));
     add_assoc_long(&document, "dropped_event_count", HOOKPHUZZ_PHASE5_G(dropped_event_count));
     array_init_size(&events, HOOKPHUZZ_PHASE5_G(event_count));
@@ -1497,8 +1541,10 @@ PHP_RINIT_FUNCTION(hookphuzz_opcode)
     HOOKPHUZZ_G(target_callback_count) = 0;
     HOOKPHUZZ_G(static_target_count) = 0;
     HOOKPHUZZ_G(file_target_count) = 0;
+    HOOKPHUZZ_G(requested_target_count) = 0;
     HOOKPHUZZ_G(target_duplicate_count) = 0;
     HOOKPHUZZ_G(target_rejected_count) = 0;
+    HOOKPHUZZ_G(target_capacity_exhausted_count) = 0;
     HOOKPHUZZ_G(registry_schema_version) = 0;
     HOOKPHUZZ_G(target_load_status) = NULL;
     HOOKPHUZZ_G(file_targets_loaded) = 1;
@@ -1543,7 +1589,7 @@ PHP_MINFO_FUNCTION(hookphuzz_opcode)
     php_info_print_table_header(2, "hookphuzz_opcode support", "enabled");
     php_info_print_table_row(2, "configured user opcodes", "ZEND_FETCH_R, ZEND_FETCH_OBJ_R, ZEND_FETCH_DIM_R, ZEND_FETCH_IS, ZEND_FETCH_DIM_IS, ZEND_ISSET_ISEMPTY_DIM_OBJ, ZEND_RETURN, ZEND_RETURN_BY_REF, ZEND_COALESCE, ZEND_QM_ASSIGN, ZEND_CAST, ZEND_ASSIGN, ZEND_JMP_SET, ZEND_IS_EQUAL, ZEND_IS_NOT_EQUAL, ZEND_IS_IDENTICAL, ZEND_IS_NOT_IDENTICAL, ZEND_SWITCH_STRING");
     php_info_print_table_row(2, "artifact output", HOOKPHUZZ_ARTIFACT_DIR);
-    php_info_print_table_row(2, "event limit per request", "4096");
+    php_info_print_table_row(2, "event limit per request", "65536");
     php_info_print_table_end();
 }
 

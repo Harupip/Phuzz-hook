@@ -5,11 +5,11 @@ extern zend_module_entry hookphuzz_opcode_module_entry;
 #define phpext_hookphuzz_opcode_ptr &hookphuzz_opcode_module_entry
 
 #define PHP_HOOKPHUZZ_OPCODE_VERSION "0.9.0"
-#define HOOKPHUZZ_OPCODE_MAX_EVENTS 4096
+#define HOOKPHUZZ_OPCODE_MAX_EVENTS 65536
 #define HOOKPHUZZ_CMPLOG_MAX_EVENTS 1024
 #define HOOKPHUZZ_CMPLOG_MAX_VALUE_BYTES 256
 #define HOOKPHUZZ_MAX_REGISTRY_BYTES (1024 * 1024)
-#define HOOKPHUZZ_MAX_TARGETS 256
+#define HOOKPHUZZ_MAX_TARGETS 512
 #define HOOKPHUZZ_MAX_CALLBACK_BYTES 255
 #define HOOKPHUZZ_OPCODE_PHASE5_MAX_EVENTS HOOKPHUZZ_OPCODE_MAX_EVENTS
 
@@ -94,8 +94,10 @@ ZEND_BEGIN_MODULE_GLOBALS(hookphuzz_opcode)
     uint32_t target_callback_count;
     uint32_t static_target_count;
     uint32_t file_target_count;
+    uint32_t requested_target_count;
     uint32_t target_duplicate_count;
     uint32_t target_rejected_count;
+    uint32_t target_capacity_exhausted_count;
     zend_long registry_schema_version;
     zend_string *target_load_status;
     zend_bool file_targets_loaded;

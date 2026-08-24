@@ -1693,6 +1693,33 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertIn('"rest_parameter_events"', extension)
         self.assertNotIn("phase9", extension.lower())
 
+    def test_active_opcode_extension_exposes_complete_target_loading_and_event_capacities(self) -> None:
+        extension_dir = FUZZER_DIR / "zend_discovery" / "extension"
+        header = (extension_dir / "php_hookphuzz_opcode.h").read_text(encoding="utf-8")
+        extension = (extension_dir / "hookphuzz_opcode.c").read_text(encoding="utf-8")
+
+        self.assertIn("#define HOOKPHUZZ_MAX_TARGETS 512", header)
+        self.assertIn("#define HOOKPHUZZ_OPCODE_MAX_EVENTS 65536", header)
+        self.assertIn("HOOKPHUZZ_TARGET_ADDED", extension)
+        self.assertIn("HOOKPHUZZ_TARGET_DUPLICATE", extension)
+        self.assertIn("HOOKPHUZZ_TARGET_INVALID", extension)
+        self.assertIn("HOOKPHUZZ_TARGET_CAPACITY_EXHAUSTED", extension)
+        self.assertIn('add_assoc_long(&loading, "target_capacity"', extension)
+        self.assertIn('add_assoc_long(&loading, "requested_target_count"', extension)
+        self.assertIn('add_assoc_long(&loading, "capacity_exhausted_count"', extension)
+        self.assertIn('add_assoc_zval(&loading, "loaded_callbacks"', extension)
+        self.assertIn('add_assoc_long(&document, "event_capacity"', extension)
+        self.assertEqual(extension.count("HOOKPHUZZ_G(requested_target_count)++;"), 2)
+        self.assertIn("uint32_t requested_target_count;", header)
+        self.assertIn("uint32_t target_capacity_exhausted_count;", header)
+        self.assertIn("HOOKPHUZZ_G(requested_target_count) = 0;", extension)
+        self.assertIn("HOOKPHUZZ_G(target_capacity_exhausted_count) = 0;", extension)
+        self.assertIn(
+            "hookphuzz_set_target_status((HOOKPHUZZ_G(target_rejected_count) || "
+            "HOOKPHUZZ_G(target_capacity_exhausted_count))",
+            extension,
+        )
+
     def test_active_opcode_extension_tracks_wp_rest_request_params_fetch_obj(self) -> None:
         extension = (
             FUZZER_DIR
