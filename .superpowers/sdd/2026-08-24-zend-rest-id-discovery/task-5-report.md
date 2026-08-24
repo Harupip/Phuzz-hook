@@ -29,3 +29,12 @@
 - `rtk python -m unittest discover -s fuzzer/tests -p test_seed_to_config_exporter.py` — 27 passed.
 - `rtk python -m unittest discover -s fuzzer/tests -p test_seed_generation_live_export.py` — 9 passed.
 - `rtk git diff --check` — passed.
+
+## Review disposition
+
+The initial reviewer proposed that explicit `REST_URL` runtime evidence was
+being silently promoted to fuzzing. Clarification review rejected that blocker:
+the bucket/path is callback-attributed runtime evidence, and the existing test
+contract explicitly maps `URL -> path -> REST_URL`. No Task 5 code change was
+required for that observation; broader URL convergence behavior is outside the
+Task 5 file boundary.
