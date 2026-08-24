@@ -311,6 +311,118 @@ class ZendDiscoveryTests(unittest.TestCase):
 
         self.assertEqual([(row["name"], row["source"], row["location"]) for row in evidence], [("search", "REST_QUERY", "query")])
 
+    def test_normalize_runtime_evidence_rejects_rest_event_for_unloaded_canonical_callback(self) -> None:
+        candidate = self.rest_candidate(method="POST", request_id="learnpress-rest-id-missing")
+        candidate.update(
+            {
+                "namespace": "learnpress/v1",
+                "route_pattern": "/courses/(?P<course_id>[\\d]+)/lessons/finish",
+                "materialized_route": "/wp-json/learnpress/v1/courses/1/lessons/finish",
+            }
+        )
+        uopz = self.pass1_artifact(
+            candidate,
+            hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+        )
+        registry = {
+            "schema_version": 1,
+            "callback_map": {"rest-items": "LP_Jwt_Lessons_V1_Controller::finish_lesson"},
+        }
+        zend = self.rest_zend_artifact(
+            candidate,
+            {
+                "source": "REST",
+                "bucket": "POST",
+                "parameter": "id",
+                "path": ["POST", "id"],
+                "callback": "LP_Jwt_Lessons_V1_Controller::finish_lesson",
+                "namespace": "learnpress/v1",
+                "route_pattern": "/courses/(?P<course_id>[\\d]+)/lessons/finish",
+                "endpoint_definition_index": 0,
+                "materialized_route": "/wp-json/learnpress/v1/courses/1/lessons/finish",
+                "method": "POST",
+                "observed_count": 1,
+            },
+        )
+        zend["target_loading"]["loaded_callbacks"] = []
+
+        self.assertEqual(normalize_runtime_evidence(candidate, uopz, zend, registry), [])
+
+    def test_normalize_runtime_evidence_exports_loaded_learnpress_rest_id_as_one_form_parameter(self) -> None:
+        candidate = self.rest_candidate(method="POST", request_id="learnpress-rest-id-loaded")
+        candidate.update(
+            {
+                "namespace": "learnpress/v1",
+                "route_pattern": "/courses/(?P<course_id>[\\d]+)/lessons/finish",
+                "materialized_route": "/wp-json/learnpress/v1/courses/1/lessons/finish",
+            }
+        )
+        uopz = self.pass1_artifact(
+            candidate,
+            hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+        )
+        registry = {
+            "schema_version": 1,
+            "callback_map": {"rest-items": "LP_Jwt_Lessons_V1_Controller::finish_lesson"},
+        }
+        zend = self.rest_zend_artifact(
+            candidate,
+            {
+                "source": "REST",
+                "bucket": "POST",
+                "parameter": "id",
+                "path": ["POST", "id"],
+                "callback": "LP_Jwt_Lessons_V1_Controller::finish_lesson",
+                "namespace": "learnpress/v1",
+                "route_pattern": "/courses/(?P<course_id>[\\d]+)/lessons/finish",
+                "endpoint_definition_index": 0,
+                "materialized_route": "/wp-json/learnpress/v1/courses/1/lessons/finish",
+                "method": "POST",
+                "observed_count": 1,
+            },
+        )
+        zend["target_loading"]["loaded_callbacks"] = ["LP_Jwt_Lessons_V1_Controller::finish_lesson"]
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual([(row["name"], row["location"], row["fuzzable"]) for row in evidence], [("id", "form", True)])
+
+    def test_target_loading_distinguishes_duplicate_complete_and_rejected_or_overflow_targets(self) -> None:
+        extension = (FUZZER_DIR / "zend_discovery" / "extension" / "hookphuzz_opcode.c").read_text(encoding="utf-8")
+
+        self.assertIn('"loaded_callbacks"', extension)
+        self.assertIn('"capacity_exhausted_count"', extension)
+        self.assertIn('"partially_loaded"', extension)
+        self.assertIn('target_rejected_count || HOOKPHUZZ_G(target_capacity_exhausted_count)', extension)
+        self.assertNotIn('target_duplicate_count || HOOKPHUZZ_G(target_rejected_count)', extension)
+
+    def test_nonzero_opcode_event_loss_blocks_final_rest_evidence(self) -> None:
+        candidate = self.rest_candidate(method="POST", request_id="rest-id-event-loss")
+        uopz = self.pass1_artifact(
+            candidate,
+            hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+        )
+        registry = {"schema_version": 1, "callback_map": {"rest-items": "Demo::list_items"}}
+        zend = self.rest_zend_artifact(
+            candidate,
+            {
+                "source": "REST",
+                "bucket": "POST",
+                "parameter": "id",
+                "path": ["POST", "id"],
+                "callback": "Demo::list_items",
+                "namespace": "demo/v1",
+                "route_pattern": "/items",
+                "endpoint_definition_index": 0,
+                "materialized_route": "/wp-json/demo/v1/items",
+                "method": "POST",
+                "observed_count": 1,
+            },
+        )
+        zend["dropped_event_count"] = 1
+
+        self.assertEqual(normalize_runtime_evidence(candidate, uopz, zend, registry), [])
+
     def test_normalize_runtime_evidence_canonicalizes_rest_bucket_paths(self) -> None:
         cases = [
             ("GET", "GET", ["GET", "search"], "search", "REST_QUERY", "query"),

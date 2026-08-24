@@ -66,6 +66,25 @@ class UopzMultistageMetadataContractTests(unittest.TestCase):
         self.assertIn("'accessor' => 'WP_REST_Request::get_param'", source)
         self.assertIn("'rest_parameter_events'", source)
 
+    def test_zend_artifact_declares_complete_target_and_event_buffer_contract(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "zend_discovery"
+            / "extension"
+            / "hookphuzz_opcode.c"
+        ).read_text(encoding="utf-8")
+
+        for field in (
+            '"loaded_callbacks"',
+            '"target_capacity"',
+            '"capacity_exhausted_count"',
+            '"requested_target_count"',
+            '"event_capacity"',
+            '"dropped_event_count"',
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, source)
+
 
 if __name__ == "__main__":
     unittest.main()
