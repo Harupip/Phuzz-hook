@@ -70,6 +70,8 @@ def build_enriched_parameters(
                 evidence={"kind": "zend_superglobal_read", "superglobal": f"$_{source}"},
                 forced_block="security_field" if source == "COOKIE" else None,
             )
+        elif source == "REST_ARRAY_ACCESS":
+            add(name, evidence={"kind": "rest_array_access_name_only"})
         elif source in {"REST_GET_PARAM", "GET_PARAM", "WP_REST_REQUEST_GET_PARAM"}:
             add(name, evidence={"kind": "rest_get_param_name_only"})
         elif source in {"HEADER", "HEADERS", "SELECTOR"}:
@@ -214,6 +216,9 @@ def build_parameter_seed(
         location = str(item.get("location") or _location_for_source(source))
         if item.get("role") == "security_nonce" or item.get("fuzzable") is False:
             _block(blocked, name, "security_field", f"static:{source or 'unknown'}")
+            continue
+        if source == "REST_ARRAY_ACCESS":
+            _block(blocked, name, "unresolved_location", "rest_array_access_name_only")
             continue
         add(name, location, f"static:{source or 'unknown'}")
 

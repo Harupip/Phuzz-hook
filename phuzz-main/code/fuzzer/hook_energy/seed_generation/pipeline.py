@@ -166,6 +166,20 @@ def _rest_parameter_policy(
             continue
         source = evidence.get(name)
         if source:
+            if source.get("location") == "unknown":
+                parameters.append(
+                    {
+                        "name": name,
+                        "location": "unknown",
+                        "location_candidates": list(LOCATION_CANDIDATES),
+                        "source": source["source"],
+                        "schema_type": schema_type,
+                        "materialized": False,
+                        "evidence_kind": source.get("evidence_kind"),
+                    }
+                )
+                block_reasons.append("rest_schema_parameter_location_unknown")
+                continue
             parameters.append(
                 {
                     "name": name,
@@ -174,6 +188,7 @@ def _rest_parameter_policy(
                     "source": source["source"],
                     "schema_type": schema_type,
                     "materialized": False,
+                    "evidence_kind": source.get("evidence_kind"),
                 }
             )
         else:
@@ -185,6 +200,7 @@ def _rest_parameter_policy(
                     "source": "schema_only",
                     "schema_type": schema_type,
                     "materialized": False,
+                    "evidence_kind": None,
                 }
             )
             block_reasons.append("rest_schema_parameter_location_unknown")
@@ -241,8 +257,8 @@ def _apply_evidence_to_rest_seed(
             fuzzable.append(name)
 
 
-def _evidence_by_name(seed: Mapping[str, Any]) -> dict[str, dict[str, str]]:
-    output: dict[str, dict[str, str]] = {}
+def _evidence_by_name(seed: Mapping[str, Any]) -> dict[str, dict[str, str | None]]:
+    output: dict[str, dict[str, str | None]] = {}
     input_params = seed.get("input_params")
     if not isinstance(input_params, Sequence) or isinstance(input_params, (str, bytes, bytearray)):
         return output
@@ -252,8 +268,20 @@ def _evidence_by_name(seed: Mapping[str, Any]) -> dict[str, dict[str, str]]:
         name = str(item.get("name") or "").strip()
         source = str(item.get("source") or "").strip().upper()
         location = _location_for_source(source)
-        if name and location and name not in output:
-            output[name] = {"source": source, "location": location}
+        if not name or name in output:
+            continue
+        if location:
+            output[name] = {
+                "source": source,
+                "location": location,
+                "evidence_kind": str(item.get("evidence_kind") or ""),
+            }
+        elif source == "REST_ARRAY_ACCESS":
+            output[name] = {
+                "source": source,
+                "location": "unknown",
+                "evidence_kind": "rest_array_access_name_only",
+            }
     return output
 
 

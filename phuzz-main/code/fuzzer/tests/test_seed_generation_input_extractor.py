@@ -213,6 +213,43 @@ class InputSignatureExtractorTests(unittest.TestCase):
             {(item["source"], item["name"]) for item in result["input_params"]},
         )
 
+    def test_extracts_nested_rest_array_access_with_whitespace_and_mixed_quotes(self) -> None:
+        source = textwrap.dedent(
+            """\
+            <?php
+            function list_items(
+                $request
+            ) {
+                if (isset( $request [ "filters" ] [ 'name' ] )) {
+                    return $request["filters"]['name'];
+                }
+            }
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_file = Path(tmp_dir) / "rest.php"
+            source_file.write_text(source, encoding="utf-8")
+
+            result = InputSignatureExtractor().extract(
+                {
+                    "source_file": str(source_file),
+                    "start_line": 2,
+                    "end_line": 8,
+                    "function_name": "list_items",
+                    "entrypoint_type": "rest_route",
+                }
+            )
+
+        self.assertEqual(
+            [
+                (item["name"], item["source"], item["location"], item["confidence"])
+                for item in result["input_params"]
+                if item["source"] == "REST_ARRAY_ACCESS"
+            ],
+            [("filters[name]", "REST_ARRAY_ACCESS", "unknown", "static_rest_array_access")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

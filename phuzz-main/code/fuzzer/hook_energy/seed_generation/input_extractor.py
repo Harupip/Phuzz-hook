@@ -37,12 +37,21 @@ class InputSignatureExtractor:
         re.IGNORECASE,
     )
     ARRAY_KEY_PATTERN_TEMPLATE = r"\${var}\s*\[\s*(?P<quote>['\"])(?P<name>[A-Za-z0-9_\-]+)(?P=quote)\s*\]"
+    ARRAY_ACCESS_CHAIN_PATTERN_TEMPLATE = r"\${var}\s*(?P<chain>(?:\[\s*['\"][A-Za-z0-9_\-]+['\"]\s*\]\s*)+)"
     SHORTCODE_DEFAULTS_PATTERN = re.compile(
         r"shortcode_atts\s*\(\s*(?P<helper>[A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*,",
         re.IGNORECASE,
     )
     FUNCTION_PATTERN_TEMPLATE = r"function\s+{name}\s*\("
     ARRAY_KEY_LITERAL_PATTERN = re.compile(r"(?P<quote>['\"])(?P<name>[A-Za-z0-9_\-]+)(?P=quote)\s*=>")
+    FUNCTION_SIGNATURE_PATTERN = re.compile(
+        r"function\b[^(]*\((?P<params>.*?)\)\s*(?::[^{]+)?\{?",
+        re.IGNORECASE | re.DOTALL,
+    )
+    FUNCTION_PARAMETER_PATTERN = re.compile(
+        r"(?:^|,)\s*(?:(?P<type>[A-Za-z_\\][A-Za-z0-9_\\|?]*)\s+)?(?:&\s*)?\$(?P<name>[A-Za-z_][A-Za-z0-9_]*)",
+        re.IGNORECASE,
+    )
 
     LOCATION_BY_SOURCE = {
         "GET": "query",
@@ -51,6 +60,7 @@ class InputSignatureExtractor:
         "COOKIE": "cookie",
         "FILES": "body",
         "BODY_JSON": "body",
+        "REST_ARRAY_ACCESS": "unknown",
     }
 
     def __init__(
@@ -92,7 +102,17 @@ class InputSignatureExtractor:
 
         start_index = max(start_line - 1, 0)
         end_index = min(max(end_line, start_line), len(lines))
-        input_params = self._extract_from_lines(lines[start_index:end_index], start_index + 1)
+        rest_array_access_vars = self._rest_array_access_variables(
+            callback_metadata,
+            lines,
+            start_index,
+            end_index,
+        )
+        input_params = self._extract_from_lines(
+            lines[start_index:end_index],
+            start_index + 1,
+            rest_array_access_vars=rest_array_access_vars,
+        )
         self._extend_from_shallow_helpers(input_params, lines[start_index:end_index], path, start_index + 1)
         return {
             "callback": callback_name,
@@ -100,10 +120,17 @@ class InputSignatureExtractor:
             "source_resolution": source_resolution.to_dict(),
         }
 
-    def _extract_from_lines(self, lines: list[str], first_line_number: int) -> list[dict[str, Any]]:
+    def _extract_from_lines(
+        self,
+        lines: list[str],
+        first_line_number: int,
+        *,
+        rest_array_access_vars: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
         json_body_vars: set[str] = set()
+        rest_array_access_vars = rest_array_access_vars or set()
 
         for offset, line in enumerate(lines):
             line_number = first_line_number + offset
@@ -159,8 +186,62 @@ class InputSignatureExtractor:
                 key_pattern = re.compile(self.ARRAY_KEY_PATTERN_TEMPLATE.format(var=re.escape(var_name)))
                 for match in key_pattern.finditer(line):
                     self._append_match(results, seen, "BODY_JSON", match.group("name"), match.group(0), line_number)
+            for var_name in rest_array_access_vars:
+                chain_pattern = re.compile(self.ARRAY_ACCESS_CHAIN_PATTERN_TEMPLATE.format(var=re.escape(var_name)))
+                for match in chain_pattern.finditer(line):
+                    name = self._name_from_chain(match.group("chain"))
+                    if name:
+                        self._append_match(
+                            results,
+                            seen,
+                            "REST_ARRAY_ACCESS",
+                            name,
+                            match.group(0),
+                            line_number,
+                            confidence="static_rest_array_access",
+                        )
 
         return results
+
+    def _rest_array_access_variables(
+        self,
+        callback_metadata: dict[str, Any],
+        lines: list[str],
+        start_index: int,
+        end_index: int,
+    ) -> set[str]:
+        if not self._is_rest_entrypoint(callback_metadata):
+            return set()
+
+        names: set[str] = set()
+        formal_parameters = callback_metadata.get("formal_parameters")
+        if isinstance(formal_parameters, list):
+            for item in formal_parameters:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip().lstrip("$")
+                type_name = str(item.get("type") or "").strip().lower()
+                if not name or type_name == "array":
+                    continue
+                names.add(name)
+
+        signature_head = " ".join(lines[start_index:min(end_index, start_index + 8)])
+        signature_match = self.FUNCTION_SIGNATURE_PATTERN.search(signature_head)
+        if signature_match:
+            for match in self.FUNCTION_PARAMETER_PATTERN.finditer(signature_match.group("params")):
+                type_name = str(match.group("type") or "").strip().lower()
+                if type_name == "array":
+                    continue
+                names.add(match.group("name"))
+
+        return names
+
+    def _is_rest_entrypoint(self, callback_metadata: dict[str, Any]) -> bool:
+        return str(callback_metadata.get("entrypoint_type") or "").strip().lower() in {
+            "rest",
+            "rest_route",
+            "wp_rest_route",
+        }
 
     def _extend_from_shallow_helpers(
         self,

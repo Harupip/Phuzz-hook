@@ -40,6 +40,7 @@ from hook_energy.seed_generation.zend_runtime.bridge_cli import (
     list_convergence_targets,
     verify_pass2_contract,
 )
+from hook_energy.seed_generation.pipeline import _rest_parameter_policy
 from zend_discovery.source_materializer import materialize_plugin_source
 from zend_discovery.parameter_seeds import build_parameter_seed
 from zend_discovery.rest_runtime import canonical_rest_parameter_name
@@ -1378,6 +1379,42 @@ class ZendDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(seed["parameters"], [])
         self.assertEqual({row["name"] for row in seed["blocked_parameters"]}, {"nonce", "session_token"})
+
+    def test_rest_array_access_static_seed_retains_name_but_blocks_without_transport(self) -> None:
+        endpoint = {"callback_id": "rest-items", "kind": "rest", "methods": ["POST"]}
+        callback = {"callback_id": "rest-items"}
+        extractor = StaticExtractor(
+            [{"name": "id", "source": "REST_ARRAY_ACCESS", "location": "unknown"}]
+        )
+
+        seed = build_parameter_seed(endpoint, callback, {"request_params": {}}, extractor)
+
+        self.assertEqual(seed["parameters"], [])
+        self.assertEqual(
+            seed["blocked_parameters"],
+            [{"name": "id", "reason": "unresolved_location", "evidence": ["rest_array_access_name_only"]}],
+        )
+
+    def test_rest_parameter_policy_retains_array_access_name_only_but_blocks_export(self) -> None:
+        policy = _rest_parameter_policy(
+            {"id": {"type": "integer", "required": False}},
+            {"input_params": [{"name": "id", "source": "REST_ARRAY_ACCESS", "location": "unknown"}]},
+            {"substitutions": {}, "route_materialization_status": "ok"},
+        )
+
+        self.assertEqual(policy["block_reasons"], ["rest_schema_parameter_location_unknown"])
+        self.assertEqual(
+            policy["parameters"],
+            [{
+                "name": "id",
+                "location": "unknown",
+                "location_candidates": ["query", "form", "json"],
+                "source": "REST_ARRAY_ACCESS",
+                "schema_type": "integer",
+                "materialized": False,
+                "evidence_kind": "rest_array_access_name_only",
+            }],
+        )
 
     def test_catalog_keeps_only_selected_plugin_and_normalizes_ajax_rest(self) -> None:
         catalog = build_catalog(self.registry(), "demo-plugin")

@@ -133,7 +133,10 @@ class SeedGeneratorBase:
             is_active = bool(registered_entry.get("is_active", True))
             status = "covered" if execute_count > 0 else "uncovered"
             seed_priority, priority_rank, target_family = self._classify_seed_priority(hook_name, is_active)
-            extraction = self._extract_input_params(registered_entry)
+            entrypoint_type = self._entrypoint_type_for_callback(hook_name, registered_entry)
+            extraction_entry = dict(registered_entry)
+            extraction_entry["entrypoint_type"] = entrypoint_type
+            extraction = self._extract_input_params(extraction_entry)
             input_params = extraction.get("input_params", [])
             source_resolution = extraction.get(
                 "source_resolution",
@@ -143,7 +146,6 @@ class SeedGeneratorBase:
                     "resolved_source_file": None,
                 },
             )
-            entrypoint_type = self._entrypoint_type_for_callback(hook_name, registered_entry)
             seeds, generation_status = self._generate_seed_templates(
                 hook_name,
                 is_active,
@@ -387,6 +389,9 @@ class SeedGeneratorBase:
 
             request_method = str(seed.get("resolved_method") or seed.get("method") or "").upper()
             method_status = seed.get("method_status") or ("resolved" if request_method else "ambiguous")
+            if source == "REST_ARRAY_ACCESS":
+                seed.setdefault("unresolved_params", {})[name] = "FUZZ"
+                continue
             if source == "REQUEST" and method_status != "resolved":
                 seed.setdefault("unresolved_params", {})[name] = "FUZZ"
                 continue
