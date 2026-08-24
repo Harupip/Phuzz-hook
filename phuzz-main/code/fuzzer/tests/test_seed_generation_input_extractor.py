@@ -250,6 +250,36 @@ class InputSignatureExtractorTests(unittest.TestCase):
             [("filters[name]", "REST_ARRAY_ACCESS", "unknown", "static_rest_array_access")],
         )
 
+    def test_does_not_report_rest_array_access_after_local_array_rebind(self) -> None:
+        source = textwrap.dedent(
+            """\
+            <?php
+            function cb(WP_REST_Request $request) {
+                $request = ['id' => 1];
+                return $request['id'];
+            }
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_file = Path(tmp_dir) / "rest.php"
+            source_file.write_text(source, encoding="utf-8")
+
+            result = InputSignatureExtractor().extract(
+                {
+                    "source_file": str(source_file),
+                    "start_line": 2,
+                    "end_line": 5,
+                    "function_name": "cb",
+                    "entrypoint_type": "rest_route",
+                }
+            )
+
+        self.assertNotIn(
+            ("REST_ARRAY_ACCESS", "id"),
+            {(item["source"], item["name"]) for item in result["input_params"]},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

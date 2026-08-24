@@ -38,6 +38,7 @@ class InputSignatureExtractor:
     )
     ARRAY_KEY_PATTERN_TEMPLATE = r"\${var}\s*\[\s*(?P<quote>['\"])(?P<name>[A-Za-z0-9_\-]+)(?P=quote)\s*\]"
     ARRAY_ACCESS_CHAIN_PATTERN_TEMPLATE = r"\${var}\s*(?P<chain>(?:\[\s*['\"][A-Za-z0-9_\-]+['\"]\s*\]\s*)+)"
+    ARRAY_REBIND_PATTERN_TEMPLATE = r"\${var}\s*=\s*(?:\[(?s:.*?)\]|array\s*\()"
     SHORTCODE_DEFAULTS_PATTERN = re.compile(
         r"shortcode_atts\s*\(\s*(?P<helper>[A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*,",
         re.IGNORECASE,
@@ -130,12 +131,19 @@ class InputSignatureExtractor:
         results: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
         json_body_vars: set[str] = set()
-        rest_array_access_vars = rest_array_access_vars or set()
+        active_rest_array_access_vars = set(rest_array_access_vars or set())
 
         for offset, line in enumerate(lines):
             line_number = first_line_number + offset
             for match in self.JSON_BODY_ASSIGNMENT_PATTERN.finditer(line):
                 json_body_vars.add(match.group("var"))
+            for var_name in tuple(active_rest_array_access_vars):
+                rebind_pattern = re.compile(
+                    self.ARRAY_REBIND_PATTERN_TEMPLATE.format(var=re.escape(var_name)),
+                    re.IGNORECASE,
+                )
+                if rebind_pattern.search(line):
+                    active_rest_array_access_vars.discard(var_name)
             for match in self.SUPERGLOBAL_PATTERN.finditer(line):
                 name = self._name_from_chain(match.group("chain"))
                 if name:
@@ -186,7 +194,7 @@ class InputSignatureExtractor:
                 key_pattern = re.compile(self.ARRAY_KEY_PATTERN_TEMPLATE.format(var=re.escape(var_name)))
                 for match in key_pattern.finditer(line):
                     self._append_match(results, seen, "BODY_JSON", match.group("name"), match.group(0), line_number)
-            for var_name in rest_array_access_vars:
+            for var_name in active_rest_array_access_vars:
                 chain_pattern = re.compile(self.ARRAY_ACCESS_CHAIN_PATTERN_TEMPLATE.format(var=re.escape(var_name)))
                 for match in chain_pattern.finditer(line):
                     name = self._name_from_chain(match.group("chain"))
