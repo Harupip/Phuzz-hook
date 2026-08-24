@@ -1720,6 +1720,36 @@ class ZendDiscoveryTests(unittest.TestCase):
             extension,
         )
 
+    def test_active_opcode_extension_fail_closes_rest_events_on_incomplete_evidence(self) -> None:
+        extension = (
+            FUZZER_DIR
+            / "zend_discovery"
+            / "extension"
+            / "hookphuzz_opcode.c"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "if (HOOKPHUZZ_PHASE5_G(dropped_event_count) > 0) return 0;",
+            extension,
+        )
+        self.assertIn(
+            "if (HOOKPHUZZ_G(target_callbacks_file_ini) == NULL "
+            "|| HOOKPHUZZ_G(target_callbacks_file_ini)[0] == '\\0') return 1;",
+            extension,
+        )
+        self.assertIn(
+            "return HOOKPHUZZ_G(target_load_status) != NULL\n"
+            "        && zend_string_equals_literal(HOOKPHUZZ_G(target_load_status), \"loaded\");",
+            extension,
+        )
+        self.assertIn(
+            "if (!hookphuzz_rest_events_export_allowed()) {\n"
+            "        add_assoc_zval(document, \"rest_parameter_events\", &rest_events);\n"
+            "        return;\n"
+            "    }",
+            extension,
+        )
+
     def test_active_opcode_extension_tracks_wp_rest_request_params_fetch_obj(self) -> None:
         extension = (
             FUZZER_DIR

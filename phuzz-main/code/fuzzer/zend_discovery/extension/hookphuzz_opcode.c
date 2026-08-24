@@ -1235,12 +1235,24 @@ static void hookphuzz_add_target_loading(zval *document)
     add_assoc_zval(document, "target_loading", &loading);
 }
 
+static zend_bool hookphuzz_rest_events_export_allowed(void)
+{
+    if (HOOKPHUZZ_PHASE5_G(dropped_event_count) > 0) return 0;
+    if (HOOKPHUZZ_G(target_callbacks_file_ini) == NULL || HOOKPHUZZ_G(target_callbacks_file_ini)[0] == '\0') return 1;
+    return HOOKPHUZZ_G(target_load_status) != NULL
+        && zend_string_equals_literal(HOOKPHUZZ_G(target_load_status), "loaded");
+}
+
 static void hookphuzz_add_rest_parameter_events(zval *document)
 {
     zval rest_events;
     uint32_t index, path_index;
 
     array_init(&rest_events);
+    if (!hookphuzz_rest_events_export_allowed()) {
+        add_assoc_zval(document, "rest_parameter_events", &rest_events);
+        return;
+    }
     for (index = 0; index < HOOKPHUZZ_PHASE5_G(event_count); index++) {
         const hookphuzz_event *event = &HOOKPHUZZ_PHASE5_G(events)[index];
         zval rest_event, path;
