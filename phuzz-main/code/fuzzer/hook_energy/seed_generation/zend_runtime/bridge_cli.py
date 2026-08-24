@@ -56,6 +56,25 @@ def _artifact_name(row: Mapping[str, Any]) -> str:
     return ""
 
 
+def _variant_suffix(seed_item: Mapping[str, Any]) -> str:
+    seed = seed_item.get("seed")
+    if isinstance(seed, Mapping):
+        variant = str(seed.get("seed_variant_id") or "")
+        if variant:
+            return f"::{variant}"
+    return ""
+
+
+def _candidate_iteration_key(
+    seed_item: Mapping[str, Any],
+    *,
+    plugin_slug: str,
+    legacy_run_id: str,
+) -> str:
+    candidate = candidate_from_seed_item(seed_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
+    return canonical_identity_id(candidate) + _variant_suffix(seed_item)
+
+
 def build_enrichment_inputs(
     raw_report: Mapping[str, Any],
     pass1_run_summary: Mapping[str, Any],
@@ -316,7 +335,7 @@ def converge_iteration(
     if not isinstance(raw_item, Mapping):
         raise RuntimeError("REPLAY_FAILED: generated candidate is invalid")
     candidate = candidate_from_seed_item(raw_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
-    candidate_key = canonical_identity_id(candidate)
+    candidate_key = _candidate_iteration_key(raw_item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
     observed = normalize_runtime_evidence(candidate, uopz, zend, registry)
     prior = known_state.get("known_parameters", [])
     if not isinstance(prior, list):
@@ -361,7 +380,7 @@ def _filter_iteration_inputs(
     selected = [
         item for item in raw_items
         if isinstance(item, Mapping)
-        and canonical_identity_id(candidate_from_seed_item(item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)) == candidate_key
+        and _candidate_iteration_key(item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id) == candidate_key
     ]
     selected_keys = {_seed_key(item) for item in selected}
     filtered_rows = [row for row in rows if isinstance(row, Mapping) and _run_key(row) in selected_keys]
@@ -717,7 +736,7 @@ def list_convergence_targets(
         if _seed_key(item) in expected_auth_skip_keys:
             continue
         candidate = candidate_from_seed_item(item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
-        key = canonical_identity_id(candidate)
+        key = _candidate_iteration_key(item, plugin_slug=plugin_slug, legacy_run_id=legacy_run_id)
         if key in seen:
             continue
         seen.add(key)

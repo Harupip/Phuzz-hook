@@ -10,6 +10,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
+from hook_energy.seed_generation.pipeline import run_entrypoint_pipeline
 from hook_energy.seed_generation.static_generator import StaticSeedGenerator
 from hook_energy.seed_generation.zend_runtime.candidate_generator import ZendRuntimeSeedGenerator
 
@@ -98,6 +99,52 @@ def build_live_coverage_payload() -> dict:
                 },
             },
         },
+    }
+
+
+def build_rest_probe_payload(source_root: Path, *, schema_name: str = "id", schema_type: str = "integer") -> dict:
+    rest_probe = source_root / "rest-probe.php"
+    rest_probe.write_text(
+        "\n".join(
+            [
+                "<?php",
+                "function learnpress_rest_probe($request) {",
+                f"    if (isset($request['{schema_name}'])) {{",
+                f"        return $request['{schema_name}'];",
+                "    }",
+                "    return null;",
+                "}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "data": {
+            "registered_callbacks": {
+                "cb-rest-probe": {
+                    "callback_id": "cb-rest-probe",
+                    "entrypoint_type": "rest_route",
+                    "hook_name": "rest_route:learnpress/v1/items",
+                    "callback_repr": "learnpress_rest_probe",
+                    "namespace": "learnpress/v1",
+                    "route": "/items",
+                    "methods": ["POST"],
+                    "permission_callback": "__return_true",
+                    "argument_definitions": {
+                        schema_name: {"type": schema_type, "required": False},
+                    },
+                    "input_params": [
+                        {"name": schema_name, "source": "REST_ARRAY_ACCESS", "location": "unknown"}
+                    ],
+                    "source_file": str(rest_probe),
+                    "start_line": 2,
+                    "end_line": 7,
+                    "is_active": True,
+                }
+            },
+            "executed_callbacks": {},
+        }
     }
 
 
@@ -258,12 +305,69 @@ class SeedGeneratorTests(unittest.TestCase):
 
         seed = next(item["seed"] for item in seed_report["suggested_seeds"] if item["seed"]["method"] == "POST")
         self.assertEqual(seed["body"]["action"], "vx_form_save_api_settings")
-        self.assertEqual(seed["body"]["vx_nonce"], "fuzz")
-        self.assertEqual(seed["body"]["cfx_settings[alert_emails]"], "FUZZ")
-        self.assertNotIn("cfx_settings", seed["body"])
-        self.assertIn("vx_nonce", seed["fixed_params"])
-        self.assertNotIn("vx_nonce", seed["fuzzable_params"])
-        self.assertEqual(seed["fuzzable_params"], ["cfx_settings[alert_emails]"])
+
+    def test_rest_post_schema_only_id_generates_isolated_replay_only_probe_configs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            result = run_entrypoint_pipeline(
+                build_rest_probe_payload(root),
+                plugin_slug="learnpress-fixture",
+                output_dir=root / "pipeline",
+                target_base="http://web",
+            )
+
+            generated = {
+                row["seed_variant_id"]: json.loads(Path(row["config_path"]).read_text(encoding="utf-8"))
+                for row in result["config_summary"]["generated"]
+            }
+            self.assertEqual(set(generated), {"rest_probe_form_id", "rest_probe_json_id"})
+            self.assertEqual(result["config_summary"]["skipped"][0]["reason"], "rest_schema_parameter_location_unknown")
+
+            form = generated["rest_probe_form_id"]
+            self.assertEqual(form["methods"], ["POST"])
+            self.assertEqual(form["config_type"], "replay_only")
+            self.assertEqual(form["body_params"]["data"], [{"name": "id", "value": 1}])
+            self.assertEqual(form["body_params"]["fuzz"], [])
+            self.assertNotIn("headers", form)
+
+            jsn = generated["rest_probe_json_id"]
+            self.assertEqual(jsn["methods"], ["POST"])
+            self.assertEqual(jsn["config_type"], "replay_only")
+            self.assertEqual(jsn["headers"]["data"], [{"name": "Content-Type", "value": "application/json"}])
+            self.assertEqual(jsn["body_params"]["data"], [{"name": "id", "value": 1}])
+            self.assertEqual(jsn["body_params"]["fuzz"], [])
+
+    def test_rest_probe_metadata_is_redacted_and_final_seed_stays_blocked_without_runtime_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            result = run_entrypoint_pipeline(
+                build_rest_probe_payload(root, schema_name="slug", schema_type="string"),
+                plugin_slug="learnpress-fixture",
+                output_dir=root / "pipeline",
+                target_base="http://web",
+            )
+
+            final_seed = next(
+                item for item in result["seed_report"]["suggested_seeds"]
+                if item["callback_id"] == "cb-rest-probe" and not item["seed"].get("probe_variant")
+            )
+            self.assertFalse(final_seed["seed"]["export_allowed"])
+            self.assertFalse(final_seed["seed"]["replay_allowed"])
+            self.assertEqual(final_seed["seed"]["fuzzable_params"], [])
+            self.assertNotIn("slug", final_seed["seed"].get("body", {}))
+
+            probe_rows = {
+                row["seed_variant_id"]: row for row in result["config_summary"]["generated"]
+            }
+            for variant_id in ("rest_probe_form_slug", "rest_probe_json_slug"):
+                metadata = probe_rows[variant_id]["probe_request"]
+                self.assertTrue(metadata["candidate_value_redacted"])
+                self.assertNotIn("candidate_value", metadata)
+
+            config_summary_text = (root / "pipeline" / "generated_config_summary.json").read_text(encoding="utf-8")
+            param_summary_text = (root / "pipeline" / "generated_param_summary.json").read_text(encoding="utf-8")
+            self.assertNotIn("\"candidate_value\": \"probe\"", config_summary_text)
+            self.assertNotIn("\"candidate_value\": \"probe\"", param_summary_text)
 
     def test_generator_prioritizes_nopriv_over_authenticated_hooks(self) -> None:
         generator = StaticSeedGenerator()

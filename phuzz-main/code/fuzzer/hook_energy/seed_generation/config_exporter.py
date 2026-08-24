@@ -25,15 +25,16 @@ def build_config_for_seed_item(
     seed = seed_item.get("seed")
     if not isinstance(seed, Mapping):
         raise SeedConfigSkip("missing_seed")
+    probe_variant = bool(seed.get("probe_variant"))
 
     auth_mode = str(seed.get("auth_mode", "")).strip()
     if auth_mode not in {"authenticated", "unauth-capable"}:
         raise SeedConfigSkip("unsupported_auth_mode")
 
     method_status = seed.get("method_status")
-    if not replay_only and (method_status == "ambiguous" or seed.get("method_confidence") == "ambiguous"):
+    if not replay_only and not probe_variant and (method_status == "ambiguous" or seed.get("method_confidence") == "ambiguous"):
         raise SeedConfigSkip("ambiguous_http_method")
-    if not replay_only and (seed.get("export_allowed") is False or (method_status and method_status != "resolved")):
+    if not replay_only and not probe_variant and (seed.get("export_allowed") is False or (method_status and method_status != "resolved")):
         raise SeedConfigSkip(str(seed.get("block_reason") or "blocked_http_method"))
 
     methods = _seed_methods(seed)
@@ -132,7 +133,7 @@ def export_seed_configs(
         except SeedConfigSkip as exc:
             summary["skipped"].append(_skipped_row(item, hook_name, callback_id, exc.reason))
             continue
-        if replay_only:
+        if replay_only or _is_probe_variant(item):
             _force_replay_only(config)
 
         config_path = output_dir / f"{file_slug}.json"
@@ -182,7 +183,10 @@ def _force_replay_only(config: dict[str, Any]) -> None:
     metadata = config.get("metadata")
     if isinstance(metadata, dict):
         metadata["fuzzing_ready"] = False
-        metadata["generated_reason"] = "zend_pass1_replay_only"
+        if metadata.get("probe_variant") is True:
+            metadata.setdefault("generated_reason", "rest_schema_parameter_probe")
+        else:
+            metadata["generated_reason"] = "zend_pass1_replay_only"
 
 
 def build_generated_param_summary(
@@ -390,9 +394,14 @@ def _metadata_for_seed_item(
         'route_declared_methods': list(seed.get('route_declared_methods') or []),
         'seed_variant_id': str(seed.get('seed_variant_id') or ''),
     }
+    if seed.get("probe_variant"):
+        metadata['probe_variant'] = True
     route = seed_item.get('route') or seed_item.get('rest_route')
     if route:
         metadata['route'] = route
+    probe_request = _probe_request_metadata(seed_item)
+    if probe_request:
+        metadata['probe_request'] = probe_request
     if discovered_file_params:
         metadata['discovered_file_params'] = discovered_file_params
     missing = _missing_requirements(seed_item, fuzzing_ready=fuzzing_ready)
@@ -427,6 +436,8 @@ def _summary_metadata(seed_item: Mapping[str, Any], config: Mapping[str, Any]) -
         'observed_request_method',
         'route_declared_methods',
         'seed_variant_id',
+        'probe_variant',
+        'probe_request',
     )
     return {key: metadata[key] for key in keys if key in metadata}
 
@@ -483,7 +494,24 @@ def _missing_requirements(seed_item: Mapping[str, Any], *, fuzzing_ready: bool) 
     existing = seed_item.get('missing_requirements')
     if isinstance(existing, list):
         return [str(item) for item in existing if str(item)]
+    seed = seed_item.get("seed")
+    if isinstance(seed, Mapping) and seed.get("probe_variant"):
+        return ["callback_attributed_runtime_bucket_evidence"]
     return ['fuzzable_params']
+
+
+def _probe_request_metadata(seed_item: Mapping[str, Any]) -> dict[str, Any] | None:
+    probe_request = seed_item.get("probe_request")
+    if not isinstance(probe_request, Mapping):
+        return None
+    metadata = {
+        "parameter": str(probe_request.get("parameter") or ""),
+        "location": str(probe_request.get("location") or ""),
+        "content_type": str(probe_request.get("content_type") or ""),
+        "schema_type": str(probe_request.get("schema_type") or ""),
+        "candidate_value_redacted": bool(probe_request.get("candidate_value_redacted")),
+    }
+    return {key: value for key, value in metadata.items() if value not in ("", None)}
 
 def _read_json_object(path: Path) -> Mapping[str, Any]:
     try:
@@ -511,6 +539,11 @@ def _config_metadata_value(config: Mapping[str, Any], key: str) -> Any:
     if isinstance(metadata, Mapping):
         return metadata.get(key)
     return None
+
+
+def _is_probe_variant(seed_item: Mapping[str, Any]) -> bool:
+    seed = seed_item.get("seed")
+    return isinstance(seed, Mapping) and bool(seed.get("probe_variant"))
 
 def _callback_repr(seed_item: Mapping[str, Any], callback_id: str) -> str:
     for key in ("callback_repr", "callback_name", "callback_raw"):

@@ -259,7 +259,14 @@ class EntrypointPipelineTests(unittest.TestCase):
             payload_param = next(item for item in entry["parameters"] if item["name"] == "payload")
             self.assertEqual(payload_param["location"], "unknown")
             self.assertEqual(payload_param["location_candidates"], ["query", "form", "json"])
-            self.assertEqual(list((root / "pipeline" / "configs").glob("*.json")), [])
+            config_paths = sorted((root / "pipeline" / "configs").glob("*.json"))
+            self.assertEqual([path.stem for path in config_paths], [
+                "rest_route_demo_v1_items_P_id_d-cb-rest-post-rest_probe_form_payload",
+                "rest_route_demo_v1_items_P_id_d-cb-rest-post-rest_probe_json_payload",
+            ])
+            for path in config_paths:
+                config = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(config["config_type"], "replay_only")
 
     def test_minimal_pipeline_generates_direct_get_post_and_skips_helper_guessing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,11 @@ from .zend_runtime.candidate_generator import ZendRuntimeSeedGenerator
 
 LOCATION_CANDIDATES = ["query", "form", "json"]
 SUPPORTED_SCHEMA_TYPES = {"string", "integer", "number", "boolean", None}
+PROBE_ONLY_CONTENT_TYPES = {
+    "form": "application/x-www-form-urlencoded",
+    "json": "application/json",
+}
+PROBE_ONLY_SECURITY_NAME = re.compile(r"(?:nonce|token|secret|password|cookie|authorization|auth)", re.IGNORECASE)
 
 
 def run_entrypoint_pipeline(
@@ -100,11 +107,14 @@ def _apply_rest_parameter_policy(
     seed_report: dict[str, Any],
     registered: Mapping[str, Mapping[str, Any]],
 ) -> None:
-    for item in seed_report.get("suggested_seeds", []):
+    probe_variants: list[dict[str, Any]] = []
+    for item in list(seed_report.get("suggested_seeds", [])):
         if not isinstance(item, dict) or item.get("entrypoint_type") != "rest_route":
             continue
         seed = item.get("seed")
         if not isinstance(seed, dict):
+            continue
+        if seed.get("probe_variant"):
             continue
         callback_id = str(item.get("callback_id", ""))
         metadata = registered.get(callback_id, {})
@@ -116,6 +126,7 @@ def _apply_rest_parameter_policy(
         _apply_evidence_to_rest_seed(seed, schema, policy)
         item["rest_parameter_policy"] = policy
         item["permission_callback"] = metadata.get("permission_callback", item.get("permission_callback"))
+        probe_variants.extend(_build_rest_probe_seed_items(item, policy))
         if policy["block_reasons"]:
             seed["export_allowed"] = False
             seed["replay_allowed"] = False
@@ -124,6 +135,8 @@ def _apply_rest_parameter_policy(
             item["generated_reason"] = policy["block_reasons"][0]
             item["fuzzing_ready"] = False
             item["missing_requirements"] = list(policy["block_reasons"])
+    if probe_variants:
+        seed_report.setdefault("suggested_seeds", []).extend(probe_variants)
 
 
 def _schema_parameters(metadata: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -167,6 +180,11 @@ def _rest_parameter_policy(
         source = evidence.get(name)
         if source:
             if source.get("location") == "unknown":
+                probe_specs = _probe_variants_for_unresolved_param(
+                    seed,
+                    name=name,
+                    schema_type=schema_type,
+                )
                 parameters.append(
                     {
                         "name": name,
@@ -176,6 +194,7 @@ def _rest_parameter_policy(
                         "schema_type": schema_type,
                         "materialized": False,
                         "evidence_kind": source.get("evidence_kind"),
+                        "probe_variants": probe_specs,
                     }
                 )
                 block_reasons.append("rest_schema_parameter_location_unknown")
@@ -192,6 +211,11 @@ def _rest_parameter_policy(
                 }
             )
         else:
+            probe_specs = _probe_variants_for_unresolved_param(
+                seed,
+                name=name,
+                schema_type=schema_type,
+            )
             parameters.append(
                 {
                     "name": name,
@@ -201,6 +225,7 @@ def _rest_parameter_policy(
                     "schema_type": schema_type,
                     "materialized": False,
                     "evidence_kind": None,
+                    "probe_variants": probe_specs,
                 }
             )
             block_reasons.append("rest_schema_parameter_location_unknown")
@@ -296,6 +321,123 @@ def _location_for_source(source: str) -> str | None:
     }.get(source)
 
 
+def _seed_methods(seed: Mapping[str, Any]) -> list[str]:
+    raw_methods = seed.get("methods", seed.get("method", ""))
+    if isinstance(raw_methods, list):
+        items = raw_methods
+    else:
+        items = [raw_methods]
+    methods: list[str] = []
+    for item in items:
+        for part in str(item or "").replace("|", ",").split(","):
+            method = part.strip().upper()
+            if method and method not in methods:
+                methods.append(method)
+    return methods
+
+
+def _probe_variants_for_unresolved_param(
+    seed: Mapping[str, Any],
+    *,
+    name: str,
+    schema_type: Any,
+) -> list[dict[str, Any]]:
+    if PROBE_ONLY_SECURITY_NAME.search(name):
+        return []
+    methods = _seed_methods(seed)
+    if methods != ["POST"]:
+        return []
+    schema_label = str(schema_type or "string")
+    variants: list[dict[str, Any]] = []
+    for location in ("form", "json"):
+        variants.append(
+            {
+                "seed_variant_id": f"rest_probe_{location}_{_variant_safe_name(name)}",
+                "location": location,
+                "content_type": PROBE_ONLY_CONTENT_TYPES[location],
+                "schema_type": schema_label,
+                "candidate_value_redacted": True,
+            }
+        )
+    return variants
+
+
+def _typed_probe_value(schema_type: Any) -> Any:
+    normalized = str(schema_type or "string").lower()
+    if normalized in {"integer", "number"}:
+        return 1
+    if normalized == "boolean":
+        return True
+    return "probe"
+
+
+def _variant_safe_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._-") or "param"
+
+
+def _build_rest_probe_seed_items(seed_item: Mapping[str, Any], policy: Mapping[str, Any]) -> list[dict[str, Any]]:
+    seed = seed_item.get("seed")
+    if not isinstance(seed, Mapping):
+        return []
+    probe_items: list[dict[str, Any]] = []
+    for parameter in policy.get("parameters", []):
+        if not isinstance(parameter, Mapping):
+            continue
+        name = str(parameter.get("name") or "")
+        for probe in parameter.get("probe_variants", []):
+            if not isinstance(probe, Mapping):
+                continue
+            probe_items.append(_clone_probe_seed_item(seed_item, seed, name=name, probe=probe))
+    return probe_items
+
+
+def _clone_probe_seed_item(
+    seed_item: Mapping[str, Any],
+    seed: Mapping[str, Any],
+    *,
+    name: str,
+    probe: Mapping[str, Any],
+) -> dict[str, Any]:
+    item = deepcopy(dict(seed_item))
+    probe_seed = deepcopy(dict(seed))
+    location = str(probe.get("location") or "")
+    content_type = str(probe.get("content_type") or "")
+    candidate_value = _typed_probe_value(probe.get("schema_type"))
+    body = {}
+    query = {}
+    headers = {}
+    if location in {"form", "json"}:
+        body[name] = candidate_value
+        if location == "json" and content_type:
+            headers["Content-Type"] = content_type
+    elif location == "query":
+        query[name] = candidate_value
+    probe_seed["body"] = body
+    probe_seed["query_params"] = query
+    probe_seed["headers"] = headers
+    probe_seed["fixed_params"] = [name]
+    probe_seed["fuzzable_params"] = []
+    probe_seed["input_params"] = []
+    probe_seed["export_allowed"] = True
+    probe_seed["replay_allowed"] = True
+    probe_seed["block_reason"] = None
+    probe_seed["probe_variant"] = True
+    probe_seed["seed_variant_id"] = str(probe.get("seed_variant_id") or "")
+    item["seed"] = probe_seed
+    item["generation_status"] = "rest_schema_parameter_probe"
+    item["generated_reason"] = "rest_schema_parameter_probe"
+    item["fuzzing_ready"] = False
+    item["missing_requirements"] = ["callback_attributed_runtime_bucket_evidence"]
+    item["probe_request"] = {
+        "parameter": name,
+        "location": location,
+        "content_type": content_type,
+        "schema_type": str(probe.get("schema_type") or ""),
+        "candidate_value_redacted": bool(probe.get("candidate_value_redacted")),
+    }
+    return item
+
+
 def _pipeline_summary(
     seed_report: Mapping[str, Any],
     config_summary: Mapping[str, Any],
@@ -306,7 +448,7 @@ def _pipeline_summary(
     generated = {
         _summary_key(row): row
         for row in config_summary.get("generated", [])
-        if isinstance(row, Mapping)
+        if isinstance(row, Mapping) and not bool(row.get("probe_variant"))
     }
     skipped = {
         _summary_key(row): row
@@ -316,6 +458,8 @@ def _pipeline_summary(
     entrypoints = []
     for item in seed_report.get("suggested_seeds", []):
         if not isinstance(item, Mapping):
+            continue
+        if _is_probe_variant_item(item):
             continue
         key = _summary_key(item)
         generated_row = generated.get(key)
@@ -386,6 +530,11 @@ def _summary_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
         str(row.get("callback_id") or ""),
         str(variant or ""),
     )
+
+
+def _is_probe_variant_item(item: Mapping[str, Any]) -> bool:
+    seed = item.get("seed")
+    return isinstance(seed, Mapping) and bool(seed.get("probe_variant"))
 
 
 def _config_path(output_config_dir: Path, config_slug: str) -> Path:

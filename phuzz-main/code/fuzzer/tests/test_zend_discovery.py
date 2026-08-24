@@ -35,6 +35,7 @@ from zend_discovery.convergence import (
     materialize_convergence_seeds,
 )
 from hook_energy.seed_generation.zend_runtime.bridge_cli import (
+    build_enrichment_inputs,
     combine_final_seed_reports,
     converge_iteration,
     list_convergence_targets,
@@ -1398,14 +1399,17 @@ class ZendDiscoveryTests(unittest.TestCase):
     def test_rest_parameter_policy_retains_array_access_name_only_but_blocks_export(self) -> None:
         policy = _rest_parameter_policy(
             {"id": {"type": "integer", "required": False}},
-            {"input_params": [{"name": "id", "source": "REST_ARRAY_ACCESS", "location": "unknown"}]},
+            {"method": "POST", "input_params": [{"name": "id", "source": "REST_ARRAY_ACCESS", "location": "unknown"}]},
             {"substitutions": {}, "route_materialization_status": "ok"},
         )
 
         self.assertEqual(policy["block_reasons"], ["rest_schema_parameter_location_unknown"])
+        self.assertEqual(len(policy["parameters"]), 1)
         self.assertEqual(
-            policy["parameters"],
-            [{
+            {key: policy["parameters"][0][key] for key in (
+                "name", "location", "location_candidates", "source", "schema_type", "materialized", "evidence_kind"
+            )},
+            {
                 "name": "id",
                 "location": "unknown",
                 "location_candidates": ["query", "form", "json"],
@@ -1413,7 +1417,26 @@ class ZendDiscoveryTests(unittest.TestCase):
                 "schema_type": "integer",
                 "materialized": False,
                 "evidence_kind": "rest_array_access_name_only",
-            }],
+            },
+        )
+        self.assertEqual(
+            policy["parameters"][0]["probe_variants"],
+            [
+                {
+                    "seed_variant_id": "rest_probe_form_id",
+                    "location": "form",
+                    "content_type": "application/x-www-form-urlencoded",
+                    "candidate_value_redacted": True,
+                    "schema_type": "integer",
+                },
+                {
+                    "seed_variant_id": "rest_probe_json_id",
+                    "location": "json",
+                    "content_type": "application/json",
+                    "candidate_value_redacted": True,
+                    "schema_type": "integer",
+                },
+            ],
         )
 
     def test_catalog_keeps_only_selected_plugin_and_normalizes_ajax_rest(self) -> None:
@@ -2214,6 +2237,89 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual(result["request_id"], "request-second")
             self.assertEqual([row["name"] for row in result["new_parameters"]], ["title"])
             self.assertEqual(len(result["merged_suggested_seeds"]["suggested_seeds"]), 1)
+
+    def test_build_enrichment_inputs_and_targets_keep_rest_probe_variants_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            form = {
+                "plugin_slug": "demo-plugin",
+                "entrypoint_type": "rest_route",
+                "hook_name": "rest_route:learnpress/v1/items",
+                "callback_id": "rest-items",
+                "route": "/learnpress/v1/items",
+                "namespace": "learnpress/v1",
+                "seed": {
+                    "seed_variant_id": "rest_probe_form_id",
+                    "method": "POST",
+                    "resolved_method": "POST",
+                    "method_status": "resolved",
+                    "path": "/wp-json/learnpress/v1/items",
+                    "body": {"id": 1},
+                    "query_params": {},
+                    "fixed_params": ["id"],
+                    "fuzzable_params": [],
+                    "auth_mode": "unauth-capable",
+                },
+            }
+            jsn = json.loads(json.dumps(form))
+            jsn["seed"]["seed_variant_id"] = "rest_probe_json_id"
+            jsn["seed"]["headers"] = {"Content-Type": "application/json"}
+
+            pass1_summary = {
+                "runs": [
+                    {
+                        "hook_name": form["hook_name"],
+                        "callback_id": form["callback_id"],
+                        "seed_variant_id": "rest_probe_form_id",
+                        "callback_reached": True,
+                        "matched_artifact": "request-form.json",
+                    },
+                    {
+                        "hook_name": jsn["hook_name"],
+                        "callback_id": jsn["callback_id"],
+                        "seed_variant_id": "rest_probe_json_id",
+                        "callback_reached": True,
+                        "matched_artifact": "request-json.json",
+                    },
+                ]
+            }
+            artifacts_dir = root / "artifacts"
+            artifacts_dir.mkdir()
+            (artifacts_dir / "request-form.json").write_text(
+                json.dumps({"request_id": "request-form", "hook_coverage": {"executed_callbacks": {"rest-items": {}}}}),
+                encoding="utf-8",
+            )
+            (artifacts_dir / "request-json.json").write_text(
+                json.dumps({"request_id": "request-json", "hook_coverage": {"executed_callbacks": {"rest-items": {}}}}),
+                encoding="utf-8",
+            )
+
+            raw_copy, matched_artifacts = build_enrichment_inputs(
+                {"suggested_seeds": [form, jsn]},
+                pass1_summary,
+                artifacts_dir,
+                plugin_slug="demo-plugin",
+                legacy_run_id="legacy-1",
+            )
+
+            self.assertEqual(
+                [item["seed"]["seed_variant_id"] for item in raw_copy["suggested_seeds"]],
+                ["rest_probe_form_id", "rest_probe_json_id"],
+            )
+            self.assertEqual(
+                [item["pass1_request_id"] for item in raw_copy["suggested_seeds"]],
+                ["request-form", "request-json"],
+            )
+            self.assertEqual([artifact["request_id"] for artifact in matched_artifacts], ["request-form", "request-json"])
+
+            targets = list_convergence_targets(
+                {"suggested_seeds": [form, jsn]},
+                plugin_slug="demo-plugin",
+                legacy_run_id="legacy-1",
+                generated_summary={"generated": pass1_summary["runs"]},
+            )
+            self.assertEqual(len(targets), 2)
+            self.assertNotEqual(targets[0]["candidate_key"], targets[1]["candidate_key"])
 
     def test_convergence_iteration_does_not_converge_when_known_parameter_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
