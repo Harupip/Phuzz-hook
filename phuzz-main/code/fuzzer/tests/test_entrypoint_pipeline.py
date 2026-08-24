@@ -11,7 +11,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.pipeline import run_entrypoint_pipeline
+from hook_energy.seed_generation.pipeline import _clone_probe_seed_item, run_entrypoint_pipeline
 
 
 def coverage_payload(source_root: Path) -> dict:
@@ -173,6 +173,93 @@ def _section(config: dict, name: str) -> dict:
 
 
 class EntrypointPipelineTests(unittest.TestCase):
+    def test_rest_probe_preserves_fixed_fields_and_selected_transport_only(self) -> None:
+        seed_item = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "rest_route",
+            "hook_name": "rest_route:demo/v1/items",
+            "callback_id": "cb-rest-items",
+            "route": "/items",
+            "namespace": "demo/v1",
+            "seed": {
+                "method": "POST",
+                "resolved_method": "POST",
+                "path": "/wp-json/demo/v1/items",
+                "body": {"action": "finish", "id": "old", "course_id": 7},
+                "query_params": {"rest_route": "/demo/v1/items", "id": "old-query", "lang": "en"},
+                "headers": {"X-Test-Token": "keep", "Content-Type": "application/x-www-form-urlencoded"},
+                "fixed_params": ["action", "course_id"],
+                "fuzzable_params": ["id"],
+                "input_params": [{"name": "id", "location": "form", "fuzzable": True}],
+            },
+        }
+
+        form = _clone_probe_seed_item(
+            seed_item,
+            seed_item["seed"],
+            name="id",
+            probe={
+                "location": "form",
+                "content_type": "application/x-www-form-urlencoded",
+                "schema_type": "integer",
+                "seed_variant_id": "rest_probe_form_id",
+            },
+        )["seed"]
+        json_probe = _clone_probe_seed_item(
+            seed_item,
+            seed_item["seed"],
+            name="id",
+            probe={
+                "location": "json",
+                "content_type": "application/json",
+                "schema_type": "integer",
+                "seed_variant_id": "rest_probe_json_id",
+            },
+        )["seed"]
+
+        self.assertEqual(form["body"], {"action": "finish", "course_id": 7, "id": 1})
+        self.assertEqual(form["query_params"], {"rest_route": "/demo/v1/items", "lang": "en"})
+        self.assertEqual(form["headers"], {"X-Test-Token": "keep", "Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual(set(form["fixed_params"]), {"action", "course_id", "id"})
+
+        json_source = json.loads(json.dumps(seed_item))
+        json_source["seed"]["headers"]["Content-Type"] = "application/json"
+        form_from_json = _clone_probe_seed_item(
+            json_source,
+            json_source["seed"],
+            name="id",
+            probe={
+                "location": "form",
+                "content_type": "application/x-www-form-urlencoded",
+                "schema_type": "integer",
+                "seed_variant_id": "rest_probe_form_id_from_json",
+            },
+        )["seed"]
+        self.assertEqual(form_from_json["headers"], {
+            "X-Test-Token": "keep",
+            "Content-Type": "application/x-www-form-urlencoded",
+        })
+
+        headerless_source = json.loads(json.dumps(seed_item))
+        headerless_source["seed"]["headers"] = {}
+        headerless_form = _clone_probe_seed_item(
+            headerless_source,
+            headerless_source["seed"],
+            name="id",
+            probe={
+                "location": "form",
+                "content_type": "application/x-www-form-urlencoded",
+                "schema_type": "integer",
+                "seed_variant_id": "rest_probe_form_id_headerless",
+            },
+        )["seed"]
+        self.assertEqual(headerless_form["headers"], {})
+
+        self.assertEqual(json_probe["body"], {"action": "finish", "course_id": 7, "id": 1})
+        self.assertEqual(json_probe["query_params"], {"rest_route": "/demo/v1/items", "lang": "en"})
+        self.assertEqual(json_probe["headers"], {"X-Test-Token": "keep", "Content-Type": "application/json"})
+        self.assertEqual(set(json_probe["fixed_params"]), {"action", "course_id", "id"})
+
     def test_pipeline_generates_ajax_rest_get_rest_post_and_skips_ambiguous_rest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

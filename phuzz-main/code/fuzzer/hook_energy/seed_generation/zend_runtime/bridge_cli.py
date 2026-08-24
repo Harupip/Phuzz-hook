@@ -769,14 +769,18 @@ def _block_ambiguous_probe_locations(seed_report: Mapping[str, Any]) -> dict[str
     items = report.get("suggested_seeds")
     if not isinstance(items, list):
         return report
-    grouped: dict[tuple[str, str], dict[str, set[str]]] = {}
+    grouped: dict[tuple[str, str], set[str]] = {}
     for item in items:
         if not isinstance(item, Mapping):
             continue
         seed = item.get("seed")
         if not isinstance(seed, Mapping) or not seed.get("probe_variant"):
             continue
-        key = (str(item.get("hook_name") or ""), str(item.get("callback_id") or ""))
+        identity = _candidate_base_key(
+            item,
+            plugin_slug=str(item.get("plugin_slug") or ""),
+            legacy_run_id="",
+        )
         for param in seed.get("input_params", []):
             if not isinstance(param, Mapping) or param.get("fuzzable") is False:
                 continue
@@ -784,19 +788,65 @@ def _block_ambiguous_probe_locations(seed_report: Mapping[str, Any]) -> dict[str
             location = str(param.get("location") or "")
             if not name or location not in {"form", "json"}:
                 continue
-            grouped.setdefault(key, {}).setdefault(name, set()).add(location)
-    ambiguous = {
-        key for key, names in grouped.items()
-        if any(locations == {"form", "json"} for locations in names.values())
-    }
+            grouped.setdefault((identity, name), set()).add(location)
+    ambiguous = {key for key, locations in grouped.items() if locations == {"form", "json"}}
     if not ambiguous:
         return report
     for item in items:
         if not isinstance(item, Mapping):
             continue
         seed = item.get("seed")
-        key = (str(item.get("hook_name") or ""), str(item.get("callback_id") or ""))
-        if key not in ambiguous or not isinstance(seed, dict):
+        if not isinstance(seed, dict):
+            continue
+        identity = _candidate_base_key(
+            item,
+            plugin_slug=str(item.get("plugin_slug") or ""),
+            legacy_run_id="",
+        )
+        parameter_keys = {
+            (identity, str(param.get("name") or ""))
+            for param in seed.get("input_params", [])
+            if isinstance(param, Mapping)
+            and param.get("fuzzable") is not False
+            and str(param.get("name") or "")
+        }
+        blocked_names = {
+            name for item_identity, name in parameter_keys.intersection(ambiguous)
+            if item_identity == identity
+        }
+        if not blocked_names:
+            continue
+        input_params = seed.get("input_params")
+        if isinstance(input_params, list):
+            updated_input_params: list[Any] = []
+            for param in input_params:
+                if not isinstance(param, Mapping):
+                    updated_input_params.append(param)
+                    continue
+                name = str(param.get("name") or "")
+                if name not in blocked_names:
+                    updated_input_params.append(param)
+                    continue
+                blocked_param = dict(param)
+                blocked_param["fuzzable"] = False
+                blocked_param["block_reason"] = "ambiguous_runtime_probe_location"
+                updated_input_params.append(blocked_param)
+            seed["input_params"] = updated_input_params
+        fuzzable_params = seed.get("fuzzable_params")
+        remaining_fuzzable = [
+            str(name) for name in fuzzable_params
+            if str(name) and str(name) not in blocked_names
+        ] if isinstance(fuzzable_params, list) else []
+        seed["fuzzable_params"] = list(dict.fromkeys(remaining_fuzzable))
+        fixed_params = seed.get("fixed_params") if isinstance(seed.get("fixed_params"), list) else []
+        seed["fixed_params"] = list(dict.fromkeys(
+            [str(name) for name in fixed_params if str(name)] + sorted(blocked_names)
+        ))
+        existing_blocked = seed.get("blocked_parameters") if isinstance(seed.get("blocked_parameters"), list) else []
+        seed["blocked_parameters"] = list(dict.fromkeys(
+            [str(name) for name in existing_blocked if str(name)] + sorted(blocked_names)
+        ))
+        if seed["fuzzable_params"]:
             continue
         seed["export_allowed"] = False
         seed["replay_allowed"] = True

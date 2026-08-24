@@ -406,19 +406,36 @@ def _clone_probe_seed_item(
     location = str(probe.get("location") or "")
     content_type = str(probe.get("content_type") or "")
     candidate_value = _typed_probe_value(probe.get("schema_type"))
-    body = {}
-    query = {}
-    headers = {}
+    body = deepcopy(dict(seed.get("body"))) if isinstance(seed.get("body"), Mapping) else {}
+    query = deepcopy(dict(seed.get("query_params"))) if isinstance(seed.get("query_params"), Mapping) else {}
+    headers = deepcopy(dict(seed.get("headers"))) if isinstance(seed.get("headers"), Mapping) else {}
+    body.pop(name, None)
+    query.pop(name, None)
     if location in {"form", "json"}:
         body[name] = candidate_value
         if location == "json" and content_type:
+            headers = {
+                key: value
+                for key, value in headers.items()
+                if str(key).lower() != "content-type"
+            }
+            headers["Content-Type"] = content_type
+        elif location == "form" and content_type and any(
+            str(key).lower() == "content-type" for key in headers
+        ):
+            headers = {
+                key: value
+                for key, value in headers.items()
+                if str(key).lower() != "content-type"
+            }
             headers["Content-Type"] = content_type
     elif location == "query":
         query[name] = candidate_value
     probe_seed["body"] = body
     probe_seed["query_params"] = query
     probe_seed["headers"] = headers
-    probe_seed["fixed_params"] = [name]
+    fixed_params = seed.get("fixed_params") if isinstance(seed.get("fixed_params"), list) else []
+    probe_seed["fixed_params"] = list(dict.fromkeys([str(value) for value in fixed_params if str(value)] + [name]))
     probe_seed["fuzzable_params"] = []
     probe_seed["input_params"] = []
     probe_seed["export_allowed"] = True

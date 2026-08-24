@@ -2557,6 +2557,115 @@ class ZendDiscoveryTests(unittest.TestCase):
             persisted = json.loads(merged_path.read_text(encoding="utf-8"))
             self.assertEqual({item["seed"]["body"]["id"] for item in persisted["suggested_seeds"]}, {"redacted"})
 
+    def test_combine_final_seed_reports_blocks_only_ambiguous_parameter_in_canonical_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+
+            def probe(
+                route: str,
+                callback_id: str,
+                parameter: str,
+                location: str,
+                variant: str,
+                *,
+                endpoint_definition_index: int = 0,
+                method: str = "POST",
+            ) -> dict:
+                return {
+                    "plugin_slug": "demo-plugin",
+                    "entrypoint_type": "rest_route",
+                    "hook_name": f"rest_route:demo/v1{route}",
+                    "callback_id": callback_id,
+                    "route": route,
+                    "namespace": "demo/v1",
+                    "endpoint_definition_index": endpoint_definition_index,
+                    "generation_status": "rest_schema_parameter_probe",
+                    "probe_request": {"parameter": parameter, "location": location},
+                    "seed": {
+                        "seed_variant_id": variant,
+                        "probe_variant": True,
+                        "method": method,
+                        "resolved_method": method,
+                        "path": f"/wp-json/demo/v1{route}",
+                        "body": {parameter: 1},
+                        "query_params": {},
+                        "headers": {},
+                        "fixed_params": [parameter],
+                        "fuzzable_params": [parameter],
+                        "input_params": [{
+                            "name": parameter,
+                            "location": location,
+                            "source": "JSON" if location == "json" else "POST",
+                            "fuzzable": True,
+                        }],
+                        "auth_mode": "unauth-capable",
+                        "export_allowed": True,
+                        "replay_allowed": True,
+                    },
+                }
+
+            items_form = probe("/items", "cb-items", "id", "form", "items-form-id")
+            items_json = probe("/items", "cb-items", "id", "json", "items-json-id")
+            for item in (items_form, items_json):
+                item["seed"]["fuzzable_params"].append("title")
+                item["seed"]["input_params"].append({
+                    "name": "title",
+                    "location": "query",
+                    "source": "GET",
+                    "fuzzable": True,
+                })
+            index_one_form = probe(
+                "/items",
+                "cb-items",
+                "id",
+                "form",
+                "items-index-one-form-id",
+                endpoint_definition_index=1,
+            )
+            get_form = probe(
+                "/items",
+                "cb-items",
+                "id",
+                "form",
+                "items-get-form-id",
+                method="GET",
+            )
+            reports = [
+                {"suggested_seeds": [items_form]},
+                {"suggested_seeds": [items_json]},
+                {"suggested_seeds": [index_one_form]},
+                {"suggested_seeds": [get_form]},
+            ]
+            paths = []
+            for index, report in enumerate(reports):
+                path = root / f"report-{index}.json"
+                path.write_text(json.dumps(report), encoding="utf-8")
+                paths.append(path)
+
+            combined = combine_final_seed_reports(paths, expected_count=4)
+            by_variant = {
+                item["seed"]["seed_variant_id"]: item
+                for item in combined["suggested_seeds"]
+            }
+
+            self.assertNotEqual(by_variant["items-form-id"]["seed"].get("block_reason"), "ambiguous_runtime_probe_location")
+            self.assertNotEqual(by_variant["items-json-id"]["seed"].get("block_reason"), "ambiguous_runtime_probe_location")
+            self.assertEqual(by_variant["items-form-id"]["seed"]["fuzzable_params"], ["title"])
+            self.assertEqual(by_variant["items-json-id"]["seed"]["fuzzable_params"], ["title"])
+            self.assertTrue(by_variant["items-form-id"]["seed"]["export_allowed"])
+            self.assertTrue(by_variant["items-json-id"]["seed"]["export_allowed"])
+            self.assertEqual(by_variant["items-form-id"]["seed"]["blocked_parameters"], ["id"])
+            self.assertEqual(by_variant["items-json-id"]["seed"]["blocked_parameters"], ["id"])
+            self.assertEqual(
+                {
+                    parameter["name"]: parameter["fuzzable"]
+                    for parameter in by_variant["items-form-id"]["seed"]["input_params"]
+                },
+                {"id": False, "title": True},
+            )
+            self.assertNotEqual(by_variant["items-index-one-form-id"]["seed"].get("block_reason"), "ambiguous_runtime_probe_location")
+            self.assertNotEqual(by_variant["items-get-form-id"]["seed"].get("block_reason"), "ambiguous_runtime_probe_location")
+
     def test_convergence_iteration_does_not_converge_when_known_parameter_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
