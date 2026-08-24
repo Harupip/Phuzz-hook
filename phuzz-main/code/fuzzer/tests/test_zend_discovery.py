@@ -439,6 +439,58 @@ class ZendDiscoveryTests(unittest.TestCase):
                 else:
                     self.assertEqual(evidence, [])
 
+    def test_json_rest_artifact_contract_accepts_complete_and_rejects_lossy_evidence(self) -> None:
+        candidate = self.rest_candidate(method="POST", request_id="rest-id-json-contract")
+        uopz = self.pass1_artifact(
+            candidate,
+            hook_coverage={"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+        )
+        registry = {"schema_version": 1, "callback_map": {"rest-items": "Demo::list_items"}}
+        artifact_json = """{
+          "schema_version": 4,
+          "run_id": "legacy-1",
+          "request_id": "rest-id-json-contract",
+          "request_method": "POST",
+          "target_loading": {
+            "load_status": "loaded",
+            "file_target_count": 1,
+            "loaded_callbacks": ["Demo::list_items"],
+            "target_capacity": 512,
+            "requested_target_count": 1,
+            "duplicate_count": 1,
+            "rejected_count": 0,
+            "capacity_exhausted_count": 0
+          },
+          "event_capacity": 65536,
+          "event_count": 1,
+          "dropped_event_count": 0,
+          "rest_parameter_events": [{
+            "source": "REST",
+            "bucket": "POST",
+            "parameter": "id",
+            "path": ["POST", "id"],
+            "callback": "Demo::list_items",
+            "namespace": "demo/v1",
+            "route_pattern": "/items",
+            "endpoint_definition_index": 0,
+            "materialized_route": "/wp-json/demo/v1/items",
+            "method": "POST",
+            "observed_count": 1
+          }]
+        }"""
+        complete_artifact = json.loads(artifact_json)
+
+        complete_evidence = normalize_runtime_evidence(candidate, uopz, complete_artifact, registry)
+
+        self.assertEqual(
+            [(row["name"], row["location"], row["fuzzable"]) for row in complete_evidence],
+            [("id", "form", True)],
+        )
+
+        lossy_artifact = json.loads(json.dumps({**complete_artifact, "dropped_event_count": 1}))
+
+        self.assertEqual(normalize_runtime_evidence(candidate, uopz, lossy_artifact, registry), [])
+
     def test_nonzero_opcode_event_loss_blocks_final_rest_evidence(self) -> None:
         candidate = self.rest_candidate(method="POST", request_id="rest-id-event-loss")
         uopz = self.pass1_artifact(
