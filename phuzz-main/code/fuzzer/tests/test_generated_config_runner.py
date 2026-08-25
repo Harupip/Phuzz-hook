@@ -773,6 +773,20 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
             script.index("Export-LiveSeedSuggestions"),
         )
 
+    def test_zend_fixture_sends_exact_admin_post_action_request_before_seed_export(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("Invoke-ZendAdminPostFixtureProbe", script)
+        self.assertIn('$PluginSlug -eq "hp-ap"', script)
+        self.assertIn('action = "hookphuzz_admin_post_test"', script)
+        self.assertIn('probe = "fixture_value"', script)
+        self.assertIn('/wp-admin/admin-post.php', script)
+        self.assertLess(
+            script.index("Invoke-ZendAdminPostFixtureProbe"),
+            script.index("Export-LiveSeedSuggestions"),
+        )
+
     def test_zend_discovery_replay_uses_rest_route_fallback_configs(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
         script = script_path.read_text(encoding="utf-8-sig")

@@ -1,5 +1,56 @@
 # Zend Discovery Agent Handoff
 
+## 2026-08-25 LearnPress admin-post proof follow-up
+
+The real-plugin LearnPress proof is still **BLOCKED**, not PASS. Generic
+admin-post fixture coverage, runtime method inference, exact action
+correlation, and the generated POST/callback-replay contracts are passing. The
+current real-plugin run proves only the strict invalid-nonce gate.
+
+### Changes made
+
+- `scripts/wordpress/run-wordpress-phuzz.ps1` selects one active LearnPress
+  `admin_post_*` row from the live runtime registry. The selected row is
+  `admin_post_lp_async_lp_background_single_course`, with fixed action
+  `lp_async_lp_background_single_course` and callback
+  `LP_Background_Single_Course->maybe_handle`.
+- The proof flow sends an exact POST to `/wp-admin/admin-post.php`, first with
+  an invalid nonce sentinel. It then obtains the LearnPress nonce and checks it
+  with the original WordPress `wp_verify_nonce()` in the same user,
+  authentication, salts, and session context before attempting the valid
+  request.
+- `action` and `_nonce` are fixed and excluded from fuzzing. Only a
+  non-nonce parameter path observed in correlated Zend runtime evidence can be
+  injected. Unrelated admin-post candidates remain fail-closed.
+- `web/applications/wordpress/_overrides/99-wordpress.php` keeps nonce
+  overrides disabled in strict mode and records nonce/action/auth context plus
+  attempted callback observation. LearnPress source, REST/convergence, and
+  AJAX logic were not changed.
+- `tests/test_learnpress_admin_post_proof.py` covers the strict contract and
+  negative-control requirements.
+
+### Current evidence
+
+Run: `learnpress-20260825T163219Z`
+
+Artifact:
+`fuzzer/output/seed_generation/zend-bridge/learnpress-20260825T163219Z/learnpress-probes/learnpress-20260825T163219Z-learnpress-invalid-nonce.json`
+
+The artifact records the exact action, authenticated user `1`, authenticated
+context, `nonce_rejected=true`, and `handler_executed=false`. A direct
+WordPress CLI evaluation also returned a real LearnPress nonce and original
+core `wp_verify_nonce()` result `1`. The final proof artifact was not emitted.
+
+### Blocker and next step
+
+The PowerShell nonce-eval helper received no JSON and failed closed before the
+valid callback request. The direct equivalent `docker exec ... wp-cli eval`
+works, so the next investigation is the helper's captured output/type and JSON
+extraction, not LearnPress nonce semantics. Compare those values with the
+working direct command. Do not report PASS until the valid callback is reached,
+one observed parameter path matches, a generated POST config is exported, and
+a fresh final replay succeeds under the original core verifier.
+
 ## 2026-08-24 Runtime CmpLog vertical slice
 
 The current CmpLog implementation is runtime-only and additive to the existing

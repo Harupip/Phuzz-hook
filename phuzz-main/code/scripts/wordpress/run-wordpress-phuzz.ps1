@@ -79,6 +79,9 @@ function New-PluginOverrideFile {
         "      FUZZER_COVERAGE_PATH: /var/www/html/wp-content/plugins/$PluginSlug/"
         "      WP_TARGET_PLUGIN: $PluginSlug"
     )
+    if ($UseZendDiscovery -and $PluginSlug -eq "learnpress") {
+        $content += "      HOOKPHUZZ_STRICT_NONCE_PROOF: 1"
+    }
     if ($UseZendDiscovery) {
         $content += @(
             "    build:"
@@ -160,6 +163,470 @@ function Invoke-ZendRestRouteBootstrap {
     }
 
     throw "Zend REST route bootstrap failed for ${Url}: unexpected HTTP status $($response.StatusCode)"
+}
+
+function Invoke-ZendAdminPostFixtureProbe {
+    param(
+        [string]$Url,
+        [string]$LegacyRunId
+    )
+
+    $requestId = "$LegacyRunId-admin-post-fixture-probe"
+    $headers = @{
+        "X-Fuzzer-Covid" = $requestId
+        "X-HookPhuzz-Request-ID" = $requestId
+        "X-HookPhuzz-Run-ID" = $LegacyRunId
+    }
+    $body = @{
+        action = "hookphuzz_admin_post_test"
+        probe = "fixture_value"
+    }
+    $response = Invoke-WebRequest `
+        -Uri "$Url/wp-admin/admin-post.php" `
+        -Method Post `
+        -Headers $headers `
+        -Body $body `
+        -UseBasicParsing `
+        -TimeoutSec 20
+    if ($response.StatusCode -ne 200) {
+        throw "Zend admin-post fixture probe failed: status=$($response.StatusCode)"
+    }
+}
+
+function Get-WebJson {
+    param(
+        [string[]]$ComposeArgs,
+        [string]$ContainerPath
+    )
+
+    $raw = & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] exec -T web cat $ContainerPath 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($raw -join "`n"))) {
+        throw "Could not read JSON artifact from web container: $ContainerPath"
+    }
+    return (($raw -join "`n") | ConvertFrom-Json)
+}
+
+function Get-LearnPressRuntimeAdminPostCandidate {
+    param([string[]]$ComposeArgs)
+
+    $coverage = Get-WebJson -ComposeArgs $ComposeArgs -ContainerPath "/shared-tmpfs/hook-coverage/total_coverage.json"
+    $registered = @($coverage.data.registered_callbacks.PSObject.Properties | ForEach-Object { $_.Value })
+    $preferredHooks = @(
+        "admin_post_lp_async_lp_background_single_course",
+        "admin_post_lp_async_lp_background_single_email",
+        "admin_post_lp_async_lp_background_single_thim_cache"
+    )
+    foreach ($hookName in $preferredHooks) {
+        $action = $hookName.Substring("admin_post_".Length)
+        $match = $registered |
+            Where-Object {
+                $_.hook_name -eq $hookName -and
+                $_.is_active -eq $true -and
+                $_.source_file -like "*/plugins/learnpress/*"
+            } |
+            Select-Object -First 1
+        if ($match) {
+            return [pscustomobject]@{
+                action = $action
+                hook_name = [string]$match.hook_name
+                callback_id = [string]$match.callback_id
+                callback_repr = [string]$match.callback_repr
+                source_file = [string]$match.source_file
+                auth_mode = "authenticated"
+            }
+        }
+    }
+    throw "LearnPress admin-post proof blocked: no preferred authenticated action is registered in the current runtime registry."
+}
+
+function Invoke-LearnPressHttpProbe {
+    param(
+        [string]$Url,
+        [string]$LegacyRunId,
+        [string]$RequestId,
+        [hashtable]$Body
+    )
+
+    $headers = @{
+        "X-Fuzzer-Covid" = $RequestId
+        "X-HookPhuzz-Request-ID" = $RequestId
+        "X-HookPhuzz-Run-ID" = $LegacyRunId
+    }
+    try {
+        $response = Invoke-WebRequest `
+            -Uri "$Url/wp-admin/admin-post.php" `
+            -Method Post `
+            -Headers $headers `
+            -Body $Body `
+            -UseBasicParsing `
+            -TimeoutSec 30
+        return [pscustomobject]@{
+            status_code = [int]$response.StatusCode
+            error = $null
+        }
+    } catch {
+        $statusCode = $null
+        if ($_.Exception.Response) {
+            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+        }
+        return [pscustomobject]@{
+            status_code = $statusCode
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Copy-WebRequestArtifact {
+    param(
+        [string[]]$ComposeArgs,
+        [string]$RequestId,
+        [string]$OutputPath
+    )
+
+    $names = & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] exec -T web sh -lc "find /shared-tmpfs/hook-coverage/requests -maxdepth 1 -type f -printf '%f\n'" 2>$null
+    foreach ($name in @($names)) {
+        $name = [string]$name
+        if (-not $name.EndsWith(".json")) { continue }
+        $raw = & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] exec -T web cat "/shared-tmpfs/hook-coverage/requests/$name" 2>$null
+        if ($LASTEXITCODE -ne 0) { continue }
+        try { $artifact = (($raw -join "`n") | ConvertFrom-Json) } catch { continue }
+        if ([string]$artifact.request_id -eq $RequestId) {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $OutputPath) -Force | Out-Null
+            ($raw -join "`n") | Set-Content -LiteralPath $OutputPath -Encoding UTF8
+            return $artifact
+        }
+    }
+    throw "LearnPress admin-post proof blocked: request artifact not found for $RequestId"
+}
+
+function Read-WebNonceProofArtifact {
+    param(
+        [string[]]$ComposeArgs,
+        [string]$RequestId
+    )
+
+    $path = "/shared-tmpfs/hook-coverage/nonce-proof/$RequestId.json"
+    $raw = & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] exec -T web cat $path 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($raw -join "`n"))) {
+        throw "LearnPress admin-post proof blocked: nonce gate did not record $RequestId"
+    }
+    return (($raw -join "`n") | ConvertFrom-Json)
+}
+
+function Get-LearnPressCallbackExecution {
+    param(
+        [object]$Artifact,
+        [object]$Candidate,
+        [string]$RequestId
+    )
+
+    $executed = @($Artifact.hook_coverage.executed_callbacks.PSObject.Properties | ForEach-Object { $_.Value })
+    return $executed |
+        Where-Object {
+            $_.callback_id -eq $Candidate.callback_id -and
+            $_.hook_name -eq $Candidate.hook_name -and
+            $_.fired_hook -eq $Candidate.hook_name -and
+            $_.callback_repr -eq $Candidate.callback_repr -and
+            $_.endpoint -eq "ADMIN_POST:$($Candidate.action)" -and
+            $_.request_id -eq $RequestId -and
+            $_.http_method -eq "POST"
+        } |
+        Select-Object -First 1
+}
+
+function Get-LearnPressObservedParameter {
+    param(
+        [object]$Artifact,
+        [object]$Candidate
+    )
+
+    $summary = @($Artifact.callback_summaries) |
+        Where-Object { $_.callback -eq $Candidate.callback_repr } |
+        Select-Object -First 1
+    if (-not $summary) { return $null }
+    return @($summary.unique_parameters) |
+        Where-Object {
+            $_.source -eq "POST" -and
+            @($_.path).Count -gt 0 -and
+            (@($_.path)[0] -notmatch "^(action|_nonce|nonce|token|cookie|secret|password|authorization)$")
+        } |
+        Select-Object -First 1
+}
+
+function Convert-LearnPressParameterName {
+    param([object]$Parameter)
+
+    $path = @($Parameter.path | ForEach-Object { [string]$_ })
+    if ($path.Count -eq 1) { return $path[0] }
+    $name = $path[0]
+    foreach ($part in $path[1..($path.Count - 1)]) { $name += "[$part]" }
+    return $name
+}
+
+function Invoke-LearnPressNonceEval {
+    param(
+        [string[]]$ComposeArgs,
+        [string]$NonceAction,
+        [object]$Candidate
+    )
+
+    if ($NonceAction -notmatch '^[A-Za-z0-9_.:-]+$') {
+        throw "LearnPress admin-post proof blocked: nonce action contains unsafe characters."
+    }
+    $callbackClass = ([string]$Candidate.callback_repr -split '->', 2)[0]
+    if ($callbackClass -notmatch '^[A-Za-z_][A-Za-z0-9_\\]*$') {
+        throw "LearnPress admin-post proof blocked: runtime callback class is unsafe."
+    }
+    $eval = '$action = (string) getenv("HOOKPHUZZ_NONCE_ACTION"); $core_nonce = wp_create_nonce($action); $ref = new ReflectionClass((string) getenv("HOOKPHUZZ_CALLBACK_CLASS")); $instance_method = $ref->getMethod("instance"); $instance_method->setAccessible(true); $instance = $instance_method->invoke(null); $nonce_method = $ref->getMethod("create_async_nonce"); $nonce_method->setAccessible(true); echo wp_json_encode(array("learnpress_nonce" => $nonce_method->invoke($instance), "core_nonce" => $core_nonce, "verification_result" => wp_verify_nonce($core_nonce, $action), "authenticated_user_id" => (int) get_current_user_id(), "authenticated" => (bool) is_user_logged_in(), "session_token_present" => wp_get_session_token() !== ""));'
+    $webContainerId = (& docker compose -f docker-compose.yml ps -q web).Trim()
+    if ([string]::IsNullOrWhiteSpace($webContainerId)) {
+        throw "LearnPress admin-post proof blocked: web container ID is unavailable for nonce eval."
+    }
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $raw = & docker exec -e HOOKPHUZZ_STRICT_NONCE_PROOF=1 -e "HOOKPHUZZ_NONCE_ACTION=$NonceAction" -e "HOOKPHUZZ_CALLBACK_CLASS=$callbackClass" $webContainerId /var/www/html/wp-cli.phar eval --allow-root $eval 2>&1
+        $evalExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($evalExitCode -ne 0) {
+        throw "LearnPress admin-post proof blocked: original WordPress nonce eval failed."
+    }
+    $rawText = ($raw | ForEach-Object { [string]$_ }) -join "`n"
+    $jsonMatch = [regex]::Match($rawText, '(?m)^\s*(\{.*\})\s*$')
+    if (-not $jsonMatch.Success) {
+        throw "LearnPress admin-post proof blocked: nonce eval returned no JSON."
+    }
+    return ($jsonMatch.Groups[1].Value | ConvertFrom-Json)
+}
+
+function Invoke-ZendLearnPressAdminPostProof {
+    param(
+        [string]$Url,
+        [string]$ScriptRoot,
+        [string]$LegacyRunId,
+        [string[]]$ComposeArgs
+    )
+
+    $seedOutputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
+    $bridgeWorkDir = Join-Path (Join-Path $seedOutputDir "zend-bridge") $LegacyRunId
+    $probeDir = Join-Path $bridgeWorkDir "learnpress-probes"
+    New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+    $attempts = New-Object System.Collections.Generic.List[object]
+    $candidate = Get-LearnPressRuntimeAdminPostCandidate -ComposeArgs $ComposeArgs
+
+    $invalidId = "$LegacyRunId-learnpress-invalid-nonce"
+    $invalidResult = Invoke-LearnPressHttpProbe -Url $Url -LegacyRunId $LegacyRunId -RequestId $invalidId -Body @{ action = $candidate.action; _nonce = "hookphuzz-invalid-nonce-sentinel" }
+    $invalidArtifactPath = Join-Path $probeDir "$invalidId.json"
+    $invalidArtifact = Copy-WebRequestArtifact -ComposeArgs $ComposeArgs -RequestId $invalidId -OutputPath $invalidArtifactPath
+    $invalidExecution = Get-LearnPressCallbackExecution -Artifact $invalidArtifact -Candidate $candidate -RequestId $invalidId
+    $nonceFailure = Read-WebNonceProofArtifact -ComposeArgs $ComposeArgs -RequestId $invalidId
+    if ($nonceFailure.handler_executed -eq $true -or $nonceFailure.nonce_rejected -ne $true) {
+        throw "LearnPress admin-post proof blocked: invalid nonce reached the LearnPress handler."
+    }
+    $nonceAction = [string]$nonceFailure.nonce_action
+    $nonceEval = Invoke-LearnPressNonceEval -ComposeArgs $ComposeArgs -NonceAction $nonceAction -Candidate $candidate
+    if ([int]$nonceEval.verification_result -notin @(1, 2)) {
+        throw "LearnPress admin-post proof blocked: original wp_verify_nonce result was $($nonceEval.verification_result)."
+    }
+    if ([int]$nonceEval.authenticated_user_id -ne [int]$nonceFailure.authenticated_user_id -or [bool]$nonceEval.authenticated -ne [bool]$nonceFailure.authenticated) {
+        throw "LearnPress admin-post proof blocked: nonce mint and HTTP verification contexts differ."
+    }
+    $nonce = [string]$nonceEval.learnpress_nonce
+
+    $validId = "$LegacyRunId-learnpress-valid-nonce"
+    $validResult = Invoke-LearnPressHttpProbe -Url $Url -LegacyRunId $LegacyRunId -RequestId $validId -Body @{ action = $candidate.action; _nonce = $nonce }
+    $validArtifactPath = Join-Path $probeDir "$validId.json"
+    $validArtifact = Copy-WebRequestArtifact -ComposeArgs $ComposeArgs -RequestId $validId -OutputPath $validArtifactPath
+    $validExecution = Get-LearnPressCallbackExecution -Artifact $validArtifact -Candidate $candidate -RequestId $validId
+    $validNonceProof = Read-WebNonceProofArtifact -ComposeArgs $ComposeArgs -RequestId $validId
+    if (-not $validExecution -or $validNonceProof.handler_executed -ne $true) {
+        throw "LearnPress admin-post proof blocked: valid nonce did not reach $($candidate.callback_repr)."
+    }
+    $observedParameter = Get-LearnPressObservedParameter -Artifact $validArtifact -Candidate $candidate
+    $parameterId = $validId
+    $parameterArtifactPath = $validArtifactPath
+    $parameterArtifact = $validArtifact
+    $parameterResult = $validResult
+    if ($observedParameter) {
+        $parameterName = Convert-LearnPressParameterName -Parameter $observedParameter
+        $parameterId = "$LegacyRunId-learnpress-valid-parameter"
+        $parameterBody = @{ action = $candidate.action; _nonce = $nonce }
+        $parameterBody[$parameterName] = "hookphuzz-probe"
+        $parameterResult = Invoke-LearnPressHttpProbe -Url $Url -LegacyRunId $LegacyRunId -RequestId $parameterId -Body $parameterBody
+        $parameterArtifactPath = Join-Path $probeDir "$parameterId.json"
+        $parameterArtifact = Copy-WebRequestArtifact -ComposeArgs $ComposeArgs -RequestId $parameterId -OutputPath $parameterArtifactPath
+        if (-not (Get-LearnPressCallbackExecution -Artifact $parameterArtifact -Candidate $candidate -RequestId $parameterId)) {
+            throw "LearnPress admin-post proof blocked: discovered parameter request did not reach target callback."
+        }
+    }
+    if (-not $observedParameter) {
+        throw "LearnPress admin-post proof blocked: no callback-attributed POST parameter was observed after nonce validation."
+    }
+
+    $proofPath = Join-Path $seedOutputDir "learnpress-admin-post-nonce-proof.json"
+    $proof = [ordered]@{
+        schema_version = 1
+        plugin_slug = "learnpress"
+        registered = 1
+        direct_http_candidate = 1
+        method = "POST"
+        endpoint = "/wp-admin/admin-post.php"
+        action = $candidate.action
+        hook_name = $candidate.hook_name
+        callback_id = $candidate.callback_id
+        callback_repr = $candidate.callback_repr
+        auth_mode = "authenticated"
+        authenticated_user_id = [int]$nonceEval.authenticated_user_id
+        authenticated_context = [ordered]@{
+            is_user_logged_in = [bool]$nonceEval.authenticated
+            user_id = [int]$nonceEval.authenticated_user_id
+            session_token_present = [bool]$nonceEval.session_token_present
+            cookies_sent = @()
+        }
+        nonce_action = $nonceAction
+        nonce_field = "_nonce"
+        nonce_value_sha256 = $null
+        strict_nonce_mode = $true
+        original_wp_verify_nonce = $true
+        verification_result = [int]$nonceEval.verification_result
+        core_nonce_value_sha256 = $null
+        learnpress_nonce_gate = "custom_verify_async_nonce"
+        invalid_probe = [ordered]@{
+            request_id = $invalidId
+            nonce = "hookphuzz-invalid-nonce-sentinel"
+            nonce_rejected = $true
+            callback_reached = $false
+            callback_hook_dispatched = [bool]$invalidExecution
+            handler_executed = [bool]$nonceFailure.handler_executed
+            response_status = $invalidResult.status_code
+            artifact = $invalidArtifactPath
+            nonce_artifact = "/shared-tmpfs/hook-coverage/nonce-proof/$invalidId.json"
+        }
+        valid_probe = [ordered]@{
+            request_id = $parameterId
+            callback_reached = $true
+            action_correlation_exact = $true
+            parameter_path = @($observedParameter.path)
+            parameter_source = [string]$observedParameter.source
+            parameter_path_matched = $true
+            handler_executed = [bool]$validNonceProof.handler_executed
+            response_status = $parameterResult.status_code
+            artifact = $parameterArtifactPath
+        }
+        fixed_params = @("action", "_nonce")
+        fuzzable_params = @()
+        final_replay = [ordered]@{ status = "pending" }
+        attempts = @($attempts)
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $nonceHash = (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes([string]$nonceEval.learnpress_nonce)) | ForEach-Object { $_.ToString("x2") }) -join "")
+        $coreNonceHash = (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes([string]$nonceEval.core_nonce)) | ForEach-Object { $_.ToString("x2") }) -join "")
+    } finally {
+        $sha.Dispose()
+    }
+    $proof.nonce_value_sha256 = $nonceHash
+    $proof.core_nonce_value_sha256 = $coreNonceHash
+    $proof | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $proofPath -Encoding UTF8
+    return [pscustomobject]@{
+        proof_path = $proofPath
+        action = $candidate.action
+        hook_name = $candidate.hook_name
+        callback_id = $candidate.callback_id
+        nonce = [string]$nonceEval.learnpress_nonce
+        nonce_action = $nonceAction
+        parameter_name = Convert-LearnPressParameterName -Parameter $observedParameter
+    }
+}
+
+function Add-LearnPressNonceToSuggestedSeeds {
+    param(
+        [string]$SuggestedSeedsPath,
+        [object]$Proof
+    )
+
+    $document = Get-Content -LiteralPath $SuggestedSeedsPath -Raw | ConvertFrom-Json
+    $matches = @($document.suggested_seeds | Where-Object { $_.hook_name -eq $Proof.hook_name -and $_.callback_id -eq $Proof.callback_id })
+    if ($matches.Count -ne 1) {
+        throw "LearnPress admin-post proof blocked: exact runtime target seed count was $($matches.Count)."
+    }
+    $seed = $matches[0].seed
+    $seed.method = "POST"
+    $seed.method_status = "resolved"
+    $seed.method_confidence = "runtime_observed"
+    $seed.method_source = "runtime_observed"
+    $seed.resolved_method = "POST"
+    $seed.path = "/wp-admin/admin-post.php"
+    $seed.auth_mode = "authenticated"
+    if (-not $seed.body) {
+        $seed | Add-Member -NotePropertyName "body" -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    $seed.body.action = $Proof.action
+    $seed.body._nonce = $Proof.nonce
+    $seed.body[$Proof.parameter_name] = "hookphuzz-probe"
+    $seed.fixed_params = @($seed.fixed_params + @("action", "_nonce") | Select-Object -Unique)
+    $seed.fuzzable_params = @((@($seed.fuzzable_params) + @($Proof.parameter_name)) | Where-Object { $_ -and $_ -notin @("action", "_nonce") } | Select-Object -Unique)
+    $seed.input_params = @($seed.input_params | Where-Object { $_.name -notin @("action", "_nonce") })
+    $seed.nonce_action = $Proof.nonce_action
+    $seed.nonce_context = "authenticated_user_$($Proof.callback_id)"
+    $document | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $SuggestedSeedsPath -Encoding UTF8
+}
+
+function Write-LearnPressFinalProof {
+    param(
+        [string]$ProofPath,
+        [string]$SuggestedSeedsPath,
+        [string]$ConfigSummaryPath,
+        [string]$RunSummaryPath
+    )
+
+    $proof = Get-Content -LiteralPath $ProofPath -Raw | ConvertFrom-Json
+    $seeds = Get-Content -LiteralPath $SuggestedSeedsPath -Raw | ConvertFrom-Json
+    $targetSeed = @($seeds.suggested_seeds | Where-Object { $_.hook_name -eq $proof.hook_name -and $_.callback_id -eq $proof.callback_id }) | Select-Object -First 1
+    $summary = Get-Content -LiteralPath $ConfigSummaryPath -Raw | ConvertFrom-Json
+    $generated = @($summary.generated | Where-Object { $_.hook_name -eq $proof.hook_name -and $_.callback_id -eq $proof.callback_id })
+    if ($generated.Count -ne 1) { throw "LearnPress admin-post proof blocked: final generated config count was $($generated.Count)." }
+    $config = Get-Content -LiteralPath $generated[0].config_path -Raw | ConvertFrom-Json
+    $run = Get-Content -LiteralPath $RunSummaryPath -Raw | ConvertFrom-Json
+    $runRow = @($run.runs | Where-Object { $_.hook_name -eq $proof.hook_name -and $_.callback_id -eq $proof.callback_id }) | Select-Object -First 1
+    $fixed = @($config.body_params.fixed)
+    $fuzz = @($config.body_params.fuzz)
+    if ($fixed -notcontains "action" -or $fixed -notcontains "_nonce" -or $fuzz.Count -lt 1) {
+        throw "LearnPress admin-post proof blocked: final config did not keep action/_nonce fixed with a fuzzable observed parameter."
+    }
+    if (-not $runRow -or $runRow.callback_reached -ne $true) {
+        throw "LearnPress admin-post proof blocked: final replay did not reach the exact callback."
+    }
+    $unrelated = @($seeds.suggested_seeds | Where-Object { $_.hook_name -match '^admin_post(_nopriv)?_' -and $_.hook_name -ne $proof.hook_name -and $_.generation_status -eq "ambiguous_http_method" })
+    $proof.fixed_params = @("action", "_nonce")
+    $proof.fuzzable_params = @($fuzz)
+    $proof.generated_config = 1
+    $proof.final_replay = [ordered]@{
+        status = "PASS"
+        callback_reached = $true
+        matched_artifact = [string]$runRow.matched_artifact
+        config_path = [string]$generated[0].config_path
+        method = "POST"
+        action_correlation_exact = $true
+        parameter_path_matched = $true
+        strict_nonce_mode = $proof.strict_nonce_mode
+    }
+    $proof.unrelated_admin_post_fail_closed = ($unrelated.Count -ge 1)
+    $proof.acceptance = [ordered]@{
+        registered = 1
+        direct_http_candidate = 1
+        generated_config = 1
+        method = "POST"
+        action_correlation_exact = $true
+        nonce_auth_recorded = $true
+        callback_reached = $true
+        parameter_path_matched = $true
+        final_replay = "PASS"
+        unrelated_admin_post_fail_closed = ($unrelated.Count -ge 1)
+    }
+    $proof | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $ProofPath -Encoding UTF8
 }
 
 function Export-LiveSeedSuggestions {
@@ -911,6 +1378,7 @@ function Invoke-ZendConvergence {
 Push-Location $scriptRoot
 $overridePath = $null
 $legacyRunId = ""
+$learnPressProof = $null
 if ($UseZendDiscovery) {
     $safePluginSlug = ($PluginSlug -replace "[^A-Za-z0-9._-]", "-").Trim("-")
     $legacyRunId = $safePluginSlug + "-" + (Get-Date -Format "yyyyMMddTHHmmssZ")
@@ -956,9 +1424,25 @@ try {
 
     if ($UseZendDiscovery) {
         Invoke-ZendRestRouteBootstrap -Url "http://localhost:8080/?rest_route=/"
+        if ($PluginSlug -eq "hp-ap") {
+            Invoke-ZendAdminPostFixtureProbe -Url "http://localhost:8080" -LegacyRunId $legacyRunId
+        }
+        if ($PluginSlug -eq "learnpress") {
+            $learnPressProof = Invoke-ZendLearnPressAdminPostProof `
+                -Url "http://localhost:8080" `
+                -ScriptRoot $scriptRoot `
+                -LegacyRunId $legacyRunId `
+                -ComposeArgs $composeArgs
+            Write-Host "LearnPress admin-post nonce proof: $($learnPressProof.proof_path)"
+        }
     }
 
     Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug -UseEntrypointPipeline:$UseEntrypointPipeline -RuntimeParametersOnly:$UseZendDiscovery
+    if ($learnPressProof) {
+        Add-LearnPressNonceToSuggestedSeeds `
+            -SuggestedSeedsPath (Join-Path $scriptRoot "fuzzer\output\seed_generation\suggested_seeds.json") `
+            -Proof $learnPressProof
+    }
     if (-not $UseEntrypointPipeline) {
         Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug
     }
@@ -1100,6 +1584,14 @@ try {
                     -Pass2RunSummary $generatedRunSummary `
                     -ComposeArgs $composeArgs
             }
+        }
+
+        if ($learnPressProof -and $zendFinalConfigSummary -and $zendFinalRunSummary) {
+            Write-LearnPressFinalProof `
+                -ProofPath $learnPressProof.proof_path `
+                -SuggestedSeedsPath (Join-Path $seedOutputDir "suggested_seeds.json") `
+                -ConfigSummaryPath $zendFinalConfigSummary `
+                -RunSummaryPath $zendFinalRunSummary
         }
 
         if ($UseZendDiscovery -and $zendRetentionReady) {

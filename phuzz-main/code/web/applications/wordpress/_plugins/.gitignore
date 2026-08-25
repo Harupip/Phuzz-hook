@@ -1,3 +1,4 @@
 *.zip
 !hookphuzz-rest-get-param-fixture.zip
+!hp-ap.zip
 */

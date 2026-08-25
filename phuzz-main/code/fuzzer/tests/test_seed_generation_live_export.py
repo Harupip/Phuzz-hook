@@ -149,6 +149,75 @@ def build_rest_probe_payload(source_root: Path, *, schema_name: str = "id", sche
 
 
 class SeedGeneratorTests(unittest.TestCase):
+    def test_zend_runtime_generator_uses_exact_admin_post_runtime_probe_evidence(self) -> None:
+        payload = build_live_coverage_payload()
+        payload["data"]["registered_callbacks"].update({
+            "cb-admin-post": {
+                "callback_id": "cb-admin-post",
+                "hook_name": "admin_post_hookphuzz_admin_post_test",
+                "callback_repr": "hookphuzz_admin_post_test",
+                "source_file": "/var/www/html/wp-content/plugins/hp-ap/hp-ap.php",
+                "request_id": "registration-request",
+                "is_active": True,
+            },
+            "cb-ambiguous": {
+                "callback_id": "cb-ambiguous",
+                "hook_name": "admin_post_unrelated_action",
+                "callback_repr": "unrelated_admin_post",
+                "source_file": "/var/www/html/wp-content/plugins/hp-ap/hp-ap.php",
+                "is_active": True,
+            },
+        })
+        payload["data"]["executed_callbacks"]["cb-admin-post"] = {
+            "callback_id": "cb-admin-post",
+            "hook_name": "admin_post_hookphuzz_admin_post_test",
+            "fired_hook": "admin_post_hookphuzz_admin_post_test",
+            "callback_repr": "hookphuzz_admin_post_test",
+            "executed_count": 1,
+            "request_id": "admin-post-fixture-probe",
+            "http_method": "POST",
+            "target_plugin": "hp-ap",
+            "endpoint": "ADMIN_POST:hookphuzz_admin_post_test",
+        }
+
+        _, seed_report = ZendRuntimeSeedGenerator().build_reports(payload)
+        by_hook = {row["hook_name"]: row for row in seed_report["suggested_seeds"]}
+
+        fixture = by_hook["admin_post_hookphuzz_admin_post_test"]
+        self.assertEqual(fixture["seed"]["method"], "POST")
+        self.assertEqual(fixture["seed"]["body"], {"action": "hookphuzz_admin_post_test"})
+        self.assertEqual(fixture["seed"]["method_source"], "runtime_observed")
+        self.assertEqual(by_hook["admin_post_unrelated_action"]["generation_status"], "ambiguous_http_method")
+        self.assertIsNone(by_hook["admin_post_unrelated_action"]["seed"]["method"])
+
+    def test_zend_runtime_generator_rejects_mismatched_admin_post_action_evidence(self) -> None:
+        payload = build_live_coverage_payload()
+        payload["data"]["registered_callbacks"]["cb-admin-post"] = {
+            "callback_id": "cb-admin-post",
+            "hook_name": "admin_post_hookphuzz_admin_post_test",
+            "callback_repr": "hookphuzz_admin_post_test",
+            "source_file": "/var/www/html/wp-content/plugins/hp-ap/hp-ap.php",
+            "is_active": True,
+        }
+        payload["data"]["executed_callbacks"]["cb-admin-post"] = {
+            "callback_id": "cb-admin-post",
+            "hook_name": "admin_post_hookphuzz_admin_post_test",
+            "fired_hook": "admin_post_other_action",
+            "callback_repr": "hookphuzz_admin_post_test",
+            "executed_count": 1,
+            "request_id": "admin-post-fixture-probe",
+            "http_method": "POST",
+            "target_plugin": "hp-ap",
+            "endpoint": "ADMIN_POST:other_action",
+        }
+
+        _, seed_report = ZendRuntimeSeedGenerator().build_reports(payload)
+
+        self.assertNotIn(
+            "admin_post_hookphuzz_admin_post_test",
+            {row["hook_name"] for row in seed_report["suggested_seeds"]},
+        )
+
     def test_zend_runtime_generator_is_source_free(self) -> None:
         runtime_source = (
             Path(__file__).resolve().parents[1]

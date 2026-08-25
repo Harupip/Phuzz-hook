@@ -125,6 +125,44 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual(row["canonical_callback"], "Demo::fetch")
             self.assertEqual(row["request_method"], "POST")
 
+    def test_admin_post_probe_is_retained_as_correlated_post_runtime_evidence(self) -> None:
+        candidate = {
+            **self.pass1_candidate(),
+            "entrypoint_type": "admin-post",
+            "action": "hookphuzz_admin_post_test",
+            "callback_id": "admin-post-fixture",
+            "auth_mode": "authenticated",
+        }
+        uopz = self.pass1_artifact(candidate, auth_variant="authenticated")
+        uopz["hook_coverage"] = {
+            "executed_callbacks": {"admin-post-fixture": {"callback_id": "admin-post-fixture"}}
+        }
+        registry = {
+            "schema_version": 1,
+            "callback_map": {"admin-post-fixture": "hookphuzz_admin_post_test"},
+        }
+        zend = {
+            "run_id": "legacy-1",
+            "request_id": "pass1-1",
+            "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{
+                "callback": "hookphuzz_admin_post_test",
+                "unique_parameters": [
+                    {"source": "POST", "path": ["probe"], "helper_depth": 0, "observed_count": 1},
+                ],
+            }],
+        }
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["name"], "probe")
+        self.assertEqual(evidence[0]["path"], ["probe"])
+        self.assertEqual(evidence[0]["source"], "POST")
+        self.assertEqual(evidence[0]["location"], "form")
+        self.assertTrue(evidence[0]["fuzzable"])
+
     def test_normalize_runtime_evidence_maps_request_to_post_form(self) -> None:
         candidate = self.pass1_candidate()
         uopz = self.pass1_artifact(
@@ -1884,6 +1922,19 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertNotIn("isset($_POST", source)
         with zipfile.ZipFile(plugin_zip) as archive:
             archived = archive.read("hookphuzz-entrypoint-direct-fixture/hookphuzz-entrypoint-direct-fixture.php").decode("utf-8")
+        self.assertEqual(archived.replace("\r\n", "\n"), source.replace("\r\n", "\n"))
+
+    def test_admin_post_fixture_is_packaged_with_one_direct_post_read(self) -> None:
+        fixture = FUZZER_DIR / "tests" / "fixtures" / "hp-ap" / "hp-ap.php"
+        source = fixture.read_text(encoding="utf-8")
+        plugin_zip = FUZZER_DIR.parent / "web" / "applications" / "wordpress" / "_plugins" / "hp-ap.zip"
+
+        self.assertEqual(source.count("add_action("), 1)
+        self.assertIn("admin_post_hookphuzz_admin_post_test", source)
+        self.assertEqual(source.count('$_POST["probe"]'), 1)
+        self.assertNotIn("admin_post_nopriv_", source)
+        with zipfile.ZipFile(plugin_zip) as archive:
+            archived = archive.read("hp-ap/hp-ap.php").decode("utf-8")
         self.assertEqual(archived.replace("\r\n", "\n"), source.replace("\r\n", "\n"))
 
     def test_rest_get_param_fixture_is_packaged_with_search_only_callback(self) -> None:
