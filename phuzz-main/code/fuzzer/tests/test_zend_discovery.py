@@ -2278,7 +2278,9 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual(result["status"], "CONTINUE")
             self.assertEqual(result["request_id"], "request-0")
             self.assertEqual([row["name"] for row in result["new_parameters"]], ["name"])
-            self.assertEqual(result["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]["body"]["name"], "FUZZ")
+            merged_seed = result["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]
+            self.assertNotIn("name", merged_seed["body"])
+            self.assertEqual(merged_seed["fuzzable_params"], [])
 
     def test_convergence_iteration_filters_multi_candidate_input_by_candidate_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

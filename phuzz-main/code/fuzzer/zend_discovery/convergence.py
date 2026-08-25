@@ -143,7 +143,12 @@ def _accepted_patch(row: Mapping[str, Any], candidate: Mapping[str, Any]) -> Map
     return patch
 
 
-def _apply_patch(raw_item: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[str, Any]:
+def _apply_patch(
+    raw_item: Mapping[str, Any],
+    patch: Mapping[str, Any],
+    *,
+    for_replay: bool = False,
+) -> dict[str, Any]:
     item = deepcopy(dict(raw_item))
     seed = item.get("seed")
     if not isinstance(seed, dict):
@@ -164,6 +169,8 @@ def _apply_patch(raw_item: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[
     seed["export_allowed"] = True
     seed["replay_allowed"] = True
     seed.pop("block_reason", None)
+    if for_replay:
+        return item
     fuzzable_parameters = _effective_fuzzable_parameters(seed, patch["fuzzable_parameters"])
     seed["fuzzable_params"] = []
     seed["input_params"] = []
@@ -252,8 +259,13 @@ def materialize_convergence_seeds(
     plugin_slug: str,
     candidate_key: str,
     known_parameters: list[Mapping[str, Any]],
+    for_replay: bool = False,
 ) -> dict[str, Any]:
-    """Materialize one candidate from direct Zend runtime observations only."""
+    """Materialize one candidate from direct Zend runtime observations only.
+
+    Convergence replays keep the raw request values so branch-dependent reads
+    remain reachable; final materialization applies the fuzz markers.
+    """
     raw_items = raw_report.get("suggested_seeds", [])
     if not isinstance(raw_items, list):
         raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
@@ -299,6 +311,7 @@ def materialize_convergence_seeds(
                     "canonical_callback": callback,
                     "fuzzable_parameters": parameters,
                 },
+                for_replay=for_replay,
             ) if parameters else deepcopy(dict(raw_item))
         )
     if len(materialized) != 1:

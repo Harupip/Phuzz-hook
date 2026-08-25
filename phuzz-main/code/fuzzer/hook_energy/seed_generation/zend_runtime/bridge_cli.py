@@ -364,13 +364,16 @@ def converge_iteration(
         raise ValueError("convergence state known_parameters must be a list")
     advanced = advance_convergence_state(prior, observed)
     missing = _missing_known_parameters(prior, observed)
+    status = "REPLAY_FAILED" if missing else "CONVERGED" if not advanced["new_parameters"] else "CONTINUE"
+    seed = raw_item.get("seed")
+    is_probe_variant = isinstance(seed, Mapping) and seed.get("probe_variant") is True
     merged = materialize_convergence_seeds(
         raw_for_iteration,
         plugin_slug=plugin_slug,
         candidate_key=base_candidate_key,
         known_parameters=advanced["known_parameters"],
+        for_replay=status == "CONTINUE" and not is_probe_variant,
     )
-    status = "REPLAY_FAILED" if missing else "CONVERGED" if not advanced["new_parameters"] else "CONTINUE"
     return {
         "status": status,
         "legacy_run_id": legacy_run_id,
