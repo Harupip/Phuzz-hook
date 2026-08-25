@@ -8,18 +8,20 @@ from .engine import candidate_from_seed_item, canonical_identity, canonical_iden
 
 
 _DIRECT_SOURCES = {"GET", "POST"}
-_REST_SOURCES = {"REST_QUERY", "REST_FORM", "REST_JSON"}
+_REST_SOURCES = {"REST_QUERY", "REST_FORM", "REST_JSON", "REST_URL"}
 _SOURCE_LOCATIONS = {
     "GET": "query",
     "POST": "form",
     "REST_QUERY": "query",
     "REST_FORM": "form",
     "REST_JSON": "json",
+    "REST_URL": "path",
 }
 _SEED_SOURCES = {
     "query": "GET",
     "form": "POST",
     "json": "JSON",
+    "path": "URL",
 }
 
 
@@ -64,9 +66,33 @@ def advance_convergence_state(
         known[identity] = normalized
         new.append(normalized)
 
+    parent_identities = _nested_runtime_parent_identities(known)
+    for identity in parent_identities:
+        known.pop(identity, None)
+    new = [
+        parameter
+        for parameter in new
+        if canonical_runtime_parameter_identity(parameter) not in parent_identities
+    ]
+
     return {
         "known_parameters": list(known.values()),
         "new_parameters": new,
+    }
+
+
+def _nested_runtime_parent_identities(
+    parameters: Mapping[tuple[str, tuple[str, ...]], Mapping[str, Any]],
+) -> set[tuple[str, tuple[str, ...]]]:
+    identities = list(parameters)
+    return {
+        identity
+        for identity in identities
+        if any(
+            other_source == identity[0]
+            and other_path[0].startswith(f"{identity[1][0]}[")
+            for other_source, other_path in identities
+        )
     }
 
 
@@ -146,16 +172,22 @@ def _apply_patch(raw_item: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[
     headers = seed.setdefault("headers", {})
     if not isinstance(body, dict) or not isinstance(query, dict) or not isinstance(headers, dict):
         return item
+    fixed_params = {str(name) for name in seed.get("fixed_params", [])}
     for parameter in fuzzable_parameters:
         name = str(parameter["name"])
         location = str(parameter["location"])
+        target = query if location == "query" else body if location in {"form", "json"} else None
+        if target is not None:
+            for existing_name in list(target):
+                if existing_name not in fixed_params and name.startswith(f"{existing_name}["):
+                    target.pop(existing_name, None)
         if location == "query":
             query[name] = "FUZZ"
         elif location in {"form", "json"}:
             body[name] = "FUZZ"
             if location == "json":
                 headers["Content-Type"] = "application/json"
-        else:
+        elif location != "path":
             continue
         seed["fuzzable_params"].append(name)
         seed["input_params"].append(
@@ -226,15 +258,19 @@ def materialize_convergence_seeds(
     if not isinstance(raw_items, list):
         raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
 
-    parameters: list[dict[str, Any]] = []
-    seen: set[tuple[str, tuple[str, ...]]] = set()
+    runtime_parameters: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
     callback = ""
     for parameter in known_parameters:
         identity = canonical_runtime_parameter_identity(parameter)
-        if identity is None or identity in seen:
+        if identity is None or identity in runtime_parameters:
             continue
-        seen.add(identity)
+        runtime_parameters[identity] = dict(parameter)
         callback = callback or str(parameter.get("canonical_callback") or "")
+    for identity in _nested_runtime_parent_identities(runtime_parameters):
+        runtime_parameters.pop(identity, None)
+
+    parameters: list[dict[str, Any]] = []
+    for identity, parameter in runtime_parameters.items():
         location = _SOURCE_LOCATIONS[identity[0]]
         parameters.append(
             {
