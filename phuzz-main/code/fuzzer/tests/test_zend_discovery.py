@@ -2282,6 +2282,182 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertNotIn("name", merged_seed["body"])
             self.assertEqual(merged_seed["fuzzable_params"], [])
 
+    def test_convergence_iteration_probes_correlated_get_param_names_before_converging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            item = {
+                "plugin_slug": "demo-plugin",
+                "entrypoint_type": "rest_route",
+                "hook_name": "rest_route:demo/v1/items",
+                "callback_id": "rest-items",
+                "namespace": "demo/v1",
+                "route": "/demo/v1/items",
+                "seed": {
+                    "method": "GET",
+                    "resolved_method": "GET",
+                    "method_status": "resolved",
+                    "path": "/wp-json/demo/v1/items",
+                    "query_params": {},
+                    "body": {},
+                    "fixed_params": [],
+                    "fuzzable_params": [],
+                    "input_params": [],
+                    "auth_mode": "unauth-capable",
+                },
+            }
+            summary = {"legacy_run_id": "legacy-1", "runs": [{
+                "hook_name": item["hook_name"],
+                "callback_id": item["callback_id"],
+                "seed_variant_id": "",
+                "callback_reached": True,
+                "matched_artifact": "request-rest.json",
+            }]}
+            uopz = {
+                "legacy_run_id": "legacy-1",
+                "request_id": "request-rest",
+                "target_plugin": "demo-plugin",
+                "compat_request_id_matches": True,
+                "http_method": "GET",
+                "endpoint": "REST:/demo/v1/items",
+                "hook_coverage": {"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+                "request_params": {"query_params": {"rest_route": "/demo/v1/items"}},
+                "rest_parameter_events": [
+                    {"accessor": "WP_REST_Request::get_param", "name": "per_page"},
+                    {"accessor": "WP_REST_Request::get_param", "name": "search"},
+                ],
+            }
+            zend = {
+                "schema_version": 4,
+                "run_id": "legacy-1",
+                "request_id": "request-rest",
+                "method": "GET",
+                "target_loading": {
+                    "load_status": "loaded",
+                    "file_target_count": 1,
+                    "loaded_callbacks": ["Demo_REST::get_items"],
+                    "rejected_count": 0,
+                    "capacity_exhausted_count": 0,
+                },
+                "rest_parameter_events": [],
+            }
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            (uopz_dir / "request-rest.json").write_text(json.dumps(uopz), encoding="utf-8")
+            (zend_dir / "request-rest.json").write_text(json.dumps(zend), encoding="utf-8")
+
+            result = converge_iteration(
+                raw_report={"suggested_seeds": [item]},
+                pass_run_summary=summary,
+                pass_artifacts_dir=uopz_dir,
+                zend_events_dir=zend_dir,
+                registry={
+                    "schema_version": 1,
+                    "callback_map": {"rest-items": "Demo_REST::get_items"},
+                    "registrations": [],
+                },
+                plugin_slug="demo-plugin",
+                legacy_run_id="legacy-1",
+                known_state={"known_parameters": []},
+            )
+
+            seed = result["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]
+            self.assertEqual(result["status"], "CONTINUE")
+            self.assertEqual(result["probe_parameter_names"], ["per_page", "search"])
+            self.assertTrue(seed["probe_variant"])
+            self.assertEqual(seed["query_params"], {"per_page": "probe", "search": "probe"})
+            self.assertEqual(seed["fuzzable_params"], [])
+
+    def test_convergence_iteration_probes_correlated_post_get_param_names_before_converging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            item = {
+                "plugin_slug": "demo-plugin",
+                "entrypoint_type": "rest_route",
+                "hook_name": "rest_route:demo/v1/items",
+                "callback_id": "rest-items",
+                "namespace": "demo/v1",
+                "route": "/demo/v1/items",
+                "seed": {
+                    "method": "POST",
+                    "resolved_method": "POST",
+                    "method_status": "resolved",
+                    "path": "/wp-json/demo/v1/items",
+                    "query_params": {},
+                    "body": {},
+                    "fixed_params": [],
+                    "fuzzable_params": [],
+                    "input_params": [],
+                    "auth_mode": "unauth-capable",
+                },
+            }
+            summary = {"legacy_run_id": "legacy-1", "runs": [{
+                "hook_name": item["hook_name"],
+                "callback_id": item["callback_id"],
+                "seed_variant_id": "",
+                "callback_reached": True,
+                "matched_artifact": "request-rest-post.json",
+            }]}
+            uopz = {
+                "legacy_run_id": "legacy-1",
+                "request_id": "request-rest-post",
+                "target_plugin": "demo-plugin",
+                "compat_request_id_matches": True,
+                "http_method": "POST",
+                "endpoint": "REST:/demo/v1/items",
+                "hook_coverage": {"executed_callbacks": {"rest-items": {"callback_id": "rest-items"}}},
+                "request_params": {
+                    "query_params": {"rest_route": "/demo/v1/items"},
+                    "body_params": [],
+                },
+                "rest_parameter_events": [
+                    {"accessor": "WP_REST_Request::get_param", "name": "id"},
+                    {"accessor": "WP_REST_Request::get_param", "name": "context"},
+                ],
+            }
+            zend = {
+                "schema_version": 4,
+                "run_id": "legacy-1",
+                "request_id": "request-rest-post",
+                "method": "POST",
+                "target_loading": {
+                    "load_status": "loaded",
+                    "file_target_count": 1,
+                    "loaded_callbacks": ["Demo_REST::get_items"],
+                    "rejected_count": 0,
+                    "capacity_exhausted_count": 0,
+                },
+                "rest_parameter_events": [],
+            }
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            (uopz_dir / "request-rest-post.json").write_text(json.dumps(uopz), encoding="utf-8")
+            (zend_dir / "request-rest-post.json").write_text(json.dumps(zend), encoding="utf-8")
+
+            result = converge_iteration(
+                raw_report={"suggested_seeds": [item]},
+                pass_run_summary=summary,
+                pass_artifacts_dir=uopz_dir,
+                zend_events_dir=zend_dir,
+                registry={
+                    "schema_version": 1,
+                    "callback_map": {"rest-items": "Demo_REST::get_items"},
+                    "registrations": [],
+                },
+                plugin_slug="demo-plugin",
+                legacy_run_id="legacy-1",
+                known_state={"known_parameters": []},
+            )
+
+            seed = result["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]
+            self.assertEqual(result["status"], "CONTINUE")
+            self.assertEqual(result["probe_parameter_names"], ["id", "context"])
+            self.assertTrue(seed["probe_variant"])
+            self.assertEqual(seed["body"], {"id": "probe", "context": "probe"})
+            self.assertEqual(seed["content_type"], "application/x-www-form-urlencoded")
+            self.assertEqual(seed["fuzzable_params"], [])
+
     def test_convergence_iteration_filters_multi_candidate_input_by_candidate_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -2527,6 +2703,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             merged_seed = result["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]
             self.assertEqual(merged_seed["body"]["id"], "FUZZ")
             self.assertEqual(merged_seed["fuzzable_params"], ["id"])
+            self.assertNotIn("id", merged_seed["fixed_params"])
 
     def test_combine_final_seed_reports_blocks_ambiguous_rest_probe_locations_and_redacts_probe_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

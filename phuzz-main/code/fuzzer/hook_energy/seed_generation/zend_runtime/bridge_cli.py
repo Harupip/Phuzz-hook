@@ -364,7 +364,17 @@ def converge_iteration(
         raise ValueError("convergence state known_parameters must be a list")
     advanced = advance_convergence_state(prior, observed)
     missing = _missing_known_parameters(prior, observed)
-    status = "REPLAY_FAILED" if missing else "CONVERGED" if not advanced["new_parameters"] else "CONTINUE"
+    probe_parameter_names = (
+        _rest_get_param_probe_names(candidate, uopz)
+        if not prior and not observed and not runtime_block_reason
+        else []
+    )
+    status = (
+        "REPLAY_FAILED" if missing
+        else "CONTINUE" if probe_parameter_names
+        else "CONVERGED" if not advanced["new_parameters"]
+        else "CONTINUE"
+    )
     seed = raw_item.get("seed")
     is_probe_variant = isinstance(seed, Mapping) and seed.get("probe_variant") is True
     merged = materialize_convergence_seeds(
@@ -374,6 +384,8 @@ def converge_iteration(
         known_parameters=advanced["known_parameters"],
         for_replay=status == "CONTINUE" and not is_probe_variant,
     )
+    if probe_parameter_names:
+        merged = _materialize_rest_get_param_probe(merged, probe_parameter_names)
     return {
         "status": status,
         "legacy_run_id": legacy_run_id,
@@ -382,6 +394,7 @@ def converge_iteration(
         "known_before": prior,
         "observed_parameters": observed,
         "runtime_block_reason": runtime_block_reason or None,
+        "probe_parameter_names": probe_parameter_names,
         "new_parameters": advanced["new_parameters"],
         "missing_parameters": missing,
         "known_parameters": advanced["known_parameters"],
@@ -394,16 +407,99 @@ def _normalization_seed_item(seed_item: Mapping[str, Any]) -> Mapping[str, Any]:
     probe = seed_item.get("probe_request")
     if not isinstance(seed, Mapping) or not seed.get("probe_variant") or not isinstance(probe, Mapping):
         return seed_item
-    parameter = str(probe.get("parameter") or "")
+    parameters = probe.get("parameters")
+    parameter_names = (
+        [str(value) for value in parameters if str(value)]
+        if isinstance(parameters, list)
+        else [str(probe.get("parameter") or "")]
+    )
     fixed = seed.get("fixed_params")
-    if not parameter or not isinstance(fixed, list):
+    if not parameter_names or not isinstance(fixed, list):
         return seed_item
     normalized = deepcopy(dict(seed_item))
     normalized_seed = normalized.get("seed")
     if not isinstance(normalized_seed, dict):
         return seed_item
-    normalized_seed["fixed_params"] = [name for name in fixed if str(name) != parameter]
+    normalized_seed["fixed_params"] = [name for name in fixed if str(name) not in parameter_names]
     return normalized
+
+
+def _rest_get_param_probe_names(candidate: Mapping[str, Any], uopz: Mapping[str, Any]) -> list[str]:
+    if candidate.get("entrypoint_type") != "rest":
+        return []
+    method = str(candidate.get("resolved_method") or candidate.get("method") or "").upper()
+    if method not in {"GET", "HEAD", "POST"}:
+        return []
+    request_params = uopz.get("request_params")
+    if method in {"GET", "HEAD"}:
+        existing = request_params.get("query_params") if isinstance(request_params, Mapping) else {}
+    else:
+        existing = request_params.get("body_params") if isinstance(request_params, Mapping) else {}
+    existing = existing if isinstance(existing, Mapping) else {}
+    events = uopz.get("rest_parameter_events")
+    if not isinstance(events, list):
+        return []
+    names: list[str] = []
+    for event in events:
+        if not isinstance(event, Mapping) or event.get("accessor") != "WP_REST_Request::get_param":
+            continue
+        name = str(event.get("name") or "")
+        if not name or "[" in name or "]" in name or _security_name(name) or name in existing or name in names:
+            continue
+        names.append(name)
+    return names
+
+
+def _materialize_rest_get_param_probe(report: Mapping[str, Any], names: list[str]) -> dict[str, Any]:
+    merged = deepcopy(dict(report))
+    items = merged.get("suggested_seeds")
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        raise ValueError("REST get_param probe requires exactly one candidate")
+    item = items[0]
+    seed = item.get("seed")
+    if not isinstance(seed, dict):
+        raise ValueError("REST get_param probe candidate is invalid")
+    method = str(seed.get("resolved_method") or seed.get("method") or "").upper()
+    if method in {"GET", "HEAD"}:
+        target = seed.setdefault("query_params", {})
+        location = "query"
+        content_type = ""
+        missing_requirement = "correlated_runtime_query_observation"
+    elif method == "POST":
+        target = seed.setdefault("body", {})
+        location = "form"
+        content_type = "application/x-www-form-urlencoded"
+        missing_requirement = "correlated_runtime_form_observation"
+        headers = seed.setdefault("headers", {})
+        if not isinstance(headers, dict):
+            raise ValueError("REST post probe headers must be an object")
+        headers["Content-Type"] = content_type
+        seed["content_type"] = content_type
+    else:
+        raise ValueError("REST get_param probe requires GET, HEAD, or POST")
+    if not isinstance(target, dict):
+        raise ValueError(f"REST {location} probe target must be an object")
+    for name in names:
+        target[name] = "probe"
+    fixed = seed.get("fixed_params") if isinstance(seed.get("fixed_params"), list) else []
+    seed["fixed_params"] = list(dict.fromkeys([str(value) for value in fixed if str(value)] + names))
+    seed["fuzzable_params"] = []
+    seed["input_params"] = []
+    seed["export_allowed"] = True
+    seed["replay_allowed"] = True
+    seed["probe_variant"] = True
+    item["fuzzing_ready"] = False
+    probe_status = "rest_post_param_runtime_probe" if method == "POST" else "rest_get_param_runtime_probe"
+    item["generation_status"] = probe_status
+    item["generated_reason"] = probe_status
+    item["missing_requirements"] = [missing_requirement]
+    item["probe_request"] = {
+        "parameters": names,
+        "location": location,
+        "content_type": content_type,
+        "candidate_value_redacted": True,
+    }
+    return merged
 
 
 def _filter_iteration_inputs(
