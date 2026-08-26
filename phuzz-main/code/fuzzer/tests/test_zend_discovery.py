@@ -930,6 +930,33 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertEqual(prepared["registrations"][0]["callback_type"], "object_method")
         self.assertNotIn("->", prepared["registrations"][0]["canonical_callback"])
 
+    def test_callback_registry_omits_names_the_zend_extension_would_reject(self) -> None:
+        registry = {
+            "data": {
+                "registered_callbacks": {
+                    "closure": {
+                        "callback_id": "closure",
+                        "hook_name": "rest_api_init",
+                        "callback_repr": "Closure@rest-api.php:5",
+                        "target_plugin": "demo-plugin",
+                        "source_file": "/plugins/demo-plugin/rest-api.php",
+                    },
+                    "valid": {
+                        "callback_id": "valid",
+                        "hook_name": "rest_route:demo/v1/items",
+                        "callback_repr": "Demo_REST::get_items",
+                        "target_plugin": "demo-plugin",
+                        "source_file": "/plugins/demo-plugin/rest-api.php",
+                    },
+                }
+            }
+        }
+
+        prepared = prepare_callback_registry(registry, "demo-plugin")
+
+        self.assertEqual(prepared["callback_map"], {"valid": "Demo_REST::get_items"})
+        self.assertEqual([row["callback_id"] for row in prepared["registrations"]], ["valid"])
+
     def test_pass1_correlation_accepts_raw_uopz_artifact_without_optional_identity_fields(self) -> None:
         candidate = self.pass1_candidate()
         artifact = self.pass1_artifact(candidate)

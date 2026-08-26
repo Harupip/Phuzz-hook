@@ -179,6 +179,15 @@ def _apply_patch(
     headers = seed.setdefault("headers", {})
     if not isinstance(body, dict) or not isinstance(query, dict) or not isinstance(headers, dict):
         return item
+    proven_names = {
+        str(parameter.get("name") or "")
+        for parameter in fuzzable_parameters
+        if str(parameter.get("location") or "") in {"query", "form", "json"}
+    }
+    seed["fixed_params"] = [
+        name for name in seed.get("fixed_params", [])
+        if str(name) not in proven_names
+    ]
     fixed_params = {str(name) for name in seed.get("fixed_params", [])}
     for parameter in fuzzable_parameters:
         name = str(parameter["name"])

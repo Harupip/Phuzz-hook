@@ -278,7 +278,7 @@ def prepare_callback_registry(registry: Mapping[str, Any], plugin_slug: str) -> 
         if not isinstance(raw, Mapping) or not _target_owned(dict(raw), plugin_slug):
             continue
         canonical = _canonical_php_callback(raw, callback_id)
-        if not canonical:
+        if not canonical or not _zend_callback_name_supported(canonical):
             continue
         registrations.append(
             {
@@ -297,6 +297,11 @@ def prepare_callback_registry(registry: Mapping[str, Any], plugin_slug: str) -> 
         "callback_map": callback_map,
         "registrations": registrations,
     }
+
+
+def _zend_callback_name_supported(name: str) -> bool:
+    """Mirror the opcode extension's callback-name grammar."""
+    return re.fullmatch(r"[A-Za-z0-9_\\]+(?:::[A-Za-z0-9_\\]+)?", name) is not None
 
 
 def _canonical_php_callback(raw: Mapping[str, Any], callback_id: str) -> str:
