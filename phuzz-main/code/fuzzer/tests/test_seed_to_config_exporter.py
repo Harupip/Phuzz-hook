@@ -678,6 +678,27 @@ class SeedToConfigExporterTests(unittest.TestCase):
             self.assertEqual(json.loads(summary_path.read_text(encoding="utf-8")), summary)
             self.assertTrue((root / "generated_param_summary.json").exists())
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows MAX_PATH regression")
+    def test_export_bounds_long_windows_paths_without_colliding(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "configs"
+            items = []
+            for suffix in ("a", "b"):
+                item = build_rest_seed_item()
+                item["hook_name"] = "rest_route:" + "demo/" + "x" * 45
+                item["callback_id"] = "callback-" + "y" * 110 + suffix
+                items.append(item)
+
+            summary = export_seed_configs({"suggested_seeds": items}, output_config_dir=output_dir)
+
+            paths = [Path(row["config_path"]) for row in summary["generated"]]
+            self.assertEqual(len(paths), 2)
+            self.assertEqual(len({path.name for path in paths}), 2)
+            for path in paths:
+                self.assertTrue(path.exists())
+                self.assertLessEqual(len(path.stem), 80)
+                self.assertLessEqual(len(str(path.resolve())), 259)
+
     def test_replay_only_export_for_zend_pass1_clears_fuzz_selectors(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

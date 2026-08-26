@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -136,6 +137,7 @@ def export_seed_configs(
         if replay_only or _is_probe_variant(item):
             _force_replay_only(config)
 
+        file_slug = _bounded_file_slug(file_slug)
         config_path = output_dir / f"{file_slug}.json"
         config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         generated_row = {
@@ -300,6 +302,16 @@ def _build_file_slug(seed_item: Mapping[str, Any]) -> str:
     variant = str(seed.get("seed_variant_id", "")) if isinstance(seed, Mapping) else ""
     suffix = f"-{_safe_slug(variant)}" if variant else ""
     return f"{_safe_slug(hook_name)}-{_safe_slug(callback_id)}{suffix}"
+
+
+def _bounded_file_slug(file_slug: str) -> str:
+    # ponytail: fixed 80-character cap; move output root if an unusually deep path still exceeds MAX_PATH.
+    if len(file_slug) <= 80:
+        return file_slug
+
+    digest = hashlib.sha256(file_slug.encode("utf-8")).hexdigest()[:12]
+    prefix_length = 80 - len(digest) - 1
+    return f"{file_slug[:prefix_length]}-{digest}"
 
 
 def _build_config_slug(output_dir: Path, file_slug: str) -> str:
