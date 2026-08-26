@@ -13,8 +13,10 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy import bootstrap_probe_runner, entry_classifier, seed_validator
-from hook_energy.phuzz_config_writer import write_candidate_configs
+from discovery.entrypoints import classifier as entry_classifier
+from discovery.wordpress import bootstrap_probe_runner
+from seed_generation.verification import seed_validator
+from seed_generation.config.phuzz_config_writer import write_candidate_configs
 
 
 FINAL_REPORT = "bootstrap_entry_discovery_report.json"

@@ -15,12 +15,12 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from candidate import Candidate
-from hook_energy.method_resolution import normalize_http_methods, resolve_http_methods
-from hook_energy.seed_generation.config_exporter import SeedConfigSkip, build_config_for_seed_item
-from hook_energy.seed_generation.static_generator import StaticSeedGenerator as LiveHookSeedGenerator
-from hook_energy.seed_generation.importer import HookSeedImporter
-from hook_energy.seed_validator import build_validation_request
+from core.candidate import Candidate
+from discovery.entrypoints.method_resolution import normalize_http_methods, resolve_http_methods
+from seed_generation.config.config_exporter import SeedConfigSkip, build_config_for_seed_item
+from seed_generation.source_assisted.static_generator import StaticSeedGenerator as LiveHookSeedGenerator
+from seed_generation.skeleton.importer import HookSeedImporter
+from seed_generation.verification.seed_validator import build_validation_request
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "seed_method_fixture.php"
 

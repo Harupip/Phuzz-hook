@@ -294,7 +294,7 @@ Nhung file nay khong phai thay doi benchmark cua toi, nhung runner co doc/dua va
 
 - `fuzzer/scoring.env`
 - `docker-compose.yml`
-- `fuzzer/scoring.py`
+- `fuzzer/core/scoring.py`
 - `web` hook coverage request artifacts
 
 ## 10. Nhung gi benchmark nay chua lam

@@ -389,7 +389,7 @@ Implemented pieces:
 
 Legacy bridge state:
 
-- `hook_energy/seed_generation/zend_runtime/bridge.py` is the Zend convergence compatibility re-export.
+- `seed_generation/convergence/compat.py` is the Zend convergence compatibility bridge; `hook_energy/seed_generation/zend_runtime/bridge.py` preserves the legacy import path.
 - `hook_energy/seed_generation/zend_runtime/bridge_cli.py` owns Zend CLI orchestration.
 - `scripts/wordpress/run-wordpress-phuzz.ps1` still owns Docker lifecycle, Pass 1/Pass 2 replay, config export, and artifact collection.
 

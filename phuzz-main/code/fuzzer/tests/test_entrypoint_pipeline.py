@@ -11,7 +11,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.pipeline import _clone_probe_seed_item, run_entrypoint_pipeline
+from seed_generation.pipeline.pipeline import _clone_probe_seed_item, run_entrypoint_pipeline
 
 
 def coverage_payload(source_root: Path) -> dict:

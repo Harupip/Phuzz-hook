@@ -10,7 +10,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.bootstrap_probe_runner import (
+from discovery.wordpress.bootstrap_probe_runner import (
     BOOTSTRAP_PROBE_REPORT,
     default_probes,
     list_request_artifacts,

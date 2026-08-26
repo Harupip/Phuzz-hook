@@ -10,7 +10,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.phuzz_config_writer import build_config_for_candidate, write_candidate_configs
+from seed_generation.config.phuzz_config_writer import build_config_for_candidate, write_candidate_configs
 
 
 def build_candidate(**overrides):

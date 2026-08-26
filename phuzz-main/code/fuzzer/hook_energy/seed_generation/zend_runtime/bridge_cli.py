@@ -9,15 +9,15 @@ from typing import Any, Mapping, Sequence
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from hook_energy.seed_generation.config_exporter import export_seed_configs
-    from zend_discovery.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
+    from seed_generation.config.config_exporter import export_seed_configs
+    from seed_generation.convergence.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
     from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment
-    from zend_discovery.rest_runtime import canonical_rest_parameter_name
+    from instrumentation.zend.rest.runtime import canonical_rest_parameter_name
 else:
-    from ..config_exporter import export_seed_configs
-    from zend_discovery.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
+    from seed_generation.config.config_exporter import export_seed_configs
+    from seed_generation.convergence.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
     from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment
-    from zend_discovery.rest_runtime import canonical_rest_parameter_name
+    from instrumentation.zend.rest.runtime import canonical_rest_parameter_name
 
 
 def _read_json(path: Path) -> Any:

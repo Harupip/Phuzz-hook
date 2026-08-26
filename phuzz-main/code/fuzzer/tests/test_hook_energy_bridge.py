@@ -8,7 +8,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from scoring import calculate_hook_coverage_energy
+from core.scoring import calculate_hook_coverage_energy
 
 
 def build_request_payload() -> dict:

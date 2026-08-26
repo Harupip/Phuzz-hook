@@ -8,8 +8,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
 
-from .parameter_seeds import build_enriched_parameters
-from .rest_runtime import normalize_rest_parameter_events
+from seed_generation.parameters.parameter_seeds import build_enriched_parameters
+from instrumentation.zend.rest.runtime import normalize_rest_parameter_events
 
 
 PASS = "PASS"

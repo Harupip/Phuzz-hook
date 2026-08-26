@@ -10,7 +10,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.zend_runtime.artifact_retention import retain_artifacts
+from artifacts.retention.generated_runs import retain_artifacts
 from hook_energy.seed_generation.generated_config_runner import load_generated_configs
 
 

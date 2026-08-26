@@ -14,7 +14,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[2]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_validator import evaluate_artifact_payloads
+from seed_generation.verification.seed_validator import evaluate_artifact_payloads
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]

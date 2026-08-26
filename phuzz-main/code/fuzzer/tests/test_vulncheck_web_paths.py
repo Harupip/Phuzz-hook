@@ -27,7 +27,7 @@ if "bs4" not in sys.modules:
     bs4_stub.element = types.SimpleNamespace(Tag=object)
     sys.modules["bs4"] = bs4_stub
 
-from vulncheck import WebPathBasedPathTraversalVulnCheck
+from core.vulncheck import WebPathBasedPathTraversalVulnCheck
 
 
 class WebPathBasedPathTraversalVulnCheckTests(unittest.TestCase):

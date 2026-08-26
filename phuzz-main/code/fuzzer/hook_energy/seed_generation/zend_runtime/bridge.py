@@ -1,15 +1,3 @@
-from __future__ import annotations
+"""Compatibility re-export for the legacy Zend convergence bridge."""
 
-from zend_discovery.convergence import (
-    advance_convergence_state,
-    canonical_runtime_parameter_identity,
-    materialize_convergence_seeds,
-    merge_enriched_seeds,
-)
-
-__all__ = [
-    "advance_convergence_state",
-    "canonical_runtime_parameter_identity",
-    "materialize_convergence_seeds",
-    "merge_enriched_seeds",
-]
+from seed_generation.convergence.compat import *  # noqa: F401,F403

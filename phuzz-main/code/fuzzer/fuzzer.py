@@ -19,12 +19,12 @@ from collections import ChainMap, Counter
 
 import traceback
 import requests
-import utils
-from candidate import Candidate
-from mutator import DefaultMutator, EmptyQueueMutator, SingleMutator
-from scoring import DefaultScoringFormula
-from utils import fuzz_open
-from hook_energy.seed_generation.zend_runtime.cmplog import (
+from core import utils
+from core.candidate import Candidate
+from core.mutator import DefaultMutator, EmptyQueueMutator, SingleMutator
+from core.scoring import DefaultScoringFormula
+from core.utils import fuzz_open
+from fuzz_guidance.cmplog.hints import (
     apply_cmplog_hint,
     normalize_comparison_events,
 )
@@ -103,7 +103,7 @@ class Fuzzer:
         self.mutator = DefaultMutator()
         self.vulnchecker = None
         if not config_only:
-            from vulncheck import ParamBasedVulnChecker
+            from core.vulncheck import ParamBasedVulnChecker
             self.vulnchecker = ParamBasedVulnChecker(
                 mysql_errors_folder=self.mysql_errors_folder,
                 shell_errors_folder=self.shell_errors_folder,

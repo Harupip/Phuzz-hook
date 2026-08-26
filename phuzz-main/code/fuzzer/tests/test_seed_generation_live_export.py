@@ -10,9 +10,9 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.pipeline import run_entrypoint_pipeline
-from hook_energy.seed_generation.static_generator import StaticSeedGenerator
-from hook_energy.seed_generation.zend_runtime.candidate_generator import ZendRuntimeSeedGenerator
+from seed_generation.pipeline.pipeline import run_entrypoint_pipeline
+from seed_generation.source_assisted.static_generator import StaticSeedGenerator
+from seed_generation.skeleton.candidate_generator import ZendRuntimeSeedGenerator
 
 
 def build_live_coverage_payload() -> dict:

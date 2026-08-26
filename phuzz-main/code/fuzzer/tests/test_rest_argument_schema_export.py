@@ -8,7 +8,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.config_exporter import build_config_for_seed_item
+from seed_generation.config.config_exporter import build_config_for_seed_item
 
 
 class RestArgumentSchemaExportTests(unittest.TestCase):

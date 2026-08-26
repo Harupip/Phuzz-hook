@@ -49,7 +49,7 @@ Other hooks stay manual-only unless later code adds a supported route mapping.
 
 The original entrypoint rules coupled two different decisions: mapping a hook to its endpoint and choosing a convenient replay method. AJAX, admin-post, login, and heartbeat templates stored `POST`, and `seed_template_for_callback()` copied that value before the generator inspected parameter provenance. `_GET` could therefore move a parameter into the query string without changing the already-selected `POST` method. Tests covered the resulting templates, so the compatibility assumption remained stable even though the hook prefix never proved the verb.
 
-Method selection is centralized in `hook_energy/method_resolution.py`. The precedence is: declared REST method, exact `GET`/`POST` source evidence, then a callback- and request-ID-correlated runtime request method. Every seed records `resolved_method`, `candidate_methods`, `method_status`, `method_source`, `method_confidence`, `method_evidence`, `observed_request_method`, `route_declared_methods`, and `seed_variant_id`.
+Method selection is centralized in `discovery/entrypoints/method_resolution.py`. The precedence is: declared REST method, exact `GET`/`POST` source evidence, then a callback- and request-ID-correlated runtime request method. Every seed records `resolved_method`, `candidate_methods`, `method_status`, `method_source`, `method_confidence`, `method_evidence`, `observed_request_method`, `route_declared_methods`, and `seed_variant_id`.
 
 ### When POST Can Still Appear
 
@@ -64,7 +64,7 @@ Direct `$_GET`/`INPUT_GET` and `$_POST`/`INPUT_POST` reads are canonical source-
 
 ## Entrypoint Rule Ownership
 
-Entrypoint mapping rules live in `code/fuzzer/hook_energy/entrypoints.py`. That file is grouped by entrypoint family (`WordPress AJAX`, `Admin Post`, `Admin Action`, `Login Form`, `Heartbeat`, and `REST route`) so new mappings have one obvious owner.
+Entrypoint mapping rules live in `code/fuzzer/discovery/entrypoints/entrypoints.py`, while WordPress REST route materialization lives in `code/fuzzer/discovery/wordpress/rest_routes.py`. The modules are grouped by entrypoint family (`WordPress AJAX`, `Admin Post`, `Admin Action`, `Login Form`, `Heartbeat`, and `REST route`) so new mappings have one obvious owner.
 
 When adding a new entrypoint family, update `entrypoints.py`, then cover the classifier, live seed generator, and recursive child seed path when that family should flow through those stages. Keep generated artifacts backward-compatible unless a separate migration is intentional.
 
@@ -72,7 +72,7 @@ When adding a new entrypoint family, update `entrypoints.py`, then cover the cla
 
 The extractor lives at:
 
-- `code/fuzzer/hook_energy/seed_generation/input_extractor.py`
+- `code/fuzzer/seed_generation/source_assisted/input_extractor.py`
 
 It uses static regex scanning. It does not require a PHP parser.
 
@@ -360,7 +360,7 @@ Run:
 
 ```powershell
 cd C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\phuzz-main\code\fuzzer
-python hook_energy\bootstrap_probe_runner.py `
+python discovery\wordpress\bootstrap_probe_runner.py `
   --base-url http://localhost:8080 `
   --hook-coverage-dir output\hook-coverage `
   --output-dir output\bootstrap_probe `
@@ -380,7 +380,7 @@ The report includes per-probe method, path, status code, duration, error, and `n
 Run:
 
 ```powershell
-python hook_energy\entry_classifier.py `
+python discovery\entrypoints\classifier.py `
   --input-file output\total_coverage.json `
   --output-dir output\entry_classifier `
   --format auto `

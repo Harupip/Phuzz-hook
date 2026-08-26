@@ -11,7 +11,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.entry_classifier import (
+from discovery.entrypoints.classifier import (
     classify_callbacks,
     load_registry,
     write_classification_artifacts,

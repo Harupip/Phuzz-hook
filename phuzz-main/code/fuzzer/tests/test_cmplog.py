@@ -6,7 +6,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.zend_runtime.cmplog import (
+from fuzz_guidance.cmplog.hints import (
     apply_cmplog_hint,
     normalize_comparison_events,
 )

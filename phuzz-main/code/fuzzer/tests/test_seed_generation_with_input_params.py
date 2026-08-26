@@ -10,7 +10,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.static_generator import StaticSeedGenerator as LiveHookSeedGenerator
+from seed_generation.source_assisted.static_generator import StaticSeedGenerator as LiveHookSeedGenerator
 
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "hook_input_callbacks.php"
@@ -391,7 +391,7 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
         self.assertEqual(seed_report["suggested_seeds"][0]["source_resolution"]["reason"], "source_copy_failed")
 
     def test_export_cli_imports_as_package_module(self) -> None:
-        from hook_energy.seed_generation.export_cli import build_argument_parser
+        from cli.export_seeds import build_argument_parser
 
         parser = build_argument_parser()
         args = parser.parse_args(

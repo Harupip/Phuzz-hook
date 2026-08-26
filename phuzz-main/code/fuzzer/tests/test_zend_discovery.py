@@ -30,7 +30,7 @@ from zend_discovery.engine import (
     run_enrichment,
     select_auto_probes,
 )
-from zend_discovery.convergence import (
+from seed_generation.convergence.convergence import (
     advance_convergence_state,
     canonical_runtime_parameter_identity,
     materialize_convergence_seeds,
@@ -43,11 +43,11 @@ from hook_energy.seed_generation.zend_runtime.bridge_cli import (
     main,
     verify_pass2_contract,
 )
-from hook_energy.seed_generation.pipeline import _rest_parameter_policy
-from zend_discovery.source_materializer import materialize_plugin_source
-from zend_discovery.parameter_seeds import build_parameter_seed
-from zend_discovery.rest_runtime import canonical_rest_parameter_name
-from hook_energy.seed_generation.input_extractor import InputSignatureExtractor
+from seed_generation.pipeline.pipeline import _rest_parameter_policy
+from seed_generation.source_assisted.source_materializer import materialize_plugin_source
+from seed_generation.parameters.parameter_seeds import build_parameter_seed
+from instrumentation.zend.rest.runtime import canonical_rest_parameter_name
+from seed_generation.source_assisted.input_extractor import InputSignatureExtractor
 
 
 class StaticExtractor:
@@ -3371,10 +3371,12 @@ class ZendDiscoveryTests(unittest.TestCase):
 
     def test_legacy_zend_bridge_is_only_compatibility_reexports(self) -> None:
         bridge_source = (FUZZER_DIR / "hook_energy" / "seed_generation" / "zend_runtime" / "bridge.py").read_text(encoding="utf-8")
+        compat_source = (FUZZER_DIR / "seed_generation" / "convergence" / "compat.py").read_text(encoding="utf-8")
 
-        self.assertIn("from zend_discovery.convergence import", bridge_source)
-        self.assertNotIn("def materialize_convergence_seeds", bridge_source)
-        self.assertNotIn("REST_JSON", bridge_source)
+        self.assertIn("from seed_generation.convergence.compat import", bridge_source)
+        self.assertIn("from .convergence import", compat_source)
+        self.assertNotIn("def materialize_convergence_seeds", compat_source)
+        self.assertNotIn("REST_JSON", compat_source)
 
     def test_zend_dockerfile_uses_only_zend_owned_extension_source(self) -> None:
         dockerfile = (FUZZER_DIR.parent / "web" / "Dockerfile.zend").read_text(encoding="utf-8")

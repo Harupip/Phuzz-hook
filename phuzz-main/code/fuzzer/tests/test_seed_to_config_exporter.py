@@ -10,8 +10,8 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.entrypoints import seed_template_for_callback
-from hook_energy.seed_generation.config_exporter import (
+from discovery.entrypoints.entrypoints import seed_template_for_callback
+from seed_generation.config.config_exporter import (
     SeedConfigSkip,
     build_generated_param_summary,
     build_config_for_seed_item,

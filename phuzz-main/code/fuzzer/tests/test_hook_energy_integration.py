@@ -11,15 +11,15 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy import HookEnergyDemoState
-from hook_energy.integration import (
+from hook_guidance.coverage.models import RequestEnergyReport
+from hook_guidance.coverage.state import HookEnergyDemoState
+from hook_guidance.integration.integration import (
     HookEnergyTracker,
     apply_hook_energy_bonus,
     apply_candidate_hook_feedback,
     apply_hook_priority_bonus,
 )
-from hook_energy.models import RequestEnergyReport
-from candidate import Candidate
+from core.candidate import Candidate
 
 
 def build_request_payload(

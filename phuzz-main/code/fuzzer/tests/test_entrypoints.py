@@ -8,7 +8,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.entrypoints import direct_http_details, rest_http_template, seed_template_for_callback
+from discovery.entrypoints.entrypoints import direct_http_details, rest_http_template, seed_template_for_callback
 
 
 class EntrypointRuleTests(unittest.TestCase):

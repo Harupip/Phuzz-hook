@@ -647,9 +647,9 @@ function Export-LiveSeedSuggestions {
     $coverageFileInContainer = "/shared-tmpfs/hook-coverage/total_coverage.json"
     $coverageSnapshot = Join-Path ([System.IO.Path]::GetTempPath()) "phuzz-live-total-coverage.json"
     $outputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
-    $exportCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\export_cli.py"
-    $zendRuntimeExportCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_runtime\export_cli.py"
-    $pipelineCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\pipeline_cli.py"
+    $exportCli = Join-Path $ScriptRoot "fuzzer\cli\export_seeds.py"
+    $zendRuntimeExportCli = Join-Path $ScriptRoot "fuzzer\cli\export_zend_seeds.py"
+    $pipelineCli = Join-Path $ScriptRoot "fuzzer\cli\entrypoint_pipeline.py"
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     $snapshotReady = $false
     $pluginSourceTempRoot = $null
@@ -769,7 +769,7 @@ function Convert-LiveSeedSuggestionsToConfigs {
     if (-not $SummaryPath) {
         $SummaryPath = Join-Path $seedOutputDir "generated_config_summary.json"
     }
-    $configCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\seed_to_config_cli.py"
+    $configCli = Join-Path $ScriptRoot "fuzzer\cli\seed_to_config.py"
 
     Assert-PathExists -Path $SuggestedSeeds -Hint "Run hook seed export before converting seeds into PHUZZ configs."
 
@@ -1057,7 +1057,7 @@ function Invoke-ZendArtifactRetention {
         [switch]$KeepDebugArtifacts
     )
 
-    $retentionCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_runtime\artifact_retention.py"
+    $retentionCli = Join-Path $ScriptRoot "fuzzer\artifacts\retention\generated_runs.py"
     $runDir = Join-Path (Join-Path $SeedOutputDir "zend-bridge") $LegacyRunId
     $retentionArgs = @(
         $retentionCli,

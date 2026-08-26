@@ -1,0 +1,291 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+from .method_resolution import normalize_http_methods, resolve_http_methods
+from discovery.wordpress.rest_routes import materialize_rest_route
+
+
+# WordPress AJAX endpoint mapping. Method is resolved from evidence later.
+_AJAX_RULES = (
+    {
+        "prefix": "wp_ajax_nopriv_",
+        "entry_type": "ajax_unauthenticated",
+        "path": "/wp-admin/admin-ajax.php",
+        "param_target": "body_params",
+        "auth_required": False,
+        "reason": "WordPress AJAX nopriv hook maps directly to admin-ajax.php?action=<action>",
+    },
+    {
+        "prefix": "wp_ajax_",
+        "entry_type": "ajax_authenticated",
+        "path": "/wp-admin/admin-ajax.php",
+        "param_target": "body_params",
+        "auth_required": True,
+        "reason": "WordPress AJAX hook maps directly to admin-ajax.php?action=<action>",
+    },
+)
+
+# Admin Post endpoint mapping. Method is resolved from evidence later.
+_ADMIN_POST_RULES = (
+    {
+        "prefix": "admin_post_nopriv_",
+        "entry_type": "admin_post_unauthenticated",
+        "path": "/wp-admin/admin-post.php",
+        "param_target": "body_params",
+        "auth_required": False,
+        "reason": "WordPress admin-post nopriv hook maps directly to admin-post.php?action=<action>",
+    },
+    {
+        "prefix": "admin_post_",
+        "entry_type": "admin_post_authenticated",
+        "path": "/wp-admin/admin-post.php",
+        "param_target": "body_params",
+        "auth_required": True,
+        "reason": "WordPress admin-post hook maps directly to admin-post.php?action=<action>",
+    },
+)
+
+# Admin Action: GET admin.php with action in the query string.
+_ADMIN_ACTION_RULES = (
+    {
+        "prefix": "admin_action_",
+        "entry_type": "admin_action",
+        "path": "/wp-admin/admin.php",
+        "param_target": "query_params",
+        "auth_required": True,
+        "reason": "WordPress admin action hook maps directly to admin.php?action=<action>",
+    },
+)
+
+# Login Form endpoint mapping; action remains in the query string.
+_LOGIN_FORM_RULES = (
+    {
+        "prefix": "login_form_",
+        "entry_type": "login_form",
+        "path": "/wp-login.php",
+        "param_target": "query_params",
+        "auth_required": False,
+        "reason": "WordPress login form hook maps directly to wp-login.php?action=<action>",
+    },
+)
+
+DIRECT_HTTP_RULES = _AJAX_RULES + _ADMIN_POST_RULES + _ADMIN_ACTION_RULES + _LOGIN_FORM_RULES
+
+# Heartbeat: exact hook names map to admin-ajax.php?action=heartbeat.
+_HEARTBEAT_BODY_PARAMS = {
+    "action": "heartbeat",
+    "_nonce": "hookphuzz",
+    "screen_id": "front",
+    "data[hookphuzz_probe]": "1",
+}
+
+DIRECT_HTTP_EXACT_RULES = {
+    "heartbeat_received": {
+        "entry_type": "heartbeat_authenticated",
+        "path": "/wp-admin/admin-ajax.php",
+        "param_target": "body_params",
+        "action": "heartbeat",
+        "body_params": _HEARTBEAT_BODY_PARAMS,
+        "auth_required": True,
+        "reason": "WordPress authenticated heartbeat hook maps directly to admin-ajax.php?action=heartbeat",
+    },
+    "heartbeat_nopriv_received": {
+        "entry_type": "heartbeat_unauthenticated",
+        "path": "/wp-admin/admin-ajax.php",
+        "param_target": "body_params",
+        "action": "heartbeat",
+        "body_params": _HEARTBEAT_BODY_PARAMS,
+        "auth_required": False,
+        "reason": "WordPress unauthenticated heartbeat hook maps directly to admin-ajax.php?action=heartbeat",
+    },
+}
+
+
+def direct_http_details(hook_name: str | None, metadata: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+    # REST route: runtime already resolved register_rest_route() into entrypoint_type=rest_route.
+    rest_template = rest_http_template(metadata or {})
+    if rest_template is not None and _is_first_class_rest_route(hook_name, metadata or {}):
+        decision = resolve_http_methods(
+            route_declared_methods=(metadata or {}).get("methods", (metadata or {}).get("method"))
+        )[0]
+        return {
+            "entry_type": "rest_route",
+            "action": None,
+            "http_template": rest_template,
+            "auth_required": _rest_auth_required(metadata or {}),
+            "confidence": "high" if decision["method_status"] == "resolved" else "low",
+            **{key: decision[key] for key in _METHOD_FIELDS},
+            "reason": "WordPress REST route maps directly to /wp-json/<namespace>/<route>",
+        }
+
+    if not hook_name:
+        return None
+
+    # Heartbeat: exact hook names beat prefix rules.
+    exact_rule = DIRECT_HTTP_EXACT_RULES.get(hook_name)
+    if exact_rule is not None:
+        return _build_direct_details(exact_rule, exact_rule["action"])
+
+    # Prefix rules: order matters, nopriv_* must be checked before authenticated prefixes.
+    for rule in DIRECT_HTTP_RULES:
+        prefix = str(rule["prefix"])
+        if hook_name.startswith(prefix):
+            return _build_direct_details(rule, hook_name.removeprefix(prefix))
+    return None
+
+
+def seed_template_for_callback(
+    hook_name: str,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    # REST route seeds target /wp-json and never carry an action parameter.
+    if _is_first_class_rest_route(hook_name, metadata or {}):
+        return rest_seed_template(metadata or {})
+
+    details = direct_http_details(hook_name)
+    if details is None:
+        return None
+
+    http_template = details["http_template"]
+    entrypoint_type = "heartbeat" if hook_name in DIRECT_HTTP_EXACT_RULES else details["entry_type"]
+    return {
+        "method": http_template["method"],
+        "path": http_template["path"],
+        "content_type": "application/x-www-form-urlencoded",
+        "body": dict(http_template.get("body_params") or {}),
+        "query_params": dict(http_template.get("query_params") or {}),
+        "auth_mode": "authenticated" if details["auth_required"] else "unauth-capable",
+        "fixed_params": list(http_template.get("body_params") or {}) + list(http_template.get("query_params") or {}),
+        "entrypoint_type": entrypoint_type,
+        **{key: details.get(key) for key in _METHOD_FIELDS},
+    }
+
+
+def rest_seed_template(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+    # REST config export preserves all route methods, while replay uses the first one.
+    template = rest_http_template(metadata)
+    if template is None:
+        return None
+    decisions = resolve_http_methods(
+        route_declared_methods=metadata.get("methods", metadata.get("method"))
+    )
+    decision = decisions[0]
+    methods = decision["candidate_methods"] if decision["method_status"] == "resolved" else []
+    route_ready = template.get("route_materialization_status") == "materialized"
+    return {
+        "method": decision["resolved_method"] if route_ready else None,
+        "methods": methods,
+        "path": template["path"],
+        "content_type": str(metadata.get("content_type") or ""),
+        "body": {},
+        "auth_mode": "authenticated" if _rest_auth_required(metadata) else "unauth-capable",
+        "fixed_params": [],
+        "entrypoint_type": "rest_route",
+        **{key: decision[key] for key in _METHOD_FIELDS},
+        "route_pattern": template.get("route_pattern"),
+        "materialized_route": template.get("materialized"),
+        "route_materialization": {
+            key: template[key]
+            for key in ("route_materialization_status", "pattern", "materialized", "substitutions", "block_reason")
+            if key in template
+        },
+        "export_allowed": bool(decision.get("export_allowed")) and route_ready,
+        "replay_allowed": bool(decision.get("replay_allowed")) and route_ready,
+        "block_reason": (
+            decision.get("block_reason")
+            if route_ready
+            else template.get("block_reason") or "unsupported_route_materialization"
+        ),
+    }
+
+
+def rest_http_template(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+    # REST route metadata comes from the WordPress register_rest_route() hook recorder.
+    # Accepted shapes: entrypoint_type=rest_route, hook_name=rest_route:namespace/path,
+    # or rest_api_init records that still carry namespace/route metadata.
+    route = str(metadata.get("rest_route") or metadata.get("route") or "").strip("/")
+    namespace = str(metadata.get("namespace") or "").strip("/")
+    if not route:
+        hook_name = str(metadata.get("hook_name") or "")
+        if hook_name.startswith("rest_route:"):
+            route = hook_name.removeprefix("rest_route:").strip("/")
+    if not route:
+        return None
+    if namespace and route.startswith(f"{namespace}/"):
+        route_pattern = "/" + route.removeprefix(f"{namespace}/")
+    else:
+        route_pattern = "/" + route
+    materialization = materialize_rest_route(route_pattern)
+    if materialization["route_materialization_status"] != "materialized":
+        return {
+            "method": None,
+            "path": "",
+            "query_params": {},
+            "body_params": {},
+            "route_pattern": route_pattern,
+            **materialization,
+        }
+    materialized_route = str(materialization["materialized"]).strip("/")
+    route = f"{namespace}/{materialized_route}" if namespace else materialized_route
+
+    methods = normalize_http_methods(metadata.get("methods", metadata.get("method")))
+    method = methods[0] if methods else None
+    return {
+        "method": method,
+        "path": f"/wp-json/{route}",
+        "query_params": {},
+        "body_params": {},
+        "route_pattern": route_pattern,
+        **materialization,
+    }
+
+
+def _build_direct_details(rule: Mapping[str, Any], action: str) -> dict[str, Any]:
+    query_params = dict(rule.get("query_params") or {})
+    body_params = dict(rule.get("body_params") or {})
+    if rule["param_target"] == "query_params":
+        query_params["action"] = action
+    else:
+        body_params["action"] = action
+
+    decision = resolve_http_methods()[0]
+    return {
+        "entry_type": rule["entry_type"],
+        "action": action,
+        "http_template": {
+            "method": decision["resolved_method"],
+            "path": rule["path"],
+            "query_params": query_params,
+            "body_params": body_params,
+        },
+        "auth_required": rule["auth_required"],
+        "confidence": "low",
+        **{key: decision[key] for key in _METHOD_FIELDS},
+        "reason": rule["reason"],
+    }
+
+
+def _is_first_class_rest_route(hook_name: str | None, metadata: Mapping[str, Any]) -> bool:
+    return metadata.get("entrypoint_type") == "rest_route" or str(hook_name or "").startswith("rest_route:")
+
+
+def _rest_auth_required(metadata: Mapping[str, Any]) -> bool:
+    permission_callback = str(metadata.get("permission_callback") or "").strip()
+    return permission_callback not in {"", "__return_true"}
+
+
+_METHOD_FIELDS = (
+    "resolved_method",
+    "candidate_methods",
+    "method_status",
+    "method_source",
+    "method_confidence",
+    "method_evidence",
+    "observed_request_method",
+    "route_declared_methods",
+    "export_allowed",
+    "replay_allowed",
+    "block_reason",
+)

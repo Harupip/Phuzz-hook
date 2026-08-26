@@ -1,0 +1,1 @@
+"""Shared artifact lifecycle support."""

@@ -321,7 +321,7 @@ Current REST convergence implementation proof (2026-08-13):
 rtk powershell.exe -ExecutionPolicy Bypass -File phuzz-main/code/phuzz.ps1 -Mode generated -PluginSlug hookphuzz-rest-get-param-fixture -UseZendDiscovery -ZendMaxIterations 5 -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs -DryRun
 rtk python -m unittest fuzzer.tests.test_zend_discovery fuzzer.tests.test_generated_config_runner fuzzer.tests.test_phuzz_wrapper_contract -v
 rtk powershell.exe -NoProfile -Command "[void][System.Management.Automation.Language.Parser]::ParseFile('scripts/wordpress/run-wordpress-phuzz.ps1',[ref]`$null,[ref]`$null); [void][System.Management.Automation.Language.Parser]::ParseFile('phuzz.ps1',[ref]`$null,[ref]`$null); 'parser ok'"
-rtk python -m py_compile fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py fuzzer/zend_discovery/convergence.py
+rtk python -m py_compile fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py fuzzer/seed_generation/convergence/convergence.py
 rtk git diff --check -- phuzz-main/code/fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py phuzz-main/code/fuzzer/tests/test_generated_config_runner.py phuzz-main/code/fuzzer/tests/test_phuzz_wrapper_contract.py phuzz-main/code/fuzzer/tests/test_zend_discovery.py phuzz-main/code/phuzz.ps1 phuzz-main/code/scripts/wordpress/run-wordpress-phuzz.ps1 phuzz-main/code/docs/guides/zend-runtime-discovery-stage1.md
 ```
 

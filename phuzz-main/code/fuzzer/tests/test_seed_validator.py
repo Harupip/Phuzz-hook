@@ -11,7 +11,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_validator import (
+from seed_generation.verification.seed_validator import (
     build_validation_request,
     evaluate_artifact_payloads,
     load_candidate,

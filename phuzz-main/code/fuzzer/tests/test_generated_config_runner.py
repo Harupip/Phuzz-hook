@@ -732,9 +732,9 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         wrapper = (FUZZER_DIR.parent / "phuzz.ps1").read_text(encoding="utf-8-sig")
 
         self.assertIn("[switch]$KeepDebugArtifacts", script)
-        self.assertIn("artifact_retention.py", script)
+        self.assertIn("generated_runs.py", script)
         self.assertIn("seed_generation\\zend_runtime\\bridge_cli.py", script)
-        self.assertIn("seed_generation\\zend_runtime\\artifact_retention.py", script)
+        self.assertIn("artifacts\\retention\\generated_runs.py", script)
         self.assertIn("--terminal-status", script)
         self.assertIn("--final-config-summary", script)
         self.assertIn("--final-run-summary", script)

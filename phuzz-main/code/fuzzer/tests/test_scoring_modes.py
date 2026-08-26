@@ -14,8 +14,8 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from candidate import Candidate
-from scoring import (
+from core.candidate import Candidate
+from core.scoring import (
     ACTIVE_SCORING_MODE,
     DefaultScoringFormula,
     DEFAULT_HOOK_ENERGY_BASE_WEIGHT,
@@ -211,7 +211,7 @@ class ScoringModeTests(unittest.TestCase):
         self.assertIn("[score-debug] total hit_counter=2 total_paths=2 score=4", debug_output)
 
     def test_env_can_select_scoring_mode_and_new_hook_energy_constants(self) -> None:
-        import scoring
+        import core.scoring as scoring
 
         old_values = {
             "active_mode": ACTIVE_SCORING_MODE,
@@ -251,7 +251,7 @@ class ScoringModeTests(unittest.TestCase):
                 importlib.reload(scoring)
 
     def test_deprecated_energy_weight_env_still_falls_back_when_new_name_is_absent(self) -> None:
-        import scoring
+        import core.scoring as scoring
 
         old_values = {
             "energy_base_weight": DEFAULT_HOOK_ENERGY_BASE_WEIGHT,

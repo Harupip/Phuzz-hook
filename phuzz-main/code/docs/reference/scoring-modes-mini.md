@@ -2,22 +2,22 @@
 
 ## Da lam duoc gi
 
-- `DefaultScoringFormula` trong `scoring.py` bay gio la bo chon mode scoring.
+- `DefaultScoringFormula` trong `core/scoring.py` bay gio la bo chon mode scoring.
 - Mac dinh mode moi la `2`, tuc `PHUZZ+hook`.
 - Mode cu `1`, tuc `PHUZZ`, van con de anh tat hook feedback khi can doi chieu.
 - Co the doi mode va tham so blend bang file `phuzz-main/code/fuzzer/scoring.env`.
 - Hook energy da duoc noi truc tiep vao `calculate_priority(...)` va `calculate_energy(...)`.
 - `priority` van cong additive theo hook signal, nhung `energy` da chuyen sang weighted blend giua PHUZZ base va hook energy.
 - `calculate_score(...)` van giu cong thuc PHUZZ goc de de so sanh voi score path-based.
-- Doan `DefaultScoringFormula` goc da duoc giu lai duoi dang comment ngay trong `scoring.py` de doi chieu.
+- Doan `DefaultScoringFormula` goc da duoc giu lai duoi dang comment ngay trong `core/scoring.py` de doi chieu.
 
 ## Agent note
 
-- Truoc khi sua tiep `phuzz-main/code/fuzzer/scoring.py`, doc file nay truoc.
+- Truoc khi sua tiep `phuzz-main/code/fuzzer/core/scoring.py`, doc file nay truoc.
 - Khi can doi mode luc chay, uu tien sua `phuzz-main/code/fuzzer/scoring.env`.
-- Neu can doi default trong code, sua `ACTIVE_SCORING_MODE` trong `scoring.py`.
+- Neu can doi default trong code, sua `ACTIVE_SCORING_MODE` trong `core/scoring.py`.
 - Neu sua cong thuc hook feedback hoac selector mode, cap nhat cung luc:
-  - `phuzz-main/code/fuzzer/scoring.py`
+  - `phuzz-main/code/fuzzer/core/scoring.py`
   - `phuzz-main/code/fuzzer/tests/test_scoring_modes.py`
   - `phuzz-main/code/fuzzer/scoring.env`
   - file mini doc nay
@@ -25,7 +25,7 @@
 
 ## Da sua o dau
 
-- Modify: `phuzz-main/code/fuzzer/scoring.py`
+- Modify: `phuzz-main/code/fuzzer/core/scoring.py`
   - Them hang so:
     - `SCORING_MODE_PHUZZ = 1`
     - `SCORING_MODE_PHUZZ_HOOK = 2`
