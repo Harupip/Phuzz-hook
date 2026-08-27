@@ -81,6 +81,21 @@ class FakeArtifacts:
 
 
 class GeneratedConfigRunnerTests(unittest.TestCase):
+    def test_optional_fuzzer_node_id_is_forwarded_to_worker(self):
+        runner = FakeRunner([completed(0)])
+        artifacts = FakeArtifacts([set(), set()], {})
+
+        run_generated_configs(
+            [generated_config()],
+            timeout_seconds=1,
+            fuzzer_node_id=101,
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=artifacts.load,
+        )
+
+        self.assertIn("FUZZER_NODE_ID=101", runner.commands[0])
+
     def test_zend_callback_mode_stops_when_callback_and_zend_artifact_match(self):
         process = FakeProcess()
         runner = FakeRunner([])

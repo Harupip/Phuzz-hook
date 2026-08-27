@@ -166,8 +166,15 @@ class Candidate:
         Path(self.get_sync_file(is_interesting=is_interesting)).touch(exist_ok=True)
 
     def write_sync_file(self):
-        with fuzz_open(self.get_sync_file(), 'w') as f:
-            f.write(str(self))
+        sync_path = self.get_sync_file()
+        temp_path = f"{sync_path}.{uuid4().hex}.tmp"
+        try:
+            with fuzz_open(temp_path, 'w') as f:
+                f.write(str(self))
+            os.replace(temp_path, sync_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
     
         if self.is_interesting:
             self.touch_sync_file(is_interesting=True)

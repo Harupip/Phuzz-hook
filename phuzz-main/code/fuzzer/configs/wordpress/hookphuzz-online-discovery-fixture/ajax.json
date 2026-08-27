@@ -1,0 +1,25 @@
+{
+  "target": "http://web/wp-admin/admin-ajax.php",
+  "methods": [
+    "POST"
+  ],
+  "body_params": {
+    "data": [
+      {
+        "name": "action",
+        "value": "hookphuzz_online_discovery"
+      },
+      {
+        "name": "ajax_post",
+        "value": "seed"
+      }
+    ],
+    "fixed": [
+      "action"
+    ],
+    "fuzz": [
+      "ajax_post"
+    ],
+    "weight": 1
+  }
+}

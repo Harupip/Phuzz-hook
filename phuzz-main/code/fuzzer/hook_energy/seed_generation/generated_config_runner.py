@@ -115,6 +115,7 @@ def run_generated_configs(
     timeout_seconds: int,
     service: str = "fuzzer-wordpress-plugin",
     legacy_run_id: str = "",
+    fuzzer_node_id: int | str | None = None,
     run_command: CommandRunner = subprocess.run,
     list_artifacts: ArtifactLister = list_request_artifacts,
     load_artifact: ArtifactLoader = load_request_artifact,
@@ -151,6 +152,8 @@ def run_generated_configs(
         ]
         if legacy_run_id:
             command += ["-e", f"HOOKPHUZZ_LEGACY_RUN_ID={legacy_run_id}"]
+        if fuzzer_node_id is not None:
+            command += ["-e", f"FUZZER_NODE_ID={fuzzer_node_id}"]
         command.append(service)
         stop_reason = None
         try:

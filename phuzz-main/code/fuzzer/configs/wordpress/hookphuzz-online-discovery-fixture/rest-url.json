@@ -1,0 +1,19 @@
+{
+  "target": "http://web/?rest_route=/hookphuzz-online/v1/cases/url/seed-url&rest_get=seed",
+  "methods": [
+    "GET"
+  ],
+  "query_params": {
+    "data": [
+      {
+        "name": "rest_get",
+        "value": "seed"
+      }
+    ],
+    "fixed": [],
+    "fuzz": [
+      "rest_get"
+    ],
+    "weight": 1
+  }
+}
