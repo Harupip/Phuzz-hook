@@ -27,7 +27,17 @@ from hook_energy.seed_generation.generated_config_runner import (
     load_request_artifact,
     run_generated_configs,
 )
-from seed_generation.config.config_exporter import SeedConfigSkip, build_config_for_seed_item
+from seed_generation.config.config_exporter import (
+    SeedConfigSkip,
+    _force_replay_only,
+    build_config_for_seed_item,
+)
+from seed_generation.convergence.convergence import materialize_convergence_seeds
+from hook_energy.seed_generation.zend_runtime.bridge_cli import (
+    converge_iteration,
+    list_convergence_targets,
+    verify_pass2_contract,
+)
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -403,6 +413,261 @@ class OnlineCoordinator:
             self._stop_created_workers("COORDINATOR_ERROR")
             return 1
 
+    def run_reuse_first(self) -> int:
+        """Run one bounded, sequential online cycle through the legacy gates."""
+
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._write_lineage()
+        try:
+            if self.max_versions < 2:
+                return self._reuse_first_failure("V1_VERSION_LIMIT_REACHED")
+
+            selected = self._select_v0()
+            if selected is None:
+                return self._reuse_first_failure("V0_PREREQUISITE_GATE_FAILED")
+            item, v0_config = selected
+            v0_path = self._write_config("v0", v0_config)
+            v0 = self._new_version("v0", v0_config, v0_path, None, None)
+            v0["worker_status"] = "not_started"
+            v0["status"] = "replay_pending"
+            self._write_lineage()
+
+            v0_report = self._run_legacy_config(
+                self._config_row("v0", v0_config, v0_path, item),
+                legacy_run_id=self.legacy_run_id,
+                stop_on_callback=True,
+            )
+            v0["replay_result"] = v0_report
+            self.lineage["v0_replay"] = v0_report
+            if not self._runner_reached(v0_report):
+                v0["status"] = "replay_failed"
+                v0["terminal_reason"] = "V0_REPLAY_FAILED"
+                return self._reuse_first_failure("V0_REPLAY_FAILED")
+            v0["status"] = "replay_pass"
+            self._write_lineage()
+
+            raw_report = {"suggested_seeds": [copy.deepcopy(dict(item))]}
+            targets = list_convergence_targets(
+                raw_report,
+                plugin_slug=self.plugin_slug,
+                legacy_run_id=self.legacy_run_id,
+                pass1_run_summary=v0_report,
+            )
+            if len(targets) != 1:
+                return self._reuse_first_failure("CONVERGENCE_TARGET_COUNT_INVALID")
+            candidate_key = str(targets[0]["candidate_key"]).split("::", 1)[0]
+            v0_artifacts = self._persist_runner_artifacts(v0_report, "v0", "replay")
+            registry = self._load_callback_registry()
+            convergence = converge_iteration(
+                raw_report=raw_report,
+                pass_run_summary=v0_report,
+                pass_artifacts_dir=v0_artifacts["request"],
+                zend_events_dir=v0_artifacts["zend"],
+                registry=registry,
+                plugin_slug=self.plugin_slug,
+                legacy_run_id=self.legacy_run_id,
+                known_state={"known_parameters": []},
+                candidate_key=candidate_key,
+            )
+            self.lineage["convergence"] = convergence
+            self._write_lineage()
+            if convergence.get("status") != "CONTINUE":
+                return self._reuse_first_failure(
+                    f"CONVERGENCE_{str(convergence.get('status') or 'FAILED')}"
+                )
+
+            convergence_report = convergence.get("merged_suggested_seeds")
+            if not isinstance(convergence_report, Mapping):
+                return self._reuse_first_failure("CONVERGENCE_REPORT_INVALID")
+            known_parameters = convergence.get("known_parameters")
+            if not isinstance(known_parameters, list) or not known_parameters:
+                return self._reuse_first_failure("CONVERGENCE_NO_RUNTIME_PARAMETERS")
+
+            replay_report = materialize_convergence_seeds(
+                convergence_report,
+                plugin_slug=self.plugin_slug,
+                candidate_key=candidate_key,
+                known_parameters=known_parameters,
+                for_replay=True,
+            )
+            final_report = materialize_convergence_seeds(
+                convergence_report,
+                plugin_slug=self.plugin_slug,
+                candidate_key=candidate_key,
+                known_parameters=known_parameters,
+                for_replay=False,
+            )
+            replay_item = self._single_seed_item(replay_report)
+            final_item = self._single_seed_item(final_report)
+            _, replay_config = build_config_for_seed_item(
+                final_item,
+                target_base="http://web",
+                replay_only=True,
+                rest_route_fallback=True,
+            )
+            _force_replay_only(replay_config)
+            _, final_config = build_config_for_seed_item(
+                final_item,
+                target_base="http://web",
+                rest_route_fallback=True,
+            )
+            v1_path = self._write_config("v1", final_config)
+            replay_path = self._write_config("v1", replay_config, replay=True)
+            v1 = self._new_version(
+                "v1",
+                final_config,
+                v1_path,
+                str(v0_path),
+                str(convergence.get("request_id") or "converge_iteration"),
+            )
+            v1["worker_status"] = "not_started"
+            v1["status"] = "replay_pending"
+            self._write_lineage()
+
+            pass2_run_id = f"{self.legacy_run_id}-pass2"
+            pass2_report = self._run_legacy_config(
+                self._config_row("v1", replay_config, replay_path, replay_item, replay=True),
+                legacy_run_id=pass2_run_id,
+                stop_on_callback=True,
+            )
+            v1["replay_result"] = pass2_report
+            self.lineage["v1_replay"] = pass2_report
+            self._write_lineage()
+            if not self._runner_reached(pass2_report):
+                v1["status"] = "replay_failed"
+                v1["terminal_reason"] = "V1_REPLAY_FAILED"
+                return self._reuse_first_failure("V1_REPLAY_FAILED")
+
+            pass2_artifacts = self._persist_runner_artifacts(pass2_report, "v1", "pass2")
+            verification = verify_pass2_contract(
+                pass2_run_summary=pass2_report,
+                merged_seed_report=final_report,
+                zend_events_dir=pass2_artifacts["zend"],
+                pass2_artifacts_dir=pass2_artifacts["request"],
+            )
+            self.lineage["pass2_verification"] = verification
+            self._write_lineage()
+            if verification.get("total", 0) < 1 or verification.get("accepted") != verification.get("total"):
+                v1["status"] = "pass2_failed"
+                v1["terminal_reason"] = "PASS2_VERIFICATION_FAILED"
+                return self._reuse_first_failure("PASS2_VERIFICATION_FAILED")
+
+            final_report_result = self._run_legacy_config(
+                self._config_row("v1", final_config, v1_path, final_item),
+                legacy_run_id=f"{self.legacy_run_id}-final",
+                stop_on_callback=False,
+            )
+            v1["final_result"] = final_report_result
+            v1["status"] = "final_pass" if self._runner_reached(final_report_result) else "final_failed"
+            v1["terminal_reason"] = "" if v1["status"] == "final_pass" else "FINAL_PHUZZ_FAILED"
+            self.lineage["final_phuzz"] = final_report_result
+            self.lineage["terminal_status"] = (
+                "ONLINE_REUSE_FIRST_COMPLETE" if v1["status"] == "final_pass" else "NOT_VERIFIED"
+            )
+            self.lineage["terminal_reason"] = "" if v1["status"] == "final_pass" else "FINAL_PHUZZ_FAILED"
+            self._write_lineage()
+            return 0 if v1["status"] == "final_pass" else 1
+        except Exception as exc:
+            self.lineage["terminal_status"] = "NOT_VERIFIED"
+            self.lineage["terminal_reason"] = f"ONLINE_REUSE_FIRST_ERROR: {exc}"
+            self._write_lineage()
+            return 1
+
+    def _run_legacy_config(
+        self,
+        row: Mapping[str, Any],
+        *,
+        legacy_run_id: str,
+        stop_on_callback: bool,
+    ) -> dict[str, Any]:
+        return self.replay_runner(
+            [row],
+            timeout_seconds=self.max_seconds,
+            service=self.service,
+            legacy_run_id=legacy_run_id,
+            run_command=self.run_command,
+            list_artifacts=self.list_artifacts,
+            load_artifact=self.load_artifact,
+            list_zend_artifacts=self.list_zend,
+            stop_on_callback=stop_on_callback,
+            poll_interval_seconds=0,
+        )
+
+    def _persist_runner_artifacts(
+        self,
+        report: Mapping[str, Any],
+        version: str,
+        phase: str,
+    ) -> dict[str, Path]:
+        runs = report.get("runs")
+        if not isinstance(runs, list) or len(runs) != 1 or not isinstance(runs[0], Mapping):
+            raise ValueError("REPLAY_FAILED: expected exactly one runner row")
+        name = str(runs[0].get("matched_artifact") or "")
+        if not name or Path(name).name != name:
+            raise ValueError("REPLAY_FAILED: matched artifact is missing")
+        if name not in self.list_zend():
+            raise ValueError("REPLAY_FAILED: exact Zend artifact is missing")
+        request_dir = self.artifact_dir / version / phase / "request"
+        zend_dir = self.artifact_dir / version / phase / "zend"
+        _write_artifact_json(request_dir / name, self.load_artifact(name))
+        _write_artifact_json(zend_dir / name, self.load_zend(name))
+        return {"request": request_dir, "zend": zend_dir}
+
+    def _load_callback_registry(self) -> Mapping[str, Any]:
+        path = self.output_root / "zend-bridge" / self.legacy_run_id / "hookphuzz-callback-registry.json"
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(value, Mapping):
+            raise ValueError("CALLBACK_REGISTRY_INVALID")
+        return value
+
+    @staticmethod
+    def _single_seed_item(report: Mapping[str, Any]) -> dict[str, Any]:
+        items = report.get("suggested_seeds")
+        if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], Mapping):
+            raise ValueError("CONVERGENCE_REPORT_REQUIRES_ONE_CANDIDATE")
+        return copy.deepcopy(dict(items[0]))
+
+    @staticmethod
+    def _config_row(
+        version: str,
+        config: Mapping[str, Any],
+        config_path: Path,
+        item: Mapping[str, Any],
+        *,
+        replay: bool = False,
+    ) -> dict[str, Any]:
+        seed = item.get("seed") if isinstance(item.get("seed"), Mapping) else {}
+        metadata = config.get("metadata") if isinstance(config.get("metadata"), Mapping) else {}
+        run_id = config_path.parent.parent.name if replay else config_path.parent.name
+        slug = f"online/{run_id}/{('replay/' if replay else '')}{version}"
+        return {
+            "config_slug": slug,
+            "config_path": str(config_path),
+            "hook_name": str(item.get("hook_name") or metadata.get("hook_name") or ""),
+            "callback_id": str(item.get("callback_id") or metadata.get("callback_id") or ""),
+            "callback_repr": str(item.get("callback_repr") or metadata.get("callback_repr") or ""),
+            "entrypoint_type": config.get("entrypoint_type") or item.get("entrypoint_type"),
+            "resolved_method": metadata.get("resolved_method") or seed.get("resolved_method") or seed.get("method"),
+            "seed_variant_id": seed.get("seed_variant_id") or "",
+        }
+
+    @staticmethod
+    def _runner_reached(report: Mapping[str, Any]) -> bool:
+        runs = report.get("runs")
+        if not isinstance(runs, list) or len(runs) != 1 or not isinstance(runs[0], Mapping):
+            return False
+        row = runs[0]
+        return bool(
+            row.get("callback_reached") is True
+            and row.get("process_status") not in {"failed", "runner_error"}
+        )
+
+    def _reuse_first_failure(self, reason: str) -> int:
+        self.lineage["terminal_status"] = "NOT_VERIFIED"
+        self.lineage["terminal_reason"] = reason
+        self._write_lineage()
+        return 1
+
     def _select_v0(self) -> tuple[Mapping[str, Any], dict[str, Any]] | None:
         payload = json.loads(self.suggested_seeds.read_text(encoding="utf-8-sig"))
         suggestions = payload.get("suggested_seeds") if isinstance(payload, Mapping) else None
@@ -749,7 +1014,7 @@ def run_online_discovery(args: argparse.Namespace) -> int:
         max_versions=args.max_versions,
         service=args.service,
     )
-    result = coordinator.run()
+    result = coordinator.run_reuse_first()
     print(f"Online lineage: {coordinator.lineage_path}")
     print(f"Online versions: {len(coordinator.lineage['versions'])}")
     print(f"Online terminal status: {coordinator.lineage.get('terminal_status', 'NOT_VERIFIED')}")
@@ -757,7 +1022,7 @@ def run_online_discovery(args: argparse.Namespace) -> int:
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run bounded online Zend discovery with immutable workers.")
+    parser = argparse.ArgumentParser(description="Run bounded online Zend discovery through the legacy gates.")
     parser.add_argument("--suggested-seeds", required=True)
     parser.add_argument("--bootstrap-config", default="")
     parser.add_argument("--config-root", required=True)
@@ -1077,6 +1342,11 @@ def _write_exclusive_json(path: Path, payload: Any) -> None:
     with path.open("x", encoding="utf-8", newline="\n") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
+
+
+def _write_artifact_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def _write_json(path: Path, payload: Any) -> None:

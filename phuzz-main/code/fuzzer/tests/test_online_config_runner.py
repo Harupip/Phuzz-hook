@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
@@ -63,6 +64,118 @@ def callback_artifact(*, source: str = "POST", name: str = "age", value: str = "
 
 
 class OnlineConfigRunnerContractTests(unittest.TestCase):
+    def test_reuse_first_path_runs_legacy_gates_in_order_without_long_lived_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            suggested = root / "suggested_seeds.json"
+            seed_item = {
+                "hook_name": "wp_ajax_nopriv_reuse_first",
+                "callback_id": "reuse-callback",
+                "callback_repr": "ReuseFixture::callback",
+                "plugin_slug": "fixture",
+                "seed": {
+                    "auth_mode": "unauth-capable",
+                    "method": "POST",
+                    "resolved_method": "POST",
+                    "method_status": "resolved",
+                    "path": "/wp-admin/admin-ajax.php",
+                    "body": {"action": "reuse_first", "seed": "stable"},
+                    "query_params": {},
+                    "headers": {},
+                    "fixed_params": ["action"],
+                    "fuzzable_params": ["seed"],
+                },
+            }
+            suggested.write_text(json.dumps({"suggested_seeds": [seed_item]}), encoding="utf-8")
+            registry_path = root / "output" / "zend-bridge" / "run-reuse" / "hookphuzz-callback-registry.json"
+            registry_path.parent.mkdir(parents=True)
+            registry_path.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+            calls = []
+            replay_configs = []
+            run_count = 0
+
+            def replay_runner(configs, **kwargs):
+                nonlocal run_count
+                run_count += 1
+                replay_configs.append(
+                    json.loads(Path(configs[0]["config_path"]).read_text(encoding="utf-8"))
+                )
+                calls.append(f"run:{run_count}:{configs[0]['config_slug']}")
+                artifact_name = f"request-{run_count}.json"
+                return {
+                    "legacy_run_id": kwargs["legacy_run_id"],
+                    "runs": [{
+                        "hook_name": configs[0]["hook_name"],
+                        "callback_id": configs[0]["callback_id"],
+                        "seed_variant_id": "",
+                        "callback_reached": True,
+                        "validation_status": "callback_reached",
+                        "process_status": "exited",
+                        "matched_artifact": artifact_name,
+                        "request_artifacts": [artifact_name],
+                    }],
+                }
+
+            def converge_runner(**kwargs):
+                calls.append("converge_iteration")
+                return {
+                    "status": "CONTINUE",
+                    "candidate_key": "candidate",
+                    "known_parameters": [{
+                        "source": "POST",
+                        "path": ["new_param"],
+                        "helper_depth": 0,
+                        "observed_count": 1,
+                        "evidence_kind": "zend_runtime",
+                    }],
+                    "merged_suggested_seeds": {"suggested_seeds": [copy.deepcopy(seed_item)]},
+                }
+
+            def materialize_runner(raw_report, **kwargs):
+                calls.append(f"materialize:{kwargs['for_replay']}")
+                return copy.deepcopy(raw_report)
+
+            def verify_runner(**kwargs):
+                calls.append("verify_pass2_contract")
+                return {"accepted": 1, "total": 1}
+
+            commands = []
+            coordinator = OnlineCoordinator(
+                suggested_seeds=suggested,
+                config_root=root / "configs",
+                output_root=root / "output",
+                plugin_slug="fixture",
+                legacy_run_id="run-reuse",
+                max_seconds=1,
+                max_versions=2,
+                run_command=lambda command, **kwargs: commands.append(command),
+                list_zend=lambda: {"request-1.json", "request-2.json", "request-3.json"},
+                load_artifact=lambda name: {"request_id": Path(name).stem},
+                load_zend=lambda name: {"request_id": Path(name).stem, "run_id": "run-reuse"},
+                replay_runner=replay_runner,
+            )
+
+            with patch("hook_energy.seed_generation.online_config_runner.converge_iteration", converge_runner, create=True), \
+                 patch("hook_energy.seed_generation.online_config_runner.materialize_convergence_seeds", materialize_runner, create=True), \
+                 patch("hook_energy.seed_generation.online_config_runner.verify_pass2_contract", verify_runner, create=True), \
+                 patch("hook_energy.seed_generation.online_config_runner._matching_artifact_name", side_effect=AssertionError("substring correlation is not allowed")):
+                result = coordinator.run_reuse_first()
+
+            self.assertEqual(result, 0)
+            self.assertEqual(run_count, 3)
+            self.assertEqual(calls[0].split(":", 2)[-1], "online/run-reuse/v0")
+            self.assertLess(calls.index("converge_iteration"), calls.index("materialize:False"))
+            self.assertLess(calls.index("materialize:False"), calls.index("verify_pass2_contract"))
+            self.assertLess(calls.index("verify_pass2_contract"), len(calls) - 1)
+            replay_call = next(call for call in calls if "online/run-reuse/replay/v1" in call)
+            self.assertIn("online/run-reuse/replay/v1", replay_call)
+            self.assertIn("online/run-reuse/v1", calls[-1])
+            self.assertEqual(replay_configs[1]["config_type"], "replay_only")
+            self.assertEqual(replay_configs[1]["body_params"]["fuzz"], [])
+            self.assertEqual(commands, [])
+            self.assertEqual([item["version"] for item in coordinator.lineage["versions"]], ["v0", "v1"])
+            self.assertEqual(coordinator.lineage["terminal_status"], "ONLINE_REUSE_FIRST_COMPLETE")
+
     def test_v0_requires_target_method_callback_and_fuzzable_config(self) -> None:
         config = online_config()
         self.assertEqual(validate_v0_config(config), (True, ""))

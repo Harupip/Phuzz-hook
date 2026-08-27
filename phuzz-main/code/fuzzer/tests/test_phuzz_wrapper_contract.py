@@ -87,6 +87,31 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn("-ZendMaxIterations 5", result.stdout)
         self.assertNotIn("-Mode zend-discovery", result.stdout)
 
+    def test_guided_wrapper_generated_mode_does_not_forward_online_controls(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode", "generated",
+                "-PluginSlug", "demo-plugin",
+                "-OnlineTimeoutSeconds", "12",
+                "-OnlineMaxVersions", "2",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-RunGeneratedConfigs", result.stdout)
+        self.assertNotIn("-RunOnline", result.stdout)
+        self.assertNotIn("-OnlineTimeoutSeconds", result.stdout)
+        self.assertNotIn("-OnlineMaxVersions", result.stdout)
+
     def test_guided_wrapper_online_mode_forwards_bounded_discovery(self):
         result = subprocess.run(
             [
