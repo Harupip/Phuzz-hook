@@ -1,0 +1,32 @@
+{
+  "target": "http://web/?rest_route=/hookphuzz-online/v1/cases/json",
+  "methods": [
+    "POST"
+  ],
+  "headers": {
+    "data": [
+      {
+        "name": "Content-Type",
+        "value": "application/json"
+      }
+    ],
+    "fixed": [
+      "Content-Type"
+    ],
+    "fuzz": [],
+    "weight": 0
+  },
+  "body_params": {
+    "data": [
+      {
+        "name": "rest_json",
+        "value": "seed"
+      }
+    ],
+    "fixed": [],
+    "fuzz": [
+      "rest_json"
+    ],
+    "weight": 1
+  }
+}

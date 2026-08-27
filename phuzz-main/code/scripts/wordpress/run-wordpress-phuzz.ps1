@@ -4,6 +4,7 @@ param(
     [switch]$ForcePlugins,
     [switch]$NoFollowLogs,
     [switch]$RunGeneratedConfigs,
+    [switch]$RunOnline,
     [switch]$UseEntrypointPipeline,
     [switch]$UseZendDiscovery,
     [switch]$KeepDebugArtifacts,
@@ -16,7 +17,11 @@ param(
     [ValidateRange(1, 30)]
     [int]$GeneratedConfigTimeoutSeconds = 30,
     [ValidateRange(1, 30)]
-    [int]$ZendMaxIterations = 5
+    [int]$ZendMaxIterations = 5,
+    [ValidateRange(1, 60)]
+    [int]$OnlineTimeoutSeconds = 60,
+    [ValidateRange(1, 20)]
+    [int]$OnlineMaxVersions = 2
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,11 +35,17 @@ $webUrl = "http://localhost:8080/"
 if ($UseEntrypointPipeline -and -not $RunGeneratedConfigs) {
     throw "-UseEntrypointPipeline requires -RunGeneratedConfigs."
 }
-if ($UseZendDiscovery -and -not $RunGeneratedConfigs) {
+if ($RunOnline -and $RunGeneratedConfigs) {
+    throw "-RunOnline cannot be combined with -RunGeneratedConfigs."
+}
+if ($UseZendDiscovery -and -not ($RunGeneratedConfigs -or $RunOnline)) {
     throw "-UseZendDiscovery requires -RunGeneratedConfigs."
 }
 if ($UseZendDiscovery -and $UseEntrypointPipeline) {
     throw "-UseZendDiscovery uses the legacy generated flow and cannot be combined with -UseEntrypointPipeline."
+}
+if ($RunOnline -and -not $UseZendDiscovery) {
+    throw "-RunOnline requires -UseZendDiscovery."
 }
 
 if (-not $BootstrapConfigSlug) {
@@ -636,7 +647,8 @@ function Export-LiveSeedSuggestions {
         [string[]]$ComposeArgs,
         [string]$PluginSlug,
         [switch]$UseEntrypointPipeline,
-        [switch]$RuntimeParametersOnly
+        [switch]$RuntimeParametersOnly,
+        [string]$OutputDir = ""
     )
 
     $webContainerId = (& $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] ps -q web).Trim()
@@ -646,7 +658,10 @@ function Export-LiveSeedSuggestions {
 
     $coverageFileInContainer = "/shared-tmpfs/hook-coverage/total_coverage.json"
     $coverageSnapshot = Join-Path ([System.IO.Path]::GetTempPath()) "phuzz-live-total-coverage.json"
-    $outputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
+    if (-not $OutputDir) {
+        $OutputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
+    }
+    $outputDir = $OutputDir
     $exportCli = Join-Path $ScriptRoot "fuzzer\cli\export_seeds.py"
     $zendRuntimeExportCli = Join-Path $ScriptRoot "fuzzer\cli\export_zend_seeds.py"
     $pipelineCli = Join-Path $ScriptRoot "fuzzer\cli\entrypoint_pipeline.py"
@@ -1437,17 +1452,57 @@ try {
         }
     }
 
-    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug -UseEntrypointPipeline:$UseEntrypointPipeline -RuntimeParametersOnly:$UseZendDiscovery
+    $onlineSeedOutputDir = ""
+    if ($RunOnline) {
+        $onlineSeedOutputDir = Join-Path $scriptRoot ("fuzzer\output\online-seed-generation\{0}" -f $legacyRunId)
+        New-Item -ItemType Directory -Path $onlineSeedOutputDir -Force | Out-Null
+    }
+    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug -UseEntrypointPipeline:$UseEntrypointPipeline -RuntimeParametersOnly:$UseZendDiscovery -OutputDir $onlineSeedOutputDir
     if ($learnPressProof) {
         Add-LearnPressNonceToSuggestedSeeds `
             -SuggestedSeedsPath (Join-Path $scriptRoot "fuzzer\output\seed_generation\suggested_seeds.json") `
             -Proof $learnPressProof
     }
-    if (-not $UseEntrypointPipeline) {
+    if (-not $UseEntrypointPipeline -and -not $RunOnline) {
         Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug
     }
 
-    if ($RunGeneratedConfigs) {
+    if ($RunOnline) {
+        Initialize-ZendCallbackRegistry `
+            -ScriptRoot $scriptRoot `
+            -PluginSlug $PluginSlug `
+            -SeedOutputDir $onlineSeedOutputDir `
+            -LegacyRunId $legacyRunId `
+            -ComposeArgs $composeArgs
+        $seedOutputDir = $onlineSeedOutputDir
+        $suggestedSeedsPath = Join-Path $seedOutputDir "suggested_seeds.json"
+        $onlineConfigRoot = Join-Path $scriptRoot "fuzzer\configs"
+        $onlineRunner = Join-Path $scriptRoot "fuzzer\hook_energy\seed_generation\online_config_runner.py"
+        Assert-PathExists -Path $onlineRunner -Hint "The online Zend coordinator is missing from this checkout."
+
+        Write-Host "Stopping bootstrap fuzzer before immutable online v0 starts"
+        Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("stop", "--timeout", "30", $fuzzerService)
+        Write-Host "Starting bounded online Zend discovery"
+        $onlineArgs = @(
+            $onlineRunner,
+            "--suggested-seeds", $suggestedSeedsPath,
+            "--bootstrap-config", $requiredConfig,
+            "--config-root", $onlineConfigRoot,
+            "--output-root", $seedOutputDir,
+            "--plugin-slug", $PluginSlug,
+            "--legacy-run-id", $legacyRunId,
+            "--max-seconds", "$OnlineTimeoutSeconds",
+            "--max-versions", "$OnlineMaxVersions",
+            "--service", $fuzzerService
+        )
+        python @onlineArgs
+        $onlineExitCode = $LASTEXITCODE
+        $onlineLineagePath = Join-Path (Join-Path $seedOutputDir "online") (Join-Path $legacyRunId "lineage.json")
+        Write-Host "Online lineage: $onlineLineagePath"
+        if ($onlineExitCode -ne 0) {
+            throw "Online Zend discovery failed. See $onlineLineagePath"
+        }
+    } elseif ($RunGeneratedConfigs) {
         $seedOutputDir = Join-Path $scriptRoot "fuzzer\output\seed_generation"
         $generatedConfigSummary = Join-Path $seedOutputDir "generated_config_summary.json"
         $generatedRunSummary = Join-Path $seedOutputDir "generated_config_run_summary.json"

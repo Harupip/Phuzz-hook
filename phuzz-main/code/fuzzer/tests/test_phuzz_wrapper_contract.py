@@ -18,14 +18,27 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertTrue(script_path.exists(), "Expected phuzz-main/code/phuzz.ps1 to exist")
         script = script_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"recursive\")]", script)
+        self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"online\", \"recursive\")]", script)
         self.assertIn("[string]$Mode", script)
         self.assertIn("[switch]$UseZendDiscovery", script)
         self.assertIn("[int]$ZendMaxIterations = 5", script)
+        self.assertIn("[int]$OnlineTimeoutSeconds = 60", script)
+        self.assertIn("[int]$OnlineMaxVersions = 2", script)
         self.assertIn("[switch]$DryRun", script)
         self.assertIn("[switch]$Help", script)
         self.assertIn("[switch]$RunRecursiveConfigs", script)
         self.assertIn("Read-Host", script)
+
+    def test_guided_wrapper_menu_offers_online_mode(self):
+        script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")
+
+        self.assertIn("4) online", script)
+        self.assertIn("5) recursive", script)
+        self.assertIn('switch ($choice)', script)
+        self.assertIn('"4" { return "online" }', script)
+        self.assertIn('"5" { return "recursive" }', script)
+        self.assertIn('Read-Host "Select [1-5]"', script)
+        self.assertIn('$interactive -and $Mode -eq "online"', script)
 
     def test_guided_wrapper_rejects_public_zend_discovery_mode(self):
         result = subprocess.run(
@@ -73,6 +86,55 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn("-UseZendDiscovery", result.stdout)
         self.assertIn("-ZendMaxIterations 5", result.stdout)
         self.assertNotIn("-Mode zend-discovery", result.stdout)
+
+    def test_guided_wrapper_online_mode_forwards_bounded_discovery(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode", "online",
+                "-PluginSlug", "hookphuzz-entrypoint-direct-fixture",
+                "-UseZendDiscovery",
+                "-OnlineTimeoutSeconds", "60",
+                "-OnlineMaxVersions", "2",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-RunOnline", result.stdout)
+        self.assertIn("-UseZendDiscovery", result.stdout)
+        self.assertIn("-OnlineTimeoutSeconds 60", result.stdout)
+        self.assertIn("-OnlineMaxVersions 2", result.stdout)
+        self.assertIn("--bootstrap-config", (CODE_DIR / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1").read_text(encoding="utf-8-sig"))
+        self.assertIn("Initialize-ZendCallbackRegistry", (CODE_DIR / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1").read_text(encoding="utf-8-sig"))
+
+    def test_guided_wrapper_rejects_online_entrypoint_pipeline(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode", "online",
+                "-UseZendDiscovery",
+                "-UseEntrypointPipeline",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("UseEntrypointPipeline", result.stderr)
 
     def test_guided_wrapper_rejects_zend_discovery_outside_generated_mode(self):
         result = subprocess.run(
@@ -556,6 +618,9 @@ sys.exit(2)
         script = (CODE_DIR / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1").read_text(encoding="utf-8-sig")
 
         self.assertIn("[switch]$UseEntrypointPipeline", script)
+        self.assertIn("[switch]$RunOnline", script)
+        self.assertIn("online_config_runner.py", script)
+        self.assertIn("OnlineMaxVersions", script)
         self.assertIn("cli\\export_seeds.py", script)
         self.assertIn("cli\\entrypoint_pipeline.py", script)
         self.assertIn("--output-config-dir", script)

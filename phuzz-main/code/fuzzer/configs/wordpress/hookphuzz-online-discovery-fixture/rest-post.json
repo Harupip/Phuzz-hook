@@ -1,0 +1,19 @@
+{
+  "target": "http://web/?rest_route=/hookphuzz-online/v1/cases/form",
+  "methods": [
+    "POST"
+  ],
+  "body_params": {
+    "data": [
+      {
+        "name": "rest_post",
+        "value": "seed"
+      }
+    ],
+    "fixed": [],
+    "fuzz": [
+      "rest_post"
+    ],
+    "weight": 1
+  }
+}
