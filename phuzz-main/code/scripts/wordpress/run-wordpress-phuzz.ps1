@@ -5,6 +5,7 @@ param(
     [switch]$NoFollowLogs,
     [switch]$RunGeneratedConfigs,
     [switch]$RunOnline,
+    [switch]$RunOnlineLinked,
     [switch]$UseEntrypointPipeline,
     [switch]$UseZendDiscovery,
     [switch]$KeepDebugArtifacts,
@@ -35,17 +36,20 @@ $webUrl = "http://localhost:8080/"
 if ($UseEntrypointPipeline -and -not $RunGeneratedConfigs) {
     throw "-UseEntrypointPipeline requires -RunGeneratedConfigs."
 }
-if ($RunOnline -and $RunGeneratedConfigs) {
-    throw "-RunOnline cannot be combined with -RunGeneratedConfigs."
+if (($RunOnline -or $RunOnlineLinked) -and $RunGeneratedConfigs) {
+    throw "-RunOnline and -RunOnlineLinked cannot be combined with -RunGeneratedConfigs."
 }
-if ($UseZendDiscovery -and -not ($RunGeneratedConfigs -or $RunOnline)) {
+if ($RunOnline -and $RunOnlineLinked) {
+    throw "-RunOnline and -RunOnlineLinked cannot be combined."
+}
+if ($UseZendDiscovery -and -not ($RunGeneratedConfigs -or $RunOnline -or $RunOnlineLinked)) {
     throw "-UseZendDiscovery requires -RunGeneratedConfigs."
 }
 if ($UseZendDiscovery -and $UseEntrypointPipeline) {
     throw "-UseZendDiscovery uses the legacy generated flow and cannot be combined with -UseEntrypointPipeline."
 }
-if ($RunOnline -and -not $UseZendDiscovery) {
-    throw "-RunOnline requires -UseZendDiscovery."
+if (($RunOnline -or $RunOnlineLinked) -and -not $UseZendDiscovery) {
+    throw "-RunOnline and -RunOnlineLinked require -UseZendDiscovery."
 }
 
 if (-not $BootstrapConfigSlug) {
@@ -1453,7 +1457,7 @@ try {
     }
 
     $onlineSeedOutputDir = ""
-    if ($RunOnline) {
+    if ($RunOnline -or $RunOnlineLinked) {
         $onlineSeedOutputDir = Join-Path $scriptRoot ("fuzzer\output\online-seed-generation\{0}" -f $legacyRunId)
         New-Item -ItemType Directory -Path $onlineSeedOutputDir -Force | Out-Null
     }
@@ -1463,11 +1467,60 @@ try {
             -SuggestedSeedsPath (Join-Path $scriptRoot "fuzzer\output\seed_generation\suggested_seeds.json") `
             -Proof $learnPressProof
     }
-    if (-not $UseEntrypointPipeline -and -not $RunOnline) {
+    if (-not $UseEntrypointPipeline -and -not ($RunOnline -or $RunOnlineLinked)) {
         Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug
     }
 
-    if ($RunOnline) {
+    if ($RunOnlineLinked) {
+        Initialize-ZendCallbackRegistry `
+            -ScriptRoot $scriptRoot `
+            -PluginSlug $PluginSlug `
+            -SeedOutputDir $onlineSeedOutputDir `
+            -LegacyRunId $legacyRunId `
+            -ComposeArgs $composeArgs
+        $seedOutputDir = $onlineSeedOutputDir
+        $suggestedSeedsPath = Join-Path $seedOutputDir "suggested_seeds.json"
+        $onlineConfigRoot = Join-Path $scriptRoot "fuzzer\configs"
+        $onlineLinkedRunner = Join-Path $scriptRoot "fuzzer\hook_energy\seed_generation\online_linked_coordinator.py"
+        $callbackRegistry = Join-Path (Join-Path (Join-Path $seedOutputDir "zend-bridge") $legacyRunId) "hookphuzz-callback-registry.json"
+        Assert-PathExists -Path $onlineLinkedRunner -Hint "The online-linked Zend coordinator is missing from this checkout."
+        Assert-PathExists -Path $suggestedSeedsPath -Hint "The online-linked seed export is missing."
+        Assert-PathExists -Path $callbackRegistry -Hint "The online-linked callback registry is missing."
+
+        Write-Host "Stopping bootstrap fuzzer before immutable online-linked v0 starts"
+        Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("stop", "--timeout", "30", $fuzzerService)
+        Write-Host "Starting bounded online-linked Zend discovery"
+        $onlineLinkedArgs = @(
+            $onlineLinkedRunner,
+            "--suggested-seeds", $suggestedSeedsPath,
+            "--bootstrap-config", $requiredConfig,
+            "--config-root", $onlineConfigRoot,
+            "--output-root", (Join-Path $scriptRoot "fuzzer\output"),
+            "--plugin-slug", $PluginSlug,
+            "--legacy-run-id", $legacyRunId,
+            "--callback-registry", $callbackRegistry,
+            "--max-seconds", "$OnlineTimeoutSeconds",
+            "--max-versions", "$OnlineMaxVersions",
+            "--service", $fuzzerService
+        )
+        $previousComposeFile = $env:COMPOSE_FILE
+        $env:COMPOSE_FILE = "docker-compose.yml;$overridePath"
+        try {
+            python @onlineLinkedArgs
+            $onlineLinkedExitCode = $LASTEXITCODE
+        } finally {
+            if ($null -eq $previousComposeFile) {
+                Remove-Item Env:COMPOSE_FILE -ErrorAction SilentlyContinue
+            } else {
+                $env:COMPOSE_FILE = $previousComposeFile
+            }
+        }
+        $onlineLinkedStatePath = Join-Path (Join-Path (Join-Path $scriptRoot "fuzzer\output\online-linked") $legacyRunId) "state.json"
+        Write-Host "Online-linked state: $onlineLinkedStatePath"
+        if ($onlineLinkedExitCode -ne 0) {
+            throw "Online-linked Zend discovery failed. See $onlineLinkedStatePath"
+        }
+    } elseif ($RunOnline) {
         Initialize-ZendCallbackRegistry `
             -ScriptRoot $scriptRoot `
             -PluginSlug $PluginSlug `

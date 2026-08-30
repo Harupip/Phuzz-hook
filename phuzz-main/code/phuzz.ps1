@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("default", "seed-config", "generated", "online", "recursive")]
+    [ValidateSet("default", "seed-config", "generated", "online", "online-linked", "recursive")]
     [string]$Mode,
     [ValidatePattern('^[a-zA-Z0-9_.-]+$')]
     [string]$PluginSlug,
@@ -54,6 +54,7 @@ Usage:
   .\phuzz.ps1 -Mode recursive -RunRecursiveConfigs
   .\phuzz.ps1 -Mode generated -PluginSlug gamipress -UseZendDiscovery -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs
   .\phuzz.ps1 -Mode online -PluginSlug hookphuzz-entrypoint-direct-fixture -UseZendDiscovery -OnlineTimeoutSeconds 60 -OnlineMaxVersions 2 -NoFollowLogs
+  .\phuzz.ps1 -Mode online-linked -PluginSlug hookphuzz-online-discovery-fixture -UseZendDiscovery -OnlineTimeoutSeconds 60 -OnlineMaxVersions 3 -NoFollowLogs
   .\phuzz.ps1 -Mode recursive -RecursiveInputFile fuzzer\output\hook-coverage\requests\latest.json
   .\phuzz.ps1 -Mode generated -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs -DryRun
 
@@ -62,6 +63,7 @@ Modes:
   seed-config  Start WordPress, export hook seeds, generate PHUZZ configs, do not follow logs.
   generated    Export seeds/configs, then run generated hook configs sequentially.
   online       Start bounded v0 fuzzing, then replay-gate immutable Zend-discovered child workers.
+  online-linked Start immutable versioned workers, replay-gating Zend-discovered child workers.
   recursive    Generate recursive child-hook seeds/configs from request artifacts.
 
 Useful options:
@@ -72,7 +74,7 @@ Useful options:
   -SeedWaitSeconds <seconds>       Wait window for live hook coverage snapshot. Default: 45.
   -GeneratedConfigTimeoutSeconds   Per generated-config run window. Default/max: 30.
   -UseEntrypointPipeline           Opt-in generated mode to the entrypoint pipeline.
-  -UseZendDiscovery                Opt-in generated/online mode to runtime-only Zend parameter discovery.
+  -UseZendDiscovery                Opt-in generated/online/online-linked mode to runtime-only Zend parameter discovery.
   -KeepDebugArtifacts              Keep Zend intermediate artifacts after a successful run.
   -ZendMaxIterations <count>       Max Zend REST convergence iterations. Default: 5.
   -OnlineTimeoutSeconds <seconds>  Bounded online discovery budget. Default/max: 60.
@@ -661,8 +663,8 @@ if ($Help) {
 if ($UseEntrypointPipeline -and $PSBoundParameters.ContainsKey("Mode") -and $Mode -ne "generated") {
     throw "-UseEntrypointPipeline is only supported with -Mode generated."
 }
-if ($UseZendDiscovery -and $PSBoundParameters.ContainsKey("Mode") -and $Mode -notin @("generated", "online")) {
-    throw "-UseZendDiscovery is only supported with -Mode generated or -Mode online."
+if ($UseZendDiscovery -and $PSBoundParameters.ContainsKey("Mode") -and $Mode -notin @("generated", "online", "online-linked")) {
+    throw "-UseZendDiscovery is only supported with -Mode generated, -Mode online, or -Mode online-linked."
 }
 
 $interactive = -not $PSBoundParameters.ContainsKey("Mode")
@@ -682,8 +684,8 @@ if ($interactive -and $Mode -eq "online") {
 if ($UseEntrypointPipeline -and $Mode -ne "generated") {
     throw "-UseEntrypointPipeline is only supported with -Mode generated."
 }
-if ($UseZendDiscovery -and $Mode -notin @("generated", "online")) {
-    throw "-UseZendDiscovery is only supported with -Mode generated or -Mode online."
+if ($UseZendDiscovery -and $Mode -notin @("generated", "online", "online-linked")) {
+    throw "-UseZendDiscovery is only supported with -Mode generated, -Mode online, or -Mode online-linked."
 }
 
 if (-not $PSBoundParameters.ContainsKey("PluginSlug")) {
@@ -748,6 +750,14 @@ switch ($Mode) {
     }
     "online" {
         $runnerParams["RunOnline"] = $true
+        $runnerParams["OnlineTimeoutSeconds"] = $OnlineTimeoutSeconds
+        $runnerParams["OnlineMaxVersions"] = $OnlineMaxVersions
+        if ($UseZendDiscovery) {
+            $runnerParams["UseZendDiscovery"] = $true
+        }
+    }
+    "online-linked" {
+        $runnerParams["RunOnlineLinked"] = $true
         $runnerParams["OnlineTimeoutSeconds"] = $OnlineTimeoutSeconds
         $runnerParams["OnlineMaxVersions"] = $OnlineMaxVersions
         if ($UseZendDiscovery) {

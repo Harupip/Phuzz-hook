@@ -18,7 +18,7 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertTrue(script_path.exists(), "Expected phuzz-main/code/phuzz.ps1 to exist")
         script = script_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"online\", \"recursive\")]", script)
+        self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"online\", \"online-linked\", \"recursive\")]", script)
         self.assertIn("[string]$Mode", script)
         self.assertIn("[switch]$UseZendDiscovery", script)
         self.assertIn("[int]$ZendMaxIterations = 5", script)
@@ -85,6 +85,8 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn("-RunGeneratedConfigs", result.stdout)
         self.assertIn("-UseZendDiscovery", result.stdout)
         self.assertIn("-ZendMaxIterations 5", result.stdout)
+        self.assertNotIn("-RunOnline", result.stdout)
+        self.assertNotIn("-RunOnlineLinked", result.stdout)
         self.assertNotIn("-Mode zend-discovery", result.stdout)
 
     def test_guided_wrapper_online_mode_forwards_bounded_discovery(self):
@@ -114,6 +116,39 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn("-OnlineMaxVersions 2", result.stdout)
         self.assertIn("--bootstrap-config", (CODE_DIR / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1").read_text(encoding="utf-8-sig"))
         self.assertIn("Initialize-ZendCallbackRegistry", (CODE_DIR / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1").read_text(encoding="utf-8-sig"))
+
+    def test_guided_wrapper_online_linked_mode_forwards_bounded_discovery(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode", "online-linked",
+                "-PluginSlug", "hookphuzz-rest-get-param-fixture",
+                "-UseZendDiscovery",
+                "-OnlineTimeoutSeconds", "60",
+                "-OnlineMaxVersions", "3",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-RunOnlineLinked", result.stdout)
+        self.assertIn("-UseZendDiscovery", result.stdout)
+        self.assertIn("-OnlineTimeoutSeconds 60", result.stdout)
+        self.assertIn("-OnlineMaxVersions 3", result.stdout)
+
+        script = (CODE_DIR / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("online_linked_coordinator.py", script)
+        self.assertIn("[switch]$RunOnlineLinked", script)
+        self.assertIn('"--bootstrap-config", $requiredConfig', script)
+        self.assertIn('"HOOKPHUZZ_CMPLOG=1"', (CODE_DIR / "fuzzer" / "hook_energy" / "seed_generation" / "online_linked_coordinator.py").read_text(encoding="utf-8"))
+        self.assertIn("$env:COMPOSE_FILE", script)
 
     def test_guided_wrapper_rejects_online_entrypoint_pipeline(self):
         result = subprocess.run(
