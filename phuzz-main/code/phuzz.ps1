@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("default", "seed-config", "generated", "online", "online-linked", "recursive")]
+    [ValidateSet("default", "seed-config", "generated", "zend", "online", "online-linked", "recursive")]
     [string]$Mode,
     [ValidatePattern('^[a-zA-Z0-9_.-]+$')]
     [string]$PluginSlug,
@@ -50,9 +50,9 @@ Usage:
   .\phuzz.ps1 -Mode default
   .\phuzz.ps1 -Mode seed-config -NoFollowLogs
   .\phuzz.ps1 -Mode generated -PluginSlug gamipress -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs
+  .\phuzz.ps1 -Mode zend -PluginSlug gamipress -ZendMaxIterations 5 -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs
   .\phuzz.ps1 -Mode recursive
   .\phuzz.ps1 -Mode recursive -RunRecursiveConfigs
-  .\phuzz.ps1 -Mode generated -PluginSlug gamipress -UseZendDiscovery -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs
   .\phuzz.ps1 -Mode online -PluginSlug hookphuzz-entrypoint-direct-fixture -UseZendDiscovery -OnlineTimeoutSeconds 60 -OnlineMaxVersions 2 -NoFollowLogs
   .\phuzz.ps1 -Mode online-linked -PluginSlug hookphuzz-online-discovery-fixture -UseZendDiscovery -OnlineTimeoutSeconds 60 -OnlineMaxVersions 3 -NoFollowLogs
   .\phuzz.ps1 -Mode recursive -RecursiveInputFile fuzzer\output\hook-coverage\requests\latest.json
@@ -62,6 +62,7 @@ Modes:
   default      Start WordPress PHUZZ with existing behavior.
   seed-config  Start WordPress, export hook seeds, generate PHUZZ configs, do not follow logs.
   generated    Export seeds/configs, then run generated hook configs sequentially.
+  zend         Run generated configs with runtime-only Zend parameter discovery.
   online       Start bounded v0 fuzzing, then replay-gate immutable Zend-discovered child workers.
   online-linked Start immutable versioned workers, replay-gating Zend-discovered child workers.
   recursive    Generate recursive child-hook seeds/configs from request artifacts.
@@ -74,7 +75,7 @@ Useful options:
   -SeedWaitSeconds <seconds>       Wait window for live hook coverage snapshot. Default: 45.
   -GeneratedConfigTimeoutSeconds   Per generated-config run window. Default/max: 30.
   -UseEntrypointPipeline           Opt-in generated mode to the entrypoint pipeline.
-  -UseZendDiscovery                Opt-in generated/online/online-linked mode to runtime-only Zend parameter discovery.
+  -UseZendDiscovery                Opt-in online/online-linked mode to runtime-only Zend parameter discovery; use -Mode zend for generated discovery.
   -KeepDebugArtifacts              Keep Zend intermediate artifacts after a successful run.
   -ZendMaxIterations <count>       Max Zend REST convergence iterations. Default: 5.
   -OnlineTimeoutSeconds <seconds>  Bounded online discovery budget. Default/max: 60.
@@ -110,18 +111,19 @@ function Read-MenuMode {
     Write-Host "  1) default     - Start WordPress PHUZZ with existing behavior"
     Write-Host "  2) seed-config - Start web, export hook seeds, generate PHUZZ configs"
     Write-Host "  3) generated   - Generate configs, then run them sequentially"
-    Write-Host "                 (optional Zend Discovery prompt follows)"
-    Write-Host "  4) online      - Bounded v0 fuzzing with Zend-discovered child workers"
-    Write-Host "  5) recursive   - Generate recursive child-hook seeds/configs from request artifacts"
+    Write-Host "  4) zend        - Generated configs with runtime-only Zend parameter discovery"
+    Write-Host "  5) online      - Bounded v0 fuzzing with Zend-discovered child workers"
+    Write-Host "  6) recursive   - Generate recursive child-hook seeds/configs from request artifacts"
 
-    $choice = (Read-Host "Select [1-5]").Trim()
+    $choice = (Read-Host "Select [1-6]").Trim()
     switch ($choice) {
         "1" { return "default" }
         "2" { return "seed-config" }
         "3" { return "generated" }
-        "4" { return "online" }
-        "5" { return "recursive" }
-        default { throw "Invalid selection '$choice'. Choose 1, 2, 3, 4, or 5." }
+        "4" { return "zend" }
+        "5" { return "online" }
+        "6" { return "recursive" }
+        default { throw "Invalid selection '$choice'. Choose 1, 2, 3, 4, 5, or 6." }
     }
 }
 
@@ -663,8 +665,11 @@ if ($Help) {
 if ($UseEntrypointPipeline -and $PSBoundParameters.ContainsKey("Mode") -and $Mode -ne "generated") {
     throw "-UseEntrypointPipeline is only supported with -Mode generated."
 }
-if ($UseZendDiscovery -and $PSBoundParameters.ContainsKey("Mode") -and $Mode -notin @("generated", "online", "online-linked")) {
-    throw "-UseZendDiscovery is only supported with -Mode generated, -Mode online, or -Mode online-linked."
+if ($UseZendDiscovery -and $PSBoundParameters.ContainsKey("Mode") -and $Mode -eq "generated") {
+    throw "-UseZendDiscovery is now a dedicated -Mode zend workflow. Use -Mode zend instead."
+}
+if ($UseZendDiscovery -and $PSBoundParameters.ContainsKey("Mode") -and $Mode -notin @("zend", "online", "online-linked")) {
+    throw "-UseZendDiscovery is only supported with -Mode zend, -Mode online, or -Mode online-linked."
 }
 
 $interactive = -not $PSBoundParameters.ContainsKey("Mode")
@@ -672,10 +677,8 @@ if ($interactive) {
     $Mode = Read-MenuMode
 }
 
-if ($interactive -and $Mode -eq "generated") {
-    $UseZendDiscovery = Read-YesNo `
-        -Prompt "Enable Zend Discovery (two-pass parameter discovery)" `
-        -Default $false
+if ($Mode -eq "zend") {
+    $UseZendDiscovery = $true
 }
 if ($interactive -and $Mode -eq "online") {
     $UseZendDiscovery = $true
@@ -684,13 +687,16 @@ if ($interactive -and $Mode -eq "online") {
 if ($UseEntrypointPipeline -and $Mode -ne "generated") {
     throw "-UseEntrypointPipeline is only supported with -Mode generated."
 }
-if ($UseZendDiscovery -and $Mode -notin @("generated", "online", "online-linked")) {
-    throw "-UseZendDiscovery is only supported with -Mode generated, -Mode online, or -Mode online-linked."
+if ($UseZendDiscovery -and $Mode -eq "generated") {
+    throw "-UseZendDiscovery is now a dedicated -Mode zend workflow. Use -Mode zend instead."
+}
+if ($UseZendDiscovery -and $Mode -notin @("zend", "online", "online-linked")) {
+    throw "-UseZendDiscovery is only supported with -Mode zend, -Mode online, or -Mode online-linked."
 }
 
 if (-not $PSBoundParameters.ContainsKey("PluginSlug")) {
     if ($interactive) {
-        $PluginSlug = Read-PluginSlug -RequireConfig ($Mode -ne "generated")
+        $PluginSlug = Read-PluginSlug -RequireConfig ($Mode -notin @("generated", "zend"))
     } else {
         $PluginSlug = "show-all-comments-in-one-page"
     }
@@ -740,10 +746,15 @@ switch ($Mode) {
         if ($UseEntrypointPipeline) {
             $runnerParams["UseEntrypointPipeline"] = $true
         }
-        if ($UseZendDiscovery) {
-            $runnerParams["UseZendDiscovery"] = $true
-            $runnerParams["ZendMaxIterations"] = $ZendMaxIterations
+        if ($KeepDebugArtifacts) {
+            $runnerParams["KeepDebugArtifacts"] = $true
         }
+    }
+    "zend" {
+        $runnerParams["RunGeneratedConfigs"] = $true
+        $runnerParams["GeneratedConfigTimeoutSeconds"] = $GeneratedConfigTimeoutSeconds
+        $runnerParams["UseZendDiscovery"] = $true
+        $runnerParams["ZendMaxIterations"] = $ZendMaxIterations
         if ($KeepDebugArtifacts) {
             $runnerParams["KeepDebugArtifacts"] = $true
         }

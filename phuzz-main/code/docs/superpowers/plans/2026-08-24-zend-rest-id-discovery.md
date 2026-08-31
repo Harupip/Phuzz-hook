@@ -135,7 +135,7 @@
 **Files/artifacts:** no production source change; use a fresh isolated output directory and the existing WordPress runtime.
 
 - [ ] Rebuild/restart the WordPress Zend image so the new extension is active.
-- [ ] Run the LearnPress generated flow through `phuzz.ps1` with `-Mode generated -PluginSlug learnpress -UseZendDiscovery -NoFollowLogs -KeepDebugArtifacts`.
+- [ ] Run the LearnPress Zend flow through `phuzz.ps1` with `-Mode zend -PluginSlug learnpress -NoFollowLogs -KeepDebugArtifacts`.
 - [ ] Verify in the fresh artifacts that `target_loading.loaded_callbacks` contains `LP_Jwt_Lessons_V1_Controller::finish_lesson`, target loading is complete, and `dropped_event_count=0`.
 - [ ] Verify the C artifact contains a callback-attributed REST event for bucket `POST`, parameter `id`, path `["POST","id"]`, and the exact canonical callback.
 - [ ] Verify the bridge/enrichment summary contains `id` exactly once, location `form`, `fuzzable=true`, and `final_fuzz_export_allowed=true`; verify the generated config contains `body_params.id` and is `fuzzing_ready`.

@@ -1,14 +1,14 @@
 # Zend Runtime Discovery Stage 1 and Phase 2
 
-Stage 1 la che do opt-in cho generated WordPress flow. Muc tieu la lay parameter fuzzing tu bang chung Zend runtime, khong lay tu static regex/source scan.
+Stage 1 la mode Zend rieng cho generated WordPress flow. Muc tieu la lay parameter fuzzing tu bang chung Zend runtime, khong lay tu static regex/source scan.
 
 Che do nay chi ap dung khi chay:
 
 ```powershell
-.\phuzz.ps1 -Mode generated -PluginSlug <plugin-slug> -UseZendDiscovery -NoFollowLogs
+.\phuzz.ps1 -Mode zend -PluginSlug <plugin-slug> -NoFollowLogs
 ```
 
-`-UseZendDiscovery` van di qua generated mode mac dinh: `export_cli.py -> seed_to_config_cli.py`. No khong bat `-UseEntrypointPipeline`, khong thay doi default generated flow khi flag nay khong duoc truyen.
+`-Mode zend` dung generated flow legacy `export_cli.py -> seed_to_config_cli.py` va tu dong bat runtime-only Zend discovery. No khong bat `-UseEntrypointPipeline`; `-Mode generated` van giu flow generated khong Zend.
 
 ## Stage 1 Lam Gi
 
@@ -318,7 +318,7 @@ Proof summary:
 Current REST convergence implementation proof (2026-08-13):
 
 ```powershell
-rtk powershell.exe -ExecutionPolicy Bypass -File phuzz-main/code/phuzz.ps1 -Mode generated -PluginSlug hookphuzz-rest-get-param-fixture -UseZendDiscovery -ZendMaxIterations 5 -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs -DryRun
+rtk powershell.exe -ExecutionPolicy Bypass -File phuzz-main/code/phuzz.ps1 -Mode zend -PluginSlug hookphuzz-rest-get-param-fixture -ZendMaxIterations 5 -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs -DryRun
 rtk python -m unittest fuzzer.tests.test_zend_discovery fuzzer.tests.test_generated_config_runner fuzzer.tests.test_phuzz_wrapper_contract -v
 rtk powershell.exe -NoProfile -Command "[void][System.Management.Automation.Language.Parser]::ParseFile('scripts/wordpress/run-wordpress-phuzz.ps1',[ref]`$null,[ref]`$null); [void][System.Management.Automation.Language.Parser]::ParseFile('phuzz.ps1',[ref]`$null,[ref]`$null); 'parser ok'"
 rtk python -m py_compile fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py fuzzer/seed_generation/convergence/convergence.py

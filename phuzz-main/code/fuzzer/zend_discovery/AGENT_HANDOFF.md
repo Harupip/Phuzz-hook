@@ -525,5 +525,5 @@ Current CF7 REST status: `BLOCKED`, because there is no fresh authenticated call
 2. Add current-run artifact test for `rest_route:contact-form-7/v1/contact-forms` route metadata from UOPZ registration.
 3. Extend downstream config/export handling for URL, defaults, and nested REST
    paths only after separate runtime proof and policy decisions.
-4. Re-run `-Mode generated -PluginSlug contact-form-7 -UseZendDiscovery` with bounded timeouts.
+4. Re-run `-Mode zend -PluginSlug contact-form-7` with bounded timeouts.
 5. Report PASS only if Pass 2 re-observes the same correlated REST parameter evidence with fresh request ids.

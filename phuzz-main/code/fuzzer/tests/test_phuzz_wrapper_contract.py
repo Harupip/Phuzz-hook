@@ -18,7 +18,7 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertTrue(script_path.exists(), "Expected phuzz-main/code/phuzz.ps1 to exist")
         script = script_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"online\", \"online-linked\", \"recursive\")]", script)
+        self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"zend\", \"online\", \"online-linked\", \"recursive\")]", script)
         self.assertIn("[string]$Mode", script)
         self.assertIn("[switch]$UseZendDiscovery", script)
         self.assertIn("[int]$ZendMaxIterations = 5", script)
@@ -29,16 +29,64 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn("[switch]$RunRecursiveConfigs", script)
         self.assertIn("Read-Host", script)
 
-    def test_guided_wrapper_menu_offers_online_mode(self):
+    def test_guided_wrapper_menu_separates_zend_and_online_modes(self):
         script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")
 
-        self.assertIn("4) online", script)
-        self.assertIn("5) recursive", script)
+        self.assertIn("4) zend", script)
+        self.assertIn("5) online", script)
+        self.assertIn("6) recursive", script)
         self.assertIn('switch ($choice)', script)
-        self.assertIn('"4" { return "online" }', script)
-        self.assertIn('"5" { return "recursive" }', script)
-        self.assertIn('Read-Host "Select [1-5]"', script)
+        self.assertIn('"4" { return "zend" }', script)
+        self.assertIn('"5" { return "online" }', script)
+        self.assertIn('"6" { return "recursive" }', script)
+        self.assertIn('Read-Host "Select [1-6]"', script)
         self.assertIn('$interactive -and $Mode -eq "online"', script)
+
+    def test_guided_wrapper_has_dedicated_zend_mode(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode", "zend",
+                "-PluginSlug", "demo-plugin",
+                "-ZendMaxIterations", "7",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-RunGeneratedConfigs", result.stdout)
+        self.assertIn("-UseZendDiscovery", result.stdout)
+        self.assertIn("-ZendMaxIterations 7", result.stdout)
+        self.assertNotIn("-RunOnline", result.stdout)
+        self.assertNotIn("-UseEntrypointPipeline", result.stdout)
+
+    def test_guided_wrapper_rejects_zend_flag_on_generated_mode(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CODE_DIR / "phuzz.ps1"),
+                "-Mode", "generated",
+                "-PluginSlug", "demo-plugin",
+                "-UseZendDiscovery",
+                "-DryRun",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("-Mode zend", result.stderr)
 
     def test_guided_wrapper_rejects_public_zend_discovery_mode(self):
         result = subprocess.run(
@@ -62,7 +110,7 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("zend-discovery", result.stderr)
 
-    def test_guided_wrapper_generated_mode_can_opt_into_zend_discovery(self):
+    def test_guided_wrapper_generated_mode_does_not_enable_zend_discovery(self):
         result = subprocess.run(
             [
                 "powershell",
@@ -72,8 +120,6 @@ class PhuzzWrapperContractTests(unittest.TestCase):
                 str(CODE_DIR / "phuzz.ps1"),
                 "-Mode", "generated",
                 "-PluginSlug", "demo-plugin",
-                "-UseZendDiscovery",
-                "-ZendMaxIterations", "5",
                 "-DryRun",
             ],
             capture_output=True,
@@ -83,8 +129,7 @@ class PhuzzWrapperContractTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-RunGeneratedConfigs", result.stdout)
-        self.assertIn("-UseZendDiscovery", result.stdout)
-        self.assertIn("-ZendMaxIterations 5", result.stdout)
+        self.assertNotIn("-UseZendDiscovery", result.stdout)
         self.assertNotIn("-RunOnline", result.stdout)
         self.assertNotIn("-RunOnlineLinked", result.stdout)
         self.assertNotIn("-Mode zend-discovery", result.stdout)
@@ -567,7 +612,7 @@ sys.exit(2)
                 str(CODE_DIR / "phuzz.ps1"),
                 "-DryRun",
             ],
-            input="3\nn\n\nn\n",
+            input="3\n\nn\n",
             capture_output=True,
             text=True,
             timeout=30,
@@ -578,7 +623,7 @@ sys.exit(2)
         self.assertIn("-RunGeneratedConfigs", result.stdout)
         self.assertNotIn("-UseZendDiscovery", result.stdout)
 
-    def test_guided_wrapper_interactive_generated_mode_can_enable_zend_discovery(self):
+    def test_guided_wrapper_interactive_zend_mode_enables_zend_discovery(self):
         script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")
         result = subprocess.run(
             [
@@ -589,14 +634,14 @@ sys.exit(2)
                 str(CODE_DIR / "phuzz.ps1"),
                 "-DryRun",
             ],
-            input="3\ny\n\nn\n",
+            input="4\n\nn\n",
             capture_output=True,
             text=True,
             timeout=30,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Enable Zend Discovery (two-pass parameter discovery)", script)
+        self.assertNotIn("Enable Zend Discovery (two-pass parameter discovery)", script)
         self.assertIn("-RunGeneratedConfigs", result.stdout)
         self.assertIn("-UseZendDiscovery", result.stdout)
 
@@ -615,7 +660,7 @@ sys.exit(2)
                     str(CODE_DIR / "phuzz.ps1"),
                     "-DryRun",
                 ],
-                input="3\nn\n\nn\n",
+                input="3\n\nn\n",
                 capture_output=True,
                 text=True,
                 timeout=30,
