@@ -854,6 +854,16 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertIn("REPEATED_CONFIG", script)
         self.assertIn("PASS_PARTIAL_AUTH_EXPECTED", script)
 
+    def test_wordpress_runner_continues_zend_after_partial_pass1_batch(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("Test-ZendPass1BatchUsable", script)
+        self.assertIn("callback_reached", script)
+        self.assertIn("PASS_PARTIAL_RUNNER_ERRORS", script)
+        self.assertIn("$finalSeedReports.Count", script)
+        self.assertIn("status = \"FAILED\"", script)
+
     def test_zend_artifact_copy_uses_only_callback_matched_request(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
         script = script_path.read_text(encoding="utf-8-sig")

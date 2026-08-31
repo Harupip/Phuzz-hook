@@ -3355,12 +3355,51 @@ class ZendDiscoveryTests(unittest.TestCase):
                         "hook_name": nopriv["hook_name"],
                         "callback_id": nopriv["callback_id"],
                         "expected_auth_skip": True,
+                        "callback_reached": False,
+                    },
+                    {
+                        "hook_name": authenticated["hook_name"],
+                        "callback_id": authenticated["callback_id"],
+                        "callback_reached": True,
                     }
                 ]
             },
         )
 
         self.assertEqual([target["callback_id"] for target in targets], ["ajax-auth"])
+
+    def test_list_convergence_targets_requires_pass1_callback_proof(self) -> None:
+        reached = self.raw_seed_item(callback_id="ajax-reached", action="demo_reached")
+        not_reached = self.raw_seed_item(callback_id="ajax-not-reached", action="demo_not_reached")
+        generated = {
+            "generated": [
+                {"hook_name": reached["hook_name"], "callback_id": reached["callback_id"]},
+                {"hook_name": not_reached["hook_name"], "callback_id": not_reached["callback_id"]},
+            ]
+        }
+        targets = list_convergence_targets(
+            {"suggested_seeds": [reached, not_reached]},
+            plugin_slug="demo-plugin",
+            legacy_run_id="legacy-1",
+            generated_summary=generated,
+            pass1_run_summary={
+                "runs": [
+                    {
+                        "hook_name": reached["hook_name"],
+                        "callback_id": reached["callback_id"],
+                        "callback_reached": True,
+                    },
+                    {
+                        "hook_name": not_reached["hook_name"],
+                        "callback_id": not_reached["callback_id"],
+                        "callback_reached": False,
+                        "process_status": "runner_error",
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual([target["callback_id"] for target in targets], ["ajax-reached"])
 
     def test_engine_has_no_legacy_runner_imports(self) -> None:
         engine_source = (FUZZER_DIR / "zend_discovery" / "engine.py").read_text(encoding="utf-8")

@@ -971,6 +971,7 @@ def list_convergence_targets(
     targets: list[dict[str, Any]] = []
     seen: set[str] = set()
     generated_keys: set[tuple[str, str, str]] | None = None
+    pass1_callback_keys: set[tuple[str, str, str]] | None = None
     expected_auth_skip_keys: set[tuple[str, str, str]] = set()
     if generated_summary is not None:
         rows = generated_summary.get("generated")
@@ -981,6 +982,11 @@ def list_convergence_targets(
         rows = pass1_run_summary.get("runs")
         if not isinstance(rows, list):
             raise ValueError("pass1-generated_config_run_summary.json must contain a runs array")
+        pass1_callback_keys = {
+            _run_key(row)
+            for row in rows
+            if isinstance(row, Mapping) and row.get("callback_reached") is True
+        }
         expected_auth_skip_keys = {
             _run_key(row)
             for row in rows
@@ -990,6 +996,8 @@ def list_convergence_targets(
         if not isinstance(item, Mapping):
             continue
         if generated_keys is not None and _seed_key(item) not in generated_keys:
+            continue
+        if pass1_callback_keys is not None and _seed_key(item) not in pass1_callback_keys:
             continue
         if _seed_key(item) in expected_auth_skip_keys:
             continue

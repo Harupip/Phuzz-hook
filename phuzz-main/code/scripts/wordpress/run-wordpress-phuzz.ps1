@@ -138,6 +138,35 @@ function Assert-PathExists {
     }
 }
 
+function Test-ZendPass1BatchUsable {
+    param(
+        [string]$SummaryPath,
+        [int]$ExitCode
+    )
+
+    Assert-PathExists -Path $SummaryPath -Hint "The generated config runner did not write its summary."
+    try {
+        $summary = Get-Content -LiteralPath $SummaryPath -Raw | ConvertFrom-Json
+    } catch {
+        throw "Generated hook config batch summary is unreadable: $SummaryPath"
+    }
+    if (-not $summary.counts) {
+        throw "Generated hook config batch summary has no counts: $SummaryPath"
+    }
+
+    $callbackReached = [int]$summary.counts.callback_reached
+    if ($ExitCode -eq 0) {
+        return [pscustomobject]@{ Status = "PASS"; Summary = $summary }
+    }
+    if ($callbackReached -gt 0) {
+        Write-Warning ("Zend Pass 1 partial: exit_code={0}, callback_reached={1}, runner_error={2}, process_failed={3}; continuing with proven callbacks. Summary: {4}" -f `
+            $ExitCode, $callbackReached, [int]$summary.counts.runner_error, [int]$summary.counts.process_failed, $SummaryPath)
+        return [pscustomobject]@{ Status = "PARTIAL"; Summary = $summary }
+    }
+
+    throw "Generated hook config batch failed before producing any callback proof. See $SummaryPath"
+}
+
 function Wait-ForWebReady {
     param(
         [string]$Url,
@@ -1219,129 +1248,145 @@ function Invoke-ZendConvergence {
     try {
         foreach ($candidate in @($targets)) {
             $targetCandidateKey = [string]$candidate.candidate_key
-            if (-not $targetCandidateKey) {
-                throw "REPLAY_FAILED: Zend convergence target is missing candidate_key"
-            }
-            $targetDirectoryName = Get-ZendTargetDirectoryName -CandidateKey $targetCandidateKey
-            $candidate | Add-Member -NotePropertyName "target_directory" -NotePropertyValue $targetDirectoryName -Force
-            $targetDir = Join-Path $targetsDir $targetDirectoryName
-            $targetIterationsDir = Join-Path $targetDir "i"
-            $targetCurrentDir = Join-Path $targetDir "cur"
-            $targetFinalDir = Join-Path $targetDir "fin"
-            $statePath = Join-Path $targetDir "state.json"
-            $targetHistoryPath = Join-Path $targetDir "summary.json"
+            $targetDirectoryName = ""
             $targetHistory = @()
-            $seenRequestIds = New-Object System.Collections.Generic.HashSet[string]
-            $seenConfigHashes = New-Object System.Collections.Generic.HashSet[string]
-            $currentRunSummary = $InitialRunSummary
-            $currentSeeds = $rawSuggestedSeeds
-            $converged = $false
-            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-            @{ known_parameters = @() } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding UTF8
+            try {
+                if (-not $targetCandidateKey) {
+                    throw "REPLAY_FAILED: Zend convergence target is missing candidate_key"
+                }
+                $targetDirectoryName = Get-ZendTargetDirectoryName -CandidateKey $targetCandidateKey
+                $candidate | Add-Member -NotePropertyName "target_directory" -NotePropertyValue $targetDirectoryName -Force
+                $targetDir = Join-Path $targetsDir $targetDirectoryName
+                $targetIterationsDir = Join-Path $targetDir "i"
+                $targetCurrentDir = Join-Path $targetDir "cur"
+                $targetFinalDir = Join-Path $targetDir "fin"
+                $statePath = Join-Path $targetDir "state.json"
+                $targetHistoryPath = Join-Path $targetDir "summary.json"
+                $seenRequestIds = New-Object System.Collections.Generic.HashSet[string]
+                $seenConfigHashes = New-Object System.Collections.Generic.HashSet[string]
+                $currentRunSummary = $InitialRunSummary
+                $currentSeeds = $rawSuggestedSeeds
+                $converged = $false
+                New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+                @{ known_parameters = @() } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding UTF8
 
-            for ($iteration = 0; $iteration -lt $MaxIterations; $iteration++) {
-                $iterationDir = Join-Path $targetIterationsDir "$iteration"
-                $uopzDir = Join-Path $iterationDir "uopz"
-                $zendDir = Join-Path $iterationDir "zend"
-                $nextStatePath = Join-Path $iterationDir "state.json"
-                $mergedSeedsPath = Join-Path $iterationDir "seeds.json"
-                $replayConfigDir = Join-Path $iterationDir "cfg"
-                $replayConfigSummary = Join-Path $iterationDir "cfg.json"
-                New-Item -ItemType Directory -Path $iterationDir -Force | Out-Null
-                Copy-GeneratedRequestArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $currentRunSummary -OutputDir $uopzDir
-                Copy-ZendOpcodeArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $currentRunSummary -OutputDir $zendDir
+                for ($iteration = 0; $iteration -lt $MaxIterations; $iteration++) {
+                    $iterationDir = Join-Path $targetIterationsDir "$iteration"
+                    $uopzDir = Join-Path $iterationDir "uopz"
+                    $zendDir = Join-Path $iterationDir "zend"
+                    $nextStatePath = Join-Path $iterationDir "state.json"
+                    $mergedSeedsPath = Join-Path $iterationDir "seeds.json"
+                    $replayConfigDir = Join-Path $iterationDir "cfg"
+                    $replayConfigSummary = Join-Path $iterationDir "cfg.json"
+                    New-Item -ItemType Directory -Path $iterationDir -Force | Out-Null
+                    Copy-GeneratedRequestArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $currentRunSummary -OutputDir $uopzDir
+                    Copy-ZendOpcodeArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $currentRunSummary -OutputDir $zendDir
 
-                python $bridgeCli `
-                    --operation converge-iteration `
-                    --plugin-slug $PluginSlug `
-                    --legacy-run-id $LegacyRunId `
-                    --candidate-key $targetCandidateKey `
-                    --registry $registry `
-                    --raw-suggested-seeds $currentSeeds `
-                    --pass1-run-summary $currentRunSummary `
-                    --pass1-artifacts-dir $uopzDir `
-                    --zend-events-dir $zendDir `
-                    --convergence-state $statePath `
-                    --convergence-state-output $nextStatePath `
-                    --convergence-merged-seeds $mergedSeedsPath `
-                    --output-config-dir $replayConfigDir `
-                    --generated-config-summary $replayConfigSummary
-                if ($LASTEXITCODE -ne 0) {
-                    throw "REPLAY_FAILED: Zend convergence correlation failed for $targetCandidateKey iteration $iteration"
-                }
+                    python $bridgeCli `
+                        --operation converge-iteration `
+                        --plugin-slug $PluginSlug `
+                        --legacy-run-id $LegacyRunId `
+                        --candidate-key $targetCandidateKey `
+                        --registry $registry `
+                        --raw-suggested-seeds $currentSeeds `
+                        --pass1-run-summary $currentRunSummary `
+                        --pass1-artifacts-dir $uopzDir `
+                        --zend-events-dir $zendDir `
+                        --convergence-state $statePath `
+                        --convergence-state-output $nextStatePath `
+                        --convergence-merged-seeds $mergedSeedsPath `
+                        --output-config-dir $replayConfigDir `
+                        --generated-config-summary $replayConfigSummary
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "REPLAY_FAILED: Zend convergence correlation failed for $targetCandidateKey iteration $iteration"
+                    }
 
-                $state = Get-Content -LiteralPath $nextStatePath -Raw | ConvertFrom-Json
-                if ($state.status -eq "REPLAY_FAILED") {
-                    throw "REPLAY_FAILED: Zend convergence lost known runtime parameters for $targetCandidateKey iteration $iteration"
+                    $state = Get-Content -LiteralPath $nextStatePath -Raw | ConvertFrom-Json
+                    if ($state.status -eq "REPLAY_FAILED") {
+                        throw "REPLAY_FAILED: Zend convergence lost known runtime parameters for $targetCandidateKey iteration $iteration"
+                    }
+                    $requestId = [string]$state.request_id
+                    if (-not $requestId -or -not $seenRequestIds.Add($requestId)) {
+                        throw "REPLAY_FAILED: matched artifact request ID is missing or duplicated"
+                    }
+                    if ($targetCandidateKey -ne [string]$state.candidate_key) {
+                        throw "REPLAY_FAILED: canonical candidate key changed across convergence iterations"
+                    }
+                    $targetHistory += [pscustomobject]@{
+                        iteration = $iteration
+                        candidate_key = $targetCandidateKey
+                        request_id = $requestId
+                        known_before = @($state.known_before)
+                        observed_parameters = @($state.observed_parameters)
+                        new_parameters = @($state.new_parameters)
+                        missing_parameters = @($state.missing_parameters)
+                        known_parameters = @($state.known_parameters)
+                        replay_summary = $currentRunSummary
+                    }
+                    @{ legacy_run_id = $LegacyRunId; candidate_key = $targetCandidateKey; status = [string]$state.status; iterations = $targetHistory } |
+                        ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $targetHistoryPath -Encoding UTF8
+                    Publish-ZendDirectorySnapshot -SourceDir $iterationDir -TargetDir $targetCurrentDir
+                    Publish-ZendAggregateTargetState -Targets $targets -SnapshotName "current" -OutputDir $rootCurrentDir
+
+                    if ($state.status -eq "CONVERGED") {
+                        Publish-ZendDirectorySnapshot -SourceDir $iterationDir -TargetDir $targetFinalDir
+                        $finalSeedReports += (Join-Path $targetFinalDir "seeds.json")
+                        $converged = $true
+                        break
+                    }
+                    if ($iteration -ge ($MaxIterations - 1)) {
+                        throw "ITERATION_LIMIT: new runtime parameters remain after iteration $iteration"
+                    }
+                    $replaySummary = Get-Content -LiteralPath $replayConfigSummary -Raw | ConvertFrom-Json
+                    if (@($replaySummary.generated).Count -ne 1) {
+                        throw "REPLAY_FAILED: Phase 2 requires exactly one generated candidate per target"
+                    }
+                    $configPath = [string]$replaySummary.generated[0].config_path
+                    $configHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
+                    if (-not $seenConfigHashes.Add($configHash)) {
+                        throw "REPEATED_CONFIG: canonical generated config hash repeated"
+                    }
+                    $currentSeeds = $mergedSeedsPath
+                    $statePath = $nextStatePath
+                    $currentRunSummary = Join-Path $iterationDir "run.json"
+                    python $generatedConfigRunner `
+                        --generated-config-summary $replayConfigSummary `
+                        --output-file $currentRunSummary `
+                        --timeout-seconds $TimeoutSeconds `
+                        --service $fuzzerService `
+                        --stop-on-callback `
+                        --legacy-run-id $LegacyRunId
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "REPLAY_FAILED: generated convergence replay failed. See $currentRunSummary"
+                    }
                 }
-                $requestId = [string]$state.request_id
-                if (-not $requestId -or -not $seenRequestIds.Add($requestId)) {
-                    throw "REPLAY_FAILED: matched artifact request ID is missing or duplicated"
+                if (-not $converged) {
+                    throw "ITERATION_LIMIT: target did not converge within $MaxIterations iterations"
                 }
-                if ($targetCandidateKey -ne [string]$state.candidate_key) {
-                    throw "REPLAY_FAILED: canonical candidate key changed across convergence iterations"
-                }
-                $targetHistory += [pscustomobject]@{
-                    iteration = $iteration
+                $targetResults += [pscustomobject]@{
                     candidate_key = $targetCandidateKey
-                    request_id = $requestId
-                    known_before = @($state.known_before)
-                    observed_parameters = @($state.observed_parameters)
-                    new_parameters = @($state.new_parameters)
-                    missing_parameters = @($state.missing_parameters)
-                    known_parameters = @($state.known_parameters)
-                    replay_summary = $currentRunSummary
+                    target_directory = $targetDirectoryName
+                    status = "CONVERGED"
+                    current = $targetCurrentDir
+                    final = $targetFinalDir
+                    iterations = $targetHistory
                 }
-                @{ legacy_run_id = $LegacyRunId; candidate_key = $targetCandidateKey; status = [string]$state.status; iterations = $targetHistory } |
-                    ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $targetHistoryPath -Encoding UTF8
-                Publish-ZendDirectorySnapshot -SourceDir $iterationDir -TargetDir $targetCurrentDir
-                Publish-ZendAggregateTargetState -Targets $targets -SnapshotName "current" -OutputDir $rootCurrentDir
-
-                if ($state.status -eq "CONVERGED") {
-                    Publish-ZendDirectorySnapshot -SourceDir $iterationDir -TargetDir $targetFinalDir
-                    $finalSeedReports += (Join-Path $targetFinalDir "seeds.json")
-                    $converged = $true
-                    break
+            } catch {
+                $failure = $_.Exception.Message
+                $targetResults += [pscustomobject]@{
+                    candidate_key = $targetCandidateKey
+                    target_directory = $targetDirectoryName
+                    status = "FAILED"
+                    error = $failure
+                    iterations = $targetHistory
                 }
-                if ($iteration -ge ($MaxIterations - 1)) {
-                    throw "ITERATION_LIMIT: new runtime parameters remain after iteration $iteration"
-                }
-                $replaySummary = Get-Content -LiteralPath $replayConfigSummary -Raw | ConvertFrom-Json
-                if (@($replaySummary.generated).Count -ne 1) {
-                    throw "REPLAY_FAILED: Phase 2 requires exactly one generated candidate per target"
-                }
-                $configPath = [string]$replaySummary.generated[0].config_path
-                $configHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
-                if (-not $seenConfigHashes.Add($configHash)) {
-                    throw "REPEATED_CONFIG: canonical generated config hash repeated"
-                }
-                $currentSeeds = $mergedSeedsPath
-                $statePath = $nextStatePath
-                $currentRunSummary = Join-Path $iterationDir "run.json"
-                python $generatedConfigRunner `
-                    --generated-config-summary $replayConfigSummary `
-                    --output-file $currentRunSummary `
-                    --timeout-seconds $TimeoutSeconds `
-                    --service $fuzzerService `
-                    --stop-on-callback `
-                    --legacy-run-id $LegacyRunId
-                if ($LASTEXITCODE -ne 0) {
-                    throw "REPLAY_FAILED: generated convergence replay failed. See $currentRunSummary"
-                }
-            }
-            if (-not $converged) {
-                throw "ITERATION_LIMIT: target did not converge within $MaxIterations iterations"
-            }
-            $targetResults += [pscustomobject]@{
-                candidate_key = $targetCandidateKey
-                target_directory = $targetDirectoryName
-                status = "CONVERGED"
-                current = $targetCurrentDir
-                final = $targetFinalDir
-                iterations = $targetHistory
+                Write-Warning "Zend convergence target failed; continuing with remaining targets: $targetCandidateKey - $failure"
             }
             @{ legacy_run_id = $LegacyRunId; status = "IN_PROGRESS"; targets = $targetResults } |
                 ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $historyPath -Encoding UTF8
+        }
+        if ($finalSeedReports.Count -eq 0) {
+            throw "REPLAY_FAILED: no Zend convergence target completed successfully"
         }
         Publish-ZendAggregateTargetState -Targets $targets -SnapshotName "final" -OutputDir $rootFinalDir
         $combinedTemp = Join-Path $bridgeWorkDir "zend_merged_suggested_seeds.final.tmp.json"
@@ -1349,7 +1394,7 @@ function Invoke-ZendConvergence {
             $bridgeCli,
             "--operation", "combine-final",
             "--merged-suggested-seeds", $combinedTemp,
-            "--expected-count", "$($targets.Count)"
+            "--expected-count", "$($finalSeedReports.Count)"
         )
         foreach ($report in $finalSeedReports) {
             $combineArgs += @("--final-seed-report", $report)
@@ -1382,9 +1427,10 @@ function Invoke-ZendConvergence {
             -SeedOutputDir $SeedOutputDir `
             -Pass2RunSummary $finalRunSummary `
             -ComposeArgs $ComposeArgs
-        @{ legacy_run_id = $LegacyRunId; status = "CONVERGED"; targets = $targetResults; current = $rootCurrentDir; final = $rootFinalDir } |
+        $convergenceStatus = if (@($targetResults | Where-Object { $_.status -ne "CONVERGED" }).Count -gt 0) { "CONVERGED_PARTIAL" } else { "CONVERGED" }
+        @{ legacy_run_id = $LegacyRunId; status = $convergenceStatus; targets = $targetResults; current = $rootCurrentDir; final = $rootFinalDir } |
             ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $historyPath -Encoding UTF8
-        return [pscustomobject]@{ ConfigSummary = $finalConfigSummary; RunSummary = $finalRunSummary; HistoryPath = $historyPath }
+        return [pscustomobject]@{ ConfigSummary = $finalConfigSummary; RunSummary = $finalRunSummary; HistoryPath = $historyPath; Status = $convergenceStatus }
     } catch {
         $failure = $_.Exception.Message
         $status = if ($failure -match "ITERATION_LIMIT") { "ITERATION_LIMIT" } elseif ($failure -match "REPEATED_CONFIG") { "REPEATED_CONFIG" } else { "REPLAY_FAILED" }
@@ -1637,11 +1683,14 @@ try {
         if ($UseEntrypointPipeline) {
             Write-EntrypointPluginProofFile -SeedOutputDir $seedOutputDir -PluginSlug $PluginSlug -RunnerLog $generatedRunnerLog
         }
-        if ($generatedExitCode -ne 0) {
+        $pass1Batch = $null
+        if ($UseZendDiscovery) {
+            $pass1Batch = Test-ZendPass1BatchUsable -SummaryPath $generatedRunSummary -ExitCode $generatedExitCode
+        } elseif ($generatedExitCode -ne 0) {
             throw "Generated hook config batch failed. See $generatedRunSummary"
         }
         if ($UseZendDiscovery) {
-            $pass1RunSummary = Get-Content -LiteralPath $generatedRunSummary -Raw | ConvertFrom-Json
+            $pass1RunSummary = $pass1Batch.Summary
             $zendAuthPartialExpected = [int]$pass1RunSummary.counts.expected_auth_skip -gt 0
         }
 
@@ -1660,7 +1709,7 @@ try {
                 $generatedConfigSummary = $convergence.ConfigSummary
                 $generatedRunSummary = $convergence.RunSummary
                 $zendRetentionReady = $true
-                $zendTerminalStatus = if ($zendAuthPartialExpected) { "PASS_PARTIAL_AUTH_EXPECTED" } else { "PASS" }
+                $zendTerminalStatus = if ($pass1Batch.Status -eq "PARTIAL" -or $convergence.Status -eq "CONVERGED_PARTIAL") { "PASS_PARTIAL_RUNNER_ERRORS" } elseif ($zendAuthPartialExpected) { "PASS_PARTIAL_AUTH_EXPECTED" } else { "PASS" }
                 $zendFinalConfigSummary = $generatedConfigSummary
                 $zendFinalRunSummary = $generatedRunSummary
                 Write-Host "Zend convergence summary: $($convergence.HistoryPath)"
