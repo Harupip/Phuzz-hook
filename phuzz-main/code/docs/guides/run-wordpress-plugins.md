@@ -14,6 +14,8 @@ cd phuzz-main\code
 
 Tat ca cac lenh ben duoi deu chay tu thu muc nay.
 
+Với `phuzz.ps1 -Mode online-linked -UseZendDiscovery`, xem [luồng online-linked](online-linked-flow.md): lệnh chạy, ngân sách từng candidate, replay/Pass 2, vị trí state và những phần còn thiếu của vòng khám phá online.
+
 ## 2. Chay plugin mac dinh
 
 Plugin mac dinh hien tai la:

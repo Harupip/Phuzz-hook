@@ -477,6 +477,152 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator.state["versions"][1]["status"], "replay_failed")
             self.assertEqual([item for item in coordinator.state["workers"] if item["version"] == "v1"], [])
             self.assertEqual(log.count("worker_start"), 2)
+            state = json.loads(coordinator.state_path.read_text())
+            self.assertEqual(state["terminal_status"], "NOT_VERIFIED")
+            self.assertEqual(state["terminal_reason"], "CHILD_REPLAY_FAILED")
+
+    def test_stop_failure_blocks_handoff_and_preserves_worker_identity(self):
+        for raises in (False, True):
+            with self.subTest(raises=raises), tempfile.TemporaryDirectory() as tmp:
+                log: list[str] = []
+                coordinator = self.make_coordinator(Path(tmp), log)
+                run_command = coordinator.run_command
+
+                def fail_stop(command, **kwargs):
+                    if command[:3] == ["docker", "rm", "-f"]:
+                        if raises:
+                            raise subprocess.TimeoutExpired(command, 30)
+                        return subprocess.CompletedProcess(command, 1, "", "daemon unavailable")
+                    return run_command(command, **kwargs)
+
+                coordinator.run_command = fail_stop
+                self.assertNotEqual(coordinator.run(), 0)
+                self.assertNotIn("run_generated_configs", log)
+                self.assertEqual(log.count("worker_start"), 1)
+                self.assertEqual(coordinator._active_container, coordinator.state["workers"][0]["container_name"])
+                state = json.loads(coordinator.state_path.read_text())
+                self.assertEqual(state["terminal_status"], "NOT_VERIFIED")
+                self.assertEqual(state["terminal_reason"], "WORKER_STOP_FAILED")
+                self.assertEqual(state["workers"][0]["status"], "stop_failed")
+
+    def test_shutdown_failure_does_not_report_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [], discovers_parameter=False)
+            run_command = coordinator.run_command
+
+            def fail_stop(command, **kwargs):
+                if command[:3] == ["docker", "rm", "-f"]:
+                    return subprocess.CompletedProcess(command, 1, "", "daemon unavailable")
+                return run_command(command, **kwargs)
+
+            coordinator.run_command = fail_stop
+            self.assertNotEqual(coordinator.run(), 0)
+            self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
+            self.assertEqual(coordinator.state["terminal_reason"], "WORKER_STOP_FAILED")
+
+    def test_child_start_failure_is_reported_after_parent_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log)
+            run_command = coordinator.run_command
+
+            def fail_child(command, **kwargs):
+                if command[:3] == ["docker", "compose", "run"] and "HOOKPHUZZ_LEGACY_RUN_ID=run-v1" in command:
+                    return subprocess.CompletedProcess(command, 1, "", "child failed")
+                return run_command(command, **kwargs)
+
+            coordinator.run_command = fail_child
+            self.assertNotEqual(coordinator.run(), 0)
+            self.assertEqual([w["version"] for w in coordinator.state["workers"]], ["v0", "v0"])
+            self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
+            self.assertEqual(coordinator.state["terminal_reason"], "CHILD_WORKER_START_FAILED")
+
+    def test_expired_evidence_does_not_create_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log)
+            list_artifacts = coordinator.list_artifacts
+
+            def slow_evidence():
+                coordinator.sleeper(3)
+                return list_artifacts()
+
+            coordinator.list_artifacts = slow_evidence
+            self.assertEqual(coordinator.run(), 0)
+            self.assertEqual([v["version"] for v in coordinator.state["versions"]], ["v0"])
+            self.assertNotIn("run_generated_configs", log)
+
+    def test_pass2_failure_does_not_use_successful_callback_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            replay_runner = coordinator.replay_runner
+
+            def reached_callback(*args, **kwargs):
+                report = replay_runner(*args, **kwargs)
+                report["runs"][0]["validation_reason"] = "Expected callback id was found in executed_callbacks"
+                return report
+
+            coordinator.replay_runner = reached_callback
+            coordinator.verify_pass2_fn = lambda *args, **kwargs: {"accepted": 0, "total": 1}
+            self.assertNotEqual(coordinator.run(), 0)
+            self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
+            self.assertEqual(coordinator.state["versions"][1]["terminal_reason"], "PASS2_VERIFICATION_FAILED")
+
+    def test_failed_parent_restart_is_terminal_for_both_handoff_failures(self):
+        for replay_passes in (True, False):
+            with self.subTest(replay_passes=replay_passes), tempfile.TemporaryDirectory() as tmp:
+                coordinator = self.make_coordinator(Path(tmp), [], replay_passes=replay_passes)
+                run_command = coordinator.run_command
+                starts = 0
+
+                def fail_after_v0(command, **kwargs):
+                    nonlocal starts
+                    if command[:3] == ["docker", "compose", "run"]:
+                        starts += 1
+                        if starts > 1:
+                            return subprocess.CompletedProcess(command, 1, "", "start failed")
+                    return run_command(command, **kwargs)
+
+                coordinator.run_command = fail_after_v0
+                self.assertNotEqual(coordinator.run(), 0)
+                self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
+                self.assertEqual(coordinator.state["terminal_reason"], "PARENT_WORKER_RESTART_FAILED")
+                self.assertEqual(len(coordinator.state["workers"]), 1)
+
+    def test_budget_spent_stopping_parent_prevents_replay(self):
+        for elapsed in (1.5, 3):
+            with self.subTest(elapsed=elapsed), tempfile.TemporaryDirectory() as tmp:
+                log: list[str] = []
+                coordinator = self.make_coordinator(Path(tmp), log)
+                run_command = coordinator.run_command
+
+                def slow_stop(command, **kwargs):
+                    if command[:3] == ["docker", "rm", "-f"]:
+                        coordinator.sleeper(elapsed)
+                    return run_command(command, **kwargs)
+
+                coordinator.run_command = slow_stop
+                self.assertEqual(coordinator.run(), 0)
+                self.assertNotIn("run_generated_configs", log)
+                self.assertEqual(log.count("worker_start"), 1)
+                self.assertEqual(coordinator.state["versions"][1]["worker_status"], "not_started_budget_expired")
+
+    def test_budget_spent_replaying_prevents_child_or_parent_start(self):
+        for replay_passes in (True, False):
+            with self.subTest(replay_passes=replay_passes), tempfile.TemporaryDirectory() as tmp:
+                log: list[str] = []
+                coordinator = self.make_coordinator(Path(tmp), log, replay_passes=replay_passes)
+                replay_runner = coordinator.replay_runner
+
+                def slow_replay(*args, **kwargs):
+                    coordinator.sleeper(3)
+                    return replay_runner(*args, **kwargs)
+
+                coordinator.replay_runner = slow_replay
+                self.assertEqual(coordinator.run(), 0 if replay_passes else 1)
+                self.assertEqual(log.count("worker_start"), 1)
+                self.assertEqual(coordinator.state["versions"][1]["replay_result"]["passed"], replay_passes)
+                self.assertEqual(coordinator.state["terminal_status"], "BOUNDED_ONLINE_COMPLETE" if replay_passes else "NOT_VERIFIED")
 
     def test_replay_pass_starts_child_only_after_parent_stops(self):
         with tempfile.TemporaryDirectory() as tmp:

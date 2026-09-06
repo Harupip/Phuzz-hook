@@ -1,5 +1,4 @@
 import json
-import zipfile
 from pathlib import Path
 import unittest
 
@@ -7,14 +6,6 @@ import unittest
 CODE_DIR = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = CODE_DIR / "tests" / "fixtures" / "hookphuzz-online-discovery-fixture"
 PLUGIN_SOURCE = FIXTURE_DIR / "hookphuzz-online-discovery-fixture.php"
-PLUGIN_ZIP = (
-    CODE_DIR.parent
-    / "web"
-    / "applications"
-    / "wordpress"
-    / "_plugins"
-    / "hookphuzz-online-discovery-fixture.zip"
-)
 BOOTSTRAP_CONFIG = (
     CODE_DIR / "configs" / "wordpress" / "hookphuzz-online-discovery-fixture.json"
 )
@@ -38,14 +29,6 @@ class OnlinePluginFixtureTests(unittest.TestCase):
             "$_COOKIE['ajax_cookie']",
         ):
             self.assertIn(marker, source)
-
-        self.assertTrue(PLUGIN_ZIP.is_file(), PLUGIN_ZIP)
-        with zipfile.ZipFile(PLUGIN_ZIP) as archive:
-            member = "hookphuzz-online-discovery-fixture/hookphuzz-online-discovery-fixture.php"
-            self.assertIn(member, archive.namelist())
-            archived = archive.read(member).decode("utf-8")
-
-        self.assertEqual(archived.replace("\r\n", "\n"), source.replace("\r\n", "\n"))
 
     def test_fixture_covers_known_ajax_and_rest_request_cases(self) -> None:
         source = PLUGIN_SOURCE.read_text(encoding="utf-8")

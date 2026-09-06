@@ -186,6 +186,10 @@ class OnlineLinkedCoordinator:
             while self.clock() < deadline:
                 for evidence in self.read_new_runtime_evidence():
                     self.advance_online_version(evidence, deadline=deadline)
+                    if self.state["terminal_reason"] == "WORKER_STOP_FAILED" or not self._active_container:
+                        break
+                if self.state["terminal_reason"] == "WORKER_STOP_FAILED" or not self._active_container:
+                    break
                 worker_exit_code = self._worker_exit_code()
                 if worker_exit_code is not None:
                     version = self._version(self._active_version)
@@ -197,7 +201,7 @@ class OnlineLinkedCoordinator:
                         self.state["terminal_reason"] = "VULN_FOUND"
                         self._stop_active_worker("VULN_FOUND")
                         self._write_state()
-                        return 0
+                        return 1 if self._failure else 0
                     if worker_exit_code != 0:
                         self._failure = True
                         if version is not None:
@@ -300,6 +304,8 @@ class OnlineLinkedCoordinator:
 
         parent = self._version(self._active_version)
         if parent is None:
+            return None
+        if deadline is not None and self.clock() >= deadline:
             return None
         if len(self.state["versions"]) >= self.max_versions:
             self._record_event({
@@ -446,7 +452,11 @@ class OnlineLinkedCoordinator:
     ) -> bool:
         """Stop parent, replay/verify child, then start exactly one active worker."""
 
-        self._stop_worker(parent, "HANDOFF_TO_" + str(child["version"]))
+        if not self._stop_worker(parent, "HANDOFF_TO_" + str(child["version"])):
+            child["worker_status"] = "not_started_parent_stop_failed"
+            child["terminal_reason"] = "WORKER_STOP_FAILED"
+            self._write_state()
+            return False
         version_name = str(child["version"])
         replay_dir = self.run_dir / "versions" / version_name / "replay"
         request_dir = replay_dir / "request"
@@ -460,7 +470,12 @@ class OnlineLinkedCoordinator:
         }
         timeout = self.max_seconds
         if deadline is not None:
-            timeout = max(1, min(30, int(deadline - self.clock())))
+            timeout = min(30, int(deadline - self.clock()))
+            if timeout < 1:
+                child["worker_status"] = "not_started_budget_expired"
+                child["terminal_reason"] = "BUDGET_EXPIRED"
+                self._write_state()
+                return False
         replay_run_id = f"{self.legacy_run_id}-{version_name}-replay"
         try:
             replay_report = self.replay_runner(
@@ -516,27 +531,35 @@ class OnlineLinkedCoordinator:
             child["status"] = "replay_pass"
             child["terminal_reason"] = ""
             self._write_state()
-            if self._start_worker(child):
+            if self._start_worker(child, deadline=deadline):
                 self._active_version = str(child["version"])
                 return True
+            if child["worker_status"] == "not_started_budget_expired":
+                return False
             child["terminal_reason"] = "WORKER_START_FAILED"
             self._failure = True
+            self.state["terminal_status"] = "NOT_VERIFIED"
+            self.state["terminal_reason"] = "CHILD_WORKER_START_FAILED"
             self._write_state()
-            self._start_worker(self._version(str(parent["version"])) or dict(parent))
-            self._active_version = str(parent["version"])
-            return False
-
-        child["status"] = "replay_failed"
-        child["worker_status"] = "not_started_replay_failed"
-        child["terminal_reason"] = str(
-            replay_row.get("validation_reason") if isinstance(replay_row, Mapping) else ""
-        ) or "PASS2_VERIFICATION_FAILED"
-        self._failure = True
-        self._write_state()
-        parent_record = self._version(str(parent["version"]))
-        if parent_record is not None and self._start_worker(parent_record):
-            self._active_version = str(parent_record["version"])
         else:
+            child["status"] = "replay_failed"
+            child["worker_status"] = "not_started_replay_failed"
+            if artifact_error:
+                child["terminal_reason"] = "REPLAY_ARTIFACT_SAVE_FAILED"
+            elif replay_report.get("error") or replay_row.get("process_status") in {"failed", "runner_error"}:
+                child["terminal_reason"] = "REPLAY_PROCESS_FAILED"
+            elif replay_row.get("validation_status") != "callback_reached":
+                child["terminal_reason"] = str(replay_row.get("validation_reason") or "CALLBACK_NOT_REACHED")
+            else:
+                child["terminal_reason"] = "PASS2_VERIFICATION_FAILED"
+            self._failure = True
+            self.state["terminal_status"] = "NOT_VERIFIED"
+            self.state["terminal_reason"] = "CHILD_REPLAY_FAILED"
+            self._write_state()
+        parent_record = self._version(str(parent["version"]))
+        if parent_record is not None and self._start_worker(parent_record, deadline=deadline):
+            self._active_version = str(parent_record["version"])
+        elif parent_record is None or parent_record["worker_status"] != "not_started_budget_expired":
             self.state["terminal_status"] = "NOT_VERIFIED"
             self.state["terminal_reason"] = "PARENT_WORKER_RESTART_FAILED"
             self._write_state()
@@ -632,8 +655,13 @@ class OnlineLinkedCoordinator:
         self._write_state()
         return record
 
-    def _start_worker(self, version: dict[str, Any]) -> bool:
+    def _start_worker(self, version: dict[str, Any], *, deadline: float | None = None) -> bool:
         if self._active_container:
+            return False
+        if deadline is not None and self.clock() >= deadline:
+            version["worker_status"] = "not_started_budget_expired"
+            version["terminal_reason"] = "BUDGET_EXPIRED"
+            self._write_state()
             return False
         version_name = str(version["version"])
         config_path = Path(str(version["config_path"]))
@@ -707,29 +735,43 @@ class OnlineLinkedCoordinator:
         if version is not None:
             self._stop_worker(version, reason)
 
-    def _stop_worker(self, version: Mapping[str, Any], reason: str) -> None:
+    def _stop_worker(self, version: Mapping[str, Any], reason: str) -> bool:
         container_name = self._active_container
         if not container_name:
-            return
-        result = self.run_command(
-            ["docker", "rm", "-f", container_name],
-            timeout=30,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        status = "stopped" if int(getattr(result, "returncode", 1)) == 0 else "stop_failed"
+            return True
+        try:
+            result = self.run_command(
+                ["docker", "rm", "-f", container_name],
+                timeout=30,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            stopped = int(getattr(result, "returncode", 1)) == 0
+            error = str(getattr(result, "stderr", "") or "WORKER_STOP_FAILED").strip() if not stopped else ""
+        except Exception as exc:
+            stopped = False
+            error = str(exc)
+        status = "stopped" if stopped else "stop_failed"
         for worker in reversed(self.state["workers"]):
             if worker.get("container_name") == container_name:
                 worker["status"] = status
                 worker["terminal_reason"] = reason
+                if not stopped:
+                    worker["stop_error"] = error
                 break
         record = self._version(str(version["version"]))
         if record is not None:
             record["worker_status"] = "stopped" if status == "stopped" else status
             record["terminal_reason"] = reason
-        self._active_container = ""
+        if stopped:
+            self._active_container = ""
+        else:
+            self._failure = True
+            self.state["terminal_status"] = "NOT_VERIFIED"
+            self.state["terminal_reason"] = "WORKER_STOP_FAILED"
         self._write_state()
+        return stopped
 
     def _save_replay_artifacts(self, row: Mapping[str, Any], request_dir: Path, zend_dir: Path) -> None:
         names = set()
