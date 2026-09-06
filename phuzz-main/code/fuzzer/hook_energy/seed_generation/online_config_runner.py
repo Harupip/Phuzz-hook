@@ -38,7 +38,7 @@ ReplayRunner = Callable[..., dict[str, Any]]
 REQUESTS_DIR = "/shared-tmpfs/hook-coverage/requests"
 ZEND_ARTIFACTS_DIR = "/shared/opcode-events"
 SUPPORTED_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
-VERSION_STATUSES = {"pending", "replay_pass", "replay_failed", "fuzzing"}
+VERSION_STATUSES = {"pending", "replaying", "replay_pass", "replay_failed", "fuzzing"}
 SENSITIVE_PARAMETER = re.compile(r"(?:nonce|password|secret|token|authorization|auth|cookie)", re.IGNORECASE)
 REST_BUCKETS = {"URL", "GET", "POST", "JSON"}
 REST_PLACEMENTS = {
@@ -59,8 +59,12 @@ class OnlineConfigError(ValueError):
     """A discovered parameter cannot be represented safely by the worker."""
 
 
-def validate_v0_config(config: Mapping[str, Any]) -> tuple[bool, str]:
-    """Validate the minimum contract required before starting an online worker."""
+def validate_v0_config(
+    config: Mapping[str, Any],
+    *,
+    require_fuzzing_ready: bool = True,
+) -> tuple[bool, str]:
+    """Validate the v0 shape, optionally requiring fuzz-ready parameters."""
 
     if not isinstance(config, Mapping):
         return False, "CONFIG_NOT_OBJECT"
@@ -83,7 +87,10 @@ def validate_v0_config(config: Mapping[str, Any]) -> tuple[bool, str]:
         return False, "INVALID_RESOLVED_METHOD"
     if not str(metadata.get("callback_repr") or metadata.get("callback_id") or "").strip():
         return False, "MISSING_CALLBACK"
-    if str(config.get("config_type") or "").strip().lower() == "replay_only" or not _has_fuzzable_parameter(config):
+    if require_fuzzing_ready and (
+        str(config.get("config_type") or "").strip().lower() == "replay_only"
+        or not _has_fuzzable_parameter(config)
+    ):
         return False, "NOT_FUZZING_READY"
     return True, ""
 
@@ -466,6 +473,7 @@ class OnlineCoordinator:
         record = {
             "version": version,
             "config_path": str(config_path),
+            "config_type": str(config.get("config_type") or "").strip().lower(),
             "parent_config": parent_config,
             "discovery_event": discovery_event,
             "replay_result": None,
@@ -522,7 +530,7 @@ class OnlineCoordinator:
             self._write_lineage()
             return False
         version["worker_status"] = "started"
-        version["status"] = "fuzzing"
+        version["status"] = "replaying" if version.get("config_type") == "replay_only" else "fuzzing"
         self.lineage["workers"].append({"version": version_name, "container_name": container_name, "run_id": worker_run_id, "status": "started", "command": command})
         self._created_containers.append(container_name)
         self._write_lineage()

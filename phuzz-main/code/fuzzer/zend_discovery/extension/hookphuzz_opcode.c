@@ -461,6 +461,20 @@ static void hookphuzz_release_provenance(void)
     HOOKPHUZZ_PHASE5_G(provenance_count) = 0;
 }
 
+static void hookphuzz_release_element_provenance(void)
+{
+    uint32_t index;
+
+    for (index = 0; index < HOOKPHUZZ_PHASE5_G(element_provenance_count); index++) {
+        hookphuzz_element_provenance *item = &HOOKPHUZZ_PHASE5_G(element_provenance)[index];
+        if (item->string_key != NULL) zend_string_release(item->string_key);
+        hookphuzz_release_path(item->path, item->depth);
+    }
+    if (HOOKPHUZZ_PHASE5_G(element_provenance) != NULL) efree(HOOKPHUZZ_PHASE5_G(element_provenance));
+    HOOKPHUZZ_PHASE5_G(element_provenance) = NULL;
+    HOOKPHUZZ_PHASE5_G(element_provenance_count) = 0;
+}
+
 static void hookphuzz_release_request_metadata(void)
 {
     if (HOOKPHUZZ_PHASE5_G(request_id) != NULL) zend_string_release(HOOKPHUZZ_PHASE5_G(request_id));
@@ -557,6 +571,74 @@ static void hookphuzz_set_provenance(const zend_execute_data *frame, const zend_
         return;
     }
     hookphuzz_set_provenance_for_result(frame, opline->result.var, source, path, depth);
+}
+
+static zend_bool hookphuzz_element_key_matches(const hookphuzz_element_provenance *item, const zval *key)
+{
+    while (Z_TYPE_P(key) == IS_REFERENCE) key = Z_REFVAL_P(key);
+    if (item->key_type != Z_TYPE_P(key)) return 0;
+    if (item->key_type == IS_STRING) return zend_string_equals(item->string_key, Z_STR_P(key));
+    if (item->key_type == IS_LONG) return item->int_key == Z_LVAL_P(key);
+    return 0;
+}
+
+static hookphuzz_element_provenance *hookphuzz_find_element_provenance(HashTable *array, const zval *key)
+{
+    uint32_t index;
+
+    if (array == NULL || key == NULL) return NULL;
+    for (index = 0; index < HOOKPHUZZ_PHASE5_G(element_provenance_count); index++) {
+        hookphuzz_element_provenance *item = &HOOKPHUZZ_PHASE5_G(element_provenance)[index];
+        if (item->array == array && hookphuzz_element_key_matches(item, key)) return item;
+    }
+    return NULL;
+}
+
+static void hookphuzz_clear_element_provenance(HashTable *array, const zval *key)
+{
+    uint32_t index;
+
+    for (index = 0; index < HOOKPHUZZ_PHASE5_G(element_provenance_count); index++) {
+        hookphuzz_element_provenance *item = &HOOKPHUZZ_PHASE5_G(element_provenance)[index];
+        if (item->array != array || !hookphuzz_element_key_matches(item, key)) continue;
+        if (item->string_key != NULL) zend_string_release(item->string_key);
+        hookphuzz_release_path(item->path, item->depth);
+        HOOKPHUZZ_PHASE5_G(element_provenance_count)--;
+        if (index != HOOKPHUZZ_PHASE5_G(element_provenance_count)) {
+            HOOKPHUZZ_PHASE5_G(element_provenance)[index] =
+                HOOKPHUZZ_PHASE5_G(element_provenance)[HOOKPHUZZ_PHASE5_G(element_provenance_count)];
+        }
+        return;
+    }
+}
+
+static void hookphuzz_set_element_provenance(HashTable *array, const zval *key,
+    hookphuzz_source source, const hookphuzz_path_key *path, uint32_t depth)
+{
+    hookphuzz_element_provenance *item;
+
+    if (array == NULL || key == NULL) return;
+    while (Z_TYPE_P(key) == IS_REFERENCE) key = Z_REFVAL_P(key);
+    if (Z_TYPE_P(key) != IS_STRING && Z_TYPE_P(key) != IS_LONG) return;
+    item = hookphuzz_find_element_provenance(array, key);
+    if (item == NULL) {
+        if (HOOKPHUZZ_PHASE5_G(element_provenance_count) == HOOKPHUZZ_OPCODE_PHASE5_MAX_EVENTS) return;
+        if (HOOKPHUZZ_PHASE5_G(element_provenance) == NULL) {
+            HOOKPHUZZ_PHASE5_G(element_provenance) =
+                ecalloc(HOOKPHUZZ_OPCODE_PHASE5_MAX_EVENTS, sizeof(hookphuzz_element_provenance));
+        }
+        item = &HOOKPHUZZ_PHASE5_G(element_provenance)[HOOKPHUZZ_PHASE5_G(element_provenance_count)++];
+    } else {
+        if (item->string_key != NULL) zend_string_release(item->string_key);
+        hookphuzz_release_path(item->path, item->depth);
+    }
+    item->array = array;
+    item->key_type = Z_TYPE_P(key);
+    item->int_key = Z_TYPE_P(key) == IS_LONG ? Z_LVAL_P(key) : 0;
+    item->string_key = Z_TYPE_P(key) == IS_STRING ? zend_string_copy(Z_STR_P(key)) : NULL;
+    item->source = source;
+    item->depth = depth;
+    item->path = hookphuzz_copy_path(path, depth);
 }
 
 static void hookphuzz_clear_provenance_for_opline_result(const zend_execute_data *frame, const zend_op *opline)
@@ -848,15 +930,15 @@ static zend_bool hookphuzz_source_from_fetch(const zend_op *opline, hookphuzz_so
     return 1;
 }
 
-static void hookphuzz_record_event(const zend_execute_data *execute_data, const zend_op *opline,
-    const hookphuzz_provenance *provenance, hookphuzz_path_key *path, const char *operation)
+static void hookphuzz_record_event_with_depth(const zend_execute_data *execute_data, const zend_op *opline,
+    const hookphuzz_provenance *provenance, hookphuzz_path_key *path, uint32_t depth, const char *operation)
 {
     hookphuzz_event *event;
     hookphuzz_context_frame *context;
 
     if (HOOKPHUZZ_PHASE5_G(event_count) == HOOKPHUZZ_OPCODE_PHASE5_MAX_EVENTS) {
         HOOKPHUZZ_PHASE5_G(dropped_event_count)++;
-        hookphuzz_release_path(path, provenance->depth + 1);
+        hookphuzz_release_path(path, depth);
         return;
     }
     if (HOOKPHUZZ_PHASE5_G(events) == NULL) {
@@ -864,7 +946,7 @@ static void hookphuzz_record_event(const zend_execute_data *execute_data, const 
     }
     event = &HOOKPHUZZ_PHASE5_G(events)[HOOKPHUZZ_PHASE5_G(event_count)++];
     event->source = provenance->source;
-    event->depth = provenance->depth + 1;
+    event->depth = depth;
     event->path = path;
     event->filename = hookphuzz_copy_filename(execute_data);
     event->function_name = hookphuzz_copy_function_name(execute_data);
@@ -877,6 +959,13 @@ static void hookphuzz_record_event(const zend_execute_data *execute_data, const 
     event->callback_depth = context == NULL ? 0 : context->depth;
     event->line = opline->lineno;
     event->operation = operation;
+}
+
+static void hookphuzz_record_event(const zend_execute_data *execute_data, const zend_op *opline,
+    const hookphuzz_provenance *provenance, hookphuzz_path_key *path, const char *operation)
+{
+    hookphuzz_record_event_with_depth(execute_data, opline, provenance, path,
+        provenance->depth + 1, operation);
 }
 
 static int hookphuzz_fetch_handler(zend_execute_data *execute_data)
@@ -919,25 +1008,132 @@ static int hookphuzz_fetch_obj_r_handler(zend_execute_data *execute_data)
     return ZEND_USER_OPCODE_DISPATCH;
 }
 
+static zend_bool hookphuzz_foreach_key(zval *iterator, zval *key)
+{
+    HashTable *array;
+    HashPosition position;
+    zend_string *string_key = NULL;
+    zend_ulong int_key = 0;
+    int key_type;
+
+    while (Z_TYPE_P(iterator) == IS_REFERENCE) iterator = Z_REFVAL_P(iterator);
+    if (Z_TYPE_P(iterator) != IS_ARRAY) return 0;
+    array = Z_ARRVAL_P(iterator);
+    position = Z_FE_POS_P(iterator);
+    key_type = zend_hash_get_current_key_ex(array, &string_key, &int_key, &position);
+    if (key_type == HASH_KEY_IS_STRING) {
+        ZVAL_STR_COPY(key, string_key);
+        return 1;
+    }
+    if (key_type == HASH_KEY_IS_LONG) {
+        ZVAL_LONG(key, int_key);
+        return 1;
+    }
+    return 0;
+}
+
+static int hookphuzz_fe_reset_r_handler(zend_execute_data *execute_data)
+{
+    const zend_op *opline = execute_data->opline;
+    hookphuzz_provenance *provenance;
+
+    if (!HOOKPHUZZ_PHASE5_G(artifact_enabled)) return ZEND_USER_OPCODE_DISPATCH;
+    provenance = hookphuzz_find_operand_provenance(execute_data, opline->op1_type, &opline->op1);
+    if (provenance != NULL && opline->result_type == IS_VAR) {
+        hookphuzz_set_provenance_for_result(execute_data, opline->result.var, provenance->source,
+            hookphuzz_copy_path(provenance->path, provenance->depth), provenance->depth);
+    } else if (opline->result_type == IS_VAR) {
+        hookphuzz_clear_provenance_for_result(execute_data, opline->result.var);
+    }
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
+static int hookphuzz_fe_fetch_r_handler(zend_execute_data *execute_data)
+{
+    const zend_op *opline = execute_data->opline;
+    hookphuzz_provenance *provenance;
+    hookphuzz_path_key *path;
+    zval key;
+    zval *iterator;
+
+    if (!HOOKPHUZZ_PHASE5_G(artifact_enabled)) return ZEND_USER_OPCODE_DISPATCH;
+    if (opline->op2_type != IS_CV && opline->op2_type != IS_VAR) return ZEND_USER_OPCODE_DISPATCH;
+    provenance = hookphuzz_find_provenance(execute_data, opline->op1.var);
+    iterator = EX_VAR(opline->op1.var);
+    if (provenance == NULL || !hookphuzz_foreach_key(iterator, &key)) {
+        hookphuzz_clear_provenance_for_result(execute_data, opline->op2.var);
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+    path = hookphuzz_append_path(provenance, &key);
+    hookphuzz_set_provenance_for_result(execute_data, opline->op2.var, provenance->source,
+        path, provenance->depth + 1);
+    zval_ptr_dtor(&key);
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
+static int hookphuzz_assign_dim_handler(zend_execute_data *execute_data)
+{
+    const zend_op *opline = execute_data->opline;
+    zval *container;
+    zval *key;
+    hookphuzz_provenance *provenance;
+    const zend_op *data_opline = opline + 1;
+
+    if (!HOOKPHUZZ_PHASE5_G(artifact_enabled)) return ZEND_USER_OPCODE_DISPATCH;
+    if (opline->op2_type == IS_UNUSED) return ZEND_USER_OPCODE_DISPATCH;
+    container = hookphuzz_operand_zval(execute_data, opline, opline->op1_type, &opline->op1);
+    key = hookphuzz_operand_zval(execute_data, opline, opline->op2_type, &opline->op2);
+    if (container == NULL || key == NULL) return ZEND_USER_OPCODE_DISPATCH;
+    while (Z_TYPE_P(container) == IS_REFERENCE) container = Z_REFVAL_P(container);
+    if (Z_TYPE_P(container) != IS_ARRAY) return ZEND_USER_OPCODE_DISPATCH;
+    provenance = hookphuzz_find_operand_provenance(execute_data, data_opline->op1_type, &data_opline->op1);
+    if (provenance != NULL) {
+        hookphuzz_set_element_provenance(Z_ARRVAL_P(container), key, provenance->source,
+            provenance->path, provenance->depth);
+    } else {
+        hookphuzz_clear_element_provenance(Z_ARRVAL_P(container), key);
+    }
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
 static int hookphuzz_fetch_dim_handler(zend_execute_data *execute_data, const char *operation)
 {
     const zend_op *opline = execute_data->opline;
     const zval *key;
+    zval *container;
+    hookphuzz_element_provenance *element_provenance;
     hookphuzz_provenance *provenance;
+    hookphuzz_provenance element_as_provenance;
     hookphuzz_path_key *path;
 
     if (!HOOKPHUZZ_PHASE5_G(artifact_enabled)) return ZEND_USER_OPCODE_DISPATCH;
-    if (opline->op1_type != IS_TMP_VAR && opline->op1_type != IS_VAR) {
-        hookphuzz_clear_provenance_for_opline_result(execute_data, opline);
-        return ZEND_USER_OPCODE_DISPATCH;
-    }
-    provenance = hookphuzz_find_provenance(execute_data, opline->op1.var);
-    if (provenance == NULL) {
+    if (opline->op1_type != IS_TMP_VAR && opline->op1_type != IS_VAR && opline->op1_type != IS_CV) {
         hookphuzz_clear_provenance_for_opline_result(execute_data, opline);
         return ZEND_USER_OPCODE_DISPATCH;
     }
     key = zend_get_zval_ptr(opline, opline->op2_type, &opline->op2, execute_data);
     if (key == NULL || (Z_TYPE_P(key) != IS_STRING && Z_TYPE_P(key) != IS_LONG)) {
+        hookphuzz_clear_provenance_for_opline_result(execute_data, opline);
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+    container = hookphuzz_operand_zval(execute_data, opline, opline->op1_type, &opline->op1);
+    while (container != NULL && Z_TYPE_P(container) == IS_REFERENCE) container = Z_REFVAL_P(container);
+    element_provenance = container != NULL && Z_TYPE_P(container) == IS_ARRAY
+        ? hookphuzz_find_element_provenance(Z_ARRVAL_P(container), key) : NULL;
+    if (element_provenance != NULL) {
+        element_as_provenance.source = element_provenance->source;
+        element_as_provenance.depth = element_provenance->depth;
+        element_as_provenance.path = element_provenance->path;
+        hookphuzz_record_event_with_depth(execute_data, opline, &element_as_provenance,
+            hookphuzz_copy_path(element_provenance->path, element_provenance->depth),
+            element_provenance->depth, operation);
+        hookphuzz_set_provenance(execute_data, opline, element_provenance->source,
+            hookphuzz_copy_path(element_provenance->path, element_provenance->depth),
+            element_provenance->depth);
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+    provenance = hookphuzz_find_provenance(execute_data, opline->op1.var);
+    if (provenance == NULL) {
         hookphuzz_clear_provenance_for_opline_result(execute_data, opline);
         return ZEND_USER_OPCODE_DISPATCH;
     }
@@ -1465,6 +1661,10 @@ PHP_MINIT_FUNCTION(hookphuzz_opcode)
     if (zend_get_user_opcode_handler(ZEND_FETCH_R) != NULL
         || zend_get_user_opcode_handler(ZEND_FETCH_OBJ_R) != NULL
         || zend_get_user_opcode_handler(ZEND_FETCH_DIM_R) != NULL
+        || zend_get_user_opcode_handler(ZEND_FETCH_DIM_FUNC_ARG) != NULL
+        || zend_get_user_opcode_handler(ZEND_FE_RESET_R) != NULL
+        || zend_get_user_opcode_handler(ZEND_FE_FETCH_R) != NULL
+        || zend_get_user_opcode_handler(ZEND_ASSIGN_DIM) != NULL
         || zend_get_user_opcode_handler(ZEND_FETCH_IS) != NULL
         || zend_get_user_opcode_handler(ZEND_FETCH_DIM_IS) != NULL
         || zend_get_user_opcode_handler(ZEND_ISSET_ISEMPTY_DIM_OBJ) != NULL
@@ -1485,6 +1685,10 @@ PHP_MINIT_FUNCTION(hookphuzz_opcode)
     if (zend_set_user_opcode_handler(ZEND_FETCH_R, hookphuzz_fetch_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_FETCH_OBJ_R, hookphuzz_fetch_obj_r_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_FETCH_DIM_R, hookphuzz_fetch_dim_r_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_FETCH_DIM_FUNC_ARG, hookphuzz_fetch_dim_r_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_FE_RESET_R, hookphuzz_fe_reset_r_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_FE_FETCH_R, hookphuzz_fe_fetch_r_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_ASSIGN_DIM, hookphuzz_assign_dim_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_FETCH_IS, hookphuzz_fetch_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_FETCH_DIM_IS, hookphuzz_fetch_dim_is_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_ISSET_ISEMPTY_DIM_OBJ, hookphuzz_isempty_dim_obj_handler) != SUCCESS
@@ -1508,6 +1712,10 @@ PHP_MSHUTDOWN_FUNCTION(hookphuzz_opcode)
     if (zend_get_user_opcode_handler(ZEND_FETCH_R) == hookphuzz_fetch_handler) zend_set_user_opcode_handler(ZEND_FETCH_R, NULL);
     if (zend_get_user_opcode_handler(ZEND_FETCH_OBJ_R) == hookphuzz_fetch_obj_r_handler) zend_set_user_opcode_handler(ZEND_FETCH_OBJ_R, NULL);
     if (zend_get_user_opcode_handler(ZEND_FETCH_DIM_R) == hookphuzz_fetch_dim_r_handler) zend_set_user_opcode_handler(ZEND_FETCH_DIM_R, NULL);
+    if (zend_get_user_opcode_handler(ZEND_FETCH_DIM_FUNC_ARG) == hookphuzz_fetch_dim_r_handler) zend_set_user_opcode_handler(ZEND_FETCH_DIM_FUNC_ARG, NULL);
+    if (zend_get_user_opcode_handler(ZEND_FE_RESET_R) == hookphuzz_fe_reset_r_handler) zend_set_user_opcode_handler(ZEND_FE_RESET_R, NULL);
+    if (zend_get_user_opcode_handler(ZEND_FE_FETCH_R) == hookphuzz_fe_fetch_r_handler) zend_set_user_opcode_handler(ZEND_FE_FETCH_R, NULL);
+    if (zend_get_user_opcode_handler(ZEND_ASSIGN_DIM) == hookphuzz_assign_dim_handler) zend_set_user_opcode_handler(ZEND_ASSIGN_DIM, NULL);
     if (zend_get_user_opcode_handler(ZEND_FETCH_IS) == hookphuzz_fetch_handler) zend_set_user_opcode_handler(ZEND_FETCH_IS, NULL);
     if (zend_get_user_opcode_handler(ZEND_FETCH_DIM_IS) == hookphuzz_fetch_dim_is_handler) zend_set_user_opcode_handler(ZEND_FETCH_DIM_IS, NULL);
     if (zend_get_user_opcode_handler(ZEND_ISSET_ISEMPTY_DIM_OBJ) == hookphuzz_isempty_dim_obj_handler) zend_set_user_opcode_handler(ZEND_ISSET_ISEMPTY_DIM_OBJ, NULL);
@@ -1542,6 +1750,8 @@ PHP_RINIT_FUNCTION(hookphuzz_opcode)
     HOOKPHUZZ_G(comparison_events) = NULL;
     HOOKPHUZZ_PHASE5_G(provenance_count) = 0;
     HOOKPHUZZ_PHASE5_G(provenance) = NULL;
+    HOOKPHUZZ_PHASE5_G(element_provenance_count) = 0;
+    HOOKPHUZZ_PHASE5_G(element_provenance) = NULL;
     HOOKPHUZZ_PHASE5_G(request_id) = NULL;
     HOOKPHUZZ_PHASE5_G(request_method) = NULL;
     HOOKPHUZZ_PHASE5_G(request_uri) = NULL;
@@ -1587,6 +1797,7 @@ PHP_RSHUTDOWN_FUNCTION(hookphuzz_opcode)
     if (HOOKPHUZZ_PHASE5_G(artifact_enabled) && !HOOKPHUZZ_PHASE5_G(artifact_flushed)) hookphuzz_flush_artifact();
     hookphuzz_release_events();
     hookphuzz_release_comparison_events();
+    hookphuzz_release_element_provenance();
     hookphuzz_release_provenance();
     hookphuzz_release_contexts();
     hookphuzz_release_targets();
@@ -1599,7 +1810,7 @@ PHP_MINFO_FUNCTION(hookphuzz_opcode)
 {
     php_info_print_table_start();
     php_info_print_table_header(2, "hookphuzz_opcode support", "enabled");
-    php_info_print_table_row(2, "configured user opcodes", "ZEND_FETCH_R, ZEND_FETCH_OBJ_R, ZEND_FETCH_DIM_R, ZEND_FETCH_IS, ZEND_FETCH_DIM_IS, ZEND_ISSET_ISEMPTY_DIM_OBJ, ZEND_RETURN, ZEND_RETURN_BY_REF, ZEND_COALESCE, ZEND_QM_ASSIGN, ZEND_CAST, ZEND_ASSIGN, ZEND_JMP_SET, ZEND_IS_EQUAL, ZEND_IS_NOT_EQUAL, ZEND_IS_IDENTICAL, ZEND_IS_NOT_IDENTICAL, ZEND_SWITCH_STRING");
+    php_info_print_table_row(2, "configured user opcodes", "ZEND_FETCH_R, ZEND_FETCH_OBJ_R, ZEND_FETCH_DIM_R, ZEND_FETCH_DIM_FUNC_ARG, ZEND_FE_RESET_R, ZEND_FE_FETCH_R, ZEND_ASSIGN_DIM, ZEND_FETCH_IS, ZEND_FETCH_DIM_IS, ZEND_ISSET_ISEMPTY_DIM_OBJ, ZEND_RETURN, ZEND_RETURN_BY_REF, ZEND_COALESCE, ZEND_QM_ASSIGN, ZEND_CAST, ZEND_ASSIGN, ZEND_JMP_SET, ZEND_IS_EQUAL, ZEND_IS_NOT_EQUAL, ZEND_IS_IDENTICAL, ZEND_IS_NOT_IDENTICAL, ZEND_SWITCH_STRING");
     php_info_print_table_row(2, "artifact output", HOOKPHUZZ_ARTIFACT_DIR);
     php_info_print_table_row(2, "event limit per request", "65536");
     php_info_print_table_end();

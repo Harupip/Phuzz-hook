@@ -81,6 +81,7 @@ class OnlineConfigRunnerContractTests(unittest.TestCase):
         candidate["config_type"] = "replay_only"
         candidate["body_params"]["fuzz"] = []
         self.assertEqual(validate_v0_config(candidate), (False, "NOT_FUZZING_READY"))
+        self.assertEqual(validate_v0_config(candidate, require_fuzzing_ready=False), (True, ""))
 
     def test_direct_ajax_provenance_supports_get_post_request_and_cookie(self) -> None:
         expected = {
@@ -413,19 +414,45 @@ class OnlineConfigRunnerContractTests(unittest.TestCase):
             self.assertEqual(child["status"], "fuzzing")
             self.assertEqual(child["replay_result"]["passed"], True)
             for version in coordinator.lineage["versions"]:
-                self.assertIn(version["status"], {"pending", "replay_pass", "replay_failed", "fuzzing"})
+                self.assertIn(version["status"], {"pending", "replaying", "replay_pass", "replay_failed", "fuzzing"})
                 self.assertTrue(version["config_hash"])
                 self.assertIn("terminal_reason", version)
                 self.assertIn("parent_config", version)
                 self.assertIn("discovery_event", version)
                 self.assertIn("replay_result", version)
                 self.assertIn("worker_status", version)
+
             self.assertEqual(len(coordinator.lineage["workers"]), 2)
             self.assertEqual(len([item for item in commands if "-d" in item]), 2)
             self.assertIn("FUZZER_NODE_ID=1", commands[0])
             self.assertIn("FUZZER_NODE_ID=2", commands[-1])
             self.assertEqual(replay_kwargs[0]["fuzzer_node_id"], 101)
             self.assertTrue(all("compose up" not in " ".join(item) for item in commands))
+
+    def test_replay_only_worker_is_marked_replaying(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            suggested = root / "suggested.json"
+            suggested.write_text(json.dumps({"suggested_seeds": []}), encoding="utf-8")
+            coordinator = OnlineCoordinator(
+                suggested_seeds=suggested,
+                config_root=root / "configs",
+                output_root=root / "output",
+                plugin_slug="fixture",
+                legacy_run_id="run-replaying",
+                max_seconds=1,
+                max_versions=2,
+                run_command=lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+            )
+            coordinator.run_dir.mkdir(parents=True)
+            replay = online_config()
+            replay["config_type"] = "replay_only"
+            replay["body_params"]["fuzz"] = []
+            config_path = coordinator._write_config("v0", replay)
+            version = coordinator._new_version("v0", replay, config_path, None, None)
+
+            self.assertTrue(coordinator._start_worker(version))
+            self.assertEqual(version["status"], "replaying")
 
     def test_replay_failure_does_not_start_child_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -19,6 +19,7 @@ if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
 from hook_energy.seed_generation.generated_config_runner import (
+    STOP_ON_VULN_EXIT_CODE,
     list_request_artifacts,
     list_zend_artifacts,
     load_request_artifact,
@@ -44,8 +45,6 @@ from seed_generation.config.config_exporter import (
     export_seed_configs,
 )
 from seed_generation.convergence.convergence import materialize_convergence_seeds
-
-
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
@@ -123,8 +122,10 @@ class OnlineLinkedCoordinator:
         self.verify_pass2_fn = verify_pass2_fn
         self.clock = clock
         self.sleeper = sleeper
-        self.run_dir = self.output_root / "online-linked" / self.legacy_run_id
-        self.config_dir = self.config_root / "online-linked" / self.legacy_run_id
+        # Keep nested evidence/config paths below Windows MAX_PATH for long run IDs.
+        storage_id = hashlib.sha256(self.legacy_run_id.encode("utf-8")).hexdigest()[:16]
+        self.run_dir = self.output_root / "online-linked" / storage_id
+        self.config_dir = self.config_root / "online-linked" / storage_id
         if registry is not None:
             self.registry = dict(registry)
         elif registry_path is not None:
@@ -185,6 +186,28 @@ class OnlineLinkedCoordinator:
             while self.clock() < deadline:
                 for evidence in self.read_new_runtime_evidence():
                     self.advance_online_version(evidence, deadline=deadline)
+                worker_exit_code = self._worker_exit_code()
+                if worker_exit_code is not None:
+                    version = self._version(self._active_version)
+                    if worker_exit_code == STOP_ON_VULN_EXIT_CODE:
+                        if version is not None:
+                            version["status"] = "vuln_found"
+                            version["terminal_reason"] = "VULN_FOUND"
+                        self.state["terminal_status"] = "VULN_FOUND"
+                        self.state["terminal_reason"] = "VULN_FOUND"
+                        self._stop_active_worker("VULN_FOUND")
+                        self._write_state()
+                        return 0
+                    if worker_exit_code != 0:
+                        self._failure = True
+                        if version is not None:
+                            version["status"] = "worker_failed"
+                            version["terminal_reason"] = f"WORKER_EXIT_CODE_{worker_exit_code}"
+                        self.state["terminal_status"] = "NOT_VERIFIED"
+                        self.state["terminal_reason"] = f"WORKER_EXIT_CODE_{worker_exit_code}"
+                        self._stop_active_worker("WORKER_FAILED")
+                        self._write_state()
+                        return 1
                 remaining = deadline - self.clock()
                 if remaining > 0:
                     self.sleeper(min(0.5, remaining))
@@ -304,7 +327,7 @@ class OnlineLinkedCoordinator:
         summary = {
             "legacy_run_id": parent["worker_run_id"],
             "runs": [{
-                "config_slug": f"online-linked/{self.legacy_run_id}/versions/{parent['version']}",
+                "config_slug": Path(parent["config_path"]).relative_to(self.config_root).with_suffix("").as_posix(),
                 "hook_name": parent["hook_name"],
                 "callback_id": parent["callback_id"],
                 "seed_variant_id": seed_variant_id,
@@ -429,7 +452,7 @@ class OnlineLinkedCoordinator:
         request_dir = replay_dir / "request"
         zend_dir = replay_dir / "zend"
         row = {
-            "config_slug": f"online-linked/{self.legacy_run_id}/versions/{version_name}/replay/config",
+            "config_slug": replay_path.relative_to(self.config_root).with_suffix("").as_posix(),
             "hook_name": child["hook_name"],
             "callback_id": child["callback_id"],
             "entrypoint_type": child["entrypoint_type"],
@@ -531,8 +554,16 @@ class OnlineLinkedCoordinator:
             try:
                 _, config = self.build_config_fn(item, target_base="http://web", rest_route_fallback=True)
             except SeedConfigSkip:
-                continue
-            valid, _ = validate_v0_config(config)
+                try:
+                    _, config = self.build_config_fn(
+                        item,
+                        target_base="http://web",
+                        replay_only=True,
+                        rest_route_fallback=True,
+                    )
+                except SeedConfigSkip:
+                    continue
+            valid, _ = validate_v0_config(config, require_fuzzing_ready=False)
             if valid:
                 selected = (item, config)
                 break
@@ -582,6 +613,7 @@ class OnlineLinkedCoordinator:
             "parent_version": parent.get("version") if isinstance(parent, Mapping) else None,
             "parent_config": parent.get("config_path") if isinstance(parent, Mapping) else None,
             "config_path": str(config_path),
+            "config_type": str(config.get("config_type") or "").strip().lower(),
             "config_hash": config_hash(config),
             "discovery_event": discovery_event,
             "replay_result": None,
@@ -633,7 +665,7 @@ class OnlineLinkedCoordinator:
             self._write_state()
             return False
         version["worker_status"] = "started"
-        version["status"] = "fuzzing"
+        version["status"] = "replaying" if version.get("config_type") == "replay_only" else "fuzzing"
         self._active_container = container_name
         self.state["workers"].append({
             "version": version_name,
@@ -644,6 +676,31 @@ class OnlineLinkedCoordinator:
         })
         self._write_state()
         return True
+
+    def _worker_exit_code(self) -> int | None:
+        """Return a stopped worker exit code while ignoring a running/unknown worker."""
+
+        if not self._active_container:
+            return None
+        try:
+            result = self.run_command(
+                ["docker", "inspect", "-f", "{{if .State.Running}}running{{else}}{{.State.ExitCode}}{{end}}", self._active_container],
+                timeout=30,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            return None
+        if int(getattr(result, "returncode", 1)) != 0:
+            return None
+        state = str(getattr(result, "stdout", "") or "").strip().lower()
+        if state == "running":
+            return None
+        try:
+            return int(state)
+        except (TypeError, ValueError):
+            return None
 
     def _stop_active_worker(self, reason: str) -> None:
         version = self._version(self._active_version)
@@ -750,24 +807,96 @@ class OnlineLinkedCoordinator:
         )
 
 
+def _candidate_slug(item: Mapping[str, Any], index: int) -> str:
+    raw = str(item.get("hook_name") or item.get("callback_id") or "candidate")
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-.") or "candidate"
+    return f"{index:03d}-{slug}"
+
+
 def run_online_linked(args: argparse.Namespace) -> int:
-    coordinator = OnlineLinkedCoordinator(
-        suggested_seeds=Path(args.suggested_seeds),
-        bootstrap_config=Path(args.bootstrap_config) if args.bootstrap_config else None,
-        config_root=Path(args.config_root),
-        output_root=Path(args.output_root),
-        plugin_slug=args.plugin_slug,
-        legacy_run_id=args.legacy_run_id,
-        max_seconds=args.max_seconds,
-        max_versions=args.max_versions,
-        registry_path=Path(args.callback_registry),
-        service=args.service,
+    suggested_path = Path(args.suggested_seeds)
+    payload = json.loads(suggested_path.read_text(encoding="utf-8-sig"))
+    items = payload.get("suggested_seeds") if isinstance(payload, Mapping) else None
+    if not isinstance(items, list):
+        raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
+
+    batch_dir = Path(args.output_root) / "online-linked" / args.legacy_run_id
+    candidate_input_dir = batch_dir / "candidates"
+    candidate_input_dir.mkdir(parents=True, exist_ok=True)
+    batch_state: dict[str, Any] = {
+        "schema_version": 1,
+        "mode": "online-linked-batch",
+        "plugin_slug": args.plugin_slug,
+        "legacy_run_id": args.legacy_run_id,
+        "max_seconds_per_candidate": args.max_seconds,
+        "max_versions_per_candidate": args.max_versions,
+        "candidates": [],
+    }
+    failed = False
+    for index, raw_item in enumerate(items, start=1):
+        if not isinstance(raw_item, Mapping):
+            continue
+        slug = _candidate_slug(raw_item, index)
+        candidate_run_id = f"{args.legacy_run_id}-candidate-{slug}"
+        candidate_input = candidate_input_dir / f"{slug}.json"
+        candidate_input.write_text(
+            json.dumps({**payload, "suggested_seeds": [dict(raw_item)]}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        candidate_record = {
+            "index": index,
+            "hook_name": str(raw_item.get("hook_name") or ""),
+            "callback_id": str(raw_item.get("callback_id") or ""),
+            "run_id": candidate_run_id,
+        }
+        try:
+            coordinator = OnlineLinkedCoordinator(
+                suggested_seeds=candidate_input,
+                bootstrap_config=Path(args.bootstrap_config) if args.bootstrap_config else None,
+                config_root=Path(args.config_root),
+                output_root=Path(args.output_root),
+                plugin_slug=args.plugin_slug,
+                legacy_run_id=candidate_run_id,
+                max_seconds=args.max_seconds,
+                max_versions=args.max_versions,
+                registry_path=Path(args.callback_registry),
+                service=args.service,
+            )
+            result = coordinator.run()
+            failed = failed or result != 0
+            candidate_record.update({
+                "exit_code": result,
+                "state_path": str(coordinator.state_path),
+                "terminal_status": coordinator.state.get("terminal_status"),
+                "terminal_reason": coordinator.state.get("terminal_reason"),
+                "versions": len(coordinator.state.get("versions", [])),
+            })
+        except (OSError, ValueError) as exc:
+            failed = True
+            candidate_record.update({
+                "exit_code": 2,
+                "state_path": "",
+                "terminal_status": "NOT_VERIFIED",
+                "terminal_reason": f"CANDIDATE_SETUP_FAILED: {exc}",
+                "versions": 0,
+            })
+        batch_state["candidates"].append(candidate_record)
+
+    batch_state_path = batch_dir / "batch-state.json"
+    _write_json(batch_state_path, batch_state)
+    print(f"Online-linked batch state: {batch_state_path}")
+    print(f"Online-linked candidates: {len(batch_state['candidates'])}")
+    print(
+        "Online-linked terminal statuses: "
+        + json.dumps(
+            {
+                status: sum(row.get("terminal_status") == status for row in batch_state["candidates"])
+                for status in sorted({str(row.get("terminal_status") or "") for row in batch_state["candidates"]})
+            },
+            sort_keys=True,
+        )
     )
-    result = coordinator.run()
-    print(f"Online-linked state: {coordinator.state_path}")
-    print(f"Online-linked versions: {len(coordinator.state['versions'])}")
-    print(f"Online-linked terminal status: {coordinator.state.get('terminal_status')}")
-    return result
+    return 1 if failed else 0
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -789,7 +918,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     try:
         return run_online_linked(args)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         print(f"Online-linked failed: {exc}", file=sys.stderr)
         return 2
 

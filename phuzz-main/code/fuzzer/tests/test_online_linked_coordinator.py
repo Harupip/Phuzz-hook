@@ -3,6 +3,8 @@ import json
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -10,7 +12,8 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.online_linked_coordinator import OnlineLinkedCoordinator
+from hook_energy.seed_generation.online_linked_coordinator import OnlineLinkedCoordinator, run_online_linked
+from seed_generation.config.config_exporter import SeedConfigSkip, export_seed_configs
 
 
 def seed_item() -> dict:
@@ -66,6 +69,77 @@ class Clock:
 
 
 class OnlineLinkedCoordinatorTests(unittest.TestCase):
+    def test_online_linked_batch_continues_after_candidate_vulnerability(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            suggested = root / "suggested_seeds.json"
+            suggested.write_text(json.dumps({
+                "plugin_slug": "fixture",
+                "suggested_seeds": [
+                    {"hook_name": "wp_ajax_first", "callback_id": "cb-first", "seed": {}},
+                    {"hook_name": "wp_ajax_second", "callback_id": "cb-second", "seed": {}},
+                ],
+            }), encoding="utf-8")
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+            calls = []
+
+            class FakeCoordinator:
+                def __init__(self, **kwargs):
+                    calls.append(kwargs)
+                    self.state_path = Path(kwargs["output_root"]) / "online-linked" / kwargs["legacy_run_id"] / "state.json"
+                    self.state = {
+                        "terminal_status": "VULN_FOUND" if len(calls) == 1 else "BOUNDED_ONLINE_COMPLETE",
+                        "terminal_reason": "VULN_FOUND" if len(calls) == 1 else "BUDGET_EXPIRED",
+                        "versions": [],
+                    }
+
+                def run(self):
+                    return 0
+
+            args = SimpleNamespace(
+                suggested_seeds=str(suggested),
+                bootstrap_config="",
+                config_root=str(root / "configs"),
+                output_root=str(root / "output"),
+                plugin_slug="fixture",
+                legacy_run_id="run",
+                max_seconds=1,
+                max_versions=2,
+                callback_registry=str(registry),
+                service="fuzzer-wordpress-plugin",
+            )
+            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator):
+                self.assertEqual(run_online_linked(args), 0)
+
+            self.assertEqual(len(calls), 2)
+            batch_state = json.loads(
+                (root / "output" / "online-linked" / "run" / "batch-state.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(batch_state["candidates"]), 2)
+            self.assertEqual(batch_state["candidates"][0]["terminal_status"], "VULN_FOUND")
+            self.assertEqual(batch_state["candidates"][1]["terminal_status"], "BOUNDED_ONLINE_COMPLETE")
+
+    def test_worker_vulnerability_exit_stops_current_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log)
+
+            def run_command(command, **kwargs):
+                if command[:2] == ["docker", "inspect"]:
+                    return subprocess.CompletedProcess(command, 0, "57\n", "")
+                if command[:3] == ["docker", "compose", "run"]:
+                    log.append("worker_start")
+                elif command[:3] == ["docker", "rm", "-f"]:
+                    log.append("worker_stop")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            coordinator.run_command = run_command
+            self.assertEqual(coordinator.run(), 0)
+            self.assertEqual(coordinator.state["terminal_status"], "VULN_FOUND")
+            self.assertEqual(coordinator.state["versions"][-1]["status"], "vuln_found")
+            self.assertIn("worker_stop", log)
+
     def make_coordinator(
         self,
         root: Path,
@@ -80,6 +154,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         max_versions: int = 3,
         request_names: set[str] | None = None,
         zend_names: set[str] | None = None,
+        legacy_run_id: str = "run",
     ) -> OnlineLinkedCoordinator:
         item = seed_item()
         raw_report = {"plugin_slug": "fixture", "suggested_seeds": [item]}
@@ -90,6 +165,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         clock = Clock()
         request_names = request_names if request_names is not None else {"req-v0.json"}
         zend_names = zend_names if zend_names is not None else {"req-v0.json"}
+        request_id = Path(sorted(request_names)[0]).stem
 
         def build_config(*args, **kwargs):
             log.append("build_config")
@@ -114,7 +190,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             log.append("load_request_artifact")
             payload = {
                 "request_id": Path(name).stem,
-                "legacy_run_id": "run-v0",
+                "legacy_run_id": f"{legacy_run_id}-v0",
                 "target_plugin": "fixture",
                 "http_method": "POST",
                 "request_params": {"body_params": {"action": "fixture", "seed": "base"}},
@@ -129,7 +205,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
         def load_zend(name):
             log.append("load_zend_artifact")
-            return {"request_id": Path(name).stem, "run_id": "run-v0"}
+            return {"request_id": Path(name).stem, "run_id": f"{legacy_run_id}-v0"}
 
         def converge(**kwargs):
             log.append("converge_iteration")
@@ -138,7 +214,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             if not discovers_parameter:
                 return {
                     "status": "CONVERGED",
-                    "request_id": "req-v0",
+                    "request_id": request_id,
                     "known_parameters": [],
                     "new_parameters": [],
                     "merged_suggested_seeds": copy.deepcopy(raw_report),
@@ -151,19 +227,19 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 "helper_depth": 0,
                 "observed_count": 1,
                 "evidence_kind": "zend_runtime",
-                "run_id": "run-v0",
+                "run_id": f"{legacy_run_id}-v0",
                 "plugin_slug": "fixture",
-                "request_id": "req-v0",
+                "request_id": request_id,
                 "canonical_callback": "fixture_callback",
                 "request_method": "POST",
             }
             if incomplete_parameter:
                 parameter.pop("request_id")
-            self.assertEqual(kwargs["legacy_run_id"], "run-v0")
+            self.assertEqual(kwargs["legacy_run_id"], f"{legacy_run_id}-v0")
             self.assertEqual(kwargs["candidate_key"], "candidate-fixture")
             return {
                 "status": "CONTINUE",
-                "request_id": "req-v0",
+                "request_id": request_id,
                 "known_parameters": [parameter],
                 "new_parameters": [parameter],
                 "merged_suggested_seeds": copy.deepcopy(raw_report),
@@ -227,7 +303,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             config_root=root / "configs",
             output_root=root / "output",
             plugin_slug="fixture",
-            legacy_run_id="run",
+            legacy_run_id=legacy_run_id,
             max_seconds=2,
             max_versions=max_versions,
             registry_path=registry,
@@ -267,6 +343,63 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertLess(positions["export_seed_configs"], positions["force_replay_only"])
             self.assertLess(positions["force_replay_only"], positions["run_generated_configs"])
             self.assertLess(positions["run_generated_configs"], positions["verify_pass2_contract"])
+
+    def test_v0_selection_allows_replay_only_seed_without_fuzz_params(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log: list[str] = []
+            coordinator = self.make_coordinator(root, log)
+
+            def build_replay_config(*args, **kwargs):
+                config = config_for(seed_item())
+                config["config_type"] = "replay_only"
+                config["body_params"]["fuzz"] = []
+                return "fixture", config
+
+            coordinator.build_config_fn = build_replay_config
+
+            selected = coordinator._select_v0()
+
+            self.assertIsNotNone(selected)
+            _, config, _ = selected
+            self.assertEqual(config["config_type"], "replay_only")
+            self.assertEqual(config["body_params"]["fuzz"], [])
+
+    def test_v0_selection_falls_back_to_replay_builder_for_blocked_seed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log: list[str] = []
+            coordinator = self.make_coordinator(root, log)
+
+            def build_blocked_then_replay(*args, **kwargs):
+                if not kwargs.get("replay_only"):
+                    raise SeedConfigSkip("blocked_http_method")
+                config = config_for(seed_item())
+                config["config_type"] = "replay_only"
+                config["body_params"]["fuzz"] = []
+                return "fixture", config
+
+            coordinator.build_config_fn = build_blocked_then_replay
+            selected = coordinator._select_v0()
+
+            self.assertIsNotNone(selected)
+            _, config, _ = selected
+            self.assertEqual(config["config_type"], "replay_only")
+
+    def test_replay_only_worker_is_marked_replaying(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log: list[str] = []
+            coordinator = self.make_coordinator(root, log)
+            config = config_for(seed_item())
+            config["config_type"] = "replay_only"
+            config["body_params"]["fuzz"] = []
+            coordinator.run_dir.mkdir(parents=True)
+            config_path = coordinator._write_config("v0", config)
+            version = coordinator._new_version("v0", config, config_path, None, None, seed_item())
+
+            self.assertTrue(coordinator._start_worker(version))
+            self.assertEqual(version["status"], "replaying")
 
     def test_cmp_log_only_does_not_create_child_version(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -393,10 +526,43 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             log: list[str] = []
             coordinator = self.make_coordinator(Path(tmp), log)
             self.assertEqual(coordinator.run(), 0)
-            run_dir = Path(tmp) / "output" / "online-linked" / "run"
+            run_dir = coordinator.run_dir
             self.assertTrue((run_dir / "state.json").is_file())
             self.assertTrue((run_dir / "events.jsonl").is_file())
             self.assertTrue((run_dir / "versions" / "v0").is_dir())
+
+    def test_long_run_id_preserves_evidence_and_resolvable_worker_configs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / ("workspace-" + "x" * 45)
+            root.mkdir()
+            run_id = "plugin-20260906T121044Z-candidate-001-wp_ajax_nopriv_" + "upload_file_" * 5
+            coordinator = self.make_coordinator(
+                root, [], legacy_run_id=run_id,
+                request_names={"1788671490-f70d334e-44a4-46f8-85e6-95b571434eec.json"},
+                zend_names={"1788671490-f70d334e-44a4-46f8-85e6-95b571434eec.json"},
+            )
+            coordinator.export_configs_fn = export_seed_configs
+            replay_runner = coordinator.replay_runner
+
+            def replay_with_existing_config(rows, **kwargs):
+                config = coordinator.config_root / (rows[0]["config_slug"] + ".json")
+                self.assertTrue(config.is_file(), config)
+                self.assertEqual(json.loads(config.read_text())["config_type"], "replay_only")
+                return replay_runner(rows, **kwargs)
+
+            coordinator.replay_runner = replay_with_existing_config
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            self.assertEqual([v["version"] for v in coordinator.state["versions"]], ["v0", "v1"])
+            self.assertTrue(coordinator.state["versions"][1]["replay_result"]["passed"])
+            state = json.loads(coordinator.state_path.read_text())
+            self.assertEqual(state["legacy_run_id"], run_id)
+            evidence = next((coordinator.run_dir / "versions/v0/observation/request").glob("*.json"))
+            self.assertEqual(json.loads(evidence.read_text())["legacy_run_id"], run_id + "-v0")
+            for worker in state["workers"]:
+                slug = next(arg.split("=", 1)[1] for arg in worker["command"] if arg.startswith("FUZZER_CONFIG="))
+                self.assertTrue((coordinator.config_root / (slug + ".json")).is_file())
+            for path in root.rglob("*.json"):
+                self.assertLess(len(str(path.resolve())), 260, path)
 
 
 if __name__ == "__main__":

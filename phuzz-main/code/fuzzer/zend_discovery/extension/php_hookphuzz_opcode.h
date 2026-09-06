@@ -35,6 +35,16 @@ typedef struct _hookphuzz_provenance {
     hookphuzz_path_key *path;
 } hookphuzz_provenance;
 
+typedef struct _hookphuzz_element_provenance {
+    HashTable *array;
+    zend_uchar key_type;
+    zend_long int_key;
+    zend_string *string_key;
+    hookphuzz_source source;
+    uint32_t depth;
+    hookphuzz_path_key *path;
+} hookphuzz_element_provenance;
+
 typedef struct _hookphuzz_event {
     hookphuzz_source source;
     uint32_t depth;
@@ -81,6 +91,8 @@ ZEND_BEGIN_MODULE_GLOBALS(hookphuzz_opcode)
     hookphuzz_comparison_event *comparison_events;
     uint32_t provenance_count;
     hookphuzz_provenance *provenance;
+    uint32_t element_provenance_count;
+    hookphuzz_element_provenance *element_provenance;
     zend_string *request_id;
     zend_string *request_method;
     zend_string *request_uri;
