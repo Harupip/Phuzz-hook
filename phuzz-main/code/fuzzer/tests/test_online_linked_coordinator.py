@@ -1,8 +1,13 @@
 import copy
 import json
+import os
+import socket
 import subprocess
 import tempfile
+import time
 import unittest
+import urllib.error
+import urllib.request
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
@@ -12,8 +17,14 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.online_linked_coordinator import OnlineLinkedCoordinator, run_online_linked
+from hook_energy.seed_generation.online_linked_coordinator import (
+    OnlineLinkedCoordinator,
+    _batch_candidate_identity,
+    run_online_linked,
+)
 from seed_generation.config.config_exporter import SeedConfigSkip, export_seed_configs
+from seed_generation.convergence.convergence import materialize_convergence_seeds
+from zend_discovery.engine import candidate_from_seed_item, canonical_identity_id
 
 
 def seed_item() -> dict:
@@ -69,6 +80,636 @@ class Clock:
 
 
 class OnlineLinkedCoordinatorTests(unittest.TestCase):
+    def run_php_json_producer(self, raw_body: str) -> dict:
+        php = Path(r"C:\xampp\php\php.exe")
+        self.assertTrue(php.is_file(), php)
+        hook_path = Path(__file__).resolve().parents[2] / "web" / "instrumentation" / "hook_coverage" / "uopz_hook_wp.php"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            harness = root / "harness.php"
+            harness.write_text(
+                "<?php\n"
+                "$hook = getenv('HOOKPHUZZ_HOOK_FILE');\n"
+                "require $hook;\n"
+                "echo json_encode($GLOBALS['__uopz_request']['request_params'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.update({
+                "HOOKPHUZZ_HOOK_FILE": str(hook_path),
+                "FUZZER_HOOK_OUTPUT_DIR": str(root / "coverage"),
+                "FUZZER_ENABLE_REQUEST_LOG": "0",
+            })
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+            process = subprocess.Popen(
+                [str(php), "-S", f"127.0.0.1:{port}", str(harness)],
+                cwd=root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/harness.php",
+                    data=raw_body.encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                expires = time.monotonic() + 5
+                while True:
+                    try:
+                        with urllib.request.urlopen(request, timeout=0.5) as response:
+                            return json.loads(response.read().decode("utf-8"))
+                    except urllib.error.URLError:
+                        if process.poll() is not None or time.monotonic() >= expires:
+                            stdout, stderr = process.communicate(timeout=5)
+                            raise AssertionError(f"PHP producer did not serve request: {stdout}\n{stderr}")
+                        time.sleep(0.02)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate(timeout=5)
+
+    def test_php_producer_preserves_json_object_array_and_status(self):
+        cases = (
+            ("{}", "empty", {}, "object"),
+            ('{"payload":{}}', "decoded", {"payload": {}}, "object"),
+            ('{"payload":[]}', "decoded", {"payload": []}, "object"),
+            ('{"payload":{"flag":false,"zero":0,"nil":null,"nested":[{}, {"x":0}]}}', "decoded", {
+                "payload": {"flag": False, "zero": 0, "nil": None, "nested": [{}, {"x": 0}]},
+            }, "object"),
+            ("[]", "decoded", [], "array"),
+            ("false", "decoded", False, "boolean"),
+            ("0", "decoded", 0, "number"),
+            ("null", "decoded", None, "null"),
+        )
+        for raw, status, expected_value, expected_type in cases:
+            with self.subTest(raw=raw):
+                params = self.run_php_json_producer(raw)
+                self.assertEqual(params["json_params_status"], status)
+                self.assertEqual(params["json_params_type"], expected_type)
+                self.assertEqual(params["json_params"], expected_value)
+
+        missing = self.run_php_json_producer("")
+        self.assertEqual(missing["json_params_status"], "missing")
+        self.assertEqual(missing["json_params_error"], "JSON_BODY_MISSING")
+        invalid = self.run_php_json_producer("{bad")
+        self.assertEqual(invalid["json_params_status"], "invalid")
+        self.assertTrue(invalid["json_params_error"])
+
+    def test_php_json_values_reach_child_and_replay_with_original_types(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator = self.make_coordinator(root, [])
+            params = self.run_php_json_producer(
+                '{"payload":{"object":{},"array":[],"flag":false,"zero":0,"nil":null}}'
+            )
+            config = config_for(seed_item())
+            config["headers"] = {"data": [{"name": "Content-Type", "value": "application/json"}]}
+            config["body_params"] = {
+                "data": [
+                    {"name": "payload[object]", "value": "probe"},
+                    {"name": "payload[array]", "value": "probe"},
+                    {"name": "payload[flag]", "value": "probe"},
+                    {"name": "payload[zero]", "value": "probe"},
+                    {"name": "payload[nil]", "value": "probe"},
+                ],
+                "fixed": [],
+                "fuzz": ["payload[object]", "payload[array]", "payload[flag]", "payload[zero]", "payload[nil]"],
+            }
+            parent_path = root / "parent.json"
+            parent_path.write_text(json.dumps(config), encoding="utf-8")
+            coordinator._restore_request_values(
+                config,
+                {"request_id": "php", "request": {"request_params": params}},
+                {"config_path": str(parent_path), "worker_run_id": "run-v0"},
+            )
+            values = {row["name"]: row["value"] for row in config["body_params"]["data"]}
+            self.assertEqual(values["payload[object]"], {})
+            self.assertEqual(values["payload[array]"], [])
+            self.assertIs(values["payload[flag]"], False)
+            self.assertEqual(values["payload[zero]"], 0)
+            self.assertIsNone(values["payload[nil]"])
+            replay = copy.deepcopy(config)
+            coordinator.force_replay_only_fn(replay)
+            replay_values = {row["name"]: row["value"] for row in replay["body_params"]["data"]}
+            self.assertEqual(replay_values, values)
+
+    def test_same_hook_different_runtime_callback_is_queued_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            item, config, target_key = coordinator._select_v0()
+            config_path = coordinator._write_config("v0", config)
+            version = coordinator._new_version("v0", config, config_path, None, None, item)
+            version["worker_run_id"] = "run-v0"
+            coordinator._active_version = "v0"
+            coordinator._target_key = target_key
+            coordinator.state["queued_candidate_ids"].append(_batch_candidate_identity(item, "fixture"))
+            request = coordinator.load_artifact("req-v0.json")
+            request["hook_coverage"] = {"registered_callbacks": {
+                "cb-child": {
+                    "callback_id": "cb-child",
+                    "callback_repr": "child_callback",
+                    "hook_name": "wp_ajax_nopriv_fixture",
+                    "entrypoint_type": "ajax_unauthenticated",
+                    "method": "POST",
+                    "request_id": "req-v0",
+                    "target_plugin": "fixture",
+                    "registered_inside_callback": True,
+                    "parent_callback_id": "cb-fixture",
+                    "parent_callback": {"callback_id": "cb-fixture"},
+                },
+                "cb-fixture": {
+                    "callback_id": "cb-fixture",
+                    "callback_repr": "fixture_callback",
+                    "hook_name": "wp_ajax_nopriv_fixture",
+                    "registered_inside_callback": True,
+                    "parent_callback_id": "cb-fixture",
+                },
+            }}
+            evidence = {"request_id": "req-v0", "request": request}
+
+            first = coordinator._discover_runtime_candidates(evidence)
+            second = coordinator._discover_runtime_candidates(evidence)
+
+            self.assertEqual(len(first), 1)
+            self.assertEqual(second, [])
+            self.assertEqual(first[0]["callback_id"], "cb-child")
+            self.assertEqual(first[0]["hook_name"], "wp_ajax_nopriv_fixture")
+            self.assertEqual(first[0]["lineage"]["parent_callback_id"], "cb-fixture")
+
+            version["callback_id"] = "cb-child"
+            request["hook_coverage"] = {"registered_callbacks": {
+                "cb-fixture": {
+                    "callback_id": "cb-fixture",
+                    "callback_repr": "fixture_callback",
+                    "hook_name": "wp_ajax_nopriv_fixture",
+                    "entrypoint_type": "ajax_unauthenticated",
+                    "method": "POST",
+                    "registered_inside_callback": True,
+                    "parent_callback_id": "cb-child",
+                    "parent_callback": {"callback_id": "cb-child"},
+                },
+            }}
+            cycle = coordinator._discover_runtime_candidates(evidence)
+            self.assertEqual(cycle, [])
+            self.assertEqual(len(coordinator.state["candidate_queue"]), 1)
+    def test_uopz_producer_contract_exports_json_status_and_cookie_names(self):
+        hook_path = Path(__file__).resolve().parents[2] / "web" / "instrumentation" / "hook_coverage" / "uopz_hook_wp.php"
+        source = hook_path.read_text(encoding="utf-8")
+        self.assertIn("'json_params'", source)
+        self.assertIn("'json_params_status'", source)
+        self.assertIn("php://input", source)
+        self.assertIn("json_last_error", source)
+        self.assertIn("'cookies' => isset($_COOKIE) ? array_keys($_COOKIE) : []", source)
+
+    def test_empty_buckets_and_cookie_names_preserve_fixed_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator = self.make_coordinator(root, [])
+            config = config_for(seed_item())
+            config["query_params"] = {
+                "data": [{"name": "page", "value": "probe"}],
+                "fixed": [],
+                "fuzz": ["page"],
+            }
+            config["cookies"] = {
+                "data": [{"name": "session", "value": "fixed-token"}],
+                "fixed": ["session"],
+                "fuzz": [],
+            }
+            parent_path = root / "parent.json"
+            parent_path.write_text(json.dumps(config), encoding="utf-8")
+            evidence = {"request_id": "r", "request": {"request_params": {
+                "query_params": [],
+                "body_params": [],
+                "cookies": ["session"],
+            }}}
+
+            coordinator._restore_request_values(
+                config, evidence, {"config_path": str(parent_path), "worker_run_id": "run-v0"}
+            )
+
+            self.assertEqual(config["query_params"]["data"][0]["value"], "probe")
+            cookie = config["cookies"]["data"][0]
+            self.assertEqual(cookie["value"], "fixed-token")
+            self.assertIn("session", config["cookies"]["fixed"])
+            self.assertNotIn("session", config["cookies"]["fuzz"])
+            values = {row["name"]: row for row in config["metadata"]["online_request_seed"]["values"]}
+            self.assertEqual(values["page"]["value_origin"], "empty")
+            self.assertEqual(values["session"]["value_origin"], "names_only")
+            self.assertNotEqual(cookie["value"], "session")
+
+    def test_malformed_request_bucket_is_rejected_with_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator = self.make_coordinator(root, [])
+            config = config_for(seed_item())
+            config["query_params"] = {
+                "data": [{"name": "page", "value": "probe"}],
+                "fixed": [],
+                "fuzz": ["page"],
+            }
+            parent_path = root / "parent.json"
+            parent_path.write_text(json.dumps(config), encoding="utf-8")
+            evidence = {"request_id": "r", "request": {"request_params": {
+                "query_params": ["not-a-map"],
+            }}}
+
+            with self.assertRaisesRegex(ValueError, r"UNSUPPORTED_REQUEST_BUCKET: query_params must be an object"):
+                coordinator._restore_request_values(
+                    config, evidence, {"config_path": str(parent_path), "worker_run_id": "run-v0"}
+                )
+
+    def test_admission_normalizes_php_callback_scope_separator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            parameter = {
+                "name": "cfx_settings",
+                "source": "POST",
+                "location": "form",
+                "evidence_kind": "zend_runtime",
+                "request_id": "req-v0",
+                "run_id": "run-v0",
+                "plugin_slug": "fixture",
+                "canonical_callback": "fixture_controller::save",
+                "request_method": "POST",
+            }
+            parent = {
+                "worker_run_id": "run-v0",
+                "resolved_method": "POST",
+                "canonical_callback": "fixture_controller->save",
+            }
+
+            self.assertTrue(coordinator._admission_complete(parameter, {"request_id": "req-v0"}, parent))
+            parameter["canonical_callback"] = "other_controller::save"
+            self.assertFalse(coordinator._admission_complete(parameter, {"request_id": "req-v0"}, parent))
+
+    def test_candidate_identity_uses_one_normalized_contract_and_ignores_legacy_identity(self):
+        initial = {
+            "hook_name": "rest_route:demo/v1/items",
+            "callback_id": "cb-shared",
+            "identity": "legacy|format|must-not-be-trusted",
+            "seed": {
+                "entrypoint_type": "rest_route",
+                "path": "/demo/v1/items/",
+                "method": "get",
+                "seed_variant_id": "query",
+            },
+        }
+        runtime = {
+            **initial,
+            "identity": "another|legacy|format",
+            "seed": {
+                **initial["seed"],
+                "route": "/demo/v1/items",
+                "resolved_method": "GET",
+            },
+        }
+        expected = "fixture|cb-shared|rest_route|rest_route:demo/v1/items|/demo/v1/items|GET|query"
+        self.assertEqual(_batch_candidate_identity(initial, "fixture"), expected)
+        self.assertEqual(_batch_candidate_identity(runtime, "fixture"), expected)
+        ajax_initial = {
+            "hook_name": "wp_ajax_nopriv_shared",
+            "callback_id": "cb-shared",
+            "seed": {"path": "/wp-admin/admin-ajax.php", "method": "POST"},
+        }
+        ajax_runtime = {
+            **ajax_initial,
+            "identity": "legacy-runtime-format",
+            "seed": {
+                **ajax_initial["seed"],
+                "entrypoint_type": "ajax_unauthenticated",
+                "seed_variant_id": "post",
+            },
+        }
+        self.assertEqual(_batch_candidate_identity(ajax_initial, "fixture"), _batch_candidate_identity(ajax_runtime, "fixture"))
+
+    def test_runtime_registration_enqueues_supported_child_with_parent_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            item, config, target_key = coordinator._select_v0()
+            config_path = coordinator._write_config("v0", config)
+            version = coordinator._new_version("v0", config, config_path, None, None, item)
+            version["worker_run_id"] = "run-v0"
+            coordinator._active_version = "v0"
+            coordinator._target_key = target_key
+            request = coordinator.load_artifact("req-v0.json")
+            request["hook_coverage"] = {
+                "registered_callbacks": {
+                    "cb-child": {
+                        "callback_id": "cb-child",
+                        "callback_repr": "child_callback",
+                        "hook_name": "wp_ajax_nopriv_child",
+                        "entrypoint_type": "ajax_unauthenticated",
+                        "method": "POST",
+                        "request_id": "req-v0",
+                        "target_plugin": "fixture",
+                        "registered_inside_callback": True,
+                        "parent_callback_id": "cb-fixture",
+                        "parent_callback": {"callback_id": "cb-fixture"},
+                    },
+                    "cb-internal": {
+                        "callback_id": "cb-internal",
+                        "callback_repr": "internal_callback",
+                        "hook_name": "init",
+                        "request_id": "req-v0",
+                        "target_plugin": "fixture",
+                        "registered_inside_callback": True,
+                        "parent_callback_id": "cb-fixture",
+                        "parent_callback": {"callback_id": "cb-fixture"},
+                    },
+                }
+            }
+            evidence = {"request_id": "req-v0", "request": request}
+
+            first = coordinator._discover_runtime_candidates(evidence)
+            second = coordinator._discover_runtime_candidates(evidence)
+
+            self.assertEqual(len(first), 1)
+            self.assertEqual(second, [])
+            child = first[0]
+            self.assertEqual(child["callback_id"], "cb-child")
+            self.assertEqual(child["hook_name"], "wp_ajax_nopriv_child")
+            self.assertEqual(child["seed"]["method"], "POST")
+            self.assertEqual(child["seed"]["seed_variant_id"], "post")
+            self.assertEqual(child["lineage"]["parent_request_id"], "req-v0")
+            self.assertEqual(child["lineage"]["parent_callback_id"], "cb-fixture")
+            self.assertIn(child["identity"], coordinator.state["queued_candidate_ids"])
+            self.assertEqual(coordinator.registry["callback_map"]["cb-child"], "child_callback")
+            registry = json.loads(coordinator.registry_path.read_text(encoding="utf-8-sig"))
+            self.assertEqual(registry["callback_map"]["cb-child"], "child_callback")
+            blocked = [event for event in coordinator.state["events"] if event.get("callback_id") == "cb-internal"]
+            self.assertEqual(len(blocked), 1)
+            self.assertEqual(blocked[0]["reason"], "ACTION_EXPANSION_SETUP_REQUIRED")
+
+    def test_runtime_registration_keeps_each_rest_method_as_distinct_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            item, config, target_key = coordinator._select_v0()
+            config_path = coordinator._write_config("v0", config)
+            version = coordinator._new_version("v0", config, config_path, None, None, item)
+            version["worker_run_id"] = "run-v0"
+            coordinator._active_version = "v0"
+            coordinator._target_key = target_key
+            request = coordinator.load_artifact("req-v0.json")
+            request["hook_coverage"] = {"registered_callbacks": {
+                "cb-rest": {
+                    "callback_id": "cb-rest",
+                    "callback_repr": "rest_callback",
+                    "hook_name": "rest_route:demo/v1/items",
+                    "entrypoint_type": "rest_route",
+                    "namespace": "demo/v1",
+                    "route": "/items",
+                    "methods": ["GET", "POST"],
+                    "request_id": "req-v0",
+                    "target_plugin": "fixture",
+                    "registered_inside_callback": True,
+                    "parent_callback_id": "cb-fixture",
+                    "parent_callback": {"callback_id": "cb-fixture"},
+                }
+            }}
+
+            candidates = coordinator._discover_runtime_candidates({"request_id": "req-v0", "request": request})
+
+            self.assertEqual([candidate["seed"]["method"] for candidate in candidates], ["GET", "POST"])
+            self.assertEqual(len({candidate["identity"] for candidate in candidates}), 2)
+
+    def test_v0_requires_registry_and_nonempty_pass2_before_fuzzing(self):
+        for missing_registry in (True, False):
+            with self.subTest(missing_registry=missing_registry), tempfile.TemporaryDirectory() as tmp:
+                log = []
+                coordinator = self.make_coordinator(Path(tmp), log)
+                if missing_registry:
+                    coordinator.registry = {'callback_map': {}}
+                else:
+                    coordinator.verify_pass2_fn = lambda *args, **kwargs: {'accepted': 0, 'total': 0}
+                self.assertEqual(coordinator.run(), 2)
+                self.assertNotIn('worker_start', log)
+                self.assertEqual(coordinator.state['terminal_reason'],
+                                 'V0_REGISTRY_MISSING' if missing_registry else 'V0_PASS2_NOT_VERIFIED')
+
+    def test_v0_selection_matches_method_when_callback_has_multiple_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            coordinator.list_targets_fn = lambda *args, **kwargs: [
+                {'hook_name': 'wp_ajax_nopriv_fixture', 'callback_id': 'cb-fixture',
+                 'method': method, 'candidate_key': method} for method in ('GET', 'POST')]
+            selected = coordinator._select_v0()
+            self.assertIsNotNone(selected)
+            self.assertEqual(selected[2], 'POST')
+
+    def test_unverified_v0_never_starts_a_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            coordinator = self.make_coordinator(Path(tmp), log)
+            coordinator.replay_runner = lambda *args, **kwargs: {'runs': []}
+            self.assertNotEqual(coordinator.run(), 0)
+            self.assertNotIn('worker_start', log)
+            self.assertEqual(coordinator.state['terminal_reason'], 'V0_CALLBACK_NOT_REACHED')
+
+    def test_runtime_seed_preserves_json_types_nested_form_and_fixed_auth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator = self.make_coordinator(root, [])
+            config = config_for(seed_item())
+            config['body_params'] = {
+                'data': [{'name': name, 'value': 'fuzz'} for name in ('enabled', 'count', 'detail', 'missing', 'nonce')],
+                'fixed': [], 'fuzz': ['enabled', 'count', 'detail', 'missing', 'nonce'],
+            }
+            config['headers'] = {'data': [{'name': 'Content-Type', 'value': 'application/json'}]}
+            parent_config = copy.deepcopy(config)
+            parent_config['body_params']['fixed'] = ['nonce']
+            path = root / 'parent.json'
+            path.write_text(json.dumps(parent_config), encoding='utf-8')
+            parent = {'config_path': str(path), 'worker_run_id': 'run-v0'}
+            evidence = {'request_id': 'r', 'request': {'request_params': {
+                'body_params': {'enabled': 'wrong-transport'},
+                'json_params_status': 'decoded',
+                'json_params': {'enabled': False, 'count': 0, 'detail': None, 'nonce': 'runtime-token'},
+            }}}
+            coordinator._restore_request_values(config, evidence, parent)
+            body = {row['name']: row['value'] for row in config['body_params']['data']}
+            self.assertIs(body['enabled'], False)
+            self.assertEqual(body['count'], 0)
+            self.assertIsNone(body['detail'])
+            self.assertEqual(body['nonce'], 'runtime-token')
+            self.assertIn('nonce', config['body_params']['fixed'])
+            self.assertNotIn('nonce', config['body_params']['fuzz'])
+            replay_config = copy.deepcopy(config)
+            coordinator.force_replay_only_fn(replay_config)
+            replay_body = {row['name']: row['value'] for row in replay_config['body_params']['data']}
+            self.assertIs(replay_body['enabled'], False)
+            self.assertEqual(replay_body['count'], 0)
+            self.assertIsNone(replay_body['detail'])
+            values = config['metadata']['online_request_seed']['values']
+            self.assertEqual(next(row for row in values if row['name'] == 'missing')['value_origin'], 'probe')
+            config.pop('headers')
+            config['body_params']['data'] = [{'name': 'data[detail]', 'value': 'fuzz'}]
+            evidence['request']['request_params']['body_params'] = {'data': {'detail': 'nested'}}
+            coordinator._restore_request_values(config, evidence, parent)
+            self.assertEqual(config['body_params']['data'][0]['value'], 'nested')
+
+    def test_json_statuses_are_distinct_without_falsifying_observed_values(self):
+        for label, request_params, expected_origin in (
+            ("missing", {}, "missing"),
+            ("invalid", {"json_params": None, "json_params_status": "invalid", "json_params_error": "bad json"}, "invalid"),
+            ("empty", {"json_params": {}, "json_params_status": "empty"}, "empty"),
+        ):
+            with self.subTest(status=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                coordinator = self.make_coordinator(root, [])
+                config = config_for(seed_item())
+                config["headers"] = {"data": [{"name": "Content-Type", "value": "application/json"}]}
+                config["body_params"] = {
+                    "data": [{"name": "mode", "value": "probe"}],
+                    "fixed": [],
+                    "fuzz": ["mode"],
+                }
+                parent_path = root / "parent.json"
+                parent_path.write_text(json.dumps(config), encoding="utf-8")
+                coordinator._restore_request_values(
+                    config,
+                    {"request_id": "r", "request": {"request_params": request_params}},
+                    {"config_path": str(parent_path), "worker_run_id": "run-v0"},
+                )
+                value = config["body_params"]["data"][0]["value"]
+                record = config["metadata"]["online_request_seed"]["values"][0]
+                self.assertEqual(value, "probe")
+                self.assertEqual(record["value_origin"], expected_origin)
+
+    def test_json_nested_values_reach_child_and_replay_config_with_types(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator = self.make_coordinator(root, [])
+            config = config_for(seed_item())
+            config["headers"] = {"data": [{"name": "Content-Type", "value": "application/json"}]}
+            config["body_params"] = {
+                "data": [
+                    {"name": "payload[mode]", "value": "probe"},
+                    {"name": "payload[enabled]", "value": "probe"},
+                ],
+                "fixed": [],
+                "fuzz": ["payload[mode]", "payload[enabled]"],
+            }
+            parent_path = root / "parent.json"
+            parent_path.write_text(json.dumps(config), encoding="utf-8")
+            evidence = {"request_id": "r", "request": {"request_params": {
+                "json_params_status": "decoded",
+                "json_params": {"payload": {"mode": "deep", "enabled": False}},
+            }}}
+            coordinator._restore_request_values(
+                config, evidence, {"config_path": str(parent_path), "worker_run_id": "run-v0"}
+            )
+            values = {row["name"]: row["value"] for row in config["body_params"]["data"]}
+            self.assertEqual(values["payload[mode]"], "deep")
+            self.assertIs(values["payload[enabled]"], False)
+            replay_config = copy.deepcopy(config)
+            coordinator.force_replay_only_fn(replay_config)
+            replay_values = {row["name"]: row["value"] for row in replay_config["body_params"]["data"]}
+            self.assertEqual(replay_values["payload[mode]"], "deep")
+            self.assertIs(replay_values["payload[enabled]"], False)
+
+    def test_failed_child_replay_does_not_confirm_parent_parameters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [], replay_passes=False)
+            self.assertEqual(coordinator.run(), 1)
+            parent, child = coordinator.state['versions']
+            self.assertEqual(parent['known_parameters'], [])
+            self.assertEqual(child['status'], 'replay_failed')
+
+    def test_export_failure_retains_parent_and_reserves_attempt_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            exporter = coordinator.export_configs_fn
+            coordinator.export_configs_fn = lambda *args, **kwargs: {'generated': []}
+            coordinator.run()
+            self.assertEqual(coordinator.state['versions'][0]['known_parameters'], [])
+            self.assertEqual(coordinator.state['attempts'][0]['reason'], 'CHILD_CONFIG_EXPORT_FAILED')
+            self.assertEqual(coordinator.state['attempts'][0]['version'], 'v1')
+            coordinator.export_configs_fn = exporter
+            converge = coordinator.converge_fn
+
+            def repeated_observation(**kwargs):
+                self.assertEqual(kwargs['known_state']['known_parameters'], [])
+                result = converge(**kwargs)
+                result['request_id'] = 'retry'
+                result['new_parameters'][0]['request_id'] = 'retry'
+                return result
+
+            coordinator.converge_fn = repeated_observation
+            request = coordinator.load_artifact('retry.json')
+            child = coordinator.advance_online_version({
+                'request_name': 'retry.json', 'zend_name': 'retry.json', 'request_id': 'retry',
+                'request': request, 'zend': coordinator.load_zend_artifact('retry.json'),
+            })
+            self.assertEqual(child['version'], 'v2')
+            self.assertEqual(child['status'], 'fuzzing')
+            self.assertEqual(coordinator.state['versions'][0]['known_parameters'], [])
+            self.assertIsNone(coordinator.advance_online_version({'request_id': 'third'}))
+
+    def test_convergence_failure_keeps_missing_parameter_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            coordinator.converge_fn = lambda **kwargs: {
+                'status': 'REPLAY_FAILED', 'new_parameters': [],
+                'missing_parameters': ['detail'], 'runtime_block_reason': 'BRANCH_NOT_REACHED',
+            }
+            coordinator.run()
+            event = coordinator.state['events'][-1]
+            self.assertEqual(event['reason'], 'BRANCH_NOT_REACHED')
+            self.assertEqual(event['missing_parameters'], ['detail'])
+
+    def test_child_replay_and_initial_seed_keep_runtime_branch_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            converge = coordinator.converge_fn
+            load = coordinator.load_artifact
+
+            def branch_request(name):
+                request = load(name)
+                request['request_params']['body_params'].update(mode='deep', detail='observed')
+                request['request_params']['query_params'] = {'detail': 'query-only'}
+                return request
+
+            def branch_parameters(**kwargs):
+                result = converge(**kwargs)
+                if not result['new_parameters']:
+                    return result
+                template = result['new_parameters'][0]
+                result['known_parameters'] = result['new_parameters'] = [
+                    {**template, 'name': name, 'path': [name]} for name in ('mode', 'detail')
+                ]
+                return result
+
+            def materialize(report, **kwargs):
+                kwargs['candidate_key'] = canonical_identity_id(
+                    candidate_from_seed_item(report['suggested_seeds'][0], plugin_slug='fixture'))
+                return materialize_convergence_seeds(report, **kwargs)
+
+            coordinator.load_artifact = branch_request
+            coordinator.converge_fn = branch_parameters
+            coordinator.materialize_fn = materialize
+            coordinator.export_configs_fn = export_seed_configs
+            self.assertEqual(coordinator.run(), 0)
+            parent, child = coordinator.state['versions']
+            self.assertEqual(coordinator.config_hash(Path(parent['config_path'])), parent['config_hash'])
+            for path in (child['config_path'], child['replay_config_path']):
+                config = json.loads(Path(path).read_text(encoding='utf-8'))
+                body = {row['name']: row['value'] for row in config['body_params']['data']}
+                self.assertEqual(body['mode'], 'deep')
+                self.assertEqual(body['detail'], 'observed')
+                self.assertEqual(body['action'], 'fixture')
+            config = json.loads(Path(child['config_path']).read_text(encoding='utf-8'))
+            self.assertIn('detail', config['body_params']['fuzz'])
+
     def test_online_linked_batch_continues_after_candidate_vulnerability(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -120,6 +761,122 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(batch_state["candidates"][0]["terminal_status"], "VULN_FOUND")
             self.assertEqual(batch_state["candidates"][1]["terminal_status"], "BOUNDED_ONLINE_COMPLETE")
 
+    def test_online_linked_batch_consumes_runtime_candidate_queue_with_lineage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            suggested = root / "suggested_seeds.json"
+            suggested.write_text(json.dumps({
+                "plugin_slug": "fixture",
+                "suggested_seeds": [{
+                    "hook_name": "wp_ajax_nopriv_parent",
+                    "callback_id": "cb-parent",
+                    "callback_repr": "parent_callback",
+                    "seed": {"method": "POST", "path": "/wp-admin/admin-ajax.php", "body": {"action": "parent"}},
+                }],
+            }), encoding="utf-8")
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({"schema_version": 1, "callback_map": {"cb-parent": "parent_callback"}}), encoding="utf-8")
+            child = {
+                "identity": "fixture|cb-child|ajax_unauthenticated|wp_ajax_nopriv_child|/wp-admin/admin-ajax.php|POST|post",
+                "hook_name": "wp_ajax_nopriv_child",
+                "callback_id": "cb-child",
+                "callback_repr": "child_callback",
+                "seed": {"method": "POST", "path": "/wp-admin/admin-ajax.php", "body": {"action": "child"}},
+                "lineage": {"parent_request_id": "req-parent", "parent_callback_id": "cb-parent"},
+            }
+            calls = []
+
+            class FakeCoordinator:
+                def __init__(self, **kwargs):
+                    calls.append(kwargs)
+                    self.state_path = Path(kwargs["output_root"]) / "online-linked" / kwargs["legacy_run_id"] / "state.json"
+                    self.state = {
+                        "terminal_status": "BOUNDED_ONLINE_COMPLETE",
+                        "terminal_reason": "BUDGET_EXPIRED",
+                        "versions": [],
+                        "candidate_queue": [child] if len(calls) == 1 else [],
+                    }
+
+                def run(self):
+                    return 0
+
+            args = SimpleNamespace(
+                suggested_seeds=str(suggested),
+                bootstrap_config="",
+                config_root=str(root / "configs"),
+                output_root=str(root / "output"),
+                plugin_slug="fixture",
+                legacy_run_id="run",
+                max_seconds=1,
+                max_versions=2,
+                max_candidates=2,
+                campaign_seconds=10,
+                callback_registry=str(registry),
+                service="fuzzer-wordpress-plugin",
+            )
+            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator):
+                self.assertEqual(run_online_linked(args), 0)
+
+            self.assertEqual(len(calls), 2)
+            self.assertIsNotNone(calls[0]["campaign_deadline"])
+            self.assertEqual(calls[0]["campaign_deadline"], calls[1]["campaign_deadline"])
+            batch_state = json.loads((root / "output" / "online-linked" / "run" / "batch-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(batch_state["candidates"][1]["lineage"]["parent_callback_id"], "cb-parent")
+            self.assertEqual(batch_state["candidates"][1]["source"], "runtime_registration")
+
+    def test_online_linked_batch_does_not_sync_or_queue_after_campaign_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            suggested = root / "suggested_seeds.json"
+            initial = {
+                "hook_name": "wp_ajax_nopriv_parent",
+                "callback_id": "cb-parent",
+                "callback_repr": "parent_callback",
+                "seed": {"method": "POST", "path": "/wp-admin/admin-ajax.php", "body": {"action": "parent"}},
+            }
+            suggested.write_text(json.dumps({"plugin_slug": "fixture", "suggested_seeds": [initial]}), encoding="utf-8")
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({"schema_version": 1, "callback_map": {"cb-parent": "parent_callback"}}), encoding="utf-8")
+            child = {
+                "hook_name": "wp_ajax_nopriv_child",
+                "callback_id": "cb-child",
+                "callback_repr": "child_callback",
+                "seed": {"method": "POST", "path": "/wp-admin/admin-ajax.php", "body": {"action": "child"}},
+                "lineage": {"parent_callback_id": "cb-parent"},
+            }
+            calls = []
+
+            class FakeCoordinator:
+                def __init__(self, **kwargs):
+                    calls.append(kwargs)
+                    self.state_path = Path(kwargs["output_root"]) / "state.json"
+                    self.state = {
+                        "terminal_status": "BOUNDED_ONLINE_COMPLETE",
+                        "terminal_reason": "BUDGET_EXPIRED",
+                        "versions": [],
+                        "candidate_queue": [child],
+                    }
+
+                def run(self):
+                    return 0
+
+            args = SimpleNamespace(
+                suggested_seeds=str(suggested), bootstrap_config="", config_root=str(root / "configs"),
+                output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="run",
+                max_seconds=60, max_versions=2, max_candidates=2, campaign_seconds=1,
+                callback_registry=str(registry), service="fuzzer-wordpress-plugin", sync_registry=True,
+            )
+            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch("hook_energy.seed_generation.online_linked_coordinator._sync_callback_registry_to_web") as sync, \
+                    patch("hook_energy.seed_generation.online_linked_coordinator.time.monotonic", side_effect=[0.0, 0.0, 2.0]):
+                self.assertEqual(run_online_linked(args), 0)
+
+            self.assertEqual(len(calls), 1)
+            sync.assert_not_called()
+            batch_state = json.loads((root / "output" / "online-linked" / "run" / "batch-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(batch_state["campaign_status"], "CAMPAIGN_BUDGET_EXPIRED")
+            self.assertEqual(len(batch_state["candidates"]), 1)
+
     def test_worker_vulnerability_exit_stops_current_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             log: list[str] = []
@@ -155,13 +912,15 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         request_names: set[str] | None = None,
         zend_names: set[str] | None = None,
         legacy_run_id: str = "run",
+        max_seconds: int = 2,
+        campaign_deadline: float | None = None,
     ) -> OnlineLinkedCoordinator:
         item = seed_item()
         raw_report = {"plugin_slug": "fixture", "suggested_seeds": [item]}
         suggested = root / "suggested_seeds.json"
         suggested.write_text(json.dumps(raw_report), encoding="utf-8")
         registry = root / "registry.json"
-        registry.write_text(json.dumps({"schema_version": 1, "callback_map": {}}), encoding="utf-8")
+        registry.write_text(json.dumps({"schema_version": 1, "callback_map": {"cb-fixture": "fixture_callback"}}), encoding="utf-8")
         clock = Clock()
         request_names = request_names if request_names is not None else {"req-v0.json"}
         zend_names = zend_names if zend_names is not None else {"req-v0.json"}
@@ -208,6 +967,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             return {"request_id": Path(name).stem, "run_id": f"{legacy_run_id}-v0"}
 
         def converge(**kwargs):
+            if kwargs['pass_run_summary']['runs'][0].get('process_status') == 'replaying':
+                log.append('v0_convergence')
+                return {'status': 'CONVERGED', 'new_parameters': [], 'known_parameters': []}
             log.append("converge_iteration")
             if convergence_error:
                 raise RuntimeError("REPLAY_FAILED: exact candidate correlation failed")
@@ -265,13 +1027,19 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             return summary
 
         def force_replay(config):
-            log.append("force_replay_only")
+            log.append("force_replay_only" if config.get('metadata', {}).get('online_request_seed') else 'v0_force_replay')
             for section in (config.get("body_params"), config.get("query_params")):
                 if isinstance(section, dict):
                     section["fuzz"] = []
             config["config_type"] = "replay_only"
 
         def replay_runner(*args, **kwargs):
+            if kwargs['legacy_run_id'] == f'{legacy_run_id}-v0':
+                log.append('v0_replay')
+                return {'legacy_run_id': kwargs['legacy_run_id'], 'runs': [{
+                    **args[0][0], 'callback_reached': True, 'validation_status': 'callback_reached',
+                    'process_status': 'replaying', 'matched_artifact': 'v0-probe.json',
+                }]}
             log.append("run_generated_configs")
             if replay_error:
                 raise RuntimeError("REPLAY_FAILED: replay runner failed")
@@ -288,6 +1056,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             }]}
 
         def verify_pass2(*args, **kwargs):
+            if args[0].get('legacy_run_id') == f'{legacy_run_id}-v0':
+                log.append('v0_pass2')
+                return {'accepted': 1, 'total': 1}
             log.append("verify_pass2_contract")
             return {"accepted": 1, "total": 1} if replay_passes else {"accepted": 0, "total": 0}
 
@@ -304,9 +1075,10 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             output_root=root / "output",
             plugin_slug="fixture",
             legacy_run_id=legacy_run_id,
-            max_seconds=2,
+            max_seconds=max_seconds,
             max_versions=max_versions,
             registry_path=registry,
+            campaign_deadline=campaign_deadline,
             build_config_fn=build_config,
             list_targets_fn=list_targets,
             list_artifacts=list_artifacts,
@@ -323,6 +1095,43 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             clock=clock,
             sleeper=clock.sleep,
         )
+
+    def test_campaign_deadline_caps_candidate_replay_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(
+                Path(tmp), [], max_seconds=60, campaign_deadline=1.0,
+            )
+            replay_timeouts = []
+            original_replay = coordinator.replay_runner
+
+            def record_timeout(*args, **kwargs):
+                replay_timeouts.append(kwargs["timeout_seconds"])
+                return original_replay(*args, **kwargs)
+
+            coordinator.replay_runner = record_timeout
+            self.assertEqual(coordinator.run(), 0)
+            self.assertEqual(replay_timeouts[0], 1)
+            self.assertEqual(coordinator.state["campaign_status"], "bounded")
+
+    def test_campaign_budget_exhausted_by_v0_replay_does_not_start_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(
+                Path(tmp), log, max_seconds=60, campaign_deadline=1.0,
+            )
+            original_replay = coordinator.replay_runner
+
+            def exhaust_campaign(*args, **kwargs):
+                report = original_replay(*args, **kwargs)
+                if kwargs["legacy_run_id"] == "run-v0":
+                    coordinator.clock.now = 2.0
+                return report
+
+            coordinator.replay_runner = exhaust_campaign
+            self.assertNotEqual(coordinator.run(), 0)
+            self.assertNotIn("worker_start", log)
+            self.assertEqual(coordinator.state["terminal_reason"], "BUDGET_EXPIRED")
+
 
     def test_online_linked_calls_legacy_pipeline_in_order(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -563,7 +1372,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 return report
 
             coordinator.replay_runner = reached_callback
-            coordinator.verify_pass2_fn = lambda *args, **kwargs: {"accepted": 0, "total": 1}
+            coordinator.verify_pass2_fn = lambda *args, **kwargs: {
+                "accepted": int(args[0].get('legacy_run_id') == 'run-v0'), "total": 1}
             self.assertNotEqual(coordinator.run(), 0)
             self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
             self.assertEqual(coordinator.state["versions"][1]["terminal_reason"], "PASS2_VERIFICATION_FAILED")
@@ -615,7 +1425,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 replay_runner = coordinator.replay_runner
 
                 def slow_replay(*args, **kwargs):
-                    coordinator.sleeper(3)
+                    if kwargs['legacy_run_id'] != 'run-v0':
+                        coordinator.sleeper(3)
                     return replay_runner(*args, **kwargs)
 
                 coordinator.replay_runner = slow_replay

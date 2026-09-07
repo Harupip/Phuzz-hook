@@ -37,7 +37,10 @@ flowchart TD
     R --> I
     J -->|Không| N[Tiếp tục quan sát trong ngân sách]
     N --> I
-    I -->|Action hoặc callback khác| X[ACTION_EXPANSION_NOT_IMPLEMENTED]
+    I -->|Runtime registration A→B| X[Classify B + identity dedupe]
+    X -->|HTTP metadata + replayable method| Y[Queue B with lineage]
+    X -->|Internal, ambiguous, setup missing| Z[Blocked with evidence]
+    Y --> D
 ```
 
 Sơ đồ biểu diễn đường đi thành công và nhánh phục hồi chính. Hết thời gian, hết số phiên bản, worker lỗi hoặc tìm thấy vulnerability có xử lý kết thúc riêng. Các worker đã chạy không được sửa config tại chỗ.
@@ -47,15 +50,15 @@ Sơ đồ biểu diễn đường đi thành công và nhánh phục hồi chín
 | Bước | Mục tiêu | Hiện trạng code và giới hạn |
 | --- | --- | --- |
 | 1 | Khởi tạo Docker, plugin, instrumentation và run ID | Có trong wrapper. HTTP 200 và bật biến môi trường chưa chứng minh Zend/UOPZ đã tạo evidence hợp lệ. |
-| 2 | Truy cập entrypoint, thu hook/route đăng ký trong runtime | Có bootstrap và hook đăng ký runtime; chưa có vòng cập nhật seed/registry và mở rộng khám phá liên tục từ action mới. |
+| 2 | Truy cập entrypoint, thu hook/route đăng ký trong runtime | Có bootstrap và hook đăng ký runtime; online-linked đọc registration trong request artifact, xác minh parent/request ID, cập nhật registry và queue HTTP child. Internal/ambiguous registrations vẫn blocked. |
 | 3 | Request khởi đầu đúng endpoint, method, auth | Có chuyển seed thành request/config và các gate. Chưa tự chuẩn bị đầy đủ auth, nonce, dữ liệu ứng dụng cho mọi plugin; replay probe không đồng nghĩa đã xác minh method/ngữ cảnh. |
 | 4 | Replay tìm tham số đúng callback, nguồn input | Có ghép exact request ID/run ID/plugin và convergence kiểm tra provenance. Chỉ nhận evidence hợp lệ. |
-| 5 | Tạo, kiểm chứng config đầu; xử lý chưa có tham số | Có `replay_only` và `fuzzing_ready`. `validate_v0_config()` kiểm tra cấu trúc; chưa bắt buộc một replay/Pass 2 riêng trước mọi v0 fuzzing. |
+| 5 | Tạo, kiểm chứng config đầu; xử lý chưa có tham số | Có `replay_only` và `fuzzing_ready`; v0 phải qua replay callback/provenance và Pass 2 trước khi fuzz. Seed không có tham số chỉ chạy probe/replay bounded hoặc ghi blocked. |
 | 6 | Chạy PHUZZ khi config đủ điều kiện | Có cho candidate đang được xử lý. Worker con phải qua replay/Pass 2 và còn ngân sách. |
 | 7 | Thu coverage, lỗi, tham số mới, so sánh khi fuzz | Có trong fuzzer và instrumentation; coordinator đọc cặp request/Zend. |
 | 8 | CmpLog mutation đúng tham số rồi gửi lại | Có `_ingest_cmplog_hints()` → `ff_mutate()` → `ff_send_request()` → coverage/lỗi. Có test đơn vị; không mặc định mọi phép so sánh đều được hỗ trợ hoặc mọi nhánh đều tới được. |
 | 9 | Tạo config khi nhánh/tham số mới, giữ giá trị mở nhánh | Mới tạo config theo tham số Zend mới. Chưa tạo config chỉ vì coverage mới, chưa giữ đầy đủ giá trị request mở nhánh trong replay con. |
-| 10 | Chạy config mới; action mới quay về bước 2, tham số mới về bước 3 | Có chuỗi phiên bản theo tham số trong giới hạn thời gian/số phiên bản. Action/callback mới chưa được đưa lại vào discovery queue. |
+| 10 | Chạy config mới; action mới quay về bước 2, tham số mới về bước 3 | Child parameter config giữ request values rồi replay/Pass 2. Runtime HTTP registration được queue lại qua batch với lineage, dedupe, candidate cap và campaign budget; internal/ambiguous child có evidence blocked. |
 
 ### Giới hạn giữ giá trị mở nhánh
 
@@ -87,12 +90,15 @@ rtk proxy powershell -NoProfile -File .\phuzz.ps1 -Mode online-linked -PluginSlu
 
 Đây là lệnh chạy, không phải tuyên bố plugin đã PASS trên checkout hiện tại. Nếu tên plugin/config khác, thay bằng slug đã kiểm tra trên máy.
 
-- `OnlineTimeoutSeconds`: 1–60 giây, mặc định 60, **cho từng candidate** sau khi worker v0 khởi động; không phải timeout toàn batch hay Docker build/bootstrap.
+- `OnlineTimeoutSeconds`: 1–120 giây, mặc định 60, **cho từng candidate**; không phải timeout toàn batch hay Docker build/bootstrap.
 - `OnlineMaxVersions`: 1–20, mặc định 2, tính cả `v0` và phiên bản đã tạo nhưng replay thất bại.
+- `OnlineMaxCandidates`: 1–128, mặc định 32, giới hạn candidate cả initial và runtime expansion.
+- `OnlineCampaignTimeoutSeconds`: 1–86400, mặc định 600, wall-clock budget toàn batch; khác timeout từng candidate.
 - Không bắt đầu xử lý evidence để mở rộng khi deadline đã hết. Sau khi dừng parent, nếu còn dưới 1 giây thì không bắt đầu replay mới.
 - Sau replay, hết ngân sách thì không khởi động worker con hoặc khởi động lại parent.
 - Các lệnh Docker đang thực thi và cleanup vẫn có timeout riêng; thời gian thực tổng cộng có thể vượt ngân sách fuzz. Không coi `60` là giới hạn wall-clock cứng cho toàn lệnh.
 - Coordinator dừng candidate khi nhận exit code `1337 % 256 = 57`. Batch hiện tiếp tục candidate khác; cần kiểm chứng marker vulnerability giữa các candidate trước khi coi từng kết quả là phát hiện độc lập.
+- Runtime child cập nhật registry theo batch; wrapper dùng `--sync-registry` để nạp lại file vào web container trước replay candidate kế tiếp. Refresh lỗi chặn child.
 
 ## 5. Artifact và cách đọc kết quả
 
@@ -103,9 +109,10 @@ fuzzer/output/online-linked/<storage-id>/state.json
 fuzzer/output/online-linked/<storage-id>/events.jsonl
 fuzzer/output/online-linked/<storage-id>/versions/vN/
 fuzzer/configs/online-linked/<storage-id>/versions/vN/config.json
+fuzzer/output/online-linked/<batch-run-id>/callback-registry.json
 ```
 
-`storage-id` của candidate là 16 ký tự đầu SHA-256 của candidate run ID để giảm độ dài đường dẫn Windows. Run ID đầy đủ vẫn nằm trong state/evidence. Lấy `state_path` từ từng dòng `batch-state.json`, không tự ghép tên thư mục từ plugin/hook. Thông báo cuối của PowerShell wrapper hiện vẫn ghép đường dẫn `<run-id>/state.json`; ưu tiên đường dẫn batch do Python in ra và `state_path` thực tế.
+`storage-id` của candidate là 16 ký tự đầu SHA-256 của candidate run ID để giảm độ dài đường dẫn Windows. Run ID đầy đủ vẫn nằm trong state/evidence. Lấy `state_path` từ từng dòng `batch-state.json`, không tự ghép tên thư mục từ plugin/hook. Batch state ghi `max_candidates`, `campaign_seconds`, `campaign_status`, expansion events và lineage của candidate runtime. Wrapper in batch state và `state_path` thực tế.
 
 | Trạng thái/lý do | Cách hiểu |
 | --- | --- |
@@ -116,7 +123,9 @@ fuzzer/configs/online-linked/<storage-id>/versions/vN/config.json
 | `NOT_VERIFIED` / `CHILD_WORKER_START_FAILED` hoặc `PARENT_WORKER_RESTART_FAILED` | Lỗi khởi động worker; không được ghi thành hoàn thành bình thường. |
 | `not_started_budget_expired` | Config có thể đã được tạo hoặc replay, nhưng worker chưa khởi động vì hết ngân sách. |
 | `NO_NEW_ZEND_PARAMETER` | Quan sát đó không bổ sung tham số; không chứng minh không còn nhánh chưa khám phá. |
-| `ACTION_EXPANSION_NOT_IMPLEMENTED` | Chưa hỗ trợ đưa action/callback mới vào vòng khám phá. |
+| `ACTION_EXPANSION_SETUP_REQUIRED` | Registration có thật nhưng thiếu direct-HTTP mapping, method/route evidence hoặc prerequisite replay; không tạo request suy đoán. |
+| `CALLBACK_REGISTRY_REFRESH_FAILED` | Registry child không nạp lại được vào web container; child candidate bị chặn. |
+| `CANDIDATE_BUDGET_EXPIRED` / `CAMPAIGN_BUDGET_EXPIRED` | Batch dừng mở rộng theo cap candidate hoặc wall-clock campaign; timeout từng candidate vẫn độc lập. |
 | `VULN_FOUND` | Worker báo điều kiện dừng vulnerability; đối chiếu run, request và artifact để xác nhận phát hiện tương ứng. |
 
 ## 6. Source map và kiểm chứng

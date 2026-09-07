@@ -19,10 +19,14 @@ param(
     [int]$GeneratedConfigTimeoutSeconds = 30,
     [ValidateRange(1, 30)]
     [int]$ZendMaxIterations = 5,
-    [ValidateRange(1, 60)]
+    [ValidateRange(1, 120)]
     [int]$OnlineTimeoutSeconds = 60,
     [ValidateRange(1, 20)]
-    [int]$OnlineMaxVersions = 2
+    [int]$OnlineMaxVersions = 2,
+    [ValidateRange(1, 128)]
+    [int]$OnlineMaxCandidates = 32,
+    [ValidateRange(1, 86400)]
+    [int]$OnlineCampaignTimeoutSeconds = 600
 )
 
 $ErrorActionPreference = "Stop"
@@ -1547,6 +1551,9 @@ try {
             "--callback-registry", $callbackRegistry,
             "--max-seconds", "$OnlineTimeoutSeconds",
             "--max-versions", "$OnlineMaxVersions",
+            "--max-candidates", "$OnlineMaxCandidates",
+            "--campaign-seconds", "$OnlineCampaignTimeoutSeconds",
+            "--sync-registry",
             "--service", $fuzzerService
         )
         $previousComposeFile = $env:COMPOSE_FILE
@@ -1561,7 +1568,7 @@ try {
                 $env:COMPOSE_FILE = $previousComposeFile
             }
         }
-        $onlineLinkedStatePath = Join-Path (Join-Path (Join-Path $scriptRoot "fuzzer\output\online-linked") $legacyRunId) "state.json"
+        $onlineLinkedStatePath = Join-Path (Join-Path (Join-Path $scriptRoot "fuzzer\output\online-linked") $legacyRunId) "batch-state.json"
         Write-Host "Online-linked state: $onlineLinkedStatePath"
         if ($onlineLinkedExitCode -ne 0) {
             throw "Online-linked Zend discovery failed. See $onlineLinkedStatePath"

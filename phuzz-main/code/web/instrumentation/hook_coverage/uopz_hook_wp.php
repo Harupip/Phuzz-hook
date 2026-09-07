@@ -26,6 +26,61 @@ $GLOBALS['__uopz_runtime_hook_contexts'] = [];
 $GLOBALS['__uopz_callback_origin_cache'] = [];
 $GLOBALS['__hookphuzz_callback_stack'] = [];
 
+// Capture the runtime JSON body once. This deliberately uses the PHP request
+// stream instead of inferring values from plugin source or adding a WordPress
+// REST hook. The status distinguishes an absent/invalid body from a valid
+// empty object and keeps false, 0, and null as real decoded values.
+function __uopz_capture_json_params(): array
+{
+    $contentType = strtolower((string) ($_SERVER['CONTENT_TYPE'] ?? $_SERVER['HTTP_CONTENT_TYPE'] ?? ''));
+    if (strpos($contentType, 'json') === false) {
+        return ['status' => 'not_json', 'value' => null, 'type' => 'not_json', 'error' => null];
+    }
+
+    $raw = file_get_contents('php://input');
+    if ($raw === false || trim($raw) === '') {
+        return ['status' => 'missing', 'value' => null, 'type' => 'missing', 'error' => 'JSON_BODY_MISSING'];
+    }
+
+    // Keep stdClass objects distinct from arrays so {} and [] survive the
+    // artifact boundary with their original JSON shape.
+    $decoded = json_decode($raw);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        return [
+            'status' => 'invalid',
+            'value' => null,
+            'type' => 'invalid',
+            'error' => json_last_error_msg(),
+        ];
+    }
+
+    if ($decoded instanceof stdClass) {
+        return [
+            'status' => count(get_object_vars($decoded)) === 0 ? 'empty' : 'decoded',
+            'value' => $decoded,
+            'type' => 'object',
+            'error' => null,
+        ];
+    }
+
+    $type = is_array($decoded) ? 'array' : (
+        is_bool($decoded) ? 'boolean' : (
+            is_int($decoded) || is_float($decoded) ? 'number' : (
+                is_string($decoded) ? 'string' : 'null'
+            )
+        )
+    );
+
+    return [
+        'status' => 'decoded',
+        'value' => $decoded,
+        'type' => $type,
+        'error' => null,
+    ];
+}
+
+$__uopz_json_params = __uopz_capture_json_params();
+
 // Tạo request_id thân thiện: <Giờ-Phút-Giây>_<Method>_<Path>_<Random>
 $__uopz_method = $_SERVER['REQUEST_METHOD'] ?? 'CLI';
 $__uopz_uri = $_SERVER['REQUEST_URI'] ?? '';
@@ -61,6 +116,10 @@ $GLOBALS['__uopz_request'] = [
     'request_params' => [
         'query_params' => $_GET ?? [],
         'body_params' => $_POST ?? [],
+        'json_params' => $__uopz_json_params['value'],
+        'json_params_status' => $__uopz_json_params['status'],
+        'json_params_type' => $__uopz_json_params['type'],
+        'json_params_error' => $__uopz_json_params['error'],
         'headers' => function_exists('getallheaders') ? getallheaders() : [],
         'cookies' => isset($_COOKIE) ? array_keys($_COOKIE) : [],
     ],

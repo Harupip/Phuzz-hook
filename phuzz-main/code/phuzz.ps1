@@ -19,10 +19,14 @@ param(
     [switch]$KeepDebugArtifacts,
     [ValidateRange(1, 30)]
     [int]$ZendMaxIterations = 5,
-    [ValidateRange(1, 60)]
+    [ValidateRange(1, 120)]
     [int]$OnlineTimeoutSeconds = 60,
     [ValidateRange(1, 20)]
     [int]$OnlineMaxVersions = 2,
+    [ValidateRange(1, 128)]
+    [int]$OnlineMaxCandidates = 32,
+    [ValidateRange(1, 86400)]
+    [int]$OnlineCampaignTimeoutSeconds = 600,
     [ValidateRange(1, 20)]
     [int]$MaxHookDepth = 3,
     [ValidateRange(1, 300)]
@@ -78,8 +82,10 @@ Useful options:
   -UseZendDiscovery                Opt-in online/online-linked mode to runtime-only Zend parameter discovery; use -Mode zend for generated discovery.
   -KeepDebugArtifacts              Keep Zend intermediate artifacts after a successful run.
   -ZendMaxIterations <count>       Max Zend REST convergence iterations. Default: 5.
-  -OnlineTimeoutSeconds <seconds>  Bounded online discovery budget. Default/max: 60.
+  -OnlineTimeoutSeconds <seconds>  Bounded online discovery budget. Default/max: 60/120.
   -OnlineMaxVersions <count>       Maximum online config versions including v0. Default: 2.
+  -OnlineMaxCandidates <count>     Maximum online-linked candidates per campaign. Default: 32.
+  -OnlineCampaignTimeoutSeconds    Maximum online-linked campaign budget. Default: 600.
   -RecursiveInputFile <path>       Child-hook input artifact. Repeat for multiple files.
   -RecursiveHookCoverageDir <path> Hook coverage dir with requests/ for recursive validation.
   -RecursiveBaseUrl <url>          WordPress base URL for recursive validation. Default: http://localhost:8080.
@@ -771,6 +777,8 @@ switch ($Mode) {
         $runnerParams["RunOnlineLinked"] = $true
         $runnerParams["OnlineTimeoutSeconds"] = $OnlineTimeoutSeconds
         $runnerParams["OnlineMaxVersions"] = $OnlineMaxVersions
+        $runnerParams["OnlineMaxCandidates"] = $OnlineMaxCandidates
+        $runnerParams["OnlineCampaignTimeoutSeconds"] = $OnlineCampaignTimeoutSeconds
         if ($UseZendDiscovery) {
             $runnerParams["UseZendDiscovery"] = $true
         }

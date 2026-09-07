@@ -331,8 +331,8 @@ class OnlineCoordinator:
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
-        if max_seconds <= 0 or max_seconds > 60:
-            raise ValueError("max_seconds must be between 1 and 60")
+        if max_seconds <= 0 or max_seconds > 120:
+            raise ValueError("max_seconds must be between 1 and 120")
         if max_versions <= 0 or max_versions > 20:
             raise ValueError("max_versions must be between 1 and 20")
         self.suggested_seeds = Path(suggested_seeds)
@@ -772,7 +772,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--plugin-slug", required=True)
     parser.add_argument("--legacy-run-id", default="")
-    parser.add_argument("--max-seconds", type=int, choices=range(1, 61), default=60)
+    parser.add_argument("--max-seconds", type=int, choices=range(1, 121), default=60)
     parser.add_argument("--max-versions", type=int, choices=range(1, 21), default=2)
     parser.add_argument("--service", default="fuzzer-wordpress-plugin")
     return parser

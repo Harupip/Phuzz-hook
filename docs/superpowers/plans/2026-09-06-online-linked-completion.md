@@ -29,7 +29,18 @@ Baseline source: nhánh `feature/online-linked`, commit nền `680563e`, cộng 
 - [x] Ghi `CHILD_REPLAY_FAILED`, `CHILD_WORKER_START_FAILED`, `PARENT_WORKER_RESTART_FAILED` dưới `NOT_VERIFIED`; tách callback success khỏi Pass 2 failure.
 - [x] Chặn mở rộng sau deadline, replay khi còn dưới 1 giây, worker con/restart parent khi hết thời gian.
 - [x] Test coordinator/runner/wrapper đạt 108 test trước khi soạn; nhóm CmpLog đạt 9 test.
-- [ ] Chạy Docker tự động toàn tuyến sau các sửa lỗi và sau từng thay đổi chức năng liên quan.
+- [x] Chạy Docker tự động toàn tuyến sau các sửa lỗi và sau từng thay đổi chức năng liên quan.
+
+### Execution checkpoint — 2026-09-07
+
+- [x] Tasks 1–3 implementation and regression coverage extended; wrapper now
+  reports the real `batch-state.json` path.
+- [x] Task 4 coordinator queue, identity, lineage, candidate/campaign budget,
+  registry merge, and refresh path implemented with unit coverage.
+- [x] Docker fixture run recorded in
+  `phuzz-main/code/docs/reports/2026-09-07-online-linked-completion.md`.
+- [ ] Full acceptance remains open: child worker replay, v0 → v1 → v2,
+  runtime A→B expansion, and real-plugin proof still need fresh artifacts.
 
 WIP không thuộc kế hoạch: ZIP/fixture test sửa từ phiên khác, configs và artifact online chưa track, kế hoạch/spec cũ ngày 2026-08-27. Không nhập chúng vào commit chỉ vì cùng tên online.
 
@@ -109,7 +120,7 @@ replay pass       -> commit trạng thái child, thử start trong deadline
 - [ ] Kiểm chứng method và `seed_variant_id` đi xuyên seed → replay row → convergence/Pass 2. REST nhiều method không được trộn evidence hoặc mất variant khi tạo child.
 - [ ] Chuẩn bị auth/cookie/nonce bằng cơ chế runtime hiện có, ghi rõ các override của môi trường instrumentation. Thiếu prerequisite thì phân loại blocked/setup-required; không invent credentials/nonce hay sửa plugin để đi qua gate.
 - [ ] Kiểm chứng runtime loading của plugin, Zend/UOPZ và callback registry theo run; HTTP 200 chỉ là readiness web. Làm rõ registry cần tái nạp sau container restart.
-- [ ] Sửa đường dẫn báo cáo cuối wrapper dùng `batch-state.json` và `state_path` thật của candidate; giữ storage ID ngắn. Test với tên hook dài, method variant và batch có candidate lỗi.
+- [x] Sửa đường dẫn báo cáo cuối wrapper dùng `batch-state.json` và `state_path` thật của candidate; giữ storage ID ngắn. Test với tên hook dài, method variant và batch có candidate lỗi.
 - [ ] Test v0 replay thành công → fuzz bắt đầu khi còn thời gian; auth skip, method ambiguous, no-parameter và registry missing có lý do cụ thể.
 
 **Acceptance:** Mỗi candidate có bằng chứng cho phép fuzz hoặc lý do không chạy. Không gộp giả lập/bypass auth với xác minh auth nguyên bản.
@@ -135,7 +146,7 @@ confirmed new parameter on same target
   -> rebuild request/config through Tasks 1–3
 ```
 
-- [ ] Làm hàng đợi tăng dần trong coordinator/batch; không chỉ lặp snapshot đầu. Bổ sung giới hạn candidate tổng và ngân sách toàn campaign trước khi mở rộng tự động; giữ timeout từng candidate riêng và ghi cả hai trong state.
+- [x] Làm hàng đợi tăng dần trong coordinator/batch; không chỉ lặp snapshot đầu. Bổ sung giới hạn candidate tổng và ngân sách toàn campaign trước khi mở rộng tự động; giữ timeout từng candidate riêng và ghi cả hai trong state.
 - [ ] Test registration lặp, chu trình A→B→A, hai route cùng callback, route nhiều method, auth-only registration, hook chỉ tồn tại trong request parent, hết ngân sách và lỗi refresh registry.
 - [ ] Chỉ gỡ `ACTION_EXPANSION_NOT_IMPLEMENTED` cho loại đã có test và runtime proof. Không tuyên bố mọi `add_action` đều trở thành HTTP endpoint.
 
