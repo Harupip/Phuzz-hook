@@ -1478,6 +1478,19 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertEqual(version["config_hash"], coordinator.config_hash(config_path))
                 self.assertNotEqual(version["config_path"], version.get("replay_config_path"))
 
+    def test_config_paths_are_grouped_by_plugin_with_readable_filenames(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            self.assertEqual(coordinator.run(), 0)
+
+            for version in coordinator.state["versions"]:
+                config_path = Path(version["config_path"])
+                replay_path = Path(version["replay_config_path"])
+                relative_parts = config_path.relative_to(coordinator.config_root).parts
+                self.assertEqual(relative_parts[:2], ("online-linked", "fixture"))
+                self.assertEqual(config_path.name, f"{version['version']}-config.json")
+                self.assertEqual(replay_path.name, f"{version['version']}-replay.json")
+
     def test_runtime_evidence_is_saved_under_run_specific_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             log: list[str] = []

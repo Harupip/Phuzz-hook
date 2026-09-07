@@ -129,7 +129,7 @@ class OnlineLinkedCoordinator:
         # Keep nested evidence/config paths below Windows MAX_PATH for long run IDs.
         storage_id = hashlib.sha256(self.legacy_run_id.encode("utf-8")).hexdigest()[:16]
         self.run_dir = self.output_root / "online-linked" / storage_id
-        self.config_dir = self.config_root / "online-linked" / storage_id
+        self.config_dir = self.config_root / "online-linked" / self.plugin_slug / storage_id
         if registry is not None:
             self.registry = dict(registry)
         elif registry_path is not None:
@@ -1218,7 +1218,8 @@ class OnlineLinkedCoordinator:
                 self._copy_json(zend_dir / exact[0], self.load_zend_artifact(exact[0]))
 
     def _write_config(self, version: str, config: Mapping[str, Any], *, replay: bool = False) -> Path:
-        relative = Path("versions") / version / ("replay" if replay else "") / "config.json"
+        filename = f"{version}-replay.json" if replay else f"{version}-config.json"
+        relative = Path("versions") / version / ("replay" if replay else "") / filename
         config_path = self.config_dir / relative
         _write_exclusive_json(config_path, config)
         mirror_path = self.run_dir / relative

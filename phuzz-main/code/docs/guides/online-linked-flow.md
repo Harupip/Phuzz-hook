@@ -108,7 +108,8 @@ fuzzer/output/online-linked/<run-id>/batch-state.json
 fuzzer/output/online-linked/<storage-id>/state.json
 fuzzer/output/online-linked/<storage-id>/events.jsonl
 fuzzer/output/online-linked/<storage-id>/versions/vN/
-fuzzer/configs/online-linked/<storage-id>/versions/vN/config.json
+fuzzer/configs/online-linked/<plugin-slug>/<storage-id>/versions/vN/vN-config.json
+fuzzer/configs/online-linked/<plugin-slug>/<storage-id>/versions/vN/replay/vN-replay.json
 fuzzer/output/online-linked/<batch-run-id>/callback-registry.json
 ```
 
