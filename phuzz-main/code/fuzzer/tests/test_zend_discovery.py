@@ -42,6 +42,7 @@ from hook_energy.seed_generation.zend_runtime.bridge_cli import (
     list_convergence_targets,
     main,
     verify_pass2_contract,
+    _materialize_ajax_runtime_probes,
 )
 from seed_generation.pipeline.pipeline import _rest_parameter_policy
 from seed_generation.source_assisted.source_materializer import materialize_plugin_source
@@ -124,6 +125,258 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual(row["callback_id"], "ajax-public")
             self.assertEqual(row["canonical_callback"], "Demo::fetch")
             self.assertEqual(row["request_method"], "POST")
+
+    def test_helper_isset_is_retained_as_candidate_without_becoming_fuzzable(self) -> None:
+        candidate = self.pass1_candidate()
+        uopz = self.pass1_artifact(
+            candidate,
+            request_params={
+                "query_params": {},
+                "body_params": {"action": "demo_fetch_items"},
+            },
+        )
+        registry = {"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}}
+        zend = {
+            "run_id": "legacy-1",
+            "request_id": "pass1-1",
+            "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{
+                "callback": "Demo::fetch",
+                "unique_parameters": [{
+                    "source": "POST", "path": ["filter_tag"],
+                    "access_forms": ["isset"], "helper_depth": 5, "observed_count": 1,
+                }],
+            }],
+            "events": [{
+                "source": "POST", "path": ["filter_tag"], "operation": "isset",
+                "callback_context": {
+                    "attributed": True, "root_callback": "Demo::fetch", "depth": 5,
+                },
+            }],
+        }
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["name"], "filter_tag")
+        self.assertEqual(evidence[0]["helper_depth"], 5)
+        self.assertFalse(evidence[0]["fuzzable"])
+        self.assertEqual(evidence[0]["candidate_status"], "pending_probe")
+        self.assertEqual(evidence[0]["candidate_reason"], "isset_without_correlated_read")
+
+    def test_helper_read_with_key_in_exact_request_bucket_is_accepted(self) -> None:
+        candidate = self.pass1_candidate()
+        uopz = self.pass1_artifact(
+            candidate,
+            request_params={
+                "query_params": {},
+                "body_params": {"action": "demo_fetch_items", "filter_tag": "probe"},
+            },
+        )
+        registry = {"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}}
+        zend = {
+            "run_id": "legacy-1",
+            "request_id": "pass1-1",
+            "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{
+                "callback": "Demo::fetch",
+                "unique_parameters": [{
+                    "source": "POST", "path": ["filter_tag"],
+                    "access_forms": ["read"], "helper_depth": 5, "observed_count": 1,
+                }],
+            }],
+            "events": [{
+                "source": "POST", "path": ["filter_tag"], "operation": "read",
+                "callback_context": {
+                    "attributed": True, "root_callback": "Demo::fetch", "depth": 5,
+                },
+            }],
+        }
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual(len(evidence), 1)
+        self.assertTrue(evidence[0]["fuzzable"])
+        self.assertEqual(evidence[0]["helper_depth"], 5)
+
+    def test_helper_candidate_requires_attributed_raw_event_and_exact_correlation(self) -> None:
+        candidate = self.pass1_candidate()
+        uopz = self.pass1_artifact(candidate, request_params={"body_params": {"action": "demo_fetch_items"}})
+        registry = {"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}}
+        zend = {
+            "run_id": "legacy-1",
+            "request_id": "pass1-1",
+            "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{
+                "callback": "Demo::fetch",
+                "unique_parameters": [{
+                    "source": "POST", "path": ["filter_tag"],
+                    "access_forms": ["isset"], "helper_depth": 5, "observed_count": 1,
+                }],
+            }],
+            "events": [{
+                "source": "POST", "path": ["filter_tag"], "operation": "isset",
+                "callback_context": {
+                    "attributed": False, "root_callback": "Other::callback", "depth": 5,
+                },
+            }],
+        }
+
+        self.assertEqual(normalize_runtime_evidence(candidate, uopz, zend, registry), [])
+        mismatched = dict(uopz)
+        mismatched["legacy_run_id"] = "other-run"
+        self.assertEqual(normalize_runtime_evidence(candidate, mismatched, zend, registry), [])
+
+    def test_helper_candidate_with_same_name_in_get_and_post_keeps_two_probe_locations(self) -> None:
+        candidate = self.pass1_candidate()
+        uopz = self.pass1_artifact(candidate, request_params={"body_params": {"action": "demo_fetch_items"}})
+        registry = {"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}}
+        params = [
+            {"source": "GET", "path": ["filter_tag"], "access_forms": ["isset"], "helper_depth": 5, "observed_count": 1},
+            {"source": "POST", "path": ["filter_tag"], "access_forms": ["isset"], "helper_depth": 5, "observed_count": 1},
+        ]
+        events = [
+            {"source": source, "path": ["filter_tag"], "operation": "isset",
+             "callback_context": {"attributed": True, "root_callback": "Demo::fetch", "depth": 5}}
+            for source in ("GET", "POST")
+        ]
+        zend = {
+            "run_id": "legacy-1", "request_id": "pass1-1", "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{"callback": "Demo::fetch", "unique_parameters": params}],
+            "events": events,
+        }
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual({(row["source"], row["name"]) for row in evidence}, {("GET", "filter_tag"), ("POST", "filter_tag")})
+        self.assertTrue(all(not row["fuzzable"] for row in evidence))
+
+    def test_convergence_keeps_helper_candidate_pending_as_ajax_probe(self) -> None:
+        raw = {
+            "plugin_slug": "demo-plugin",
+            "hook_name": "wp_ajax_nopriv_demo_fetch_items",
+            "callback_id": "ajax-public",
+            "callback_repr": "Demo::fetch",
+            "entrypoint_type": "ajax",
+            "seed": {
+                "method": "POST", "resolved_method": "POST", "path": "/wp-admin/admin-ajax.php",
+                "body": {"action": "demo_fetch_items"}, "query_params": {}, "headers": {},
+                "fixed_params": ["action"], "fuzzable_params": [], "auth_mode": "nopriv",
+            },
+        }
+        candidate = candidate_from_seed_item(raw, plugin_slug="demo-plugin", legacy_run_id="legacy-1")
+        request = {
+            "legacy_run_id": "legacy-1", "request_id": "request-1", "target_plugin": "demo-plugin",
+            "canonical_identity_id": canonical_identity_id(candidate), "callback_id": "ajax-public",
+            "http_method": "POST", "auth_variant": "unauthenticated",
+            "hook_coverage": {"executed_callbacks": {"ajax-public": {"callback_id": "ajax-public"}}},
+            "request_params": {"query_params": {}, "body_params": {"action": "demo_fetch_items"}},
+        }
+        zend = {
+            "run_id": "legacy-1", "request_id": "request-1", "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{"callback": "Demo::fetch", "unique_parameters": [{
+                "source": "POST", "path": ["filter_tag"], "access_forms": ["isset"],
+                "helper_depth": 5, "observed_count": 1,
+            }]}],
+            "events": [{
+                "source": "POST", "path": ["filter_tag"], "operation": "isset",
+                "callback_context": {"attributed": True, "root_callback": "Demo::fetch", "depth": 5},
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            request_dir, zend_dir = root / "request", root / "zend"
+            request_dir.mkdir()
+            zend_dir.mkdir()
+            (request_dir / "request-1.json").write_text(json.dumps(request), encoding="utf-8")
+            (zend_dir / "request-1.json").write_text(json.dumps(zend), encoding="utf-8")
+            result = converge_iteration(
+                raw_report={"suggested_seeds": [raw]},
+                pass_run_summary={"runs": [{
+                    "hook_name": raw["hook_name"], "callback_id": "ajax-public", "seed_variant_id": "",
+                    "callback_reached": True, "matched_artifact": "request-1.json",
+                }]},
+                pass_artifacts_dir=request_dir, zend_events_dir=zend_dir,
+                registry={"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}},
+                plugin_slug="demo-plugin", legacy_run_id="legacy-1", known_state={"known_parameters": []},
+            )
+            request["request_params"]["body_params"]["filter_tag"] = "probe"
+            zend["callback_summaries"][0]["unique_parameters"][0]["access_forms"] = ["read"]
+            zend["events"][0]["operation"] = "read"
+            (request_dir / "request-1.json").write_text(json.dumps(request), encoding="utf-8")
+            (zend_dir / "request-1.json").write_text(json.dumps(zend), encoding="utf-8")
+            accepted_result = converge_iteration(
+                raw_report={"suggested_seeds": [raw]},
+                pass_run_summary={"runs": [{
+                    "hook_name": raw["hook_name"], "callback_id": "ajax-public", "seed_variant_id": "",
+                    "callback_reached": True, "matched_artifact": "request-1.json",
+                }]},
+                pass_artifacts_dir=request_dir, zend_events_dir=zend_dir,
+                registry={"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}},
+                plugin_slug="demo-plugin", legacy_run_id="legacy-1", known_state={"known_parameters": []},
+            )
+
+        self.assertEqual(result["status"], "CONTINUE")
+        self.assertEqual(len(result["pending_probes"]), 1)
+        self.assertEqual(result["pending_probes"][0]["source"], "POST")
+        probe_seed = result["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]
+        self.assertTrue(probe_seed["probe_variant"])
+        self.assertEqual(probe_seed["body"]["filter_tag"], "probe")
+        self.assertIn("action", probe_seed["fixed_params"])
+        self.assertIn("filter_tag", probe_seed["fixed_params"])
+        self.assertEqual(accepted_result["status"], "CONTINUE")
+        self.assertEqual(accepted_result["new_parameters"][0]["helper_depth"], 5)
+        self.assertTrue(accepted_result["new_parameters"][0]["fuzzable"])
+
+    def test_convergence_identity_accepts_helper_depth_without_accepting_pending_candidate(self) -> None:
+        accepted = {
+            "name": "filter_tag", "path": ["filter_tag"], "source": "POST", "location": "form",
+            "helper_depth": 5, "observed_count": 1, "evidence_kind": "zend_runtime", "fuzzable": True,
+        }
+        pending = {**accepted, "fuzzable": False, "candidate_status": "pending_probe"}
+
+        self.assertEqual(canonical_runtime_parameter_identity(accepted), ("POST", ("filter_tag",)))
+        self.assertIsNone(canonical_runtime_parameter_identity(pending))
+
+    def test_ajax_probe_keeps_same_name_get_and_post_as_separate_requests(self) -> None:
+        report = {"suggested_seeds": [{
+            "hook_name": "wp_ajax_nopriv_demo_fetch_items",
+            "callback_id": "ajax-public",
+            "seed": {
+                "method": "POST", "resolved_method": "POST",
+                "path": "/wp-admin/admin-ajax.php", "body": {"action": "demo_fetch_items"},
+                "query_params": {}, "fixed_params": ["action"], "fuzzable_params": [],
+            },
+        }]}
+        candidates = [
+            {"name": "filter_tag", "source": "GET", "location": "query", "helper_depth": 5},
+            {"name": "filter_tag", "source": "POST", "location": "form", "helper_depth": 5},
+        ]
+
+        merged, probes = _materialize_ajax_runtime_probes(report, candidates)
+
+        self.assertEqual({(probe["source"], probe["name"]) for probe in probes}, {
+            ("GET", "filter_tag"), ("POST", "filter_tag"),
+        })
+        self.assertEqual(len(merged["suggested_seeds"]), 2)
+        for item in merged["suggested_seeds"]:
+            seed = item["seed"]
+            self.assertEqual(seed["body"].get("action"), "demo_fetch_items")
+            self.assertIn("action", seed["fixed_params"])
+            self.assertEqual(item["probe_request"]["value_origin"], "generated_probe")
+        self.assertEqual(
+            [item["seed"]["query_params"].get("filter_tag") for item in merged["suggested_seeds"]],
+            ["probe", None],
+        )
+        self.assertEqual(
+            [item["seed"]["body"].get("filter_tag") for item in merged["suggested_seeds"]],
+            [None, "probe"],
+        )
 
     def test_admin_post_probe_is_retained_as_correlated_post_runtime_evidence(self) -> None:
         candidate = {
@@ -2961,6 +3214,86 @@ class ZendDiscoveryTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "REPLAY_FAILED")
             self.assertEqual([row["name"] for row in result["missing_parameters"]], ["age"])
+
+    def test_pass2_helper_parameter_requires_correlated_read_and_request_key(self) -> None:
+        raw = {
+            "plugin_slug": "demo-plugin",
+            "entrypoint_type": "ajax_authenticated",
+            "callback_id": "cb-1",
+            "hook_name": "wp_ajax_save_settings",
+            "seed": {
+                "path": "/wp-admin/admin-ajax.php",
+                "method": "POST",
+                "auth_mode": "authenticated",
+                "zend_canonical_callback": "Demo::save_settings",
+                "input_params": [{
+                    "name": "filter_tag",
+                    "path": ["filter_tag"],
+                    "source": "POST",
+                    "location": "form",
+                    "fuzzable": True,
+                    "evidence_kind": "zend_runtime",
+                }],
+            },
+        }
+        request = self.pass1_artifact(
+            candidate_from_seed_item(raw, plugin_slug="demo-plugin", legacy_run_id="legacy-1"),
+            request_params={"body_params": {"action": "save_settings", "filter_tag": "probe"}},
+        )
+        request.update({"request_id": "helper-pass2", "legacy_run_id": "legacy-1", "auth_variant": "authenticated"})
+        zend = {
+            "schema_version": 4,
+            "run_id": "legacy-1",
+            "request_id": "helper-pass2",
+            "request_method": "POST",
+            "callback_summaries": [{
+                "callback": "Demo::save_settings",
+                "unique_parameters": [{
+                    "source": "POST", "path": ["filter_tag"], "helper_depth": 5,
+                    "observed_count": 1, "access_forms": ["read"],
+                }],
+            }],
+            "events": [{
+                "operation": "read", "source": "POST", "path": ["filter_tag"],
+                "callback_context": {
+                    "attributed": True, "root_callback": "Demo::save_settings", "depth": 5,
+                },
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            (uopz_dir / "helper-pass2.json").write_text(json.dumps(request), encoding="utf-8")
+            (zend_dir / "helper-pass2.json").write_text(json.dumps(zend), encoding="utf-8")
+            run = {"legacy_run_id": "legacy-1", "runs": [{
+                "hook_name": "wp_ajax_save_settings", "callback_id": "cb-1",
+                "seed_variant_id": "", "callback_reached": True,
+                "matched_artifact": "helper-pass2.json", "resolved_method": "POST",
+            }]}
+
+            accepted = verify_pass2_contract(
+                run, {"suggested_seeds": [raw]}, zend_dir, pass2_artifacts_dir=uopz_dir,
+            )
+            self.assertEqual(accepted, {"accepted": 1, "total": 1})
+
+            request["request_params"]["body_params"].pop("filter_tag")
+            (uopz_dir / "helper-pass2.json").write_text(json.dumps(request), encoding="utf-8")
+            self.assertEqual(
+                verify_pass2_contract(run, {"suggested_seeds": [raw]}, zend_dir, pass2_artifacts_dir=uopz_dir),
+                {"accepted": 0, "total": 1},
+            )
+
+            request["request_params"]["body_params"]["filter_tag"] = "probe"
+            zend["events"][0]["operation"] = "isset"
+            zend["callback_summaries"][0]["unique_parameters"][0]["access_forms"] = ["isset"]
+            (uopz_dir / "helper-pass2.json").write_text(json.dumps(request), encoding="utf-8")
+            (zend_dir / "helper-pass2.json").write_text(json.dumps(zend), encoding="utf-8")
+            self.assertEqual(
+                verify_pass2_contract(run, {"suggested_seeds": [raw]}, zend_dir, pass2_artifacts_dir=uopz_dir),
+                {"accepted": 0, "total": 1},
+            )
 
     def test_pass2_verification_accepts_nested_form_leaf_when_zend_observes_parent(self) -> None:
         raw = {

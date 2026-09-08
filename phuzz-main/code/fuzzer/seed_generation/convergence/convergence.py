@@ -30,6 +30,10 @@ def canonical_runtime_parameter_identity(parameter: Mapping[str, Any]) -> tuple[
     evidence_kind = str(parameter.get("evidence_kind") or "")
     source = str(parameter.get("source") or "").upper()
     path = parameter.get("path")
+    try:
+        helper_depth = int(parameter.get("helper_depth"))
+    except (TypeError, ValueError):
+        return None
     if (
         not (
             evidence_kind == "zend_runtime" and source in _DIRECT_SOURCES
@@ -39,7 +43,8 @@ def canonical_runtime_parameter_identity(parameter: Mapping[str, Any]) -> tuple[
         or len(path) != 1
         or not isinstance(path[0], str)
         or not path[0]
-        or parameter.get("helper_depth") != 0
+        or parameter.get("fuzzable") is not True
+        or helper_depth < 0
         or int(parameter.get("observed_count") or 0) < 1
     ):
         return None

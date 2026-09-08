@@ -33,8 +33,8 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn('switch ($choice)', script)
         self.assertIn('"4" { return "zend" }', script)
         self.assertIn('"5" { return "online" }', script)
-        self.assertIn('Read-Host "Select [1-5]"', script)
-        self.assertIn('$interactive -and $Mode -eq "online"', script)
+        self.assertIn('Read-Host "Select [1-6]"', script)
+        self.assertIn('$interactive -and $Mode -in @("online", "online-linked")', script)
 
     def test_guided_wrapper_removes_recursive_mode_from_public_contract(self):
         script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")

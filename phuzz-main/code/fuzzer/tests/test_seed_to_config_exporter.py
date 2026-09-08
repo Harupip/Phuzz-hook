@@ -420,6 +420,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
                 'callback_source_file': '/var/www/html/wp-content/plugins/demo/includes/ajax.php',
                 'callback_start_line': 42,
                 'auth_mode': 'unauth-capable',
+                'auth_context': 'guest',
                 'generated_reason': 'supported_http_seed',
                 'fuzzing_ready': True,
                 'setup_required': False,

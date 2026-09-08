@@ -549,6 +549,11 @@ class Fuzzer:
         if self._disable_auth_cookies():
             the_cookies = self._without_auth_cookies(the_cookies)
         the_headers = {**candidate.fuzz_params['headers'], **candidate.fixed_params['headers']}
+        auth_context = self._request_auth_context()
+        the_headers = {name: value for name, value in the_headers.items()
+                       if name.lower() != 'x-hookphuzz-auth-context'
+                       and not (auth_context == 'guest' and name.lower() == 'cookie')}
+        the_headers['X-HookPhuzz-Auth-Context'] = auth_context
         the_headers["X-Fuzzer-Covid"] = candidate.coverage_id
         the_headers["X-HookPhuzz-Request-ID"] = candidate.coverage_id
         legacy_run_id = os.environ.get("HOOKPHUZZ_LEGACY_RUN_ID", "")
@@ -593,7 +598,22 @@ class Fuzzer:
 
         return prepared
 
+    def _request_auth_context(self):
+        metadata = self.config.get('metadata') or {}
+        hook = str(metadata.get('hook_name') or self.config.get('hook_name') or '')
+        entrypoint = str(self.config.get('entrypoint_type') or metadata.get('entrypoint_type') or '')
+        if (hook.startswith(('wp_ajax_nopriv_', 'admin_post_nopriv_'))
+                or hook == 'heartbeat_nopriv_received'
+                or entrypoint in {'ajax_unauthenticated', 'admin_post_unauthenticated'}):
+            return 'guest'
+        context = metadata.get('auth_context', 'authenticated')
+        if context not in {'guest', 'authenticated'}:
+            raise ValueError('unsupported auth_context')
+        return context
+
     def _disable_auth_cookies(self):
+        if self._request_auth_context() == 'guest':
+            return True
         metadata = self.config.get("metadata") if isinstance(self.config, dict) else {}
         if not isinstance(metadata, dict):
             metadata = {}
@@ -608,7 +628,7 @@ class Fuzzer:
     def _without_auth_cookies(self, cookies):
         return {
             name: value for name, value in cookies.items()
-            if not str(name).startswith(("wordpress_logged_in_", "wordpress_sec_"))
+            if not (str(name).startswith('wordpress_') and str(name) != 'wordpress_test_cookie')
         }
 
     def run(self):

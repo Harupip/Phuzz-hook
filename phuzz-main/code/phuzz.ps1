@@ -99,15 +99,17 @@ function Read-MenuMode {
     Write-Host "  3) generated   - Generate configs, then run them sequentially"
     Write-Host "  4) zend        - Generated configs with runtime-only Zend parameter discovery"
     Write-Host "  5) online      - Bounded v0 fuzzing with Zend-discovered child workers"
+    Write-Host "  6) online-linked - Versioned workers with linked Zend-discovered child workers"
 
-    $choice = (Read-Host "Select [1-5]").Trim()
+    $choice = (Read-Host "Select [1-6]").Trim()
     switch ($choice) {
         "1" { return "default" }
         "2" { return "seed-config" }
         "3" { return "generated" }
         "4" { return "zend" }
         "5" { return "online" }
-        default { throw "Invalid selection '$choice'. Choose 1, 2, 3, 4, or 5." }
+        "6" { return "online-linked" }
+        default { throw "Invalid selection '$choice'. Choose 1, 2, 3, 4, 5, or 6." }
     }
 }
 
@@ -217,7 +219,7 @@ if ($interactive) {
 if ($Mode -eq "zend") {
     $UseZendDiscovery = $true
 }
-if ($interactive -and $Mode -eq "online") {
+if ($interactive -and $Mode -in @("online", "online-linked")) {
     $UseZendDiscovery = $true
 }
 

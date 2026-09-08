@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from copy import deepcopy
+import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -11,12 +12,12 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from seed_generation.config.config_exporter import export_seed_configs
     from seed_generation.convergence.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment
+    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment, runtime_parameter_is_accepted
     from instrumentation.zend.rest.runtime import canonical_rest_parameter_name
 else:
     from seed_generation.config.config_exporter import export_seed_configs
     from seed_generation.convergence.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment
+    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment, runtime_parameter_is_accepted
     from instrumentation.zend.rest.runtime import canonical_rest_parameter_name
 
 
@@ -358,20 +359,30 @@ def converge_iteration(
         if candidate.get("entrypoint_type") == "rest"
         else ""
     )
+    raw_runtime_candidate_count, rejected_reasons = _runtime_candidate_diagnostics(
+        zend,
+        canonical_callback,
+        fixed_parameters=(candidate.get("fixed_bootstrap") if isinstance(candidate.get("fixed_bootstrap"), Mapping) else {}),
+    )
     observed = normalize_runtime_evidence(candidate, uopz, zend, registry)
     prior = known_state.get("known_parameters", [])
     if not isinstance(prior, list):
         raise ValueError("convergence state known_parameters must be a list")
     advanced = advance_convergence_state(prior, observed)
     missing = _missing_known_parameters(prior, observed)
+    pending_candidates = [
+        dict(parameter) for parameter in observed
+        if isinstance(parameter, Mapping) and parameter.get("candidate_status") == "pending_probe"
+    ]
     probe_parameter_names = (
         _rest_get_param_probe_names(candidate, uopz)
         if not prior and not observed and not runtime_block_reason
         else []
     )
+    pending_probes: list[dict[str, Any]] = []
     status = (
         "REPLAY_FAILED" if missing
-        else "CONTINUE" if probe_parameter_names
+        else "CONTINUE" if probe_parameter_names or pending_candidates
         else "CONVERGED" if not advanced["new_parameters"]
         else "CONTINUE"
     )
@@ -382,10 +393,20 @@ def converge_iteration(
         plugin_slug=plugin_slug,
         candidate_key=base_candidate_key,
         known_parameters=advanced["known_parameters"],
-        for_replay=status == "CONTINUE" and not is_probe_variant,
+        for_replay=status == "CONTINUE" and not is_probe_variant and not pending_candidates,
     )
     if probe_parameter_names:
         merged = _materialize_rest_get_param_probe(merged, probe_parameter_names)
+    elif pending_candidates and candidate.get("entrypoint_type") == "ajax":
+        merged, pending_probes = _materialize_ajax_runtime_probes(raw_for_iteration, pending_candidates)
+    runtime_candidate_reasons = dict(rejected_reasons)
+    for parameter in observed:
+        reason = parameter.get("candidate_reason")
+        if reason:
+            runtime_candidate_reasons[str(reason)] = runtime_candidate_reasons.get(str(reason), 0) + 1
+    unexplained_rejections = max(raw_runtime_candidate_count - len(observed) - sum(rejected_reasons.values()), 0)
+    if unexplained_rejections:
+        runtime_candidate_reasons["correlation_or_attribution_failed"] = unexplained_rejections
     return {
         "status": status,
         "legacy_run_id": legacy_run_id,
@@ -395,6 +416,18 @@ def converge_iteration(
         "observed_parameters": observed,
         "runtime_block_reason": runtime_block_reason or None,
         "probe_parameter_names": probe_parameter_names,
+        "pending_probes": pending_probes,
+        "runtime_candidate_count": raw_runtime_candidate_count,
+        "runtime_pending_count": len(pending_candidates),
+        "runtime_accepted_count": sum(1 for parameter in observed if parameter.get("fuzzable") is True),
+        "runtime_rejected_count": max(raw_runtime_candidate_count - len(observed), 0),
+        "runtime_candidate_reasons": dict(sorted(runtime_candidate_reasons.items())),
+        "runtime_candidate_status": (
+            "awaiting_probe" if probe_parameter_names or pending_candidates else
+            "accepted" if any(parameter.get("fuzzable") is True for parameter in observed) else
+            "all_rejected" if raw_runtime_candidate_count else
+            "no_raw_candidate"
+        ),
         "new_parameters": advanced["new_parameters"],
         "missing_parameters": missing,
         "known_parameters": advanced["known_parameters"],
@@ -500,6 +533,86 @@ def _materialize_rest_get_param_probe(report: Mapping[str, Any], names: list[str
         "candidate_value_redacted": True,
     }
     return merged
+
+
+def _materialize_ajax_runtime_probes(
+    report: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Create one replay-only probe seed per flat runtime GET/POST candidate."""
+    items = report.get("suggested_seeds")
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], Mapping):
+        raise ValueError("AJAX runtime probe requires exactly one candidate")
+    raw_item = items[0]
+    raw_seed = raw_item.get("seed")
+    if not isinstance(raw_seed, Mapping):
+        raise ValueError("AJAX runtime probe candidate is invalid")
+    probes: list[dict[str, Any]] = []
+    probe_rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        source = str(candidate.get("source") or "").upper()
+        name = str(candidate.get("name") or "")
+        location = str(candidate.get("location") or "")
+        if source not in {"GET", "POST"} or location not in {"query", "form"} or not name:
+            continue
+        identity = (source, name)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        seed = deepcopy(dict(raw_seed))
+        variant = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"zend_probe_{source.lower()}_{name}").strip("-.")
+        seed["seed_variant_id"] = variant or f"zend_probe_{source.lower()}"
+        bucket_name = "query_params" if location == "query" else "body"
+        target = seed.setdefault(bucket_name, {})
+        if not isinstance(target, dict):
+            raise ValueError(f"AJAX {location} probe target must be an object")
+        target[name] = "probe"
+        fixed = seed.get("fixed_params") if isinstance(seed.get("fixed_params"), list) else []
+        seed["fixed_params"] = list(dict.fromkeys([str(value) for value in fixed if str(value)] + [name]))
+        seed["fuzzable_params"] = []
+        seed["input_params"] = []
+        seed["export_allowed"] = True
+        seed["replay_allowed"] = True
+        seed["probe_variant"] = True
+        item = deepcopy(dict(raw_item))
+        item["seed"] = seed
+        item["fuzzing_ready"] = False
+        item["generation_status"] = "zend_runtime_parameter_probe"
+        item["generated_reason"] = "zend_runtime_parameter_probe"
+        item["missing_requirements"] = ["correlated_runtime_read"]
+        item["probe_request"] = {
+            "parameters": [name],
+            "source": source,
+            "location": location,
+            "content_type": "",
+            "candidate_value_redacted": True,
+            "value_origin": "generated_probe",
+            "helper_depth": candidate.get("helper_depth"),
+            "run_id": candidate.get("run_id"),
+            "request_id": candidate.get("request_id"),
+            "plugin_slug": candidate.get("plugin_slug"),
+            "callback_id": candidate.get("callback_id"),
+            "canonical_callback": candidate.get("canonical_callback"),
+            "request_method": candidate.get("request_method"),
+        }
+        probes.append(item)
+        probe_rows.append({
+            "name": name,
+            "source": source,
+            "location": location,
+            "helper_depth": candidate.get("helper_depth"),
+            "seed_variant_id": seed["seed_variant_id"],
+            "request_id": candidate.get("request_id"),
+            "run_id": candidate.get("run_id"),
+            "plugin_slug": candidate.get("plugin_slug"),
+            "callback_id": candidate.get("callback_id"),
+            "canonical_callback": candidate.get("canonical_callback"),
+            "request_method": candidate.get("request_method"),
+        })
+    merged = deepcopy(dict(report))
+    merged["suggested_seeds"] = probes
+    return merged, probe_rows
 
 
 def _filter_iteration_inputs(
@@ -701,8 +814,15 @@ def _zend_observed_params(
             not isinstance(path, list)
             or len(path) != 1
             or not isinstance(path[0], str)
-            or helper_depth != 0
             or observed_count < 1
+        ):
+            continue
+        if not runtime_parameter_is_accepted(
+            param,
+            uopz,
+            zend,
+            canonical_callback=canonical_callback,
+            request_method=str(zend.get("request_method") or zend.get("method") or ""),
         ):
             continue
         location = {"GET": "query", "POST": "form"}.get(source)
@@ -818,6 +938,59 @@ def _param_location(param: Mapping[str, Any], source: str) -> str:
     if location in {"query", "form", "json", "path"}:
         return location
     return {"GET": "query", "POST": "form", "JSON": "json", "URL": "path"}.get(source, "")
+
+
+def _runtime_candidate_diagnostics(
+    zend: Mapping[str, Any],
+    canonical_callback: str,
+    *,
+    fixed_parameters: Mapping[str, Any],
+) -> tuple[int, dict[str, int]]:
+    """Count valid direct candidates and classify simple pre-normalization rejects."""
+    summaries = zend.get("callback_summaries")
+    if not isinstance(summaries, list):
+        return 0, {}
+    matched = [
+        summary for summary in summaries
+        if isinstance(summary, Mapping) and str(summary.get("callback") or "") == canonical_callback
+    ]
+    if len(matched) != 1 or not isinstance(matched[0].get("unique_parameters"), list):
+        return 0, {}
+    count = 0
+    reasons: dict[str, int] = {}
+    for parameter in matched[0]["unique_parameters"]:
+        if not isinstance(parameter, Mapping):
+            continue
+        source = str(parameter.get("source") or "").upper()
+        path = parameter.get("path")
+        try:
+            observed_count = int(parameter.get("observed_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            source not in {"GET", "POST", "REQUEST"}
+            or not isinstance(path, list)
+            or len(path) != 1
+            or not isinstance(path[0], str)
+            or not path[0]
+            or observed_count < 1
+        ):
+            continue
+        count += 1
+        name = path[0]
+        if name in fixed_parameters:
+            reason = "fixed_parameter"
+        else:
+            forms = parameter.get("access_forms")
+            operations = {
+                str(value).strip().lower()
+                for value in forms
+                if str(value).strip()
+            } if isinstance(forms, list) else set()
+            reason = "unsupported_access_operation" if not operations.intersection({"isset", "read"}) else ""
+        if reason:
+            reasons[reason] = reasons.get(reason, 0) + 1
+    return count, reasons
 
 
 def _security_name(name: str) -> bool:

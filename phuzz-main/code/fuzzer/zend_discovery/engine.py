@@ -20,6 +20,7 @@ BLOCKED_UNSAFE_AUTO_PROBE = "BLOCKED_UNSAFE_AUTO_PROBE"
 BLOCKED_NEEDS_RECIPE = "BLOCKED_NEEDS_RECIPE"
 READ_ACTION = re.compile(r"(?:get|list|fetch|search|load|view)", re.IGNORECASE)
 PERSISTENCE_FORBIDDEN_KEY = re.compile(r"(?:authorization|cookie|password|secret|token|pass2)", re.IGNORECASE)
+_DIRECT_RUNTIME_SOURCES = {"GET", "POST", "REQUEST"}
 
 
 def _safe_int(value: Any) -> int:
@@ -94,6 +95,131 @@ def resolve_request_transport(
         if content_type in {"application/x-www-form-urlencoded", "multipart/form-data"}:
             return ("POST", "form")
     return None
+
+
+def _runtime_parameter_operations(
+    parameter: Mapping[str, Any],
+    zend_artifact: Mapping[str, Any],
+    *,
+    canonical_callback: str,
+    helper_depth: int,
+) -> set[str] | None:
+    """Return operations proven by attributed raw events, or summary fallback for legacy direct rows."""
+    summary_forms = parameter.get("access_forms")
+    summary_operations = {
+        str(value).strip().lower()
+        for value in summary_forms
+        if str(value).strip()
+    } if isinstance(summary_forms, list) else set()
+    events = zend_artifact.get("events")
+    if not isinstance(events, list) or not events:
+        if helper_depth == 0 and not summary_operations:
+            return {"read"}
+        return summary_operations if helper_depth == 0 else None
+    path = parameter.get("path")
+    source = str(parameter.get("source") or "").upper()
+    operations: set[str] = set()
+    for event in events:
+        if not isinstance(event, Mapping) or str(event.get("source") or "").upper() != source:
+            continue
+        if event.get("path") != path:
+            continue
+        context = event.get("callback_context")
+        if not isinstance(context, Mapping) or context.get("attributed") is not True:
+            continue
+        if str(context.get("root_callback") or "") != canonical_callback:
+            continue
+        try:
+            event_depth = int(context.get("depth"))
+        except (TypeError, ValueError):
+            continue
+        if event_depth != helper_depth:
+            continue
+        operation = str(event.get("operation") or "").strip().lower()
+        if operation:
+            operations.add(operation)
+    return operations
+
+
+def _runtime_request_contains(
+    name: str,
+    source: str,
+    *,
+    request_method: str,
+    request_params: Mapping[str, Any],
+    headers: Mapping[str, Any],
+) -> bool:
+    resolved_source = source
+    if source == "REQUEST":
+        resolved = resolve_request_transport(
+            name,
+            request_method=request_method,
+            request_params=request_params,
+            headers=headers,
+        )
+        if resolved is None:
+            return False
+        resolved_source = resolved[0]
+    bucket = {"GET": "query_params", "POST": "body_params"}.get(resolved_source)
+    values = request_params.get(bucket) if bucket else None
+    return isinstance(values, Mapping) and name in values
+
+
+def _runtime_request_details(uopz_artifact: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    request_params = uopz_artifact.get("request_params")
+    request_params = request_params if isinstance(request_params, Mapping) else {}
+    headers = uopz_artifact.get("headers")
+    if not isinstance(headers, Mapping):
+        headers = request_params.get("headers")
+    headers = headers if isinstance(headers, Mapping) else {}
+    return request_params, headers
+
+
+def runtime_parameter_is_accepted(
+    parameter: Mapping[str, Any],
+    uopz_artifact: Mapping[str, Any],
+    zend_artifact: Mapping[str, Any],
+    *,
+    canonical_callback: str,
+    request_method: str,
+    operations: set[str] | None = None,
+    request_has_key: bool | None = None,
+) -> bool:
+    """Require a correlated raw read and its key in the matching request bucket."""
+    source = str(parameter.get("source") or "").upper()
+    path = parameter.get("path")
+    try:
+        helper_depth = int(parameter.get("helper_depth"))
+        observed_count = int(parameter.get("observed_count"))
+    except (TypeError, ValueError):
+        return False
+    if source not in _DIRECT_RUNTIME_SOURCES or not isinstance(path, list) or len(path) != 1 or not isinstance(path[0], str):
+        return False
+    if not path[0] or helper_depth < 0 or observed_count < 1:
+        return False
+    if operations is None:
+        operations = _runtime_parameter_operations(
+            parameter,
+            zend_artifact,
+            canonical_callback=canonical_callback,
+            helper_depth=helper_depth,
+        )
+    if not operations or "read" not in operations:
+        return False
+    if request_has_key is None:
+        request_params, request_headers = _runtime_request_details(uopz_artifact)
+        request_has_key = _runtime_request_contains(
+            path[0],
+            source,
+            request_method=request_method,
+            request_params=request_params,
+            headers=request_headers,
+        )
+    return request_has_key or (
+        helper_depth == 0
+        and not zend_artifact.get("events")
+        and not parameter.get("access_forms")
+    )
 
 
 def correlate_pass1_artifact(
@@ -206,6 +332,7 @@ def normalize_runtime_evidence(
     parameters = matched[0].get("unique_parameters")
     if not isinstance(parameters, list):
         return []
+    request_params, request_headers = _runtime_request_details(uopz_artifact)
     normalized: list[dict[str, Any]] = []
     for parameter in parameters:
         if not isinstance(parameter, Mapping):
@@ -222,19 +349,24 @@ def normalize_runtime_evidence(
             or len(path) != 1
             or not isinstance(path[0], str)
             or not path[0]
-            or helper_depth != 0
+            or source not in _DIRECT_RUNTIME_SOURCES
             or observed_count < 1
             or path[0] in fixed
         ):
             continue
+        operations = _runtime_parameter_operations(
+            parameter,
+            zend_artifact,
+            canonical_callback=canonical_callback,
+            helper_depth=helper_depth,
+        )
+        if operations is None:
+            continue
+        if not operations.intersection({"isset", "read"}):
+            continue
         location = {"GET": "query", "POST": "form"}.get(source)
         if source == "REQUEST":
-            request_params = uopz_artifact.get("request_params")
-            request_params = request_params if isinstance(request_params, Mapping) else {}
-            request_headers = uopz_artifact.get("headers")
-            if not isinstance(request_headers, Mapping):
-                request_headers = request_params.get("headers")
-            request_headers = dict(request_headers) if isinstance(request_headers, Mapping) else {}
+            request_headers = dict(request_headers)
             content_type = uopz_artifact.get("content_type") or uopz_artifact.get("request_content_type")
             if not content_type:
                 content_type = request_params.get("content_type")
@@ -251,24 +383,49 @@ def normalize_runtime_evidence(
             source, location = resolved
         elif source not in {"GET", "POST"}:
             continue
-        normalized.append(
-            {
-                "name": path[0],
-                "path": [path[0]],
-                "source": source,
-                "location": location,
-                "helper_depth": 0,
-                "observed_count": observed_count,
-                "evidence_kind": "zend_runtime",
-                "fuzzable": True,
-                "run_id": str(candidate.get("legacy_run_id") or ""),
-                "request_id": str(candidate.get("pass1_request_id") or ""),
-                "plugin_slug": identity["plugin_slug"],
-                "callback_id": identity["callback_identity"],
-                "canonical_callback": canonical_callback,
-                "request_method": zend_method,
-            }
+        name = path[0]
+        request_has_key = _runtime_request_contains(
+            name,
+            source,
+            request_method=zend_method or str(identity["resolved_method"]),
+            request_params=request_params,
+            headers=request_headers,
         )
+        accepted = runtime_parameter_is_accepted(
+            parameter,
+            uopz_artifact,
+            zend_artifact,
+            canonical_callback=canonical_callback,
+            request_method=zend_method or str(identity["resolved_method"]),
+            operations=operations,
+            request_has_key=request_has_key,
+        )
+        row = {
+            "name": name,
+            "path": [name],
+            "source": source,
+            "location": location,
+            "helper_depth": helper_depth,
+            "observed_count": observed_count,
+            "evidence_kind": "zend_runtime",
+            "fuzzable": accepted,
+            "run_id": str(candidate.get("legacy_run_id") or ""),
+            "request_id": str(candidate.get("pass1_request_id") or ""),
+            "plugin_slug": identity["plugin_slug"],
+            "callback_id": identity["callback_identity"],
+            "canonical_callback": canonical_callback,
+            "request_method": zend_method,
+        }
+        if not accepted:
+            row.update({
+                "candidate_status": "pending_probe",
+                "candidate_reason": (
+                    "request_key_missing" if "read" in operations and not request_has_key
+                    else "isset_without_correlated_read"
+                ),
+                "access_forms": sorted(operations),
+            })
+        normalized.append(row)
     return sorted(normalized, key=lambda item: (item["source"], item["name"]))
 
 

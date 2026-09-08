@@ -21,26 +21,47 @@ if ( getenv( 'HOOKPHUZZ_STRICT_NONCE_PROOF' ) !== '1' ) {
     uopz_set_return('check_ajax_referer', 1);
 }
 
-uopz_set_return('current_user_can', true);
+// Request-scoped fuzz context; absent headers preserve legacy authenticated mode.
+$__hookphuzz_auth_context = (string) ($_SERVER['HTTP_X_HOOKPHUZZ_AUTH_CONTEXT'] ?? 'authenticated');
+if (!in_array($__hookphuzz_auth_context, ['guest', 'authenticated'], true)) {
+    http_response_code(400);
+    exit('Invalid HookPhuzz auth context');
+}
+if (isset($GLOBALS['__uopz_request'])) {
+    $GLOBALS['__uopz_request']['auth_context'] = $__hookphuzz_auth_context;
+}
+if ($__hookphuzz_auth_context === 'guest') {
+    uopz_set_return('is_user_logged_in', false);
+    uopz_set_return('get_current_user_id', 0);
+    uopz_set_return('wp_get_current_user', function () {
+        return new WP_User(0);
+    }, true);
+    uopz_set_return('current_user_can', false);
+    uopz_set_return('user_can', false);
+    uopz_set_return('is_super_admin', false);
+    // Leave get_user_meta unchanged; never redirect guest reads to user 1.
+} else {
+    uopz_set_return('current_user_can', true);
 
-uopz_set_return("get_current_user_id", 1);
+    uopz_set_return("get_current_user_id", 1);
 
-uopz_set_return('get_user_meta', function ($user_id, $key = '', $single = false) {
-    $admin_user_id = 1;
-    return get_user_meta($admin_user_id, $key, $single);
-}, true);
+    uopz_set_return('get_user_meta', function ($user_id, $key = '', $single = false) {
+        $admin_user_id = 1;
+        return get_user_meta($admin_user_id, $key, $single);
+    }, true);
 
 
-uopz_set_return('is_super_admin', true);
+    uopz_set_return('is_super_admin', true);
 
-uopz_set_return('is_user_logged_in', true);
+    uopz_set_return('is_user_logged_in', true);
 
-uopz_set_return('user_can', true);
+    uopz_set_return('user_can', true);
 
-uopz_set_return('wp_get_current_user', function () {
-    $admin_user_id = 1;
-    return get_user_by('ID', $admin_user_id);
-}, true);
+    uopz_set_return('wp_get_current_user', function () {
+        $admin_user_id = 1;
+        return get_user_by('ID', $admin_user_id);
+    }, true);
+}
 
 if ( getenv( 'HOOKPHUZZ_STRICT_NONCE_PROOF' ) === '1' ) {
     $nonce_proof_dir = '/shared-tmpfs/hook-coverage/nonce-proof';

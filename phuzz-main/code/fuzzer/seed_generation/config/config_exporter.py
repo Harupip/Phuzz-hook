@@ -94,6 +94,10 @@ def build_config_for_seed_item(
         fuzzing_ready=bool(fuzz_count),
         discovered_file_params=discovered_file_params,
     )
+    config['metadata']['auth_context'] = (
+        'guest' if entrypoint_type in {'ajax_unauthenticated', 'admin_post_unauthenticated'}
+        or seed_item.get('hook_name') == 'heartbeat_nopriv_received' else 'authenticated'
+    )
     return _build_file_slug(seed_item), config
 
 

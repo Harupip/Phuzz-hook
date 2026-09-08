@@ -47,6 +47,7 @@ from seed_generation.config.config_exporter import (
 from seed_generation.convergence.convergence import materialize_convergence_seeds
 from discovery.entrypoints.entrypoints import seed_template_for_callback
 from discovery.entrypoints.method_resolution import resolve_http_methods
+from zend_discovery.engine import runtime_parameter_is_accepted
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
@@ -59,12 +60,24 @@ Pass2Verifier = Callable[..., dict[str, int]]
 ConfigBuilder = Callable[..., tuple[str, dict[str, Any]]]
 
 
+def _parameter_key(parameter: Any) -> tuple[str, str, str]:
+    if not isinstance(parameter, Mapping):
+        return "", "", ""
+    return (
+        str(parameter.get("name") or ""),
+        str(parameter.get("source") or "").upper(),
+        str(parameter.get("location") or ""),
+    )
+
+
 class OnlineLinkedError(ValueError):
     """A coordinator transition cannot be completed safely."""
 
 
 class OnlineLinkedCoordinator:
     """Coordinate immutable online versions without changing worker configs."""
+
+    MAX_PROBE_ATTEMPTS = 64
 
     def __init__(
         self,
@@ -150,6 +163,7 @@ class OnlineLinkedCoordinator:
             "campaign_status": "running" if self.campaign_deadline is not None else None,
             "versions": [],
             "attempts": [],
+            "probe_attempts": [],
             "candidate_queue": [],
             "queued_candidate_ids": [],
             "events": [],
@@ -636,6 +650,26 @@ class OnlineLinkedCoordinator:
                 "request_id": evidence.get("request_id"),
             })
             return None
+        return self._handle_convergence_result(
+            parent=parent,
+            evidence=evidence,
+            raw_report=raw_report,
+            result=result,
+            seed=seed,
+            deadline=deadline,
+        )
+
+    def _handle_convergence_result(
+        self,
+        *,
+        parent: dict[str, Any],
+        evidence: Mapping[str, Any],
+        raw_report: Mapping[str, Any],
+        result: Mapping[str, Any],
+        seed: Mapping[str, Any],
+        deadline: float | None,
+    ) -> dict[str, Any] | None:
+        """Admit accepted evidence, or service one pending runtime probe."""
         if result.get("status") == "REPLAY_FAILED" or result.get("missing_parameters") or result.get("runtime_block_reason"):
             self._record_event({
                 "kind": "RUNTIME_OBSERVATION", "status": "REJECTED",
@@ -644,24 +678,58 @@ class OnlineLinkedCoordinator:
                 "version": parent["version"], "request_id": evidence.get("request_id"),
             })
             return None
-        new_parameters = result.get("new_parameters") if isinstance(result, Mapping) else None
+
+        pending_probes = result.get("pending_probes")
+        if isinstance(pending_probes, list) and pending_probes:
+            return self._run_pending_probe(
+                parent=parent,
+                evidence=evidence,
+                raw_report=raw_report,
+                convergence=result,
+                probe=pending_probes[0],
+                seed=seed,
+                deadline=deadline,
+            )
+
+        new_parameters = result.get("new_parameters")
         if not isinstance(new_parameters, list) or not new_parameters:
+            status = str(result.get("runtime_candidate_status") or "no_raw_candidate")
+            reason = {
+                "no_raw_candidate": "NO_RAW_ZEND_CANDIDATE",
+                "all_rejected": "ALL_ZEND_CANDIDATES_REJECTED",
+            }.get(status, "NO_NEW_ZEND_PARAMETER")
             self._record_event({
                 "kind": "RUNTIME_OBSERVATION",
                 "status": "IGNORED",
-                "reason": "NO_NEW_ZEND_PARAMETER",
+                "reason": reason,
+                "runtime_candidate_count": result.get("runtime_candidate_count", 0),
                 "version": parent["version"],
                 "request_id": evidence.get("request_id"),
             })
             return None
+        evidence_by_parameter = result.get("parameter_evidence")
         for parameter in new_parameters:
-            if not self._admission_complete(parameter, evidence, parent):
+            parameter_evidence = evidence
+            if isinstance(evidence_by_parameter, Mapping):
+                candidate_evidence = evidence_by_parameter.get(_parameter_key(parameter))
+                if isinstance(candidate_evidence, Mapping):
+                    parameter_evidence = candidate_evidence
+            try:
+                helper_depth = int(parameter.get("helper_depth")) if isinstance(parameter, Mapping) else 0
+            except (TypeError, ValueError):
+                helper_depth = 0
+            admitted = (
+                self._probe_admission_complete(parameter, parameter_evidence, parent)
+                if helper_depth != 0
+                else self._admission_complete(parameter, parameter_evidence, parent)
+            )
+            if not admitted:
                 self._record_event({
                     "kind": "PARAMETER_DISCOVERY",
                     "status": "REJECTED",
                     "reason": "CORRELATION_OR_PROVENANCE_INCOMPLETE",
                     "version": parent["version"],
-                    "request_id": evidence.get("request_id"),
+                    "request_id": parameter_evidence.get("request_id"),
                     "parameter": dict(parameter) if isinstance(parameter, Mapping) else {},
                 })
                 return None
@@ -680,13 +748,19 @@ class OnlineLinkedCoordinator:
         discovery = self._record_event(discovery)
         proposed_parameters = list(result.get("known_parameters") or [])
         materialize_candidate_key = str(result.get("candidate_key") or self._target_key).split("::", 1)[0]
-        materialized = self.materialize_fn(
-            raw_report,
-            plugin_slug=self.plugin_slug,
-            candidate_key=materialize_candidate_key,
-            known_parameters=proposed_parameters,
-            for_replay=False,
-        )
+        try:
+            materialized = self.materialize_fn(
+                raw_report,
+                plugin_slug=self.plugin_slug,
+                candidate_key=materialize_candidate_key,
+                known_parameters=proposed_parameters,
+                for_replay=False,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._record_event({**discovery, "event_id": "", "status": "REJECTED",
+                                "reason": "CHILD_CONFIG_MATERIALIZATION_FAILED", "detail": str(exc)})
+            self._recover_parent_after_failure(parent, deadline)
+            return None
         if deadline is not None and self.clock() >= deadline:
             self._record_event({
                 "kind": "PARAMETER_DISCOVERY",
@@ -703,12 +777,18 @@ class OnlineLinkedCoordinator:
         self._write_state()
         generated_dir = self.config_dir / "versions" / next_version / "exported"
         generated_summary_path = self.run_dir / "versions" / next_version / "generated_config_summary.json"
-        generated_dir.mkdir(parents=True, exist_ok=True)
-        generated_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            generated_dir.mkdir(parents=True, exist_ok=True)
+            generated_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return self._reject_child_attempt(
+                parent, attempt, discovery, "CHILD_CONFIG_PREPARE_FAILED", deadline, detail=str(exc),
+            )
         if deadline is not None and self.clock() >= deadline:
             attempt.update(status="failed", reason="BUDGET_EXPIRED")
             self._record_event({**discovery, "event_id": "", "status": "REJECTED", "reason": "BUDGET_EXPIRED"})
             return None
+        child_failure_reason = "CHILD_CONFIG_EXPORT_FAILED"
         try:
             generated = self.export_configs_fn(
                 materialized,
@@ -718,28 +798,40 @@ class OnlineLinkedCoordinator:
                 rest_route_fallback=True,
             )
         except (OSError, RuntimeError, ValueError) as exc:
-            generated = {}
             attempt["error"] = str(exc)
+            generated = {}
         rows = generated.get("generated") if isinstance(generated, Mapping) else None
-        if not isinstance(rows, list) or len(rows) != 1:
-            attempt.update(status="failed", reason="CHILD_CONFIG_EXPORT_FAILED")
-            self._record_event({**discovery, "event_id": "", "status": "REJECTED", "reason": "CHILD_CONFIG_EXPORT_FAILED"})
-            return None
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
+            return self._reject_child_attempt(parent, attempt, discovery, child_failure_reason, deadline)
         generated_path = Path(str(rows[0].get("config_path") or ""))
         if not generated_path.is_file():
-            attempt.update(status="failed", reason="CHILD_CONFIG_MISSING")
-            self._record_event({**discovery, "event_id": "", "status": "REJECTED", "reason": "CHILD_CONFIG_MISSING"})
-            return None
-        child_config = json.loads(generated_path.read_text(encoding="utf-8-sig"))
-        self._restore_request_values(child_config, evidence, parent)
-        child_path = self._write_config(next_version, child_config)
-        child = self._new_version(next_version, child_config, child_path, parent, discovery["event_id"], seed)
-        child["known_parameters"] = proposed_parameters
-        self._reports[next_version] = copy.deepcopy(materialized)
-        replay_config = copy.deepcopy(child_config)
-        self.force_replay_only_fn(replay_config)
-        replay_path = self._write_config(next_version, replay_config, replay=True)
-        child["replay_config_path"] = str(replay_path)
+            return self._reject_child_attempt(parent, attempt, discovery, "CHILD_CONFIG_MISSING", deadline)
+        try:
+            child_config = json.loads(generated_path.read_text(encoding="utf-8-sig"))
+            base_evidence = result.get("base_evidence") if isinstance(result.get("base_evidence"), Mapping) else evidence
+            self._restore_request_values(child_config, base_evidence, parent)
+            if isinstance(evidence_by_parameter, Mapping):
+                for parameter in new_parameters:
+                    parameter_evidence = evidence_by_parameter.get(_parameter_key(parameter))
+                    if isinstance(parameter_evidence, Mapping):
+                        self._restore_request_values(
+                            child_config,
+                            parameter_evidence,
+                            parent,
+                            only_parameters={_parameter_key(parameter)},
+                        )
+            child_path = self._write_config(next_version, child_config)
+            child = self._new_version(next_version, child_config, child_path, parent, discovery["event_id"], seed)
+            child["known_parameters"] = proposed_parameters
+            self._reports[next_version] = copy.deepcopy(materialized)
+            replay_config = copy.deepcopy(child_config)
+            self.force_replay_only_fn(replay_config)
+            replay_path = self._write_config(next_version, replay_config, replay=True)
+            child["replay_config_path"] = str(replay_path)
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            return self._reject_child_attempt(
+                parent, attempt, discovery, "CHILD_CONFIG_BUILD_FAILED", deadline, detail=str(exc),
+            )
         self._write_state()
         if deadline is not None and self.clock() >= deadline:
             child["status"] = "not_started_budget_expired"
@@ -752,8 +844,401 @@ class OnlineLinkedCoordinator:
         self._write_state()
         return child
 
+    def _probe_context_key(
+        self, parent: Mapping[str, Any], probe: Mapping[str, Any], evidence: Mapping[str, Any],
+    ) -> str:
+        request = evidence.get("request")
+        params = request.get("request_params") if isinstance(request, Mapping) else None
+        params = params if isinstance(params, Mapping) else {}
+        # Ignore request IDs and metadata; preserve input types and array order.
+        inputs = {bucket: params.get(bucket, {}) for bucket in ("query_params", "body_params", "json_params")}
+        input_hash = hashlib.sha256(
+            json.dumps(inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        return json.dumps([
+            str(parent.get("version") or ""),
+            str(parent.get("worker_run_id") or ""),
+            str(parent.get("callback_id") or ""),
+            str(parent.get("hook_name") or ""),
+            str(parent.get("entrypoint_type") or ""),
+            str(probe.get("name") or ""),
+            str(probe.get("source") or "").upper(),
+            str(probe.get("location") or ""),
+            str(probe.get("callback_id") or parent.get("callback_id") or ""),
+            str(probe.get("plugin_slug") or self.plugin_slug),
+            str(probe.get("canonical_callback") or parent.get("canonical_callback") or ""),
+            str(probe.get("request_method") or parent.get("resolved_method") or "").upper(),
+            input_hash,
+        ], separators=(",", ":"))
+
+    def _recover_parent_after_failure(self, parent: Mapping[str, Any], deadline: float | None) -> bool:
+        if self._active_container:
+            return True
+        if deadline is not None and self.clock() >= deadline:
+            return False
+        parent_record = self._version(str(parent["version"]))
+        if parent_record is not None and self._start_worker(parent_record, deadline=deadline):
+            self._active_version = str(parent_record["version"])
+            return True
+        self._failure = True
+        self.state["terminal_status"] = "NOT_VERIFIED"
+        self.state["terminal_reason"] = "PARENT_WORKER_RESTART_FAILED"
+        self._write_state()
+        return False
+
+    def _reject_child_attempt(
+        self,
+        parent: Mapping[str, Any],
+        attempt: dict[str, Any],
+        discovery: Mapping[str, Any],
+        reason: str,
+        deadline: float | None,
+        *,
+        detail: str = "",
+    ) -> None:
+        attempt.update(status="failed", reason=reason)
+        if detail:
+            attempt["error"] = detail
+        self._record_event({
+            **dict(discovery), "event_id": "", "status": "REJECTED", "reason": reason,
+            **({"detail": detail} if detail else {}),
+        })
+        self._recover_parent_after_failure(parent, deadline)
+        return None
+
+    def _run_pending_probe(
+        self,
+        *,
+        parent: dict[str, Any],
+        evidence: Mapping[str, Any],
+        raw_report: Mapping[str, Any],
+        convergence: Mapping[str, Any],
+        probe: Mapping[str, Any],
+        seed: Mapping[str, Any],
+        deadline: float | None,
+    ) -> dict[str, Any] | None:
+        """Try each pending candidate once, then admit the valid subset."""
+        pending = convergence.get("pending_probes")
+        candidates = pending if isinstance(pending, list) else [probe]
+        accepted = [
+            dict(item) for item in convergence.get("new_parameters", [])
+            if isinstance(item, Mapping)
+        ] if isinstance(convergence.get("new_parameters"), list) else []
+        parameter_evidence: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+        for parameter in accepted:
+            parameter_evidence[_parameter_key(parameter)] = evidence
+        last_result: Mapping[str, Any] | None = convergence if accepted else None
+        last_evidence: Mapping[str, Any] | None = evidence if accepted else None
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            if accepted and deadline is not None:
+                remaining = deadline - self.clock()
+                next_probe_timeout = min(30, self.max_seconds, int(remaining))
+                # Keep the existing one-second minimum for child replay.
+                if next_probe_timeout < 1 or remaining <= next_probe_timeout + 1:
+                    break
+            outcome = self._run_pending_probe_once(
+                parent=parent, evidence=evidence, raw_report=raw_report,
+                convergence=convergence, probe=candidate, seed=seed, deadline=deadline,
+            )
+            if not isinstance(outcome, Mapping) or outcome.get("status") != "accepted":
+                if self.state.get("terminal_status") or (
+                    not self._active_container and
+                    (deadline is not None and self.clock() >= deadline)
+                ):
+                    break
+                continue
+            parameter = outcome.get("parameter")
+            probe_evidence = outcome.get("evidence")
+            if not isinstance(parameter, Mapping) or not isinstance(probe_evidence, Mapping):
+                continue
+            accepted.append(dict(parameter))
+            parameter_evidence[_parameter_key(parameter)] = probe_evidence
+            last_result = outcome.get("result") if isinstance(outcome.get("result"), Mapping) else None
+            last_evidence = probe_evidence
+        if not accepted or last_result is None or last_evidence is None:
+            return None
+        final_result = dict(last_result)
+        final_result["new_parameters"] = accepted
+        existing = parent.get("known_parameters", [])
+        existing = [dict(item) for item in existing if isinstance(item, Mapping)] if isinstance(existing, list) else []
+        final_result["known_parameters"] = existing + accepted
+        final_result["pending_probes"] = []
+        final_result["parameter_evidence"] = parameter_evidence
+        final_result["base_evidence"] = evidence
+        final_result["candidate_key"] = str(convergence.get("candidate_key") or self._target_key)
+        return self._handle_convergence_result(
+            parent=parent, evidence=last_evidence, raw_report=raw_report,
+            result=final_result, seed=seed, deadline=deadline,
+        )
+
+    def _run_pending_probe_once(
+        self,
+        *,
+        parent: dict[str, Any],
+        evidence: Mapping[str, Any],
+        raw_report: Mapping[str, Any],
+        convergence: Mapping[str, Any],
+        probe: Mapping[str, Any],
+        seed: Mapping[str, Any],
+        deadline: float | None,
+    ) -> dict[str, Any] | None:
+        """Replay one artifact-derived AJAX probe, then re-enter admission."""
+        attempts = self.state.setdefault("probe_attempts", [])
+        dedupe_key = self._probe_context_key(parent, probe, evidence)
+        if any(item.get("dedupe_key") == dedupe_key for item in attempts if isinstance(item, Mapping)):
+            self._record_event({
+                "kind": "PARAMETER_PROBE", "status": "SKIPPED", "reason": "PROBE_ALREADY_ATTEMPTED",
+                "version": parent["version"], "request_id": evidence.get("request_id"),
+                "candidate": dict(probe), "dedupe_key": dedupe_key,
+            })
+            return {"status": "skipped"}
+        if len(attempts) >= self.MAX_PROBE_ATTEMPTS:
+            self._record_event({
+                "kind": "PARAMETER_PROBE", "status": "REJECTED", "reason": "PROBE_BUDGET_EXHAUSTED",
+                "version": parent["version"], "request_id": evidence.get("request_id"),
+                "candidate": dict(probe),
+            })
+            return None
+        merged_probe_report = convergence.get("merged_suggested_seeds")
+        probe_items = merged_probe_report.get("suggested_seeds", []) if isinstance(merged_probe_report, Mapping) else []
+        if not isinstance(probe_items, list):
+            probe_items = []
+        variant = str(probe.get("seed_variant_id") or "")
+        probe_item = next(
+            (item for item in probe_items if isinstance(item, Mapping)
+             and str((item.get("seed") or {}).get("seed_variant_id") or "") == variant),
+            None,
+        )
+        if probe_item is None and len(probe_items) == 1 and isinstance(probe_items[0], Mapping):
+            probe_item = probe_items[0]
+        if probe_item is None:
+            return self._finish_probe_failure(parent, evidence, None, "PROBE_CONFIG_MISSING", deadline)
+        if deadline is not None and self.clock() >= deadline:
+            return self._finish_probe_failure(parent, evidence, None, "PROBE_BUDGET_EXPIRED", deadline)
+
+        probe_id = f"p{len(attempts) + 1}"
+        probe_run_id = f"{parent['worker_run_id']}-probe-{probe_id}"
+        probe_root = self.run_dir / "versions" / str(parent["version"]) / "probe" / probe_id
+        generated_dir = self.config_dir / "versions" / str(parent["version"]) / "probe" / probe_id / "exported"
+        generated_summary_path = probe_root / "generated_config_summary.json"
+        attempt: dict[str, Any] = {
+            "probe_id": probe_id, "parent_version": parent["version"],
+            "request_id": evidence.get("request_id"), "status": "exporting",
+            "candidate": dict(probe), "probe_run_id": probe_run_id, "dedupe_key": dedupe_key,
+        }
+        attempts.append(attempt)
+        self._write_state()
+        try:
+            generated_dir.mkdir(parents=True, exist_ok=True)
+            generated_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONFIG_PREPARE_FAILED", deadline, detail=str(exc))
+        try:
+            generated = self.export_configs_fn(
+                {"suggested_seeds": [dict(probe_item)]},
+                output_config_dir=generated_dir,
+                summary_path=generated_summary_path,
+                target_base="http://web",
+                replay_only=True,
+                rest_route_fallback=True,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONFIG_EXPORT_FAILED", deadline, detail=str(exc))
+        rows = generated.get("generated") if isinstance(generated, Mapping) else None
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
+            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONFIG_EXPORT_FAILED", deadline)
+        generated_path = Path(str(rows[0].get("config_path") or ""))
+        if not generated_path.is_file():
+            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONFIG_MISSING", deadline)
+        try:
+            probe_config = json.loads(generated_path.read_text(encoding="utf-8-sig"))
+            self._restore_request_values(probe_config, evidence, parent)
+            probe_metadata = probe_config.setdefault("metadata", {})
+            if not isinstance(probe_metadata, dict):
+                raise OnlineLinkedError("PROBE_CONFIG_METADATA_INVALID")
+            probe_metadata["zend_runtime_probe"] = {
+                "parameter": str(probe.get("name") or ""),
+                "source": str(probe.get("source") or "").upper(),
+                "location": str(probe.get("location") or ""),
+                "helper_depth": probe.get("helper_depth"),
+                "value_origin": "generated_probe",
+                "candidate_value_redacted": True,
+                "candidate_request_id": probe.get("request_id"),
+                "candidate_run_id": probe.get("run_id"),
+            }
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONFIG_INVALID", deadline, detail=str(exc))
+        probe_config_path = self.config_dir / "versions" / str(parent["version"]) / "probe" / probe_id / f"{probe_id}-config.json"
+        probe_mirror_path = probe_root / f"{probe_id}-config.json"
+        replay_path = self.config_dir / "versions" / str(parent["version"]) / "probe" / probe_id / f"{probe_id}-replay.json"
+        replay_mirror_path = probe_root / f"{probe_id}-replay.json"
+        try:
+            _write_exclusive_json(probe_config_path, probe_config)
+            _write_exclusive_json(probe_mirror_path, probe_config)
+            replay_config = copy.deepcopy(probe_config)
+            self.force_replay_only_fn(replay_config)
+            _write_exclusive_json(replay_path, replay_config)
+            _write_exclusive_json(replay_mirror_path, replay_config)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONFIG_WRITE_FAILED", deadline, detail=str(exc))
+        attempt.update(config_path=str(probe_config_path), replay_config_path=str(replay_path), status="replaying")
+        self._record_event({
+            "kind": "PARAMETER_PROBE", "status": "PENDING", "reason": "ZEND_RUNTIME_CANDIDATE",
+            "version": parent["version"], "worker_run_id": parent["worker_run_id"],
+            "request_id": evidence.get("request_id"), "probe_id": probe_id,
+            "probe_run_id": probe_run_id, "candidate": dict(probe),
+        })
+        if not self._stop_worker(parent, "PARAMETER_PROBE"):
+            return self._finish_probe_failure(parent, evidence, attempt, "WORKER_STOP_FAILED", deadline)
+        probe_seed = probe_item.get("seed") if isinstance(probe_item.get("seed"), Mapping) else {}
+        probe_row = {
+            "config_slug": replay_path.relative_to(self.config_root).with_suffix("").as_posix(),
+            "hook_name": str(probe_item.get("hook_name") or parent["hook_name"]),
+            "callback_id": str(probe_item.get("callback_id") or parent["callback_id"]),
+            "entrypoint_type": str(probe_item.get("entrypoint_type") or parent["entrypoint_type"]),
+            "resolved_method": str(probe_seed.get("resolved_method") or probe_seed.get("method") or parent["resolved_method"]),
+            "seed_variant_id": str(probe_seed.get("seed_variant_id") or ""),
+        }
+        timeout = self.max_seconds
+        if deadline is not None:
+            timeout = min(30, int(deadline - self.clock()))
+        if timeout < 1:
+            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_BUDGET_EXPIRED", deadline)
+        try:
+            probe_report = self.replay_runner(
+                [probe_row], timeout_seconds=timeout, service=self.service,
+                legacy_run_id=probe_run_id, run_command=self.run_command,
+                list_artifacts=self.list_artifacts, load_artifact=self.load_artifact,
+                list_zend_artifacts=self.list_zend_artifacts, poll_interval_seconds=0,
+                fuzzer_node_id=100 + len(attempts), stop_on_callback=True,
+            )
+        except Exception as exc:
+            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_REPLAY_FAILED", deadline, detail=str(exc))
+        rows = probe_report.get("runs", []) if isinstance(probe_report, Mapping) else []
+        replay_row = rows[0] if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], Mapping) else {}
+        if (
+            replay_row.get("callback_reached") is not True
+            or replay_row.get("validation_status") != "callback_reached"
+            or replay_row.get("process_status") in {"failed", "runner_error"}
+        ):
+            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CALLBACK_NOT_REACHED", deadline)
+        request_dir = probe_root / "request"
+        zend_dir = probe_root / "zend"
+        try:
+            self._save_replay_artifacts(replay_row, request_dir, zend_dir)
+            artifact_name = str(replay_row.get("matched_artifact") or "")
+            request_path = request_dir / artifact_name
+            zend_paths = [path for path in zend_dir.glob("*.json") if path.stem == request_path.stem]
+            if Path(artifact_name).name != artifact_name or not request_path.is_file() or len(zend_paths) != 1:
+                raise OnlineLinkedError("PROBE_ARTIFACT_CORRELATION_FAILED")
+            probe_request = json.loads(request_path.read_text(encoding="utf-8-sig"))
+            probe_zend = json.loads(zend_paths[0].read_text(encoding="utf-8-sig"))
+            if (
+                not isinstance(probe_request, Mapping)
+                or not isinstance(probe_zend, Mapping)
+                or str(probe_request.get("request_id") or "") != request_path.stem
+                or str(probe_zend.get("request_id") or "") != request_path.stem
+                or str(probe_request.get("legacy_run_id") or probe_request.get("run_id") or "") != probe_run_id
+                or str(probe_zend.get("run_id") or probe_zend.get("legacy_run_id") or "") != probe_run_id
+            ):
+                raise OnlineLinkedError("PROBE_ARTIFACT_CORRELATION_FAILED")
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_ARTIFACT_CORRELATION_FAILED", deadline, detail=str(exc))
+
+        probe_evidence = {
+            "version": parent["version"], "worker_run_id": probe_run_id,
+            "request_name": artifact_name, "request_id": request_path.stem,
+            "request": dict(probe_request), "zend_name": zend_paths[0].name, "zend": dict(probe_zend),
+        }
+        try:
+            probe_result = self.converge_fn(
+                raw_report={"suggested_seeds": [dict(probe_item)]},
+                pass_run_summary={"legacy_run_id": probe_run_id, "runs": [{
+                    **probe_row, "callback_reached": True, "matched_artifact": artifact_name,
+                    "process_status": "replaying",
+                }]},
+                pass_artifacts_dir=request_dir, zend_events_dir=zend_dir, registry=self.registry,
+                plugin_slug=self.plugin_slug, legacy_run_id=probe_run_id,
+                known_state={"known_parameters": parent.get("known_parameters", [])}, candidate_key=None,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONVERGENCE_FAILED", deadline, detail=str(exc))
+        probe_parameters = probe_result.get("new_parameters") if isinstance(probe_result, Mapping) else None
+        if not isinstance(probe_parameters, list) or not probe_parameters:
+            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_NO_CORRELATED_READ", deadline)
+        target_key = _parameter_key(probe)
+        matching = [
+            parameter for parameter in probe_parameters
+            if isinstance(parameter, Mapping)
+            and _parameter_key(parameter) == target_key
+            and parameter.get("fuzzable") is True
+        ]
+        unexpected = [
+            dict(parameter) for parameter in probe_parameters
+            if isinstance(parameter, Mapping) and _parameter_key(parameter) != target_key
+        ]
+        if not matching:
+            if unexpected:
+                attempt["unexpected_parameters"] = unexpected
+            return self._finish_probe_failure(
+                parent, evidence, attempt, "PROBE_TARGET_MISMATCH", deadline,
+                extra={"unexpected_parameters": unexpected},
+            )
+        parameter = matching[0]
+        if not self._probe_admission_complete(parameter, probe_evidence, parent):
+            return self._finish_probe_failure(
+                parent, evidence, attempt, "PROBE_PROVENANCE_INCOMPLETE", deadline,
+                extra={"unexpected_parameters": unexpected},
+            )
+        if unexpected:
+            attempt["unexpected_parameters"] = unexpected
+        attempt.update(status="accepted", probe_request_id=probe_evidence["request_id"])
+        self._record_event({
+            "kind": "PARAMETER_PROBE", "status": "ACCEPTED", "reason": "CORRELATED_ZEND_READ",
+            "version": parent["version"], "worker_run_id": probe_run_id,
+            "request_id": probe_evidence["request_id"], "probe_id": probe_id,
+            "candidate": dict(probe), "parameter": dict(parameter),
+            **({"unexpected_parameters": unexpected} if unexpected else {}),
+        })
+        return {
+            "status": "accepted",
+            "parameter": dict(parameter),
+            "evidence": probe_evidence,
+            "result": probe_result,
+        }
+
+    def _finish_probe_failure(
+        self,
+        parent: dict[str, Any],
+        evidence: Mapping[str, Any],
+        attempt: dict[str, Any] | None,
+        reason: str,
+        deadline: float | None,
+        *,
+        detail: str = "",
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        if attempt is not None:
+            attempt.update(status="failed", reason=reason)
+            if detail:
+                attempt["error"] = detail
+        self._record_event({
+            "kind": "PARAMETER_PROBE", "status": "REJECTED", "reason": reason,
+            "version": parent["version"], "request_id": evidence.get("request_id"),
+            **(dict(extra) if isinstance(extra, Mapping) else {}),
+            **({"detail": detail} if detail else {}),
+        })
+        if reason == "WORKER_STOP_FAILED":
+            return None
+        self._recover_parent_after_failure(parent, deadline)
+        self._write_state()
+        return None
+
     def _restore_request_values(
         self, config: dict[str, Any], evidence: Mapping[str, Any], parent: Mapping[str, Any],
+        *, only_parameters: set[tuple[str, str, str]] | None = None,
     ) -> None:
         """Seed child inputs from this correlated request, retaining fuzz selectors."""
         request = evidence.get("request") or {}
@@ -771,12 +1256,18 @@ class OnlineLinkedCoordinator:
             and "json" in str(row.get("value", "")).lower() for row in headers
         )
         values = []
+        section_identity = {
+            "query_params": ("GET", "query"),
+            "body_params": ("POST", "form"),
+            "headers": ("HEADER", "header"),
+            "cookies": ("COOKIE", "cookie"),
+        }
         for section_name in ("query_params", "body_params", "headers", "cookies"):
             section = config.get(section_name)
             if not isinstance(section, dict):
                 continue
             bucket = "json_params" if section_name == "body_params" and is_json else section_name
-            observed, source, source_reason = self._request_bucket_values(params, bucket)
+            observed, source_status, source_reason = self._request_bucket_values(params, bucket)
             parent_section = parent_config.get(section_name, {})
             if not isinstance(parent_section, Mapping):
                 parent_section = {}
@@ -785,6 +1276,9 @@ class OnlineLinkedCoordinator:
                 raise OnlineLinkedError(f"UNSUPPORTED_CONFIG_BUCKET: {section_name}.fixed must be a list")
             for row in section.get("data", []):
                 name = str(row["name"])
+                transport, location = section_identity[section_name]
+                if only_parameters is not None and (name, transport, location) not in only_parameters:
+                    continue
                 value = observed
                 path = [name] if name in observed else [part for part in re.split(r"\[|\]", name) if part]
                 found = True
@@ -807,14 +1301,38 @@ class OnlineLinkedCoordinator:
                 value_record = {
                     "name": name,
                     "bucket": bucket,
-                    "value_origin": "observed" if found else ("probe" if source == "observed" else source),
+                    "request_id": evidence.get("request_id"),
+                    "run_id": evidence.get("worker_run_id") or evidence.get("run_id") or parent["worker_run_id"],
+                    "value_origin": "observed" if found else ("probe" if source_status == "observed" else source_status),
                 }
                 if not found:
                     value_record["reason"] = source_reason or "REQUEST_VALUE_MISSING"
                 values.append(value_record)
-        config.setdefault("metadata", {})["online_request_seed"] = {
-            "request_id": evidence["request_id"], "run_id": parent["worker_run_id"],
-            "values": values,
+        metadata = config.setdefault("metadata", {})
+        if not isinstance(metadata, dict):
+            raise OnlineLinkedError("PROBE_CONFIG_METADATA_INVALID")
+        previous = metadata.get("online_request_seed")
+        previous_values = previous.get("values", []) if isinstance(previous, Mapping) else []
+        records: dict[tuple[str, str], dict[str, Any]] = {}
+        for value in previous_values if isinstance(previous_values, list) else []:
+            if isinstance(value, Mapping):
+                records[(str(value.get("bucket") or ""), str(value.get("name") or ""))] = dict(value)
+        for value in values:
+            records[(str(value.get("bucket") or ""), str(value.get("name") or ""))] = value
+        request_ids = []
+        if isinstance(previous, Mapping):
+            request_ids.extend(str(item) for item in previous.get("evidence_request_ids", []) if str(item))
+            if previous.get("request_id") and previous.get("request_id") != "multiple":
+                request_ids.append(str(previous["request_id"]))
+        request_id = str(evidence.get("request_id") or "")
+        if request_id:
+            request_ids.append(request_id)
+        request_ids = list(dict.fromkeys(request_ids))
+        metadata["online_request_seed"] = {
+            "request_id": request_ids[0] if len(request_ids) == 1 else "multiple",
+            "run_id": parent["worker_run_id"],
+            "evidence_request_ids": request_ids,
+            "values": list(records.values()),
         }
 
     @staticmethod
@@ -982,13 +1500,8 @@ class OnlineLinkedCoordinator:
             self.state["terminal_status"] = "NOT_VERIFIED"
             self.state["terminal_reason"] = "CHILD_REPLAY_FAILED"
             self._write_state()
-        parent_record = self._version(str(parent["version"]))
-        if parent_record is not None and self._start_worker(parent_record, deadline=deadline):
-            self._active_version = str(parent_record["version"])
-        elif parent_record is None or parent_record["worker_status"] != "not_started_budget_expired":
-            self.state["terminal_status"] = "NOT_VERIFIED"
-            self.state["terminal_reason"] = "PARENT_WORKER_RESTART_FAILED"
-            self._write_state()
+        self._recover_parent_after_failure(parent, deadline)
+        self._write_state()
         return False
 
     def _select_v0(self) -> tuple[Mapping[str, Any], dict[str, Any], str] | None:
@@ -1268,14 +1781,52 @@ class OnlineLinkedCoordinator:
             parameter.get("canonical_callback"),
             parameter.get("request_method"),
         )
+        evidence_run_id = str(
+            evidence.get("worker_run_id")
+            or evidence.get("run_id")
+            or parent.get("worker_run_id")
+            or ""
+        )
         return (
             all(str(value or "").strip() for value in required)
             and str(parameter.get("request_id")) == str(evidence.get("request_id"))
-            and str(parameter.get("run_id")) == str(parent.get("worker_run_id"))
+            and str(parameter.get("run_id")) == evidence_run_id
             and str(parameter.get("plugin_slug")) == self.plugin_slug
             and str(parameter.get("request_method")).upper() == str(parent.get("resolved_method") or "").upper()
             and _canonical_callback_name(parameter.get("canonical_callback"))
             == _canonical_callback_name(parent.get("canonical_callback"))
+        )
+
+    def _probe_admission_complete(
+        self, parameter: Mapping[str, Any], evidence: Mapping[str, Any], parent: Mapping[str, Any],
+    ) -> bool:
+        if not self._admission_complete(parameter, evidence, parent):
+            return False
+        request = evidence.get("request")
+        zend = evidence.get("zend")
+        source = str(parameter.get("source") or "").upper()
+        location = str(parameter.get("location") or "")
+        request_method = str(parent.get("resolved_method") or "").upper()
+        artifact_method = str(
+            (request.get("http_method") if isinstance(request, Mapping) else "")
+            or (request.get("method") if isinstance(request, Mapping) else "")
+            or (zend.get("request_method") if isinstance(zend, Mapping) else "")
+            or (zend.get("method") if isinstance(zend, Mapping) else "")
+            or request_method
+        ).upper()
+        return (
+            isinstance(request, Mapping)
+            and isinstance(zend, Mapping)
+            and request.get("target_plugin") == self.plugin_slug
+            and (source, location) in {("GET", "query"), ("POST", "form")}
+            and artifact_method == request_method
+            and runtime_parameter_is_accepted(
+                parameter,
+                request,
+                zend,
+                canonical_callback=str(parent.get("canonical_callback") or ""),
+                request_method=str(parent.get("resolved_method") or ""),
+            )
         )
 
 
