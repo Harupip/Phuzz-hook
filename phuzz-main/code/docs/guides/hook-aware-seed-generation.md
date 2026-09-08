@@ -160,7 +160,6 @@ The wrapper only selects the workflow, plugin, and runner flags. It delegates to
 | `default` | Starts WordPress and the normal PHUZZ fuzzer for the selected plugin config. | Normal PHUZZ console output and `fuzzer/output/`. | Does not generate hook-aware configs first. |
 | `seed-config` | Starts WordPress, exports live hook coverage, writes `suggested_seeds.*`, then converts supported seeds into `configs/generated-config/<plugin>/*.json`. | `fuzzer/output/seed_generation/generated_config_summary.json` | Does not run the generated configs. |
 | `generated` | Does everything in `seed-config`, stops the default fuzzer, then runs each generated config sequentially with `FUZZER_CONFIG=generated-config/<plugin>/<slug>`. | `fuzzer/output/seed_generation/generated_config_run_summary.json` | Does not recursively queue newly discovered child hooks. |
-| `recursive` | Starts the selected plugin/config with the seed export flow, copies the new request artifacts, then runs `recursive_child_hook_seeds.py` with replay validation. If `-RecursiveInputFile` is passed, it skips the setup run and uses that artifact directly. | `fuzzer/output/recursive-child-hooks/recursive_child_hook_seeds.json`, `validation_result.json`, and `generated_config_summary.json` | Does not run PHUZZ against the recursive configs. |
 
 The plugin prompt lists only local plugins that have both:
 
@@ -179,26 +178,6 @@ To inspect the command without running Docker or PHUZZ:
 .\phuzz.ps1 -Mode generated -PluginSlug photo-gallery -GeneratedConfigTimeoutSeconds 30 -NoFollowLogs -DryRun
 ```
 
-Run recursive child-hook seed generation from existing live request artifacts:
-
-```powershell
-.\phuzz.ps1 -Mode recursive
-```
-
-For mode `recursive`, the wrapper chooses the plugin/config first, runs the seed export setup for that plugin, then runs recursive child-hook generation. The console prints `Mode recursive target plugin: <slug>` before it consumes artifacts.
-
-Run recursive child-hook seed generation from one local artifact. The input file should be inside a `requests\` directory, or pass `-RecursiveHookCoverageDir` explicitly.
-
-```powershell
-.\phuzz.ps1 -Mode recursive -RecursiveInputFile fuzzer\output\recursive-child-hooks\coverage-YYYYMMDD-HHMMSS\requests\latest.json
-```
-
-Use a shorter replay timeout while testing:
-
-```powershell
-.\phuzz.ps1 -Mode recursive -RecursiveValidationTimeoutSeconds 3
-```
-
 The useful recursive outputs are:
 
 - `fuzzer/output/recursive-child-hooks/recursive_child_hook_seeds.json`
@@ -206,7 +185,7 @@ The useful recursive outputs are:
 - `fuzzer/output/recursive-child-hooks/generated_config_summary.json`
 - `fuzzer/output/recursive-child-hooks/configs/*.json`
 
-The wrapper prints a recursive summary after the helper exits. If `generated`, `manual_analysis`, `duplicates_skipped`, and `depth_skipped` are all `0`, the copied request artifacts did not contain child-hook metadata, so there was nothing new to convert.
+The helper writes a recursive summary after it exits. If `generated`, `manual_analysis`, `duplicates_skipped`, and `depth_skipped` are all `0`, the input artifacts did not contain child-hook metadata, so there was nothing new to convert.
 
 Interpret `generated_config_run_summary.json` with these status meanings:
 
@@ -218,7 +197,7 @@ Interpret `generated_config_run_summary.json` with these status meanings:
 | `no_artifact` | The run produced no new request artifact for validation. |
 | `not_observed` | Artifacts existed, but they did not show the target hook/callback. |
 
-Recursive child-hook replay is separate from wrapper mode `generated`. Wrapper mode `recursive` turns already observed child hooks into seeds/configs and validates those child-hook seeds against `http://localhost:8080`. It mirrors request artifacts from the running `web` container so validation can compare before/after artifacts.
+Recursive child-hook replay is separate from wrapper modes. The standalone helper turns already observed child hooks into seeds/configs and validates those child-hook seeds against `http://localhost:8080`.
 
 The WordPress runner can execute every generated config sequentially after export:
 
@@ -468,13 +447,7 @@ python hook_energy\recursive_child_hook_seeds.py `
   --max-hook-depth 3
 ```
 
-Use wrapper mode `recursive` when you want it to copy request artifacts from the running `web` container first:
-
-```powershell
-.\phuzz.ps1 -Mode recursive
-```
-
-This still writes artifacts and generated configs only. It does not insert recursive child seeds into PHUZZ's live `Candidate` queue.
+This writes artifacts and generated configs only. It does not insert recursive child seeds into PHUZZ's live `Candidate` queue.
 
 ### 4. Replay One Candidate
 
