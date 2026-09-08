@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -81,8 +82,8 @@ class Clock:
 
 class OnlineLinkedCoordinatorTests(unittest.TestCase):
     def run_php_json_producer(self, raw_body: str) -> dict:
-        php = Path(r"C:\xampp\php\php.exe")
-        self.assertTrue(php.is_file(), php)
+        php = Path(shutil.which("php") or r"C:\xampp\php\php.exe")
+        self.assertTrue(php.is_file(), f"PHP CLI required; resolved {php}")
         hook_path = Path(__file__).resolve().parents[2] / "web" / "instrumentation" / "hook_coverage" / "uopz_hook_wp.php"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1249,29 +1250,30 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         return coordinator, parent, base_evidence, convergence
 
     def test_failed_probe_continues_to_next_candidate_and_dedupes_same_parent_context(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            log: list[str] = []
-            coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), log, accepted=("b",))
+        for deadline in (None, 31.5):
+            with self.subTest(deadline=deadline), tempfile.TemporaryDirectory() as tmp:
+                log: list[str] = []
+                coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), log, accepted=("b",))
 
-            coordinator._run_pending_probe(
-                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
-                convergence=convergence, probe=convergence["pending_probes"][0],
-                seed=parent["seed_item"], deadline=None,
-            )
-            first_attempts = list(coordinator.state["probe_attempts"])
-            coordinator._run_pending_probe(
-                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
-                convergence=convergence, probe=convergence["pending_probes"][0],
-                seed=parent["seed_item"], deadline=None,
-            )
+                coordinator._run_pending_probe(
+                    parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                    convergence=convergence, probe=convergence["pending_probes"][0],
+                    seed=parent["seed_item"], deadline=deadline,
+                )
+                first_attempts = list(coordinator.state["probe_attempts"])
+                coordinator._run_pending_probe(
+                    parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                    convergence=convergence, probe=convergence["pending_probes"][0],
+                    seed=parent["seed_item"], deadline=deadline,
+                )
 
-            self.assertEqual([item["candidate"]["name"] for item in first_attempts if item["status"] == "accepted"], ["b"])
-            self.assertEqual(
-                len([item for item in coordinator.state["events"] if item.get("reason") == "PROBE_ALREADY_ATTEMPTED"]),
-                2,
-            )
-            self.assertEqual([item for item in coordinator.state["probe_attempts"] if item["candidate"]["name"] == "a"], [first_attempts[0]])
-            self.assertIn("probe:b", log)
+                self.assertEqual([item["candidate"]["name"] for item in first_attempts if item["status"] == "accepted"], ["b"])
+                self.assertEqual(
+                    len([item for item in coordinator.state["events"] if item.get("reason") == "PROBE_ALREADY_ATTEMPTED"]),
+                    2,
+                )
+                self.assertEqual([item for item in coordinator.state["probe_attempts"] if item["candidate"]["name"] == "a"], [first_attempts[0]])
+                self.assertIn("probe:b", log)
 
     def test_probe_dedupe_retries_changed_inputs_not_request_ids_or_key_order(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1389,28 +1391,34 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(parent["known_parameters"], [])
 
     def test_existing_accepted_parameter_survives_pending_probe_admission(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, evidence, convergence = self.make_probe_context(
-                Path(tmp), [], names=("a",), accepted=("a",),
-            )
-            existing = {
-                "name": "existing", "source": "POST", "location": "form", "helper_depth": 0,
-                "evidence_kind": "zend_runtime", "fuzzable": True, "observed_count": 1,
-                "request_id": "req-v0", "run_id": "run-v0", "plugin_slug": "fixture",
-                "canonical_callback": "fixture_callback", "request_method": "POST",
-            }
-            convergence["new_parameters"] = [existing]
+        for deadline in (None, 31.5):
+            with self.subTest(deadline=deadline), tempfile.TemporaryDirectory() as tmp:
+                log: list[str] = []
+                coordinator, parent, evidence, convergence = self.make_probe_context(
+                    Path(tmp), log, names=("a",), accepted=("a",),
+                )
+                existing = {
+                    "name": "existing", "source": "POST", "location": "form", "helper_depth": 0,
+                    "evidence_kind": "zend_runtime", "fuzzable": True, "observed_count": 1,
+                    "request_id": "req-v0", "run_id": "run-v0", "plugin_slug": "fixture",
+                    "canonical_callback": "fixture_callback", "request_method": "POST",
+                }
+                convergence["new_parameters"] = [existing]
 
-            result = coordinator._run_pending_probe(
-                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
-                convergence=convergence, probe=convergence["pending_probes"][0],
-                seed=parent["seed_item"], deadline=None,
-            )
+                result = coordinator._run_pending_probe(
+                    parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                    convergence=convergence, probe=convergence["pending_probes"][0],
+                    seed=parent["seed_item"], deadline=deadline,
+                )
 
-            self.assertIsNotNone(result)
-            child_names = {item["name"] for item in coordinator.state["versions"][1]["known_parameters"]}
-            self.assertEqual(child_names, {"existing", "a"})
-            self.assertEqual(parent["known_parameters"], [])
+                self.assertIsNotNone(result)
+                child_names = {item["name"] for item in coordinator.state["versions"][1]["known_parameters"]}
+                self.assertEqual(child_names, {"existing", "a"} if deadline is None else {"existing"})
+                self.assertEqual(parent["known_parameters"], [])
+                if deadline is None:
+                    self.assertIn("probe:a", log)
+                else:
+                    self.assertNotIn("probe:a", log)
 
     def test_child_export_error_recovers_parent_after_probe_stop(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1453,6 +1461,78 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(parent["known_parameters"], [])
             self.assertTrue(coordinator.state["versions"][1]["replay_result"]["passed"])
             self.assertNotIn("probe:b", json.dumps(coordinator.state["events"]))
+
+    def test_optional_probe_overhead_cannot_starve_accepted_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), log, names=("a", "b"), accepted=("a",),
+            )
+            original_replay = coordinator.replay_runner
+
+            def replay(*args, **kwargs):
+                report = original_replay(*args, **kwargs)
+                run_id = kwargs["legacy_run_id"]
+                if run_id.endswith("-probe-p1"):
+                    coordinator.clock.now = 0.0
+                elif run_id.endswith("-probe-p2"):
+                    coordinator.clock.now = 31.5
+                return report
+
+            coordinator.replay_runner = replay
+            result = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence,
+                raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=31.5,
+            )
+            self.assertIsNotNone(result)
+            self.assertEqual(
+                [row["status"] for row in coordinator.state["probe_attempts"]],
+                ["accepted"],
+            )
+            self.assertNotIn("probe:b", log)
+            self.assertEqual(
+                [row["version"] for row in coordinator.state["versions"]],
+                ["v0", "v1"],
+            )
+            child = coordinator.state["versions"][1]
+            self.assertEqual({row["name"] for row in child["known_parameters"]}, {"a"})
+            self.assertTrue(child["replay_result"]["passed"])
+            verification = child["replay_result"]["pass2_verification"]
+            self.assertGreater(verification["total"], 0)
+            self.assertEqual(verification["accepted"], verification["total"])
+            self.assertEqual(coordinator._active_version, "v1")
+            self.assertTrue(coordinator._active_container)
+            self.assertEqual(parent["known_parameters"], [])
+
+    def test_deadline_expiration_after_accepted_probe_does_not_start_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), log, names=("a",), accepted=("a",),
+            )
+            original_replay = coordinator.replay_runner
+
+            def replay(*args, **kwargs):
+                report = original_replay(*args, **kwargs)
+                if kwargs["legacy_run_id"].endswith("-probe-p1"):
+                    coordinator.clock.now = 31.5
+                return report
+
+            coordinator.replay_runner = replay
+            result = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence,
+                raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=31.5,
+            )
+
+            self.assertIsNone(result)
+            self.assertEqual([row["status"] for row in coordinator.state["probe_attempts"]], ["accepted"])
+            self.assertEqual([row["version"] for row in coordinator.state["versions"]], ["v0"])
+            self.assertNotIn("worker_start", log)
+            self.assertIn("BUDGET_EXPIRED", json.dumps(coordinator.state["events"]))
 
     def test_campaign_deadline_caps_candidate_replay_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1813,6 +1893,64 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             state = json.loads(coordinator.state_path.read_text())
             self.assertEqual(state["terminal_status"], "NOT_VERIFIED")
             self.assertEqual(state["terminal_reason"], "CHILD_REPLAY_FAILED")
+
+    def test_probe_admission_normalizes_instance_callback_without_weakening_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            parent = {"canonical_callback": "Fixture->handle", "resolved_method": "POST"}
+            parameter = {
+                "name": "task", "path": ["task"], "source": "GET", "location": "query",
+                "helper_depth": 2, "observed_count": 1, "evidence_kind": "zend_runtime",
+                "request_id": "probe-request", "run_id": "probe-run", "plugin_slug": "fixture",
+                "canonical_callback": "Fixture::handle", "request_method": "POST",
+            }
+            evidence = {
+                "request_id": "probe-request", "worker_run_id": "probe-run",
+                "request": {"target_plugin": "fixture", "http_method": "POST",
+                            "request_params": {"query_params": {"task": "probe"}}},
+                "zend": {"events": [{"source": "GET", "path": ["task"], "operation": "read",
+                         "callback_context": {"attributed": True, "root_callback": "Fixture::handle", "depth": 2}}]},
+            }
+            self.assertTrue(coordinator._probe_admission_complete(parameter, evidence, parent))
+            for field, value in (("root_callback", "Other::handle"), ("attributed", False), ("depth", 3)):
+                invalid = copy.deepcopy(evidence)
+                invalid["zend"]["events"][0]["callback_context"][field] = value
+                self.assertFalse(coordinator._probe_admission_complete(parameter, invalid, parent))
+            invalid = copy.deepcopy(evidence)
+            invalid["request"]["request_params"]["query_params"] = {}
+            self.assertFalse(coordinator._probe_admission_complete(parameter, invalid, parent))
+
+    def test_stop_waits_for_in_progress_removal_and_fails_closed(self):
+        for outcome in ("removed", "stuck", "daemon_error"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
+                inspected = []
+
+                def remove(command, **kwargs):
+                    self.assertGreater(kwargs["timeout"], 0)
+                    self.assertLessEqual(kwargs["timeout"], 30)
+                    if command[:3] == ["docker", "rm", "-f"]:
+                        return subprocess.CompletedProcess(command, 1, "", "removal of container parent-container is already in progress")
+                    self.assertEqual(command[:3], ["docker", "container", "inspect"])
+                    self.assertEqual(command[-1], "parent-container")
+                    inspected.append(command)
+                    if outcome == "daemon_error":
+                        return subprocess.CompletedProcess(command, 1, "", "daemon unavailable")
+                    if outcome == "removed" and len(inspected) > 1:
+                        return subprocess.CompletedProcess(command, 1, "", "Error response from daemon: No such container: parent-container")
+                    return subprocess.CompletedProcess(command, 0, "removing", "")
+
+                coordinator.run_command = remove
+                self.assertEqual(coordinator._stop_worker(parent, "PARAMETER_PROBE"), outcome == "removed")
+                self.assertTrue(inspected)
+                self.assertLessEqual(coordinator.clock(), 30)
+                if outcome == "removed":
+                    self.assertEqual(coordinator._active_container, "")
+                    self.assertEqual(parent["worker_status"], "stopped")
+                    self.assertIsNone(coordinator.state["terminal_status"])
+                else:
+                    self.assertEqual(coordinator._active_container, "parent-container")
+                    self.assertEqual(coordinator.state["terminal_reason"], "WORKER_STOP_FAILED")
 
     def test_stop_failure_blocks_handoff_and_preserves_worker_identity(self):
         for raises in (False, True):

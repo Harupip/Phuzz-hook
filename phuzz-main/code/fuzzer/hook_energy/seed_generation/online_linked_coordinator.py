@@ -917,7 +917,12 @@ class OnlineLinkedCoordinator:
         seed: Mapping[str, Any],
         deadline: float | None,
     ) -> dict[str, Any] | None:
-        """Try each pending candidate once, then admit the valid subset."""
+        """Try pending candidates, prioritizing accepted evidence before a deadline.
+
+        Calls without a deadline retain unlimited batching; bounded calls stop
+        admitting optional probes once accepted evidence is available so the
+        child handoff keeps the remaining budget.
+        """
         pending = convergence.get("pending_probes")
         candidates = pending if isinstance(pending, list) else [probe]
         accepted = [
@@ -933,11 +938,8 @@ class OnlineLinkedCoordinator:
             if not isinstance(candidate, Mapping):
                 continue
             if accepted and deadline is not None:
-                remaining = deadline - self.clock()
-                next_probe_timeout = min(30, self.max_seconds, int(remaining))
-                # Keep the existing one-second minimum for child replay.
-                if next_probe_timeout < 1 or remaining <= next_probe_timeout + 1:
-                    break
+                # Admit proven evidence before spending the deadline on optional probes.
+                break
             outcome = self._run_pending_probe_once(
                 parent=parent, evidence=evidence, raw_report=raw_report,
                 convergence=convergence, probe=candidate, seed=seed, deadline=deadline,
@@ -1680,6 +1682,7 @@ class OnlineLinkedCoordinator:
         container_name = self._active_container
         if not container_name:
             return True
+        stop_deadline = self.clock() + 30
         try:
             result = self.run_command(
                 ["docker", "rm", "-f", container_name],
@@ -1690,6 +1693,26 @@ class OnlineLinkedCoordinator:
             )
             stopped = int(getattr(result, "returncode", 1)) == 0
             error = str(getattr(result, "stderr", "") or "WORKER_STOP_FAILED").strip() if not stopped else ""
+            if not stopped and "removal of container" in error and "is already in progress" in error:
+                # Do not reuse the name until Docker confirms removal has finished.
+                while True:
+                    remaining = stop_deadline - self.clock()
+                    if remaining <= 0:
+                        break
+                    inspection = self.run_command(
+                        ["docker", "container", "inspect", "--format", "{{.State.Status}}", container_name],
+                        timeout=remaining, check=False, capture_output=True, text=True,
+                    )
+                    if int(getattr(inspection, "returncode", 1)) != 0:
+                        detail = str(getattr(inspection, "stderr", "") or "").strip()
+                        stopped = detail in {
+                            f"Error: No such container: {container_name}",
+                            f"Error response from daemon: No such container: {container_name}",
+                        }
+                        if not stopped:
+                            error = detail or error
+                        break
+                    self.sleeper(min(0.5, max(0, stop_deadline - self.clock())))
         except Exception as exc:
             stopped = False
             error = str(exc)
@@ -1824,7 +1847,7 @@ class OnlineLinkedCoordinator:
                 parameter,
                 request,
                 zend,
-                canonical_callback=str(parent.get("canonical_callback") or ""),
+                canonical_callback=_canonical_callback_name(parent.get("canonical_callback")),
                 request_method=str(parent.get("resolved_method") or ""),
             )
         )
