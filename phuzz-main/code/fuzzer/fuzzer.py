@@ -24,6 +24,7 @@ from core.candidate import Candidate
 from core.mutator import DefaultMutator, EmptyQueueMutator, SingleMutator
 from core.scoring import DefaultScoringFormula
 from core.utils import fuzz_open
+from core.finding_artifact import build_finding_record, write_finding_artifact
 from fuzz_guidance.cmplog.hints import (
     apply_cmplog_hint,
     normalize_comparison_events,
@@ -327,6 +328,32 @@ class Fuzzer:
                 if not os.path.exists(vuln_info_file):
                     continue
                 shutil.copyfile(vuln_info_file, os.path.join(self.output_dir, f"{k}-{candidate.coverage_id}.json"))
+
+        run_id = os.environ.get("HOOKPHUZZ_LEGACY_RUN_ID", "") or f"fuzzer-{self.fuzzer_id}-{self.start_time}"
+        finding_records = []
+        for vuln_type, candidates in self.vulnerable_candidates.items():
+            for candidate in candidates:
+                finding_records.append(
+                    build_finding_record(candidate, vuln_type=vuln_type, run_id=run_id)
+                )
+
+        finding_path = os.environ.get("HOOKPHUZZ_FINDING_ARTIFACT", "")
+        if not finding_path:
+            safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip(".-") or "worker"
+            finding_path = os.path.join(
+                "/shared-tmpfs",
+                "fuzzer-findings",
+                f"{safe_run_id}.json",
+            )
+        try:
+            write_finding_artifact(
+                finding_path,
+                run_id=run_id,
+                fuzzer_id=self.fuzzer_id,
+                findings=finding_records,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"Could not save vulnerability finding artifact: {exc}")
 
         print("Vulnerable candidates saved!")
 

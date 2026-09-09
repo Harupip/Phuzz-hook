@@ -519,6 +519,7 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
             run_command=runner,
             list_artifacts=artifacts.list,
             load_artifact=artifacts.load,
+            finding_artifact_loader=lambda name: None,
         )
 
         self.assertEqual(report["runs"][0]["process_status"], "vuln_found")
@@ -526,6 +527,40 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
         self.assertEqual(report["runs"][0]["validation_status"], "callback_reached")
         self.assertEqual(report["counts"]["vuln_found"], 1)
         self.assertEqual(report["counts"]["process_failed"], 0)
+
+    def test_vulnerability_artifact_is_attached_to_vuln_found_run(self):
+        runner = FakeRunner([completed(57)])
+        artifacts = FakeArtifacts([set(), {"request-one.json"}], {
+            "request-one.json": {
+                "hook_coverage": {
+                    "registered_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                    "executed_callbacks": {"cb-one": {"callback_id": "cb-one", "fired_hook": "wp_ajax_nopriv_demo"}},
+                    "blindspot_callbacks": {},
+                }
+            }
+        })
+        finding = {
+            "run_id": "legacy-123",
+            "findings": [{
+                "vuln_type": "SQLi",
+                "mutated_param_name": "album_id",
+                "payload": "PAYLOAD",
+                "coverage_id": "coverage-123",
+            }],
+        }
+
+        report = run_generated_configs(
+            [generated_config()],
+            timeout_seconds=5,
+            legacy_run_id="legacy-123",
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=artifacts.load,
+            finding_artifact_loader=lambda name: finding,
+        )
+
+        self.assertEqual(report["runs"][0]["finding_artifact"], finding)
+        self.assertTrue(any("HOOKPHUZZ_FINDING_ARTIFACT=" in item for item in runner.commands[0]))
 
     def test_timeout_cleans_named_container_and_continues(self):
         runner = FakeRunner([subprocess.TimeoutExpired(["docker"], 5), completed(0)])

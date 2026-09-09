@@ -12,6 +12,8 @@ class FuzzerStopOnVulnContractTests(unittest.TestCase):
 
         self.assertIn('with open("/sync-tmpfs/vuln_found", "w") as f:', lines)
         self.assertIn('f.write(f"Found by {self.fuzzer_id} in {diff}s")', lines)
+        self.assertIn("write_finding_artifact(", source)
+        self.assertIn("HOOKPHUZZ_FINDING_ARTIFACT", source)
         self.assertIn("sys.exit(1337) #TODO: comment me out!", lines)
 
 

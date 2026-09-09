@@ -22,6 +22,7 @@ ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
 ProcessFactory = Callable[..., Any]
 REQUESTS_DIR = "/shared-tmpfs/hook-coverage/requests"
+FINDING_ARTIFACT_DIR = "/shared-tmpfs/fuzzer-findings"
 ZEND_ARTIFACTS_DIR = "/shared/opcode-events"
 STOP_ON_VULN_EXIT_CODE = 1337 % 256
 METHOD_PROVENANCE_FIELDS = (
@@ -93,6 +94,21 @@ def load_request_artifact(name: str) -> Any:
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"Could not read request artifact: {name}")
+    return json.loads(result.stdout)
+
+
+def load_finding_artifact(name: str) -> Any:
+    if Path(name).name != name:
+        raise ValueError(f"Invalid finding artifact name: {name}")
+    result = subprocess.run(
+        ["docker", "compose", "exec", "-T", "web", "cat", f"{FINDING_ARTIFACT_DIR}/{name}"],
+        timeout=30,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"Could not read finding artifact: {name}")
     return json.loads(result.stdout)
 
 
@@ -243,6 +259,7 @@ def run_generated_configs(
     run_command: CommandRunner = subprocess.run,
     list_artifacts: ArtifactLister = list_request_artifacts,
     load_artifact: ArtifactLoader = load_request_artifact,
+    finding_artifact_loader: ArtifactLoader = load_finding_artifact,
     stop_on_callback: bool = False,
     process_factory: ProcessFactory = subprocess.Popen,
     list_zend_artifacts: ArtifactLister = list_zend_artifacts,
@@ -273,6 +290,11 @@ def run_generated_configs(
             container_name,
             "-e",
             f"FUZZER_CONFIG={_runtime_config_slug(config)}",
+        ]
+        finding_artifact_name = _finding_artifact_name(legacy_run_id, container_name)
+        command += [
+            "-e",
+            f"HOOKPHUZZ_FINDING_ARTIFACT={FINDING_ARTIFACT_DIR}/{finding_artifact_name}",
         ]
         if legacy_run_id:
             command += ["-e", f"HOOKPHUZZ_LEGACY_RUN_ID={legacy_run_id}"]
@@ -317,6 +339,14 @@ def run_generated_configs(
             runs.append(_runner_error_row(config, container_name, started_at, str(exc)))
             continue
 
+        finding_artifact = None
+        finding_artifact_error = None
+        if process_status == "vuln_found":
+            try:
+                finding_artifact = finding_artifact_loader(finding_artifact_name)
+            except Exception as exc:
+                finding_artifact_error = str(exc)
+
         try:
             new_artifacts = sorted(list_artifacts() - artifacts_before)
             artifact_payloads = [(name, load_artifact(name)) for name in new_artifacts]
@@ -330,28 +360,32 @@ def run_generated_configs(
         matched_artifact = _matched_artifact(config, artifact_payloads)
         failure_category = _failure_category(process_status, validation["status"])
 
-        runs.append(
-            {
-                "config_slug": slug,
-                "config_path": config.get("config_path"),
-                "hook_name": config["hook_name"],
-                "callback_id": config["callback_id"],
-                "entrypoint_type": config.get("entrypoint_type"),
-                **_method_metadata(config),
-                "process_status": process_status,
-                "stop_reason": stop_reason,
-                "validation_status": validation["status"],
-                "validation_reason": validation["reason"],
-                "callback_reached": validation["expected_callback_reached"],
-                "failure_category": failure_category,
-                "requests_created": len(new_artifacts),
-                "request_artifacts": new_artifacts,
-                "matched_artifact": matched_artifact,
-                "exit_code": exit_code,
-                "duration_seconds": round(time.monotonic() - started_at, 3),
-                "container_name": container_name,
-            }
-        )
+        run_row = {
+            "config_slug": slug,
+            "config_path": config.get("config_path"),
+            "hook_name": config["hook_name"],
+            "callback_id": config["callback_id"],
+            "entrypoint_type": config.get("entrypoint_type"),
+            **_method_metadata(config),
+            "process_status": process_status,
+            "stop_reason": stop_reason,
+            "validation_status": validation["status"],
+            "validation_reason": validation["reason"],
+            "callback_reached": validation["expected_callback_reached"],
+            "failure_category": failure_category,
+            "requests_created": len(new_artifacts),
+            "request_artifacts": new_artifacts,
+            "matched_artifact": matched_artifact,
+            "exit_code": exit_code,
+            "duration_seconds": round(time.monotonic() - started_at, 3),
+            "container_name": container_name,
+        }
+        if process_status == "vuln_found":
+            run_row["finding_artifact"] = finding_artifact
+            run_row["finding_artifact_path"] = f"{FINDING_ARTIFACT_DIR}/{finding_artifact_name}"
+            if finding_artifact_error:
+                run_row["finding_artifact_error"] = finding_artifact_error
+        runs.append(run_row)
 
     expected_auth_skip = classify_expected_auth_skips(runs)
     statuses = (
@@ -488,6 +522,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _container_name(index: int, slug: str) -> str:
     safe_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", slug).strip(".-") or "config"
     return f"hookphuzz-generated-{index}-{safe_slug}"[:120]
+
+
+def _finding_artifact_name(legacy_run_id: str, container_name: str) -> str:
+    safe_run_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(legacy_run_id or "run")).strip(".-") or "run"
+    safe_container = re.sub(r"[^a-zA-Z0-9_.-]+", "-", container_name).strip(".-") or "worker"
+    return f"{safe_run_id}-{safe_container}.json"
 
 
 def _process_status(returncode: int) -> str:

@@ -22,6 +22,7 @@ from hook_energy.seed_generation.generated_config_runner import (
     STOP_ON_VULN_EXIT_CODE,
     list_request_artifacts,
     list_zend_artifacts,
+    load_finding_artifact,
     load_request_artifact,
     run_generated_configs,
 )
@@ -102,6 +103,7 @@ class OnlineLinkedCoordinator:
         run_command: CommandRunner = subprocess.run,
         list_artifacts: ArtifactLister = list_request_artifacts,
         load_artifact: ArtifactLoader = load_request_artifact,
+        load_finding_artifact: ArtifactLoader | None = None,
         list_zend_artifacts: ArtifactLister = list_zend_artifacts,
         load_zend_artifact: ArtifactLoader = _load_zend_artifact,
         build_config_fn: ConfigBuilder = build_config_for_seed_item,
@@ -134,6 +136,7 @@ class OnlineLinkedCoordinator:
         self.run_command = run_command
         self.list_artifacts = list_artifacts
         self.load_artifact = load_artifact
+        self.load_finding_artifact = load_finding_artifact
         self.list_zend_artifacts = list_zend_artifacts
         self.load_zend_artifact = load_zend_artifact
         self.build_config_fn = build_config_fn
@@ -264,6 +267,7 @@ class OnlineLinkedCoordinator:
     def _handle_worker_exit(self, worker_exit_code: int) -> None:
         version = self._version(self._active_version)
         if worker_exit_code == STOP_ON_VULN_EXIT_CODE:
+            self._attach_finding_artifact(version)
             if version is not None:
                 version["status"] = "vuln_found"
                 version["terminal_reason"] = "VULN_FOUND"
@@ -293,6 +297,28 @@ class OnlineLinkedCoordinator:
             self.state["terminal_reason"] = "WORKER_EXITED"
             self._active_container = ""
         self._write_state()
+
+    def _attach_finding_artifact(self, version: Mapping[str, Any] | None) -> None:
+        if version is None or self.load_finding_artifact is None:
+            return
+        run_id = str(version.get("worker_run_id") or "").strip()
+        if not run_id:
+            return
+        artifact_name = f"{run_id}.json"
+        artifact_path = f"/shared-tmpfs/fuzzer-findings/{artifact_name}"
+        try:
+            finding = self.load_finding_artifact(artifact_name)
+        except Exception as exc:
+            version["finding_artifact_path"] = artifact_path
+            version["finding_artifact_error"] = str(exc)
+            return
+        version["finding_artifact_path"] = artifact_path
+        version["finding_artifact"] = finding
+        for worker in reversed(self.state.get("workers", [])):
+            if worker.get("run_id") == run_id:
+                worker["finding_artifact_path"] = artifact_path
+                worker["finding_artifact"] = finding
+                break
 
     def _observe_parent_exit(self, *, timeout: float | None = None) -> int | None:
         exit_code = self._worker_exit_code(timeout=timeout)
@@ -1884,6 +1910,7 @@ class OnlineLinkedCoordinator:
             "-e", f"FUZZER_CONFIG={runtime_slug}",
             "-e", f"FUZZER_NODE_ID={1 + int(version_name[1:])}",
             "-e", f"HOOKPHUZZ_LEGACY_RUN_ID={worker_run_id}",
+            "-e", f"HOOKPHUZZ_FINDING_ARTIFACT=/shared-tmpfs/fuzzer-findings/{worker_run_id}.json",
             "-e", "HOOKPHUZZ_CMPLOG=1",
             self.service,
         ]
@@ -2313,6 +2340,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 max_versions=args.max_versions,
                 registry_path=batch_registry,
                 service=args.service,
+                load_finding_artifact=load_finding_artifact,
                 campaign_deadline=campaign_deadline,
             )
             result = coordinator.run()

@@ -913,6 +913,16 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log: list[str] = []
             coordinator = self.make_coordinator(Path(tmp), log)
+            finding = {
+                "run_id": "run-v0",
+                "findings": [{
+                    "vuln_type": "SQLi",
+                    "mutated_param_name": "album_id",
+                    "payload": "PAYLOAD",
+                    "coverage_id": "coverage-123",
+                }],
+            }
+            coordinator.load_finding_artifact = lambda name: finding
 
             def run_command(command, **kwargs):
                 if command[:2] == ["docker", "inspect"]:
@@ -927,6 +937,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator.run(), 0)
             self.assertEqual(coordinator.state["terminal_status"], "VULN_FOUND")
             self.assertEqual(coordinator.state["versions"][-1]["status"], "vuln_found")
+            self.assertEqual(coordinator.state["versions"][-1]["finding_artifact"], finding)
+            self.assertTrue(any("HOOKPHUZZ_FINDING_ARTIFACT=" in item for item in coordinator.state["workers"][0]["command"]))
             self.assertIn("worker_stop", log)
 
     def make_coordinator(
