@@ -235,7 +235,7 @@ if ($UseZendDiscovery -and $Mode -notin @("zend", "online", "online-linked")) {
 
 if (-not $PSBoundParameters.ContainsKey("PluginSlug")) {
     if ($interactive) {
-        $PluginSlug = Read-PluginSlug -RequireConfig ($Mode -notin @("generated", "zend"))
+        $PluginSlug = Read-PluginSlug -RequireConfig ($Mode -notin @("generated", "zend", "online", "online-linked"))
     } else {
         $PluginSlug = "show-all-comments-in-one-page"
     }

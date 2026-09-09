@@ -57,7 +57,7 @@ if (($RunOnline -or $RunOnlineLinked) -and -not $UseZendDiscovery) {
 }
 
 if (-not $BootstrapConfigSlug) {
-    if ($RunGeneratedConfigs) {
+    if ($RunGeneratedConfigs -or $RunOnline -or $RunOnlineLinked) {
         $BootstrapConfigSlug = "wordpress/bootstrap-generated"
     } else {
         $BootstrapConfigSlug = "wordpress/$PluginSlug"
@@ -425,7 +425,8 @@ function Invoke-LearnPressNonceEval {
     if ($callbackClass -notmatch '^[A-Za-z_][A-Za-z0-9_\\]*$') {
         throw "LearnPress admin-post proof blocked: runtime callback class is unsafe."
     }
-    $eval = '$action = (string) getenv("HOOKPHUZZ_NONCE_ACTION"); $core_nonce = wp_create_nonce($action); $ref = new ReflectionClass((string) getenv("HOOKPHUZZ_CALLBACK_CLASS")); $instance_method = $ref->getMethod("instance"); $instance_method->setAccessible(true); $instance = $instance_method->invoke(null); $nonce_method = $ref->getMethod("create_async_nonce"); $nonce_method->setAccessible(true); echo wp_json_encode(array("learnpress_nonce" => $nonce_method->invoke($instance), "core_nonce" => $core_nonce, "verification_result" => wp_verify_nonce($core_nonce, $action), "authenticated_user_id" => (int) get_current_user_id(), "authenticated" => (bool) is_user_logged_in(), "session_token_present" => wp_get_session_token() !== ""));'
+    $eval = '<?php $action = (string) getenv("HOOKPHUZZ_NONCE_ACTION"); $core_nonce = wp_create_nonce($action); $ref = new ReflectionClass((string) getenv("HOOKPHUZZ_CALLBACK_CLASS")); $instance_method = $ref->getMethod("instance"); $instance_method->setAccessible(true); $instance = $instance_method->invoke(null); $nonce_method = $ref->getMethod("create_async_nonce"); $nonce_method->setAccessible(true); echo wp_json_encode(array("learnpress_nonce" => $nonce_method->invoke($instance), "core_nonce" => $core_nonce, "verification_result" => wp_verify_nonce($core_nonce, $action), "authenticated_user_id" => (int) get_current_user_id(), "authenticated" => (bool) is_user_logged_in(), "session_token_present" => wp_get_session_token() !== ""));'
+    $evalBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($eval))
     $webContainerId = (& docker compose -f docker-compose.yml ps -q web).Trim()
     if ([string]::IsNullOrWhiteSpace($webContainerId)) {
         throw "LearnPress admin-post proof blocked: web container ID is unavailable for nonce eval."
@@ -433,7 +434,7 @@ function Invoke-LearnPressNonceEval {
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $raw = & docker exec -e HOOKPHUZZ_STRICT_NONCE_PROOF=1 -e "HOOKPHUZZ_NONCE_ACTION=$NonceAction" -e "HOOKPHUZZ_CALLBACK_CLASS=$callbackClass" $webContainerId /var/www/html/wp-cli.phar eval --allow-root $eval 2>&1
+        $raw = & docker exec -e HOOKPHUZZ_STRICT_NONCE_PROOF=1 -e "HOOKPHUZZ_NONCE_ACTION=$NonceAction" -e "HOOKPHUZZ_CALLBACK_CLASS=$callbackClass" -e "HOOKPHUZZ_NONCE_EVAL_B64=$evalBase64" $webContainerId sh -lc 'printf %s "$HOOKPHUZZ_NONCE_EVAL_B64" | base64 -d | /var/www/html/wp-cli.phar eval-file --allow-root -' 2>&1
         $evalExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference

@@ -36,6 +36,14 @@ class LearnPressAdminPostProofContractTests(unittest.TestCase):
         self.assertIn("HOOKPHUZZ_STRICT_NONCE_PROOF", override)
         self.assertIn("if ( getenv( 'HOOKPHUZZ_STRICT_NONCE_PROOF' ) !== '1' )", override)
 
+    def test_learnpress_nonce_eval_preserves_php_quotes_across_native_call(self) -> None:
+        script = SCRIPT.read_text(encoding="utf-8-sig")
+
+        self.assertIn("[Convert]::ToBase64String", script)
+        self.assertIn("HOOKPHUZZ_NONCE_EVAL_B64", script)
+        self.assertIn("base64 -d", script)
+        self.assertNotIn("eval --allow-root $eval 2>&1", script)
+
     def test_learnpress_final_replay_keeps_action_and_nonce_out_of_fuzzable_params(self) -> None:
         script = SCRIPT.read_text(encoding="utf-8-sig")
 

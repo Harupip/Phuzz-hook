@@ -220,6 +220,24 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn('"HOOKPHUZZ_CMPLOG=1"', (CODE_DIR / "fuzzer" / "hook_energy" / "seed_generation" / "online_linked_coordinator.py").read_text(encoding="utf-8"))
         self.assertIn("$env:COMPOSE_FILE", script)
 
+    def test_guided_wrapper_online_modes_allow_any_local_plugin_zip(self):
+        script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")
+
+        self.assertIn(
+            '$Mode -notin @("generated", "zend", "online", "online-linked")',
+            script,
+        )
+
+    def test_wordpress_runner_uses_shared_bootstrap_for_online_modes(self):
+        script = (CODE_DIR / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+
+        self.assertIn(
+            'if ($RunGeneratedConfigs -or $RunOnline -or $RunOnlineLinked)',
+            script,
+        )
+
     def test_guided_wrapper_rejects_online_entrypoint_pipeline(self):
         result = subprocess.run(
             [
