@@ -109,6 +109,130 @@ def list_zend_artifacts() -> set[str]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
+def read_correlated_artifact_pair(
+    request_dir: Path,
+    zend_dir: Path,
+    *,
+    request_id: str,
+    run_id: str,
+    expected: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Read one complete request/Zend pair from already-mounted directories."""
+    expected = expected if isinstance(expected, Mapping) else {}
+    request_id = str(request_id).strip()
+    run_id = str(run_id).strip()
+    if (
+        not request_id
+        or not run_id
+        or request_id in {".", ".."}
+        or re.fullmatch(r"[A-Za-z0-9_.-]+", request_id) is None
+        or Path(request_id).name != request_id
+        or ".tmp" in request_id
+    ):
+        return None
+
+    request_path = Path(request_dir) / f"{request_id}.json"
+    zend_path = Path(zend_dir) / f"{request_id}.json"
+    try:
+        request_payload = json.loads(request_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(request_payload, Mapping):
+        return None
+    if str(request_payload.get("request_id") or "").strip() != request_id:
+        return None
+    if str(request_payload.get("legacy_run_id") or request_payload.get("run_id") or "").strip() != run_id:
+        return None
+    response = request_payload.get("response")
+    if not isinstance(response, Mapping):
+        return None
+    try:
+        if int(response.get("status_code")) != 200:
+            return None
+    except (TypeError, ValueError):
+        return None
+    if expected.get("plugin_slug") and str(request_payload.get("target_plugin") or "") != str(expected["plugin_slug"]):
+        return None
+    if expected.get("hook_name") or expected.get("callback_id"):
+        coverage = request_payload.get("hook_coverage")
+        if not _artifact_matches_callback(
+            request_payload,
+            coverage if isinstance(coverage, Mapping) else {},
+            hook_name=str(expected.get("hook_name") or ""),
+            callback_id=str(expected.get("callback_id") or ""),
+        ):
+            return None
+    if expected.get("method") and str(request_payload.get("http_method") or "").upper() != str(expected["method"]).upper():
+        return None
+    auth_context = request_payload.get("auth_context")
+    if auth_context is None:
+        request_params = request_payload.get("request_params")
+        headers = request_params.get("headers") if isinstance(request_params, Mapping) else {}
+        if isinstance(headers, Mapping):
+            auth_context = next(
+                (value for name, value in headers.items()
+                 if str(name).lower() == "x-hookphuzz-auth-context"),
+                None,
+            )
+    if expected.get("auth_context") and str(auth_context or "") != str(expected["auth_context"]):
+        return None
+
+    try:
+        zend_payload = json.loads(zend_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(zend_payload, Mapping):
+        return None
+    if str(zend_payload.get("request_id") or "").strip() != request_id:
+        return None
+    if str(zend_payload.get("run_id") or zend_payload.get("legacy_run_id") or "").strip() != run_id:
+        return None
+    return {
+        "request_name": request_path.name,
+        "request": dict(request_payload),
+        "zend_name": zend_path.name,
+        "zend": dict(zend_payload),
+    }
+
+
+def _artifact_matches_callback(
+    request_payload: Mapping[str, Any],
+    coverage: Mapping[str, Any],
+    *,
+    hook_name: str,
+    callback_id: str,
+) -> bool:
+    """Match callback identity from either legacy top-level or hook coverage fields."""
+    if request_payload.get("hook_name") or request_payload.get("callback_id"):
+        return (
+            (not hook_name or str(request_payload.get("hook_name") or "") == hook_name)
+            and (not callback_id or str(request_payload.get("callback_id") or "") == callback_id)
+        )
+    entries: list[tuple[str, Mapping[str, Any]]] = []
+    for bucket in ("registered_callbacks", "executed_callbacks"):
+        mapping = coverage.get(bucket)
+        if not isinstance(mapping, Mapping):
+            continue
+        entries.extend(
+            (str(key), entry) for key, entry in mapping.items() if isinstance(entry, Mapping)
+        )
+    for key, entry in entries:
+        entry_ids = {key}
+        if entry.get("callback_id"):
+            entry_ids.add(str(entry["callback_id"]))
+        entry_hooks = {
+            str(entry.get(field) or "")
+            for field in ("hook_name", "fired_hook")
+            if entry.get(field)
+        }
+        if callback_id and callback_id not in entry_ids:
+            continue
+        if hook_name and hook_name not in entry_hooks:
+            continue
+        return True
+    return not hook_name and not callback_id
+
+
 def run_generated_configs(
     generated_configs: Sequence[Mapping[str, str]],
     *,

@@ -49,6 +49,7 @@ services:
     volumes:
       - ./web/applications:/applications/
       - shared-tmpfs:/shared-tmpfs
+      - shared-tmpfs:/shared
     ports:
       - 8080:80
       - 8181:8181
@@ -79,6 +80,7 @@ services:
     volumes:
       - ./fuzzer:/app
       - shared-tmpfs:/shared-tmpfs
+      - shared-tmpfs:/shared
       - sync-tmpfs-wordpress-plugin:/sync-tmpfs
 
 

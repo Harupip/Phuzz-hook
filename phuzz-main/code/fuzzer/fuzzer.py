@@ -32,6 +32,122 @@ from fuzz_guidance.cmplog.hints import (
 #def print(*args, **kwargs):
 #    pass
 
+
+def _request_auth_context_from_config(config):
+    metadata = config.get('metadata') or {}
+    hook = str(metadata.get('hook_name') or config.get('hook_name') or '')
+    entrypoint = str(config.get('entrypoint_type') or metadata.get('entrypoint_type') or '')
+    if (hook.startswith(('wp_ajax_nopriv_', 'admin_post_nopriv_'))
+            or hook == 'heartbeat_nopriv_received'
+            or entrypoint in {'ajax_unauthenticated', 'admin_post_unauthenticated'}):
+        return 'guest'
+    context = metadata.get('auth_context', 'authenticated')
+    if context not in {'guest', 'authenticated'}:
+        raise ValueError('unsupported auth_context')
+    return context
+
+
+def _disable_auth_cookies_from_config(config):
+    if _request_auth_context_from_config(config) == 'guest':
+        return True
+    metadata = config.get('metadata') if isinstance(config, dict) else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    auth_mode = str(metadata.get('auth_mode') or config.get('auth_mode') or '').strip().lower()
+    if auth_mode in {'unauth-capable', 'unauthenticated', 'nopriv', 'public'}:
+        return True
+    if auth_mode in {'authenticated', 'auth'}:
+        return False
+    hook_name = str(metadata.get('hook_name') or config.get('hook_name') or '')
+    return hook_name.startswith('wp_ajax_nopriv_')
+
+
+def _without_auth_cookies(cookies):
+    return {
+        name: value for name, value in cookies.items()
+        if not (str(name).startswith('wordpress_') and str(name) != 'wordpress_test_cookie')
+    }
+
+
+def _prepare_request(
+    config, *, base_url, http_method, fuzz_params, fixed_params, request_id, run_id,
+    force_run_id=False,
+):
+    url_parts = list(urlparse.urlparse(base_url))
+    query = dict(urlparse.parse_qsl(url_parts[4]))
+    url_parts[4] = ''
+
+    the_params = {**query, **fuzz_params['query_params'], **fixed_params['query_params']}
+    the_body_params = {**fuzz_params['body_params'], **fixed_params['body_params']}
+    the_cookies = {**fuzz_params['cookies'], **fixed_params['cookies']}
+    if _disable_auth_cookies_from_config(config):
+        the_cookies = _without_auth_cookies(the_cookies)
+    the_headers = {**fuzz_params['headers'], **fixed_params['headers']}
+    auth_context = _request_auth_context_from_config(config)
+    the_headers = {name: value for name, value in the_headers.items()
+                   if name.lower() != 'x-hookphuzz-auth-context'
+                   and not (auth_context == 'guest' and name.lower() == 'cookie')}
+    the_headers['X-HookPhuzz-Auth-Context'] = auth_context
+    the_headers['X-Fuzzer-Covid'] = request_id
+    the_headers['X-HookPhuzz-Request-ID'] = request_id
+    if run_id:
+        if force_run_id:
+            the_headers['X-HookPhuzz-Run-ID'] = run_id
+        else:
+            the_headers.setdefault('X-HookPhuzz-Run-ID', run_id)
+
+    if http_method in ['GET', 'OPTIONS', 'TRACE']:
+        req = requests.Request(method=http_method, url=urlparse.urlunparse(url_parts),
+                                params=the_params, cookies=the_cookies, headers=the_headers)
+    elif http_method in ['POST', 'PUT', 'PATCH', 'DELETE']:
+        content_type = the_headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+        kwargs = {'method': http_method, 'url': urlparse.urlunparse(url_parts),
+                  'params': the_params, 'cookies': the_cookies, 'headers': the_headers}
+        if content_type == 'application/json':
+            kwargs['json'] = the_body_params
+        else:
+            kwargs['data'] = the_body_params
+        req = requests.Request(**kwargs)
+    else:
+        raise Exception('Unknown HTTP method!')
+    return req.prepare()
+
+
+def _config_request_params(config):
+    params = {bucket: {} for bucket in ('headers', 'cookies', 'query_params', 'body_params')}
+    for bucket in params:
+        section = config.get(bucket) or {}
+        if not isinstance(section, dict):
+            raise ValueError(f'Config parsing error: invalid {bucket}')
+        for item in section.get('data', []):
+            if not isinstance(item, dict) or not item.get('name'):
+                raise ValueError(f'Config parsing error: invalid {bucket} data')
+            if 'value' in item:
+                value = item['value']
+            elif item.get('seeds'):
+                value = item['seeds'][0]
+            else:
+                raise ValueError(f"Neither seeds nor value for param {item['name']}")
+            params[bucket][item['name']] = value
+    return params
+
+
+def prepare_request_from_config(config, *, request_id, run_id):
+    params = _config_request_params(config)
+    metadata = config.get('metadata') or {}
+    methods = config.get('methods') or []
+    http_method = str(metadata.get('resolved_method') or (methods[0] if methods else '')).upper()
+    return _prepare_request(
+        config,
+        base_url=config['target'],
+        http_method=http_method,
+        fuzz_params={bucket: {} for bucket in params},
+        fixed_params=params,
+        request_id=str(request_id),
+        run_id=str(run_id),
+        force_run_id=True,
+    )
+
 class Fuzzer:
     def __init__(self, fuzzer_id, config_only=False):
 
@@ -536,100 +652,25 @@ class Fuzzer:
             return False
 
     def prepare_request(self, candidate):
-        base_url = candidate.http_target
-
-        # based on https://stackoverflow.com/a/2506477
-        url_parts = list(urlparse.urlparse(base_url))
-        query = dict(urlparse.parse_qsl(url_parts[4]))
-        url_parts[4] = '' # reset query string, which we will set using params={...}
-
-        the_params = {**query, **candidate.fuzz_params['query_params'], **candidate.fixed_params['query_params']}
-        the_body_params = {**candidate.fuzz_params['body_params'], **candidate.fixed_params['body_params']}
-        the_cookies = {**candidate.fuzz_params['cookies'], **candidate.fixed_params['cookies']} # self._urlencode_dict()
-        if self._disable_auth_cookies():
-            the_cookies = self._without_auth_cookies(the_cookies)
-        the_headers = {**candidate.fuzz_params['headers'], **candidate.fixed_params['headers']}
-        auth_context = self._request_auth_context()
-        the_headers = {name: value for name, value in the_headers.items()
-                       if name.lower() != 'x-hookphuzz-auth-context'
-                       and not (auth_context == 'guest' and name.lower() == 'cookie')}
-        the_headers['X-HookPhuzz-Auth-Context'] = auth_context
-        the_headers["X-Fuzzer-Covid"] = candidate.coverage_id
-        the_headers["X-HookPhuzz-Request-ID"] = candidate.coverage_id
         legacy_run_id = os.environ.get("HOOKPHUZZ_LEGACY_RUN_ID", "")
-        if legacy_run_id:
-            the_headers.setdefault("X-HookPhuzz-Run-ID", legacy_run_id)
-
-        # print({
-        #     'query': the_params,
-        #     'cookies': the_cookies,
-        #     'headers': the_headers,
-        #     'body': the_body_params    
-        #     })
-
-        if candidate.http_method in ["GET", "OPTIONS", "TRACE"]:
-            req = requests.Request(method=candidate.http_method, 
-                                    url=urlparse.urlunparse(url_parts),
-                                    params=the_params,
-                                    cookies=the_cookies,
-                                    headers=the_headers)
-
-        elif candidate.http_method in ["POST", "PUT", "PATCH", "DELETE"]:
-            content_type = the_headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
-            if content_type == 'application/json':
-                req = requests.Request(method=candidate.http_method, 
-                                    url=urlparse.urlunparse(url_parts),
-                                    params=the_params,
-                                    cookies=the_cookies,
-                                    headers=the_headers,
-                                    json=the_body_params)
-            else:
-                req = requests.Request(method=candidate.http_method, 
-                                    url=urlparse.urlunparse(url_parts),
-                                    params=the_params,
-                                    cookies=the_cookies,
-                                    headers=the_headers,
-                                    data=the_body_params)
-
-        else:
-            raise Exception("Unknown HTTP method!")
-
-        prepared = req.prepare()
-
-        return prepared
+        return _prepare_request(
+            self.config,
+            base_url=candidate.http_target,
+            http_method=candidate.http_method,
+            fuzz_params=candidate.fuzz_params,
+            fixed_params=candidate.fixed_params,
+            request_id=candidate.coverage_id,
+            run_id=legacy_run_id,
+        )
 
     def _request_auth_context(self):
-        metadata = self.config.get('metadata') or {}
-        hook = str(metadata.get('hook_name') or self.config.get('hook_name') or '')
-        entrypoint = str(self.config.get('entrypoint_type') or metadata.get('entrypoint_type') or '')
-        if (hook.startswith(('wp_ajax_nopriv_', 'admin_post_nopriv_'))
-                or hook == 'heartbeat_nopriv_received'
-                or entrypoint in {'ajax_unauthenticated', 'admin_post_unauthenticated'}):
-            return 'guest'
-        context = metadata.get('auth_context', 'authenticated')
-        if context not in {'guest', 'authenticated'}:
-            raise ValueError('unsupported auth_context')
-        return context
+        return _request_auth_context_from_config(self.config)
 
     def _disable_auth_cookies(self):
-        if self._request_auth_context() == 'guest':
-            return True
-        metadata = self.config.get("metadata") if isinstance(self.config, dict) else {}
-        if not isinstance(metadata, dict):
-            metadata = {}
-        auth_mode = str(metadata.get("auth_mode") or self.config.get("auth_mode") or "").strip().lower()
-        if auth_mode in {"unauth-capable", "unauthenticated", "nopriv", "public"}:
-            return True
-        if auth_mode in {"authenticated", "auth"}:
-            return False
-        hook_name = str(metadata.get("hook_name") or self.config.get("hook_name") or "")
-        return hook_name.startswith("wp_ajax_nopriv_")
+        return _disable_auth_cookies_from_config(self.config)
 
     def _without_auth_cookies(self, cookies):
-        return {
-            name: value for name, value in cookies.items()
-            if not (str(name).startswith('wordpress_') and str(name) != 'wordpress_test_cookie')
-        }
+        return _without_auth_cookies(cookies)
 
     def run(self):
         self.load_request_data()
@@ -972,6 +1013,11 @@ class Fuzzer:
 
 if __name__ == "__main__":
     #time.sleep(10)
+
+    if "--online-linked-probe" in sys.argv:
+        from hook_energy.seed_generation.probe_sender import main as probe_main
+        probe_index = sys.argv.index("--online-linked-probe")
+        raise SystemExit(probe_main(sys.argv[probe_index + 1:]))
 
     if "FUZZER_SEED" in os.environ:
         random_seed = int(os.environ["FUZZER_SEED"])

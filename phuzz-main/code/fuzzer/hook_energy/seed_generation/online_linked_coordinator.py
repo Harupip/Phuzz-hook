@@ -25,6 +25,11 @@ from hook_energy.seed_generation.generated_config_runner import (
     load_request_artifact,
     run_generated_configs,
 )
+from hook_energy.seed_generation.probe_sender import (
+    ParentInspectionError,
+    ParentInspectionTimeout,
+    run_in_container,
+)
 from hook_energy.seed_generation.online_config_runner import (
     OnlineCoordinator,
     _load_zend_artifact,
@@ -56,6 +61,7 @@ TargetLister = Callable[..., list[dict[str, Any]]]
 MaterializeRunner = Callable[..., dict[str, Any]]
 Exporter = Callable[..., dict[str, Any]]
 ReplayRunner = Callable[..., dict[str, Any]]
+ProbeSender = Callable[..., dict[str, Any]]
 Pass2Verifier = Callable[..., dict[str, int]]
 ConfigBuilder = Callable[..., tuple[str, dict[str, Any]]]
 
@@ -105,6 +111,8 @@ class OnlineLinkedCoordinator:
         export_configs_fn: Exporter = export_seed_configs,
         force_replay_only_fn: Callable[[dict[str, Any]], None] = _force_replay_only,
         replay_runner: ReplayRunner = run_generated_configs,
+        probe_sender: ProbeSender = run_in_container,
+        process_factory: Callable[..., Any] = subprocess.Popen,
         verify_pass2_fn: Pass2Verifier = verify_pass2_contract,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
@@ -135,6 +143,8 @@ class OnlineLinkedCoordinator:
         self.export_configs_fn = export_configs_fn
         self.force_replay_only_fn = force_replay_only_fn
         self.replay_runner = replay_runner
+        self.probe_sender = probe_sender
+        self.process_factory = process_factory
         self.verify_pass2_fn = verify_pass2_fn
         self.clock = clock
         self.sleeper = sleeper
@@ -216,6 +226,11 @@ class OnlineLinkedCoordinator:
                 return 1
 
             while self.clock() < deadline:
+                worker_exit_code = self._observe_parent_exit()
+                if worker_exit_code is not None:
+                    if worker_exit_code == STOP_ON_VULN_EXIT_CODE:
+                        return 1 if self._failure else 0
+                    return 1
                 for evidence in self.read_new_runtime_evidence(deadline=deadline):
                     self.advance_online_version(evidence, deadline=deadline)
                     if self.state["terminal_reason"] == "WORKER_STOP_FAILED" or not self._active_container:
@@ -224,26 +239,10 @@ class OnlineLinkedCoordinator:
                     break
                 worker_exit_code = self._worker_exit_code()
                 if worker_exit_code is not None:
-                    version = self._version(self._active_version)
+                    self._handle_worker_exit(worker_exit_code)
                     if worker_exit_code == STOP_ON_VULN_EXIT_CODE:
-                        if version is not None:
-                            version["status"] = "vuln_found"
-                            version["terminal_reason"] = "VULN_FOUND"
-                        self.state["terminal_status"] = "VULN_FOUND"
-                        self.state["terminal_reason"] = "VULN_FOUND"
-                        self._stop_active_worker("VULN_FOUND")
-                        self._write_state()
                         return 1 if self._failure else 0
-                    if worker_exit_code != 0:
-                        self._failure = True
-                        if version is not None:
-                            version["status"] = "worker_failed"
-                            version["terminal_reason"] = f"WORKER_EXIT_CODE_{worker_exit_code}"
-                        self.state["terminal_status"] = "NOT_VERIFIED"
-                        self.state["terminal_reason"] = f"WORKER_EXIT_CODE_{worker_exit_code}"
-                        self._stop_active_worker("WORKER_FAILED")
-                        self._write_state()
-                        return 1
+                    return 1
                 remaining = deadline - self.clock()
                 if remaining > 0:
                     self.sleeper(min(0.5, remaining))
@@ -261,6 +260,111 @@ class OnlineLinkedCoordinator:
             self._write_state()
             self._stop_active_worker("COORDINATOR_ERROR")
             return 1
+
+    def _handle_worker_exit(self, worker_exit_code: int) -> None:
+        version = self._version(self._active_version)
+        if worker_exit_code == STOP_ON_VULN_EXIT_CODE:
+            if version is not None:
+                version["status"] = "vuln_found"
+                version["terminal_reason"] = "VULN_FOUND"
+            self.state["terminal_status"] = "VULN_FOUND"
+            self.state["terminal_reason"] = "VULN_FOUND"
+            self._stop_active_worker("VULN_FOUND")
+        elif worker_exit_code != 0:
+            self._failure = True
+            if version is not None:
+                version["status"] = "worker_failed"
+                version["terminal_reason"] = f"WORKER_EXIT_CODE_{worker_exit_code}"
+            self.state["terminal_status"] = "NOT_VERIFIED"
+            self.state["terminal_reason"] = f"WORKER_EXIT_CODE_{worker_exit_code}"
+            self._stop_active_worker("WORKER_FAILED")
+        else:
+            self._failure = True
+            if version is not None:
+                version["status"] = "worker_exited"
+                version["worker_status"] = "exited"
+                version["terminal_reason"] = "WORKER_EXITED"
+            for worker in reversed(self.state["workers"]):
+                if worker.get("container_name") == self._active_container:
+                    worker["status"] = "exited"
+                    worker["terminal_reason"] = "WORKER_EXITED"
+                    break
+            self.state["terminal_status"] = "NOT_VERIFIED"
+            self.state["terminal_reason"] = "WORKER_EXITED"
+            self._active_container = ""
+        self._write_state()
+
+    def _observe_parent_exit(self, *, timeout: float | None = None) -> int | None:
+        exit_code = self._worker_exit_code(timeout=timeout)
+        if exit_code is not None:
+            self._handle_worker_exit(exit_code)
+        return exit_code
+
+    def _run_light_sender(
+        self,
+        *,
+        config_path: Path,
+        request_id: str,
+        run_id: str,
+        hook_name: str,
+        callback_id: str,
+        method: str,
+        auth_context: str,
+        deadline: float | None,
+        seed_variant_id: str = "",
+    ) -> dict[str, Any]:
+        if not self._active_container:
+            return {"status": "parent_container_missing", "error": "PARENT_CONTAINER_MISSING"}
+        timeout = self.max_seconds
+        if deadline is not None:
+            timeout = min(30, max(0, deadline - self.clock()))
+        if timeout <= 0:
+            return {"status": "timeout", "error": "SENDER_BUDGET_EXPIRED"}
+        config_slug = config_path.relative_to(self.config_root).with_suffix("").as_posix()
+        result = self.probe_sender(
+            self._active_container,
+            config_slug=config_slug,
+            request_id=request_id,
+            run_id=run_id,
+            timeout_seconds=timeout,
+            expected={
+                "plugin_slug": self.plugin_slug,
+                "hook_name": hook_name,
+                "callback_id": callback_id,
+                "method": method,
+                "auth_context": auth_context,
+                "seed_variant_id": seed_variant_id,
+            },
+            process_factory=self.process_factory,
+            parent_exit_code=self._worker_exit_code,
+            clock=self.clock,
+            sleeper=self.sleeper,
+        )
+        return dict(result) if isinstance(result, Mapping) else {"status": "sender_invalid"}
+
+    @staticmethod
+    def _sender_runner_row(base: Mapping[str, Any], result: Mapping[str, Any], run_id: str) -> dict[str, Any]:
+        reached = result.get("status") == "callback_reached" or result.get("callback_reached") is True
+        status = "stopped_on_callback" if reached else (
+            "window_elapsed" if result.get("status") == "timeout" else "failed"
+        )
+        row = {
+            **dict(base),
+            "legacy_run_id": run_id,
+            "process_status": status,
+            "callback_reached": reached,
+            "validation_status": result.get("validation_status") or (
+                "callback_reached" if reached else "registered_not_executed"
+            ),
+            "validation_reason": result.get("validation_reason") or result.get("error") or "",
+            "matched_artifact": result.get("request_name"),
+            "request_artifacts": [result["request_name"]] if result.get("request_name") else [],
+            "zend_artifact": result.get("zend_name"),
+            "request_payload": result.get("request"),
+            "zend_payload": result.get("zend"),
+            "timing": dict(result.get("timing") or {}),
+        }
+        return row
 
     def _candidate_deadline(self) -> float:
         candidate_deadline = self.clock() + self.max_seconds
@@ -1029,6 +1133,7 @@ class OnlineLinkedCoordinator:
             "probe_id": probe_id, "parent_version": parent["version"],
             "request_id": evidence.get("request_id"), "status": "exporting",
             "candidate": dict(probe), "probe_run_id": probe_run_id, "dedupe_key": dedupe_key,
+            "_started_at": self.clock(),
         }
         attempts.append(attempt)
         self._write_state()
@@ -1092,8 +1197,6 @@ class OnlineLinkedCoordinator:
             "request_id": evidence.get("request_id"), "probe_id": probe_id,
             "probe_run_id": probe_run_id, "candidate": dict(probe),
         })
-        if not self._stop_worker(parent, "PARAMETER_PROBE"):
-            return self._finish_probe_failure(parent, evidence, attempt, "WORKER_STOP_FAILED", deadline)
         probe_seed = probe_item.get("seed") if isinstance(probe_item.get("seed"), Mapping) else {}
         probe_row = {
             "config_slug": replay_path.relative_to(self.config_root).with_suffix("").as_posix(),
@@ -1103,29 +1206,80 @@ class OnlineLinkedCoordinator:
             "resolved_method": str(probe_seed.get("resolved_method") or probe_seed.get("method") or parent["resolved_method"]),
             "seed_variant_id": str(probe_seed.get("seed_variant_id") or ""),
         }
-        timeout = self.max_seconds
-        if deadline is not None:
-            timeout = min(30, int(deadline - self.clock()))
-        if timeout < 1:
+        timeout = deadline - self.clock() if deadline is not None else self.max_seconds
+        if timeout <= 0:
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_BUDGET_EXPIRED", deadline)
         try:
-            probe_report = self.replay_runner(
-                [probe_row], timeout_seconds=timeout, service=self.service,
-                legacy_run_id=probe_run_id, run_command=self.run_command,
-                list_artifacts=self.list_artifacts, load_artifact=self.load_artifact,
-                list_zend_artifacts=self.list_zend_artifacts, poll_interval_seconds=0,
-                fuzzer_node_id=100 + len(attempts), stop_on_callback=True,
+            sender_result = self._run_light_sender(
+                config_path=replay_path,
+                request_id=f"{probe_run_id}-request",
+                run_id=probe_run_id,
+                hook_name=probe_row["hook_name"],
+                callback_id=probe_row["callback_id"],
+                method=probe_row["resolved_method"],
+                auth_context=str(probe_config.get("metadata", {}).get("auth_context") or "authenticated"),
+                seed_variant_id=probe_row["seed_variant_id"],
+                deadline=deadline,
             )
         except Exception as exc:
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_REPLAY_FAILED", deadline, detail=str(exc))
-        rows = probe_report.get("runs", []) if isinstance(probe_report, Mapping) else []
-        replay_row = rows[0] if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], Mapping) else {}
+        if sender_result.get("status") == "parent_stopped":
+            exit_code = sender_result.get("parent_exit_code")
+            if isinstance(exit_code, int):
+                self._handle_worker_exit(exit_code)
+            return self._finish_probe_failure(
+                parent, evidence, attempt, "PARENT_WORKER_EXITED_DURING_PROBE", deadline,
+                detail=str(sender_result.get("error") or "parent worker exited"),
+            )
+        if sender_result.get("status") == "parent_container_missing":
+            self._failure = True
+            self._active_container = ""
+            self.state["terminal_status"] = "NOT_VERIFIED"
+            self.state["terminal_reason"] = "PARENT_CONTAINER_MISSING"
+            return self._finish_probe_failure(
+                parent, evidence, attempt, "PARENT_CONTAINER_MISSING", deadline,
+                detail=str(sender_result.get("error") or "PARENT_CONTAINER_MISSING"),
+            )
+        if sender_result.get("status") in {"parent_check_timeout", "parent_check_error"}:
+            reason = "PARENT_CHECK_TIMEOUT" if sender_result.get("status") == "parent_check_timeout" else "PARENT_CHECK_ERROR"
+            return self._finish_probe_failure(
+                parent, evidence, attempt, reason, deadline,
+                detail=str(sender_result.get("error") or reason),
+            )
+        parent_timeout = None if deadline is None else deadline - self.clock()
+        if parent_timeout is not None and parent_timeout <= 0:
+            return self._finish_probe_failure(
+                parent, evidence, attempt, "PROBE_BUDGET_EXPIRED", deadline,
+            )
+        try:
+            parent_exit_code = self._observe_parent_exit(timeout=parent_timeout)
+        except (ParentInspectionTimeout, ParentInspectionError) as exc:
+            reason = "PARENT_CHECK_TIMEOUT" if isinstance(exc, ParentInspectionTimeout) else "PARENT_CHECK_ERROR"
+            return self._finish_probe_failure(
+                parent, evidence, attempt, reason, deadline, detail=str(exc),
+            )
+        if parent_exit_code is not None:
+            return self._finish_probe_failure(
+                parent, evidence, attempt, "PARENT_WORKER_EXITED_DURING_PROBE", deadline,
+                detail="parent worker exited after sender completed",
+            )
+        attempt["timing"] = dict(sender_result.get("timing") or {})
+        attempt["_verify_started_at"] = self.clock()
+        replay_row = self._sender_runner_row(probe_row, sender_result, probe_run_id)
+        probe_report = {
+            "legacy_run_id": probe_run_id,
+            "runs": [replay_row],
+            "timing": dict(sender_result.get("timing") or {}),
+        }
         if (
             replay_row.get("callback_reached") is not True
             or replay_row.get("validation_status") != "callback_reached"
-            or replay_row.get("process_status") in {"failed", "runner_error"}
+            or replay_row.get("process_status") in {"failed", "runner_error", "window_elapsed"}
         ):
-            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CALLBACK_NOT_REACHED", deadline)
+            return self._finish_probe_failure(
+                parent, evidence, attempt, "PROBE_CALLBACK_NOT_REACHED", deadline,
+                detail=str(sender_result.get("error") or "callback not reached"),
+            )
         request_dir = probe_root / "request"
         zend_dir = probe_root / "zend"
         try:
@@ -1197,11 +1351,16 @@ class OnlineLinkedCoordinator:
         if unexpected:
             attempt["unexpected_parameters"] = unexpected
         attempt.update(status="accepted", probe_request_id=probe_evidence["request_id"])
+        timing = dict(attempt.get("timing") or {})
+        timing["verify"] = round(self.clock() - float(attempt.pop("_verify_started_at", self.clock())), 3)
+        timing["total"] = round(self.clock() - float(attempt.pop("_started_at", self.clock())), 3)
+        attempt["timing"] = timing
         self._record_event({
             "kind": "PARAMETER_PROBE", "status": "ACCEPTED", "reason": "CORRELATED_ZEND_READ",
             "version": parent["version"], "worker_run_id": probe_run_id,
             "request_id": probe_evidence["request_id"], "probe_id": probe_id,
-            "candidate": dict(probe), "parameter": dict(parameter),
+            "hook_name": probe_row["hook_name"], "candidate": dict(probe), "parameter": dict(parameter),
+            "timing": timing,
             **({"unexpected_parameters": unexpected} if unexpected else {}),
         })
         return {
@@ -1222,19 +1381,30 @@ class OnlineLinkedCoordinator:
         detail: str = "",
         extra: Mapping[str, Any] | None = None,
     ) -> None:
+        timing: dict[str, Any] = {}
         if attempt is not None:
             attempt.update(status="failed", reason=reason)
             if detail:
                 attempt["error"] = detail
+            timing = dict(attempt.get("timing") or {})
+            verify_started_at = attempt.pop("_verify_started_at", None)
+            started_at = attempt.pop("_started_at", None)
+            if verify_started_at is not None:
+                timing["verify"] = round(self.clock() - float(verify_started_at), 3)
+            if started_at is not None:
+                timing["total"] = round(self.clock() - float(started_at), 3)
+            attempt["timing"] = timing
         self._record_event({
             "kind": "PARAMETER_PROBE", "status": "REJECTED", "reason": reason,
             "version": parent["version"], "request_id": evidence.get("request_id"),
+            "hook_name": parent.get("hook_name"),
+            "probe_id": attempt.get("probe_id") if attempt else None,
+            "probe_run_id": attempt.get("probe_run_id") if attempt else None,
+            "parameter": (attempt.get("candidate") or {}).get("name") if attempt else None,
+            "timing": timing,
             **(dict(extra) if isinstance(extra, Mapping) else {}),
             **({"detail": detail} if detail else {}),
         })
-        if reason == "WORKER_STOP_FAILED":
-            return None
-        self._recover_parent_after_failure(parent, deadline)
         self._write_state()
         return None
 
@@ -1394,11 +1564,11 @@ class OnlineLinkedCoordinator:
         *,
         deadline: float | None = None,
     ) -> bool:
-        """Stop parent, replay/verify child, then start exactly one active worker."""
+        """Replay/verify child in parent, then stop parent and start one worker."""
 
-        if not self._stop_worker(parent, "HANDOFF_TO_" + str(child["version"])):
-            child["worker_status"] = "not_started_parent_stop_failed"
-            child["terminal_reason"] = "WORKER_STOP_FAILED"
+        if self._observe_parent_exit() is not None:
+            child["worker_status"] = "not_started_parent_exited"
+            child["terminal_reason"] = str(self.state.get("terminal_reason") or "PARENT_WORKER_EXITED")
             self._write_state()
             return False
         version_name = str(child["version"])
@@ -1413,33 +1583,89 @@ class OnlineLinkedCoordinator:
             "resolved_method": child["resolved_method"],
             "seed_variant_id": child.get("seed_variant_id", ""),
         }
-        timeout = self.max_seconds
-        if deadline is not None:
-            timeout = min(30, int(deadline - self.clock()))
-            if timeout < 1:
-                child["worker_status"] = "not_started_budget_expired"
-                child["terminal_reason"] = "BUDGET_EXPIRED"
-                self._write_state()
-                return False
+        timeout = deadline - self.clock() if deadline is not None else self.max_seconds
+        if timeout <= 0:
+            child["worker_status"] = "not_started_budget_expired"
+            child["terminal_reason"] = "BUDGET_EXPIRED"
+            self._write_state()
+            return False
         replay_run_id = f"{self.legacy_run_id}-{version_name}-replay"
+        replay_started_at = self.clock()
         try:
-            replay_report = self.replay_runner(
-                [row],
-                timeout_seconds=timeout,
-                service=self.service,
-                legacy_run_id=replay_run_id,
-                run_command=self.run_command,
-                list_artifacts=self.list_artifacts,
-                load_artifact=self.load_artifact,
-                list_zend_artifacts=self.list_zend_artifacts,
-                poll_interval_seconds=0,
-                fuzzer_node_id=100 + int(version_name[1:]),
-                stop_on_callback=True,
+            sender_result = self._run_light_sender(
+                config_path=replay_path,
+                request_id=f"{replay_run_id}-request",
+                run_id=replay_run_id,
+                hook_name=row["hook_name"],
+                callback_id=row["callback_id"],
+                method=row["resolved_method"],
+                auth_context=str(child.get("auth_context") or "authenticated"),
+                seed_variant_id=str(child.get("seed_variant_id") or ""),
+                deadline=deadline,
             )
         except Exception as exc:
-            replay_report = {"error": str(exc), "runs": []}
-        replay_rows = replay_report.get("runs") if isinstance(replay_report, Mapping) else None
-        replay_row = replay_rows[0] if isinstance(replay_rows, list) and replay_rows else {}
+            sender_result = {"status": "sender_error", "error": str(exc)}
+        if sender_result.get("status") == "parent_stopped":
+            exit_code = sender_result.get("parent_exit_code")
+            if isinstance(exit_code, int):
+                self._handle_worker_exit(exit_code)
+            child["worker_status"] = "not_started_parent_exited"
+            child["terminal_reason"] = str(self.state.get("terminal_reason") or "PARENT_WORKER_EXITED")
+            self._write_state()
+            return False
+        if sender_result.get("status") == "parent_container_missing":
+            self._failure = True
+            self._active_container = ""
+            child["worker_status"] = "not_started_parent_missing"
+            child["terminal_reason"] = "PARENT_CONTAINER_MISSING"
+            self.state["terminal_status"] = "NOT_VERIFIED"
+            self.state["terminal_reason"] = "PARENT_CONTAINER_MISSING"
+            self._write_state()
+            return False
+        if sender_result.get("status") in {"parent_check_timeout", "parent_check_error"}:
+            reason = "PARENT_CHECK_TIMEOUT" if sender_result.get("status") == "parent_check_timeout" else "PARENT_CHECK_ERROR"
+            self._failure = True
+            child["worker_status"] = "not_started_parent_check_timeout"
+            child["terminal_reason"] = reason
+            self.state["terminal_status"] = "NOT_VERIFIED"
+            self.state["terminal_reason"] = reason
+            self._write_state()
+            return False
+        parent_timeout = None if deadline is None else deadline - self.clock()
+        deadline_expired = parent_timeout is not None and parent_timeout <= 0
+        if deadline_expired:
+            sender_result = dict(sender_result)
+            sender_result.update(
+                status="timeout",
+                callback_reached=False,
+                validation_status="registered_not_executed",
+                validation_reason="SENDER_TIMEOUT",
+                error="SENDER_TIMEOUT",
+            )
+        else:
+            try:
+                parent_exit_code = self._observe_parent_exit(timeout=parent_timeout)
+            except (ParentInspectionTimeout, ParentInspectionError) as exc:
+                reason = "PARENT_CHECK_TIMEOUT" if isinstance(exc, ParentInspectionTimeout) else "PARENT_CHECK_ERROR"
+                self._failure = True
+                child["worker_status"] = "not_started_parent_check_timeout"
+                child["terminal_reason"] = reason
+                self.state["terminal_status"] = "NOT_VERIFIED"
+                self.state["terminal_reason"] = reason
+                self._write_state()
+                return False
+            if parent_exit_code is not None:
+                child["worker_status"] = "not_started_parent_exited"
+                child["terminal_reason"] = str(self.state.get("terminal_reason") or "PARENT_WORKER_EXITED")
+                self._write_state()
+                return False
+        verify_started_at = self.clock()
+        replay_row = self._sender_runner_row(row, sender_result, replay_run_id)
+        replay_report = {
+            "legacy_run_id": replay_run_id,
+            "runs": [replay_row],
+            "timing": dict(sender_result.get("timing") or {}),
+        }
         artifact_error = ""
         try:
             self._save_replay_artifacts(replay_row, request_dir, zend_dir)
@@ -1458,7 +1684,7 @@ class OnlineLinkedCoordinator:
             isinstance(replay_row, Mapping)
             and not artifact_error
             and replay_row.get("validation_status") == "callback_reached"
-            and replay_row.get("process_status") not in {"failed", "runner_error"}
+            and replay_row.get("process_status") not in {"failed", "runner_error", "window_elapsed"}
             and verification.get("accepted") == verification.get("total")
             and verification.get("total", 0) > 0
         )
@@ -1469,23 +1695,56 @@ class OnlineLinkedCoordinator:
             "runner": replay_report,
             "pass2_verification": verification,
         }
+        replay_result["timing"] = dict(sender_result.get("timing") or {})
+        replay_result["timing"]["verify"] = round(self.clock() - verify_started_at, 3)
+        replay_result["timing"]["total"] = round(self.clock() - replay_started_at, 3)
+        replay_result["timing"].setdefault("handoff", 0.0)
         if artifact_error:
             replay_result["artifact_error"] = artifact_error
         child["replay_result"] = replay_result
         self.state.setdefault("replay_results", []).append(replay_result)
+
+        def record_replay_event(status: str, reason: str) -> None:
+            self._record_event({
+                "kind": "CHILD_REPLAY", "status": status, "reason": reason,
+                "hook_name": child.get("hook_name"), "version": version_name,
+                "probe_id": None, "parameter": None, "timing": dict(replay_result["timing"]),
+            })
+
         if replay_passed:
             child["status"] = "replay_pass"
             child["terminal_reason"] = ""
             self._write_state()
+            if self._observe_parent_exit() is not None:
+                child["worker_status"] = "not_started_parent_exited"
+                child["terminal_reason"] = str(self.state.get("terminal_reason") or "PARENT_WORKER_EXITED")
+                record_replay_event("PASS", "PARENT_WORKER_EXITED")
+                self._write_state()
+                return False
+            handoff_started_at = self.clock()
+            if not self._stop_worker(parent, "HANDOFF_TO_" + str(child["version"])):
+                child["worker_status"] = "not_started_parent_stop_failed"
+                child["terminal_reason"] = "WORKER_STOP_FAILED"
+                replay_result["timing"]["handoff"] = round(self.clock() - handoff_started_at, 3)
+                record_replay_event("PASS", "WORKER_STOP_FAILED")
+                self._write_state()
+                return False
             if self._start_worker(child, deadline=deadline):
                 self._active_version = str(child["version"])
+                replay_result["timing"]["handoff"] = round(self.clock() - handoff_started_at, 3)
+                record_replay_event("PASS", "PASS2_VERIFIED")
+                self._write_state()
                 return True
+            replay_result["timing"]["handoff"] = round(self.clock() - handoff_started_at, 3)
             if child["worker_status"] == "not_started_budget_expired":
+                record_replay_event("PASS", "BUDGET_EXPIRED")
+                self._write_state()
                 return False
             child["terminal_reason"] = "WORKER_START_FAILED"
             self._failure = True
             self.state["terminal_status"] = "NOT_VERIFIED"
             self.state["terminal_reason"] = "CHILD_WORKER_START_FAILED"
+            record_replay_event("PASS", "CHILD_WORKER_START_FAILED")
             self._write_state()
         else:
             child["status"] = "replay_failed"
@@ -1501,9 +1760,15 @@ class OnlineLinkedCoordinator:
             self._failure = True
             self.state["terminal_status"] = "NOT_VERIFIED"
             self.state["terminal_reason"] = "CHILD_REPLAY_FAILED"
+            record_replay_event(
+                "REJECTED",
+                str(
+                    replay_result.get("artifact_error")
+                    or replay_row.get("validation_reason")
+                    or "PASS2_VERIFICATION_FAILED"
+                ),
+            )
             self._write_state()
-        self._recover_parent_after_failure(parent, deadline)
-        self._write_state()
         return False
 
     def _select_v0(self) -> tuple[Mapping[str, Any], dict[str, Any], str] | None:
@@ -1591,6 +1856,7 @@ class OnlineLinkedCoordinator:
             "canonical_callback": str(metadata.get("callback_repr") or seed_item.get("callback_repr") or ""),
             "entrypoint_type": str(config.get("entrypoint_type") or ""),
             "resolved_method": str(metadata.get("resolved_method") or ""),
+            "auth_context": str(metadata.get("auth_context") or "authenticated"),
             "seed_variant_id": str(metadata.get("seed_variant_id") or (seed_item.get("seed") or {}).get("seed_variant_id") or ""),
             "seed_item": copy.deepcopy(dict(seed_item)),
         }
@@ -1648,20 +1914,29 @@ class OnlineLinkedCoordinator:
         self._write_state()
         return True
 
-    def _worker_exit_code(self) -> int | None:
+    def _worker_exit_code(self, timeout: float | None = None) -> int | None:
         """Return a stopped worker exit code while ignoring a running/unknown worker."""
 
         if not self._active_container:
             return None
+        inspect_timeout = 30 if timeout is None else max(0, timeout)
+        if inspect_timeout <= 0:
+            return None
         try:
             result = self.run_command(
                 ["docker", "inspect", "-f", "{{if .State.Running}}running{{else}}{{.State.ExitCode}}{{end}}", self._active_container],
-                timeout=30,
+                timeout=inspect_timeout,
                 check=False,
                 capture_output=True,
                 text=True,
             )
-        except Exception:
+        except subprocess.TimeoutExpired as exc:
+            if timeout is not None:
+                raise ParentInspectionTimeout("PARENT_INSPECT_TIMEOUT") from exc
+            return None
+        except Exception as exc:
+            if timeout is not None:
+                raise ParentInspectionError("PARENT_INSPECT_FAILED") from exc
             return None
         if int(getattr(result, "returncode", 1)) != 0:
             return None
@@ -1746,12 +2021,18 @@ class OnlineLinkedCoordinator:
         for name in names:
             if Path(name).name != name:
                 continue
-            payload = self.load_artifact(name)
+            payload = row.get("request_payload") if name == matched else None
+            if payload is None:
+                payload = self.load_artifact(name)
             self._copy_json(request_dir / name, payload)
-            zend_names = self.list_zend_artifacts()
-            exact = [candidate for candidate in zend_names if Path(candidate).name == candidate and Path(candidate).stem == Path(name).stem]
-            if len(exact) == 1:
-                self._copy_json(zend_dir / exact[0], self.load_zend_artifact(exact[0]))
+            zend_name = str(row.get("zend_artifact") or "") if name == matched else ""
+            if zend_name and Path(zend_name).name == zend_name:
+                self._copy_json(zend_dir / zend_name, row.get("zend_payload"))
+            else:
+                zend_names = self.list_zend_artifacts()
+                exact = [candidate for candidate in zend_names if Path(candidate).name == candidate and Path(candidate).stem == Path(name).stem]
+                if len(exact) == 1:
+                    self._copy_json(zend_dir / exact[0], self.load_zend_artifact(exact[0]))
 
     def _write_config(self, version: str, config: Mapping[str, Any], *, replay: bool = False) -> Path:
         filename = f"{version}-replay.json" if replay else f"{version}-config.json"
@@ -2131,10 +2412,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plugin-slug", required=True)
     parser.add_argument("--legacy-run-id", required=True)
     parser.add_argument("--callback-registry", required=True)
-    parser.add_argument("--max-seconds", type=int, choices=range(1, 121), default=60)
+    parser.add_argument("--max-seconds", type=int, choices=range(1, 121), default=120)
     parser.add_argument("--max-versions", type=int, choices=range(1, 21), default=2)
     parser.add_argument("--max-candidates", type=int, choices=range(1, 129), default=32)
-    parser.add_argument("--campaign-seconds", type=int, choices=range(1, 86401), default=600)
+    parser.add_argument("--campaign-seconds", type=int, choices=range(1, 86401), default=3600)
     parser.add_argument("--sync-registry", action="store_true")
     parser.add_argument("--service", default="fuzzer-wordpress-plugin")
     return parser

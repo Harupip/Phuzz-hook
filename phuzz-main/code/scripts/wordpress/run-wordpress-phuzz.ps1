@@ -20,13 +20,13 @@ param(
     [ValidateRange(1, 30)]
     [int]$ZendMaxIterations = 5,
     [ValidateRange(1, 120)]
-    [int]$OnlineTimeoutSeconds = 60,
+    [int]$OnlineTimeoutSeconds = 120,
     [ValidateRange(1, 20)]
     [int]$OnlineMaxVersions = 2,
     [ValidateRange(1, 128)]
     [int]$OnlineMaxCandidates = 32,
     [ValidateRange(1, 86400)]
-    [int]$OnlineCampaignTimeoutSeconds = 600
+    [int]$OnlineCampaignTimeoutSeconds = 3600
 )
 
 $ErrorActionPreference = "Stop"

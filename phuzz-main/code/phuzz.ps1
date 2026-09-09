@@ -17,13 +17,13 @@ param(
     [ValidateRange(1, 30)]
     [int]$ZendMaxIterations = 5,
     [ValidateRange(1, 120)]
-    [int]$OnlineTimeoutSeconds = 60,
+    [int]$OnlineTimeoutSeconds = 120,
     [ValidateRange(1, 20)]
     [int]$OnlineMaxVersions = 2,
     [ValidateRange(1, 128)]
     [int]$OnlineMaxCandidates = 32,
     [ValidateRange(1, 86400)]
-    [int]$OnlineCampaignTimeoutSeconds = 600,
+    [int]$OnlineCampaignTimeoutSeconds = 3600,
     [switch]$DryRun,
     [switch]$Help
 )
@@ -68,10 +68,10 @@ Useful options:
   -UseZendDiscovery                Opt-in online/online-linked mode to runtime-only Zend parameter discovery; use -Mode zend for generated discovery.
   -KeepDebugArtifacts              Keep Zend intermediate artifacts after a successful run.
   -ZendMaxIterations <count>       Max Zend REST convergence iterations. Default: 5.
-  -OnlineTimeoutSeconds <seconds>  Bounded online discovery budget. Default/max: 60/120.
+  -OnlineTimeoutSeconds <seconds>  Bounded online discovery budget. Default/max: 120/120.
   -OnlineMaxVersions <count>       Maximum online config versions including v0. Default: 2.
   -OnlineMaxCandidates <count>     Maximum online-linked candidates per campaign. Default: 32.
-  -OnlineCampaignTimeoutSeconds    Maximum online-linked campaign budget. Default: 600.
+  -OnlineCampaignTimeoutSeconds    Maximum online-linked campaign budget. Default: 3600.
   -DryRun                          Print the delegated command without running it.
 "@
 }

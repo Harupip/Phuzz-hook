@@ -23,6 +23,8 @@ from hook_energy.seed_generation.online_linked_coordinator import (
     _batch_candidate_identity,
     run_online_linked,
 )
+from hook_energy.seed_generation.generated_config_runner import STOP_ON_VULN_EXIT_CODE
+from hook_energy.seed_generation.probe_sender import ParentInspectionTimeout
 from seed_generation.config.config_exporter import SeedConfigSkip, export_seed_configs
 from seed_generation.convergence.convergence import materialize_convergence_seeds
 from zend_discovery.engine import candidate_from_seed_item, canonical_identity_id
@@ -81,6 +83,33 @@ class Clock:
 
 
 class OnlineLinkedCoordinatorTests(unittest.TestCase):
+    def test_worker_exit_inspect_timeout_is_bounded_and_distinct(self):
+        coordinator = object.__new__(OnlineLinkedCoordinator)
+        coordinator._active_container = "parent-container"
+        calls = []
+
+        def inspect(command, **kwargs):
+            calls.append(kwargs)
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        coordinator.run_command = inspect
+        with self.assertRaises(ParentInspectionTimeout):
+            coordinator._worker_exit_code(0.05)
+        self.assertLessEqual(calls[0]["timeout"], 0.05)
+
+    def test_worker_exit_inspect_keeps_legacy_noarg_behavior(self):
+        coordinator = object.__new__(OnlineLinkedCoordinator)
+        coordinator._active_container = "parent-container"
+        calls = []
+
+        def inspect(command, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(returncode=0, stdout="running")
+
+        coordinator.run_command = inspect
+        self.assertIsNone(coordinator._worker_exit_code())
+        self.assertEqual(calls[0]["timeout"], 30)
+
     def run_php_json_producer(self, raw_body: str) -> dict:
         php = Path(shutil.which("php") or r"C:\xampp\php\php.exe")
         self.assertTrue(php.is_file(), f"PHP CLI required; resolved {php}")
@@ -636,6 +665,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator.state['attempts'][0]['reason'], 'CHILD_CONFIG_EXPORT_FAILED')
             self.assertEqual(coordinator.state['attempts'][0]['version'], 'v1')
             coordinator.export_configs_fn = exporter
+            coordinator._active_container = coordinator.state["workers"][0]["container_name"]
+            coordinator.state["workers"][0]["status"] = "started"
             converge = coordinator.converge_fn
 
             def repeated_observation(**kwargs):
@@ -1071,7 +1102,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 log.append("worker_stop")
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        return OnlineLinkedCoordinator(
+        coordinator = OnlineLinkedCoordinator(
             suggested_seeds=suggested,
             config_root=root / "configs",
             output_root=root / "output",
@@ -1097,6 +1128,65 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             clock=clock,
             sleeper=clock.sleep,
         )
+
+        def light_sender(container_name, **kwargs):
+            self.assertEqual(container_name, coordinator._active_container)
+            run_id = kwargs["run_id"]
+            config_payload = json.loads(
+                (coordinator.config_root / f'{kwargs["config_slug"]}.json').read_text(encoding="utf-8")
+            )
+            metadata = config_payload.get("metadata") if isinstance(config_payload, dict) else {}
+            row = {
+                "config_slug": kwargs["config_slug"],
+                "hook_name": kwargs["expected"]["hook_name"],
+                "callback_id": kwargs["expected"]["callback_id"],
+                "entrypoint_type": "ajax",
+                "resolved_method": kwargs["expected"]["method"],
+                "seed_variant_id": str(
+                    kwargs["expected"].get("seed_variant_id")
+                    or (metadata or {}).get("seed_variant_id") or ""
+                ),
+            }
+            try:
+                report = coordinator.replay_runner(
+                    [row], timeout_seconds=kwargs["timeout_seconds"], service=coordinator.service,
+                    legacy_run_id=run_id, run_command=coordinator.run_command,
+                    list_artifacts=coordinator.list_artifacts, load_artifact=coordinator.load_artifact,
+                    list_zend_artifacts=coordinator.list_zend_artifacts,
+                    poll_interval_seconds=0, fuzzer_node_id=100, stop_on_callback=True,
+                )
+            except Exception as exc:
+                return {"status": "sender_error", "error": str(exc)}
+            old_row = report.get("runs", [{}])[0] if isinstance(report, dict) else {}
+            reached = old_row.get("callback_reached") is True
+            matched = str(old_row.get("matched_artifact") or "")
+            name = str(row.get("seed_variant_id") or "").rsplit("_", 1)[-1] or "seed"
+            return {
+                "status": "callback_reached" if reached else "request_completed",
+                "callback_reached": reached,
+                "validation_status": old_row.get("validation_status"),
+                "validation_reason": old_row.get("validation_reason", ""),
+                "request_name": matched,
+                "request": ({
+                    "request_id": Path(matched).stem, "legacy_run_id": run_id,
+                    "target_plugin": "fixture", "http_method": row["resolved_method"],
+                    "request_params": {"body_params": {"action": "fixture", name: f"probe-{name}"}},
+                } if matched else None),
+                "zend_name": matched if matched else old_row.get("zend_artifact"),
+                "zend": ({
+                    "request_id": Path(matched).stem, "run_id": run_id,
+                    "callback_summaries": [{"callback": "fixture_callback", "unique_parameters": [{
+                        "source": "POST", "path": [name], "helper_depth": 5,
+                        "observed_count": 1, "access_forms": ["read"],
+                    }]}],
+                    "events": [{"source": "POST", "path": [name], "operation": "read",
+                                 "callback_context": {"attributed": True, "root_callback": "fixture_callback", "depth": 5}}],
+                } if matched else None),
+                "timing": {},
+            }
+
+        coordinator.probe_sender = light_sender
+        return coordinator
 
     def make_probe_context(
         self,
@@ -1157,6 +1247,12 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             request_name = str(row["matched_artifact"])
             request_dir.mkdir(parents=True, exist_ok=True)
             zend_dir.mkdir(parents=True, exist_ok=True)
+            if row.get("request_payload") is not None and row.get("zend_payload") is not None:
+                (request_dir / request_name).write_text(json.dumps(row["request_payload"]), encoding="utf-8")
+                (zend_dir / str(row.get("zend_artifact") or request_name)).write_text(
+                    json.dumps(row["zend_payload"]), encoding="utf-8"
+                )
+                return
             name = str(row["hook_name"]).split("probe-", 1)[-1]
             (request_dir / request_name).write_text(json.dumps({
                 "request_id": Path(request_name).stem, "legacy_run_id": current_probe_run_id,
@@ -1420,10 +1516,11 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 else:
                     self.assertNotIn("probe:a", log)
 
-    def test_child_export_error_recovers_parent_after_probe_stop(self):
+    def test_child_export_error_keeps_parent_running_without_probe_stop(self):
         with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
             coordinator, parent, evidence, convergence = self.make_probe_context(
-                Path(tmp), [], names=("a",), accepted=("a",), child_export_error=True,
+                Path(tmp), log, names=("a",), accepted=("a",), child_export_error=True,
             )
             coordinator._run_pending_probe(
                 parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
@@ -1432,6 +1529,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             )
 
             self.assertTrue(coordinator._active_container)
+            self.assertNotIn("worker_stop", log)
             self.assertNotEqual(coordinator.state.get("terminal_reason"), "BUDGET_EXPIRED")
             self.assertIn("CHILD_CONFIG_EXPORT_FAILED", json.dumps(coordinator.state["events"]))
 
@@ -1459,6 +1557,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual([item["status"] for item in coordinator.state["probe_attempts"]], ["accepted"])
             self.assertEqual([version["version"] for version in coordinator.state["versions"]], ["v0", "v1"])
             self.assertEqual(parent["known_parameters"], [])
+            accepted_event = next(event for event in coordinator.state["events"] if event.get("status") == "ACCEPTED")
+            self.assertIn("verify", accepted_event["timing"])
+            self.assertIn("total", accepted_event["timing"])
             self.assertTrue(coordinator.state["versions"][1]["replay_result"]["passed"])
             self.assertNotIn("probe:b", json.dumps(coordinator.state["events"]))
 
@@ -1529,7 +1630,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             )
 
             self.assertIsNone(result)
-            self.assertEqual([row["status"] for row in coordinator.state["probe_attempts"]], ["accepted"])
+            self.assertEqual([row["status"] for row in coordinator.state["probe_attempts"]], ["failed"])
             self.assertEqual([row["version"] for row in coordinator.state["versions"]], ["v0"])
             self.assertNotIn("worker_start", log)
             self.assertIn("BUDGET_EXPIRED", json.dumps(coordinator.state["events"]))
@@ -1787,7 +1888,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(versions[1]["status"], "fuzzing")
             self.assertIn("new_param", json.dumps(json.loads(Path(versions[1]["config_path"]).read_text())))
 
-    def test_failed_ajax_probe_restarts_parent_without_confirming_parameter(self):
+    def test_failed_ajax_probe_keeps_parent_without_confirming_parameter(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             log: list[str] = []
@@ -1833,7 +1934,24 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual([version["version"] for version in coordinator.state["versions"]], ["v0"])
             self.assertEqual(coordinator.state["versions"][0]["known_parameters"], [])
             self.assertIn("PROBE_CALLBACK_NOT_REACHED", json.dumps(coordinator.state["events"]))
-            self.assertEqual(log.count("worker_start"), 2)
+            self.assertEqual(log.count("worker_start"), 1)
+
+    def test_parent_vulnerability_exit_cancels_probe_without_admission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
+            coordinator.probe_sender = lambda *args, **kwargs: {
+                "status": "parent_stopped", "parent_exit_code": STOP_ON_VULN_EXIT_CODE,
+                "error": "PARENT_WORKER_EXITED_DURING_SENDER",
+            }
+            result = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=None,
+            )
+            self.assertIsNone(result)
+            self.assertEqual(coordinator.state["terminal_status"], "VULN_FOUND")
+            self.assertEqual(parent["known_parameters"], [])
+            self.assertIn("PARENT_WORKER_EXITED_DURING_PROBE", json.dumps(coordinator.state["events"]))
 
     def test_missing_correlation_does_not_create_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1871,7 +1989,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual([version["version"] for version in coordinator.state["versions"]], ["v0"])
             self.assertIn("CORRELATION_OR_PROVENANCE_INCOMPLETE", json.dumps(coordinator.state["events"]))
 
-    def test_replay_exception_restarts_parent_without_child_worker(self):
+    def test_replay_exception_keeps_parent_without_child_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
             log: list[str] = []
             coordinator = self.make_coordinator(Path(tmp), log, replay_error=True)
@@ -1879,9 +1997,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(len(coordinator.state["versions"]), 2)
             self.assertEqual(coordinator.state["versions"][1]["status"], "replay_failed")
             self.assertEqual([item for item in coordinator.state["workers"] if item["version"] == "v1"], [])
-            self.assertEqual(log.count("worker_start"), 2)
+            self.assertEqual(log.count("worker_start"), 1)
 
-    def test_replay_failure_restarts_parent_without_child_worker(self):
+    def test_replay_failure_keeps_parent_without_child_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
             log: list[str] = []
             coordinator = self.make_coordinator(Path(tmp), log, replay_passes=False)
@@ -1889,7 +2007,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(len(coordinator.state["versions"]), 2)
             self.assertEqual(coordinator.state["versions"][1]["status"], "replay_failed")
             self.assertEqual([item for item in coordinator.state["workers"] if item["version"] == "v1"], [])
-            self.assertEqual(log.count("worker_start"), 2)
+            self.assertEqual(log.count("worker_start"), 1)
             state = json.loads(coordinator.state_path.read_text())
             self.assertEqual(state["terminal_status"], "NOT_VERIFIED")
             self.assertEqual(state["terminal_reason"], "CHILD_REPLAY_FAILED")
@@ -1952,7 +2070,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     self.assertEqual(coordinator._active_container, "parent-container")
                     self.assertEqual(coordinator.state["terminal_reason"], "WORKER_STOP_FAILED")
 
-    def test_stop_failure_blocks_handoff_and_preserves_worker_identity(self):
+    def test_stop_failure_blocks_handoff_after_replay_and_preserves_worker_identity(self):
         for raises in (False, True):
             with self.subTest(raises=raises), tempfile.TemporaryDirectory() as tmp:
                 log: list[str] = []
@@ -1968,7 +2086,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
                 coordinator.run_command = fail_stop
                 self.assertNotEqual(coordinator.run(), 0)
-                self.assertNotIn("run_generated_configs", log)
+                self.assertIn("run_generated_configs", log)
                 self.assertEqual(log.count("worker_start"), 1)
                 self.assertEqual(coordinator._active_container, coordinator.state["workers"][0]["container_name"])
                 state = json.loads(coordinator.state_path.read_text())
@@ -1991,7 +2109,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
             self.assertEqual(coordinator.state["terminal_reason"], "WORKER_STOP_FAILED")
 
-    def test_child_start_failure_is_reported_after_parent_restart(self):
+    def test_child_start_failure_is_reported_after_parent_stop(self):
         with tempfile.TemporaryDirectory() as tmp:
             log: list[str] = []
             coordinator = self.make_coordinator(Path(tmp), log)
@@ -2004,7 +2122,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
             coordinator.run_command = fail_child
             self.assertNotEqual(coordinator.run(), 0)
-            self.assertEqual([w["version"] for w in coordinator.state["workers"]], ["v0", "v0"])
+            self.assertEqual([w["version"] for w in coordinator.state["workers"]], ["v0"])
             self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
             self.assertEqual(coordinator.state["terminal_reason"], "CHILD_WORKER_START_FAILED")
 
@@ -2040,7 +2158,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
             self.assertEqual(coordinator.state["versions"][1]["terminal_reason"], "PASS2_VERIFICATION_FAILED")
 
-    def test_failed_parent_restart_is_terminal_for_both_handoff_failures(self):
+    def test_child_handoff_failure_is_terminal_without_parent_restart(self):
         for replay_passes in (True, False):
             with self.subTest(replay_passes=replay_passes), tempfile.TemporaryDirectory() as tmp:
                 coordinator = self.make_coordinator(Path(tmp), [], replay_passes=replay_passes)
@@ -2058,10 +2176,13 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 coordinator.run_command = fail_after_v0
                 self.assertNotEqual(coordinator.run(), 0)
                 self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
-                self.assertEqual(coordinator.state["terminal_reason"], "PARENT_WORKER_RESTART_FAILED")
+                self.assertEqual(
+                    coordinator.state["terminal_reason"],
+                    "CHILD_WORKER_START_FAILED" if replay_passes else "CHILD_REPLAY_FAILED",
+                )
                 self.assertEqual(len(coordinator.state["workers"]), 1)
 
-    def test_budget_spent_stopping_parent_prevents_replay(self):
+    def test_budget_spent_after_replay_prevents_or_allows_child_start(self):
         for elapsed in (1.5, 3):
             with self.subTest(elapsed=elapsed), tempfile.TemporaryDirectory() as tmp:
                 log: list[str] = []
@@ -2075,9 +2196,10 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
                 coordinator.run_command = slow_stop
                 self.assertEqual(coordinator.run(), 0)
-                self.assertNotIn("run_generated_configs", log)
-                self.assertEqual(log.count("worker_start"), 1)
-                self.assertEqual(coordinator.state["versions"][1]["worker_status"], "not_started_budget_expired")
+                self.assertIn("run_generated_configs", log)
+                self.assertEqual(log.count("worker_start"), 1 if elapsed >= 3 else 2)
+                if elapsed >= 3:
+                    self.assertEqual(coordinator.state["versions"][1]["worker_status"], "not_started_budget_expired")
 
     def test_budget_spent_replaying_prevents_child_or_parent_start(self):
         for replay_passes in (True, False):
@@ -2092,10 +2214,10 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     return replay_runner(*args, **kwargs)
 
                 coordinator.replay_runner = slow_replay
-                self.assertEqual(coordinator.run(), 0 if replay_passes else 1)
+                self.assertEqual(coordinator.run(), 1)
                 self.assertEqual(log.count("worker_start"), 1)
-                self.assertEqual(coordinator.state["versions"][1]["replay_result"]["passed"], replay_passes)
-                self.assertEqual(coordinator.state["terminal_status"], "BOUNDED_ONLINE_COMPLETE" if replay_passes else "NOT_VERIFIED")
+                self.assertFalse(coordinator.state["versions"][1]["replay_result"]["passed"])
+                self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
 
     def test_replay_pass_starts_child_only_after_parent_stops(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2105,8 +2227,10 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             stop_index = log.index("worker_stop")
             replay_index = log.index("run_generated_configs")
             child_start_index = log.index("worker_start", log.index("worker_start") + 1)
-            self.assertLess(stop_index, replay_index)
+            self.assertLess(replay_index, stop_index)
             self.assertLess(replay_index, child_start_index)
+            replay_event = [event for event in coordinator.state["events"] if event.get("kind") == "CHILD_REPLAY"][-1]
+            self.assertEqual(replay_event["timing"], coordinator.state["versions"][1]["replay_result"]["timing"])
 
     def test_online_max_versions_includes_v0(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,14 +1,12 @@
-import ast
 import os
 import json
+import importlib
 import shutil
 import subprocess
+import sys
 import unittest
-import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
-
-import requests
 
 
 class RequestAuthContextTests(unittest.TestCase):
@@ -40,15 +38,11 @@ $GLOBALS['__uopz_request'] = [];
                 self.assertNotIn('get_user_meta', returns)
 
     def test_guest_header_cannot_be_mutated_and_auth_cookies_are_removed(self):
-        source = Path(__file__).resolve().parents[1] / 'fuzzer.py'
-        tree = ast.parse(source.read_text(encoding='utf-8-sig'))
-        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and any(
-            isinstance(m, ast.FunctionDef) and m.name == 'prepare_request' for m in n.body))
-        names = {'prepare_request', '_request_auth_context', '_disable_auth_cookies', '_without_auth_cookies'}
-        cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
-        ns = {'os': os, 'requests': requests, 'urlparse': urllib.parse}
-        exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), 'exec'), ns)
-        sender = ns[cls.name]()
+        module_root = Path(__file__).resolve().parents[1]
+        if str(module_root) not in sys.path:
+            sys.path.insert(0, str(module_root))
+        fuzzer_module = importlib.import_module('fuzzer.fuzzer')
+        sender = object.__new__(fuzzer_module.Fuzzer)
         sender.config = {'metadata': {'hook_name': 'wp_ajax_nopriv_demo'}}
         empty = {'query_params': {}, 'body_params': {}, 'cookies': {}, 'headers': {}}
         candidate = SimpleNamespace(http_target='http://web/wp-admin/admin-ajax.php', http_method='POST',
