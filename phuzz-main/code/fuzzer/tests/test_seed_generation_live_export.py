@@ -242,6 +242,35 @@ class SeedGeneratorTests(unittest.TestCase):
         self.assertEqual(item["seed"]["fuzzable_params"], [])
         self.assertEqual(item["seed"]["input_params"], [])
 
+    def test_zend_runtime_generator_reuses_ajax_post_rule_for_heartbeat_hooks(self) -> None:
+        payload = build_live_coverage_payload()
+        payload["data"]["registered_callbacks"].update({
+            "cb-heartbeat": {
+                "callback_id": "cb-heartbeat",
+                "hook_name": "heartbeat_received",
+                "callback_repr": "private_heartbeat",
+                "source_file": "/var/www/html/wp-content/plugins/fixture/fixture.php",
+                "is_active": True,
+            },
+            "cb-heartbeat-nopriv": {
+                "callback_id": "cb-heartbeat-nopriv",
+                "hook_name": "heartbeat_nopriv_received",
+                "callback_repr": "public_heartbeat",
+                "source_file": "/var/www/html/wp-content/plugins/fixture/fixture.php",
+                "is_active": True,
+            },
+        })
+
+        _, seed_report = ZendRuntimeSeedGenerator().build_reports(payload)
+        by_hook = {row["hook_name"]: row for row in seed_report["suggested_seeds"]}
+
+        for hook_name in ("heartbeat_received", "heartbeat_nopriv_received"):
+            item = by_hook[hook_name]
+            self.assertEqual(item["generation_status"], "supported_http_seed")
+            self.assertEqual(item["seed"]["method"], "POST")
+            self.assertEqual(item["seed"]["resolved_method"], "POST")
+            self.assertEqual(item["seed"]["method_confidence"], "runtime_probe")
+
     def test_generator_derives_direct_http_seed_and_manual_only_entries(self) -> None:
         generator = StaticSeedGenerator()
 

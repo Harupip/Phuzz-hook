@@ -67,7 +67,10 @@ class ZendRuntimeSeedGenerator(SeedGeneratorBase):
         metadata: dict[str, Any],
         input_params: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        if hook_name.startswith(("wp_ajax_nopriv_", "wp_ajax_")):
+        if hook_name.startswith(("wp_ajax_nopriv_", "wp_ajax_")) or hook_name in {
+            "heartbeat_received",
+            "heartbeat_nopriv_received",
+        }:
             return [{
                 "method": "POST",
                 "resolved_method": "POST",
