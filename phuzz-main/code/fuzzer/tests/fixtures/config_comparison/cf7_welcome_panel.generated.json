@@ -1,0 +1,56 @@
+{
+  "target": "http://web/wp-admin/admin-ajax.php",
+  "methods": [
+    "POST"
+  ],
+  "print_timestamps": true,
+  "entrypoint_type": "ajax_authenticated",
+  "body_params": {
+    "data": [
+      {
+        "name": "action",
+        "value": "wpcf7-update-welcome-panel"
+      },
+      {
+        "name": "visible",
+        "value": "fuzz"
+      }
+    ],
+    "fixed": [
+      "action"
+    ],
+    "fuzz": [
+      "visible"
+    ],
+    "weight": 1
+  },
+  "config_type": "fuzzing_ready",
+  "metadata": {
+    "entrypoint_type": "ajax_authenticated",
+    "hook_name": "wp_ajax_wpcf7-update-welcome-panel",
+    "callback_repr": "wpcf7_admin_ajax_welcome_panel",
+    "callback_source_file": "/var/www/html/wp-content/plugins/contact-form-7/admin/includes/welcome-panel.php",
+    "callback_start_line": 240,
+    "auth_mode": "authenticated",
+    "generated_reason": "supported_http_seed",
+    "fuzzing_ready": true,
+    "setup_required": false,
+    "manual_analysis": false,
+    "method_source": "runtime_observed",
+    "method_confidence": "runtime_observed",
+    "method_evidence": {
+      "evidence_kind": "runtime_request",
+      "request_id": "",
+      "request_method": "POST",
+      "run_id": ""
+    },
+    "resolved_method": "POST",
+    "candidate_methods": [
+      "POST"
+    ],
+    "method_status": "resolved",
+    "observed_request_method": null,
+    "route_declared_methods": [],
+    "seed_variant_id": ""
+  }
+}

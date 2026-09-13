@@ -1,0 +1,42 @@
+{
+  "fixtures": [
+    {
+      "fixture_path": "gamipress_get_logs.expected.json",
+      "original_repo_relative_path": null,
+      "source_sha256": null,
+      "fixture_sha256": "538cca3d08a63d937af8486da32038f110d339136f3fcb3948982624eb6c3d56",
+      "provenance_kind": "synthetic_user_example"
+    },
+    {
+      "fixture_path": "cf7_welcome_panel.expected.json",
+      "original_repo_relative_path": "experiment/02-0day-vulns/configs/5000000-contact-form-7.5.7.6.zip/wpcf7_admin_ajax_welcome_panel/fuzzer-config.wpcf7-update-welcome-panel.json",
+      "source_sha256": "c5045480bdce065bf0f21696614f148a497372ea3a633621f867e5a5800822c3",
+      "fixture_sha256": "3c456a885107410a76cbc2ea2cf4abb5554e6308a90da12da18bac238d6373d6",
+      "provenance_kind": "legacy_reference",
+      "plugin_zip_path": "experiment/02-0day-vulns/plugins/5000000-contact-form-7.5.7.6.zip",
+      "plugin_zip_sha256": "b68515fda648a4c880471295e318c29148d08a2791a06712e629c348791e1588",
+      "source_member": "contact-form-7/admin/includes/welcome-panel.php",
+      "source_lines": "234-251"
+    },
+    {
+      "fixture_path": "cf7_welcome_panel.generated.json",
+      "original_repo_relative_path": "phuzz-main/code/fuzzer/configs/generated-config/contact-form-7/wp_ajax_wpcf7-update-welcome-panel-b0e3bcba509d03d1cce35a59f20dd3625acdaa26.json",
+      "source_sha256": "9f99bd58b10e21d59768b674b48bd1a5374e16c0b5257700ee027b8e258d6b74",
+      "fixture_sha256": "c55d420cf09106c5460fb9dd84ca5af9132487b7f19d5e5d82361ef20b9f3340",
+      "provenance_kind": "generated_snapshot",
+      "plugin_zip_path": "experiment/02-0day-vulns/plugins/5000000-contact-form-7.5.7.6.zip",
+      "plugin_zip_sha256": "b68515fda648a4c880471295e318c29148d08a2791a06712e629c348791e1588"
+    },
+    {
+      "fixture_path": "essential_addons_duplicate.invalid.json",
+      "original_repo_relative_path": "experiment/02-0day-vulns/configs/1000000-essential-addons-for-elementor-lite.5.7.1.zip/facebook_feed_render_items/fuzzer-config.facebook_feed_load_more.json",
+      "source_sha256": "bc2df523c32181454f0906273d15f65408b95bb9b031d8ca021f791c986d2f8b",
+      "fixture_sha256": "fbde7f21a6fd4521ed064ade9e9b4b830ac7f15d9f28f016297c146580b797f2",
+      "provenance_kind": "negative_legacy"
+    }
+  ],
+  "notes": [
+    "cf7_welcome_panel.generated.json is an actual snapshot, never an expected oracle.",
+    "gamipress_get_logs.expected.json is synthetic and not plugin-verified."
+  ]
+}
