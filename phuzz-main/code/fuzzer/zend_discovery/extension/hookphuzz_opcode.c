@@ -1659,6 +1659,7 @@ static void hookphuzz_flush_artifact(void)
 PHP_MINIT_FUNCTION(hookphuzz_opcode)
 {
     if (zend_get_user_opcode_handler(ZEND_FETCH_R) != NULL
+        || zend_get_user_opcode_handler(ZEND_FETCH_FUNC_ARG) != NULL
         || zend_get_user_opcode_handler(ZEND_FETCH_OBJ_R) != NULL
         || zend_get_user_opcode_handler(ZEND_FETCH_DIM_R) != NULL
         || zend_get_user_opcode_handler(ZEND_FETCH_DIM_FUNC_ARG) != NULL
@@ -1683,6 +1684,7 @@ PHP_MINIT_FUNCTION(hookphuzz_opcode)
     REGISTER_INI_ENTRIES();
     zend_observer_fcall_register(hookphuzz_observer_init);
     if (zend_set_user_opcode_handler(ZEND_FETCH_R, hookphuzz_fetch_handler) != SUCCESS
+        || zend_set_user_opcode_handler(ZEND_FETCH_FUNC_ARG, hookphuzz_fetch_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_FETCH_OBJ_R, hookphuzz_fetch_obj_r_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_FETCH_DIM_R, hookphuzz_fetch_dim_r_handler) != SUCCESS
         || zend_set_user_opcode_handler(ZEND_FETCH_DIM_FUNC_ARG, hookphuzz_fetch_dim_r_handler) != SUCCESS
@@ -1710,6 +1712,7 @@ PHP_MINIT_FUNCTION(hookphuzz_opcode)
 PHP_MSHUTDOWN_FUNCTION(hookphuzz_opcode)
 {
     if (zend_get_user_opcode_handler(ZEND_FETCH_R) == hookphuzz_fetch_handler) zend_set_user_opcode_handler(ZEND_FETCH_R, NULL);
+    if (zend_get_user_opcode_handler(ZEND_FETCH_FUNC_ARG) == hookphuzz_fetch_handler) zend_set_user_opcode_handler(ZEND_FETCH_FUNC_ARG, NULL);
     if (zend_get_user_opcode_handler(ZEND_FETCH_OBJ_R) == hookphuzz_fetch_obj_r_handler) zend_set_user_opcode_handler(ZEND_FETCH_OBJ_R, NULL);
     if (zend_get_user_opcode_handler(ZEND_FETCH_DIM_R) == hookphuzz_fetch_dim_r_handler) zend_set_user_opcode_handler(ZEND_FETCH_DIM_R, NULL);
     if (zend_get_user_opcode_handler(ZEND_FETCH_DIM_FUNC_ARG) == hookphuzz_fetch_dim_r_handler) zend_set_user_opcode_handler(ZEND_FETCH_DIM_FUNC_ARG, NULL);
@@ -1810,7 +1813,7 @@ PHP_MINFO_FUNCTION(hookphuzz_opcode)
 {
     php_info_print_table_start();
     php_info_print_table_header(2, "hookphuzz_opcode support", "enabled");
-    php_info_print_table_row(2, "configured user opcodes", "ZEND_FETCH_R, ZEND_FETCH_OBJ_R, ZEND_FETCH_DIM_R, ZEND_FETCH_DIM_FUNC_ARG, ZEND_FE_RESET_R, ZEND_FE_FETCH_R, ZEND_ASSIGN_DIM, ZEND_FETCH_IS, ZEND_FETCH_DIM_IS, ZEND_ISSET_ISEMPTY_DIM_OBJ, ZEND_RETURN, ZEND_RETURN_BY_REF, ZEND_COALESCE, ZEND_QM_ASSIGN, ZEND_CAST, ZEND_ASSIGN, ZEND_JMP_SET, ZEND_IS_EQUAL, ZEND_IS_NOT_EQUAL, ZEND_IS_IDENTICAL, ZEND_IS_NOT_IDENTICAL, ZEND_SWITCH_STRING");
+    php_info_print_table_row(2, "configured user opcodes", "ZEND_FETCH_R, ZEND_FETCH_FUNC_ARG, ZEND_FETCH_OBJ_R, ZEND_FETCH_DIM_R, ZEND_FETCH_DIM_FUNC_ARG, ZEND_FE_RESET_R, ZEND_FE_FETCH_R, ZEND_ASSIGN_DIM, ZEND_FETCH_IS, ZEND_FETCH_DIM_IS, ZEND_ISSET_ISEMPTY_DIM_OBJ, ZEND_RETURN, ZEND_RETURN_BY_REF, ZEND_COALESCE, ZEND_QM_ASSIGN, ZEND_CAST, ZEND_ASSIGN, ZEND_JMP_SET, ZEND_IS_EQUAL, ZEND_IS_NOT_EQUAL, ZEND_IS_IDENTICAL, ZEND_IS_NOT_IDENTICAL, ZEND_SWITCH_STRING");
     php_info_print_table_row(2, "artifact output", HOOKPHUZZ_ARTIFACT_DIR);
     php_info_print_table_row(2, "event limit per request", "65536");
     php_info_print_table_end();

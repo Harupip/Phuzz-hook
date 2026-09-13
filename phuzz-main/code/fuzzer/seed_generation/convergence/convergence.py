@@ -7,11 +7,12 @@ from typing import Any
 from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id
 
 
-_DIRECT_SOURCES = {"GET", "POST"}
+_DIRECT_SOURCES = {"GET", "POST", "COOKIE"}
 _REST_SOURCES = {"REST_QUERY", "REST_FORM", "REST_JSON", "REST_URL"}
 _SOURCE_LOCATIONS = {
     "GET": "query",
     "POST": "form",
+    "COOKIE": "cookie",
     "REST_QUERY": "query",
     "REST_FORM": "form",
     "REST_JSON": "json",
@@ -22,6 +23,7 @@ _SEED_SOURCES = {
     "form": "POST",
     "json": "JSON",
     "path": "URL",
+    "cookie": "COOKIE",
 }
 
 
@@ -182,12 +184,18 @@ def _apply_patch(
     body = seed.setdefault("body", {})
     query = seed.setdefault("query_params", {})
     headers = seed.setdefault("headers", {})
-    if not isinstance(body, dict) or not isinstance(query, dict) or not isinstance(headers, dict):
+    cookies = seed.setdefault("cookies", {})
+    if (
+        not isinstance(body, dict)
+        or not isinstance(query, dict)
+        or not isinstance(headers, dict)
+        or not isinstance(cookies, dict)
+    ):
         return item
     proven_names = {
         str(parameter.get("name") or "")
         for parameter in fuzzable_parameters
-        if str(parameter.get("location") or "") in {"query", "form", "json"}
+        if str(parameter.get("location") or "") in {"query", "form", "json", "cookie"}
     }
     seed["fixed_params"] = [
         name for name in seed.get("fixed_params", [])
@@ -197,7 +205,12 @@ def _apply_patch(
     for parameter in fuzzable_parameters:
         name = str(parameter["name"])
         location = str(parameter["location"])
-        target = query if location == "query" else body if location in {"form", "json"} else None
+        target = (
+            query if location == "query"
+            else body if location in {"form", "json"}
+            else cookies if location == "cookie"
+            else None
+        )
         if target is not None:
             for existing_name in list(target):
                 if existing_name not in fixed_params and name.startswith(f"{existing_name}["):
@@ -208,6 +221,8 @@ def _apply_patch(
             body[name] = "FUZZ"
             if location == "json":
                 headers["Content-Type"] = "application/json"
+        elif location == "cookie":
+            cookies[name] = "FUZZ"
         elif location != "path":
             continue
         seed["fuzzable_params"].append(name)
@@ -257,13 +272,15 @@ def _effective_fuzzable_parameters(
 
 def _input_param_location(item: Mapping[str, Any], default: str) -> str:
     location = str(item.get("location") or "").lower()
-    if location in {"query", "form", "json"}:
+    if location in {"query", "form", "json", "cookie"}:
         return location
     source = str(item.get("source") or "").upper()
     if source == "GET":
         return "query"
     if source == "POST":
         return "form"
+    if source == "COOKIE":
+        return "cookie"
     return default
 
 

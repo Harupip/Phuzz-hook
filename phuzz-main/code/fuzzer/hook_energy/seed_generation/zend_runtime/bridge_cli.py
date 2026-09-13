@@ -151,6 +151,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--targets-output")
     parser.add_argument("--final-seed-report", action="append", default=[])
     parser.add_argument("--expected-count", type=int)
+    parser.add_argument("--runtime-cookie-probes", action="store_true")
     return parser
 
 
@@ -170,6 +171,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _read_json(Path(args.merged_suggested_seeds)),
                 Path(args.zend_events_dir),
                 pass2_artifacts_dir=Path(args.pass2_artifacts_dir) if args.pass2_artifacts_dir else None,
+                runtime_cookie_probes=args.runtime_cookie_probes,
             )
             print(
                 "Zend Pass 2 verification: "
@@ -193,6 +195,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 legacy_run_id=args.legacy_run_id,
                 known_state=_read_json(Path(args.convergence_state)),
                 candidate_key=args.candidate_key,
+                runtime_cookie_probes=args.runtime_cookie_probes,
             )
             _write_json(Path(args.convergence_state_output), result)
             _write_json(Path(args.convergence_merged_seeds), _redacted_probe_seed_report(result["merged_suggested_seeds"]))
@@ -307,6 +310,7 @@ def converge_iteration(
     legacy_run_id: str,
     known_state: Mapping[str, Any],
     candidate_key: str | None = None,
+    runtime_cookie_probes: bool = False,
 ) -> dict[str, Any]:
     """Correlate one replay and materialize its direct runtime discoveries."""
     raw_report, pass_run_summary = _filter_iteration_inputs(
@@ -363,8 +367,11 @@ def converge_iteration(
         zend,
         canonical_callback,
         fixed_parameters=(candidate.get("fixed_bootstrap") if isinstance(candidate.get("fixed_bootstrap"), Mapping) else {}),
+        runtime_cookie_probes=runtime_cookie_probes,
     )
-    observed = normalize_runtime_evidence(candidate, uopz, zend, registry)
+    observed = normalize_runtime_evidence(
+        candidate, uopz, zend, registry, runtime_cookie_probes=runtime_cookie_probes,
+    )
     prior = known_state.get("known_parameters", [])
     if not isinstance(prior, list):
         raise ValueError("convergence state known_parameters must be a list")
@@ -398,7 +405,9 @@ def converge_iteration(
     if probe_parameter_names:
         merged = _materialize_rest_get_param_probe(merged, probe_parameter_names)
     elif pending_candidates and candidate.get("entrypoint_type") == "ajax":
-        merged, pending_probes = _materialize_ajax_runtime_probes(raw_for_iteration, pending_candidates)
+        merged, pending_probes = _materialize_ajax_runtime_probes(
+            raw_for_iteration, pending_candidates, runtime_cookie_probes=runtime_cookie_probes,
+        )
     runtime_candidate_reasons = dict(rejected_reasons)
     for parameter in observed:
         reason = parameter.get("candidate_reason")
@@ -538,8 +547,10 @@ def _materialize_rest_get_param_probe(report: Mapping[str, Any], names: list[str
 def _materialize_ajax_runtime_probes(
     report: Mapping[str, Any],
     candidates: Sequence[Mapping[str, Any]],
+    *,
+    runtime_cookie_probes: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Create one replay-only probe seed per flat runtime GET/POST candidate."""
+    """Create one replay-only probe seed per flat runtime candidate."""
     items = report.get("suggested_seeds")
     if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], Mapping):
         raise ValueError("AJAX runtime probe requires exactly one candidate")
@@ -554,7 +565,12 @@ def _materialize_ajax_runtime_probes(
         source = str(candidate.get("source") or "").upper()
         name = str(candidate.get("name") or "")
         location = str(candidate.get("location") or "")
-        if source not in {"GET", "POST"} or location not in {"query", "form"} or not name:
+        if (
+            source not in {"GET", "POST", "COOKIE"}
+            or (source == "COOKIE" and not runtime_cookie_probes)
+            or location not in {"query", "form", "cookie"}
+            or not name
+        ):
             continue
         identity = (source, name)
         if identity in seen:
@@ -563,11 +579,15 @@ def _materialize_ajax_runtime_probes(
         seed = deepcopy(dict(raw_seed))
         variant = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"zend_probe_{source.lower()}_{name}").strip("-.")
         seed["seed_variant_id"] = variant or f"zend_probe_{source.lower()}"
-        bucket_name = "query_params" if location == "query" else "body"
+        bucket_name = (
+            "query_params" if location == "query"
+            else "body" if location == "form"
+            else "cookies"
+        )
         target = seed.setdefault(bucket_name, {})
         if not isinstance(target, dict):
             raise ValueError(f"AJAX {location} probe target must be an object")
-        target[name] = "probe"
+        target[name] = "HOOKPHUZZ_COOKIE_PROBE" if source == "COOKIE" else "probe"
         fixed = seed.get("fixed_params") if isinstance(seed.get("fixed_params"), list) else []
         seed["fixed_params"] = list(dict.fromkeys([str(value) for value in fixed if str(value)] + [name]))
         seed["fuzzable_params"] = []
@@ -665,8 +685,11 @@ def verify_pass2_contract(
     zend_events_dir: Path,
     *,
     pass2_artifacts_dir: Path | None = None,
+    runtime_cookie_probes: bool = False,
 ) -> dict[str, int]:
-    expected = _expected_pass2_params(merged_seed_report)
+    expected = _expected_pass2_params(
+        merged_seed_report, runtime_cookie_probes=runtime_cookie_probes,
+    )
     legacy_run_id = str(pass2_run_summary.get("legacy_run_id") or "")
     total = 0
     accepted = 0
@@ -706,7 +729,9 @@ def verify_pass2_contract(
         row_method = str(row.get("resolved_method") or "").upper()
         if zend_method and row_method and zend_method != row_method:
             continue
-        observed = _zend_observed_params(zend, uopz, canonical_callback) | _zend_observed_rest_params(
+        observed = _zend_observed_params(
+            zend, uopz, canonical_callback, runtime_cookie_probes=runtime_cookie_probes,
+        ) | _zend_observed_rest_params(
             zend,
             uopz,
             canonical_callback,
@@ -745,7 +770,11 @@ def _bracket_parent_name(name: str) -> str:
     return name[:bracket]
 
 
-def _expected_pass2_params(merged_seed_report: Mapping[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+def _expected_pass2_params(
+    merged_seed_report: Mapping[str, Any],
+    *,
+    runtime_cookie_probes: bool = False,
+) -> dict[tuple[str, str], dict[str, Any]]:
     expected: dict[tuple[str, str], dict[str, Any]] = {}
     for item in merged_seed_report.get("suggested_seeds", []):
         if not isinstance(item, Mapping):
@@ -755,7 +784,11 @@ def _expected_pass2_params(merged_seed_report: Mapping[str, Any]) -> dict[tuple[
             (str(param.get("name")), source, _param_location(param, source))
             for param in (seed.get("input_params") or [])
             if isinstance(param, Mapping)
-            and (source := _param_source(param)) in {"GET", "POST", "JSON", "URL"}
+            and (source := _param_source(param)) in (
+                {"GET", "POST", "JSON", "URL", "COOKIE"}
+                if runtime_cookie_probes
+                else {"GET", "POST", "JSON", "URL"}
+            )
             and str(param.get("name"))
         }
         value = {
@@ -786,6 +819,8 @@ def _zend_observed_params(
     zend: Mapping[str, Any],
     uopz: Mapping[str, Any],
     canonical_callback: str,
+    *,
+    runtime_cookie_probes: bool = False,
 ) -> set[tuple[str, str, str]]:
     summaries = zend.get("callback_summaries")
     if not isinstance(summaries, list):
@@ -823,9 +858,10 @@ def _zend_observed_params(
             zend,
             canonical_callback=canonical_callback,
             request_method=str(zend.get("request_method") or zend.get("method") or ""),
+            runtime_cookie_probes=runtime_cookie_probes,
         ):
             continue
-        location = {"GET": "query", "POST": "form"}.get(source)
+        location = {"GET": "query", "POST": "form", "COOKIE": "cookie"}.get(source)
         if source == "REQUEST":
             request_params = uopz.get("request_params") if isinstance(uopz.get("request_params"), Mapping) else {}
             request_headers = uopz.get("headers")
@@ -846,7 +882,7 @@ def _zend_observed_params(
             if resolved is None:
                 continue
             source, location = resolved
-        elif source not in {"GET", "POST"}:
+        elif source not in {"GET", "POST", "COOKIE"}:
             continue
         observed.add((path[0], source, location))
     return observed
@@ -930,14 +966,19 @@ def _param_source(param: Mapping[str, Any]) -> str:
     if source:
         return source
     location = str(param.get("location") or "")
-    return {"query": "GET", "form": "POST", "body": "POST", "json": "JSON", "path": "URL"}.get(location, "")
+    return {
+        "query": "GET", "form": "POST", "body": "POST", "json": "JSON",
+        "path": "URL", "cookie": "COOKIE",
+    }.get(location, "")
 
 
 def _param_location(param: Mapping[str, Any], source: str) -> str:
     location = str(param.get("location") or "")
-    if location in {"query", "form", "json", "path"}:
+    if location in {"query", "form", "json", "path", "cookie"}:
         return location
-    return {"GET": "query", "POST": "form", "JSON": "json", "URL": "path"}.get(source, "")
+    return {
+        "GET": "query", "POST": "form", "JSON": "json", "URL": "path", "COOKIE": "cookie",
+    }.get(source, "")
 
 
 def _runtime_candidate_diagnostics(
@@ -945,6 +986,7 @@ def _runtime_candidate_diagnostics(
     canonical_callback: str,
     *,
     fixed_parameters: Mapping[str, Any],
+    runtime_cookie_probes: bool = False,
 ) -> tuple[int, dict[str, int]]:
     """Count valid direct candidates and classify simple pre-normalization rejects."""
     summaries = zend.get("callback_summaries")
@@ -968,7 +1010,8 @@ def _runtime_candidate_diagnostics(
         except (TypeError, ValueError):
             continue
         if (
-            source not in {"GET", "POST", "REQUEST"}
+            source not in {"GET", "POST", "REQUEST", "COOKIE"}
+            or (source == "COOKIE" and not runtime_cookie_probes)
             or not isinstance(path, list)
             or len(path) != 1
             or not isinstance(path[0], str)
@@ -987,7 +1030,7 @@ def _runtime_candidate_diagnostics(
                 for value in forms
                 if str(value).strip()
             } if isinstance(forms, list) else set()
-            reason = "unsupported_access_operation" if not operations.intersection({"isset", "read"}) else ""
+            reason = "unsupported_access_operation" if not operations.intersection({"empty", "isset", "read"}) else ""
         if reason:
             reasons[reason] = reasons.get(reason, 0) + 1
     return count, reasons
@@ -1025,6 +1068,7 @@ def _redacted_probe_seed_report(seed_report: Mapping[str, Any]) -> dict[str, Any
         if isinstance(seed, dict) and seed.get("probe_variant"):
             seed["body"] = _redact_probe_mapping(seed.get("body"))
             seed["query_params"] = _redact_probe_mapping(seed.get("query_params"))
+            seed["cookies"] = _redact_probe_mapping(seed.get("cookies"))
         redacted.append(row)
     report["suggested_seeds"] = redacted
     return report

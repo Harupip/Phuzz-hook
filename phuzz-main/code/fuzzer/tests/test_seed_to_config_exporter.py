@@ -16,6 +16,7 @@ from seed_generation.config.config_exporter import (
     build_generated_param_summary,
     build_config_for_seed_item,
     export_seed_configs,
+    _force_replay_only,
 )
 from hook_energy.seed_generation.zend_runtime.bridge import merge_enriched_seeds
 from zend_discovery.engine import canonical_identity, canonical_identity_id, candidate_from_seed_item
@@ -717,6 +718,21 @@ class SeedToConfigExporterTests(unittest.TestCase):
             self.assertEqual(set(config["body_params"]["fixed"]), {"action", "item_id"})
             self.assertEqual(config["query_params"]["fixed"], ["page"])
             self.assertEqual(summary["generated"][0]["config_path"], str(output_dir / "wp_ajax_nopriv_example_lookup-cb-public.json"))
+
+    def test_force_replay_only_clears_cookie_fuzz_selector(self):
+        config = {
+            "cookies": {
+                "data": [{"name": "fixture_cookie", "value": "fuzz"}],
+                "fixed": [],
+                "fuzz": ["fixture_cookie"],
+            },
+        }
+
+        _force_replay_only(config)
+
+        self.assertEqual(config["cookies"]["fixed"], ["fixture_cookie"])
+        self.assertEqual(config["cookies"]["fuzz"], [])
+        self.assertEqual(config["config_type"], "replay_only")
 
     def test_replay_only_export_for_zend_pass1_allows_probe_candidate_without_runtime_params(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

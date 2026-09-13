@@ -24,6 +24,7 @@ except ModuleNotFoundError as exc:
         raise
     fuzzer = importlib.import_module("fuzzer")
 from hook_energy.seed_generation import generated_config_runner, probe_sender
+from seed_generation.config.config_exporter import export_seed_configs
 
 
 class ProbeSenderTests(unittest.TestCase):
@@ -399,6 +400,73 @@ class ProbeSenderTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
         self.assertEqual(hits, [("/redirect", "redirect-request", "redirect-run")])
+
+    def test_cookie_export_prepare_and_sender_round_trip_uses_cookie_bucket(self):
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                hits.append((self.headers.get("Cookie", ""), body))
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                report = {"suggested_seeds": [{
+                    "plugin_slug": "fixture",
+                    "entrypoint_type": "ajax",
+                    "hook_name": "wp_ajax_nopriv_fixture",
+                    "callback_id": "cb-fixture",
+                    "callback_repr": "fixture_callback",
+                    "seed": {
+                        "auth_mode": "unauth-capable",
+                        "method": "POST",
+                        "resolved_method": "POST",
+                        "method_status": "resolved",
+                        "path": "/wp-admin/admin-ajax.php",
+                        "body": {"action": "fixture", "fixture_cookie": "body"},
+                        "query_params": {},
+                        "headers": {},
+                        "cookies": {"fixture_cookie": "HOOKPHUZZ_COOKIE_PROBE"},
+                        "fixed_params": ["action", "fixture_cookie"],
+                        "fuzzable_params": [],
+                        "probe_variant": True,
+                    },
+                }]}
+                config_dir = root / "configs"
+                export_seed_configs(
+                    report,
+                    output_config_dir=config_dir,
+                    target_base=f"http://127.0.0.1:{server.server_port}",
+                )
+                config_path = next(config_dir.glob("*.json"))
+                result = probe_sender.send_and_wait(
+                    config_path,
+                    request_id="cookie-roundtrip-request",
+                    run_id="cookie-roundtrip-run",
+                    timeout_seconds=0.2,
+                    expected={"hook_name": "wp_ajax_nopriv_fixture", "callback_id": "cb-fixture",
+                              "method": "POST", "auth_context": "guest"},
+                    request_dir=root / "requests", zend_dir=root / "zend",
+                )
+                self.assertEqual(result["status"], "timeout")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.assertEqual(len(hits), 1)
+        cookie_header, body = hits[0]
+        self.assertIn("fixture_cookie=HOOKPHUZZ_COOKIE_PROBE", cookie_header)
+        self.assertIn("fixture_cookie=body", body)
 
     def test_send_and_wait_timing_separates_http_and_artifact_wait(self):
         class Clock:

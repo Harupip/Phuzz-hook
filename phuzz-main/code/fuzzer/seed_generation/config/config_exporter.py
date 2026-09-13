@@ -74,13 +74,19 @@ def build_config_for_seed_item(
         if not isinstance(values, Mapping) or not values:
             continue
 
+        section_fuzzable_params = _fuzzable_params_for_section(
+            seed, fuzzable_params, config_key,
+        )
+
         section = _build_param_section(
             values,
             fixed_params=fixed_params,
-            fuzzable_params=fuzzable_params,
+            fuzzable_params=section_fuzzable_params,
         )
         config[config_key] = section
-        if config_key in {"body_params", "query_params"}:
+        if config_key in {"body_params", "query_params"} or (
+            config_key == "cookies" and section["fuzz"]
+        ):
             fuzz_count += len(section["fuzz"])
 
     config['config_type'] = 'fuzzing_ready' if fuzz_count else 'replay_only'
@@ -99,6 +105,37 @@ def build_config_for_seed_item(
         or seed_item.get('hook_name') == 'heartbeat_nopriv_received' else 'authenticated'
     )
     return _build_file_slug(seed_item), config
+
+
+def _fuzzable_params_for_section(
+    seed: Mapping[str, Any],
+    fuzzable_params: set[str],
+    config_key: str,
+) -> set[str]:
+    """Keep same-name parameters in distinct runtime transport buckets."""
+    input_params = seed.get("input_params")
+    if not isinstance(input_params, list):
+        return fuzzable_params
+    by_section: dict[str, set[str]] = {}
+    annotated: set[str] = set()
+    for item in input_params:
+        if not isinstance(item, Mapping) or item.get("fuzzable") is not True:
+            continue
+        name = str(item.get("name") or "")
+        location = str(item.get("location") or "").lower()
+        section = {
+            "query": "query_params",
+            "form": "body_params",
+            "json": "body_params",
+            "cookie": "cookies",
+            "header": "headers",
+        }.get(location)
+        if name and section:
+            annotated.add(name)
+            by_section.setdefault(section, set()).add(name)
+    if annotated and fuzzable_params <= annotated:
+        return by_section.get(config_key, set())
+    return fuzzable_params
 
 
 def export_seed_configs(
@@ -172,7 +209,7 @@ def export_seed_configs(
 
 
 def _force_replay_only(config: dict[str, Any]) -> None:
-    for section_name in ("query_params", "body_params"):
+    for section_name in ("query_params", "body_params", "cookies"):
         section = config.get(section_name)
         if not isinstance(section, dict):
             continue

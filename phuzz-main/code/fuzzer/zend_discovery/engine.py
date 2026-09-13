@@ -20,7 +20,7 @@ BLOCKED_UNSAFE_AUTO_PROBE = "BLOCKED_UNSAFE_AUTO_PROBE"
 BLOCKED_NEEDS_RECIPE = "BLOCKED_NEEDS_RECIPE"
 READ_ACTION = re.compile(r"(?:get|list|fetch|search|load|view)", re.IGNORECASE)
 PERSISTENCE_FORBIDDEN_KEY = re.compile(r"(?:authorization|cookie|password|secret|token|pass2)", re.IGNORECASE)
-_DIRECT_RUNTIME_SOURCES = {"GET", "POST", "REQUEST"}
+_DIRECT_RUNTIME_SOURCES = {"GET", "POST", "REQUEST", "COOKIE"}
 
 
 def _safe_int(value: Any) -> int:
@@ -160,6 +160,11 @@ def _runtime_request_contains(
         if resolved is None:
             return False
         resolved_source = resolved[0]
+    if resolved_source == "COOKIE":
+        values = request_params.get("cookies")
+        if isinstance(values, Mapping):
+            return name in values
+        return isinstance(values, (list, tuple, set)) and name in values
     bucket = {"GET": "query_params", "POST": "body_params"}.get(resolved_source)
     values = request_params.get(bucket) if bucket else None
     return isinstance(values, Mapping) and name in values
@@ -184,6 +189,7 @@ def runtime_parameter_is_accepted(
     request_method: str,
     operations: set[str] | None = None,
     request_has_key: bool | None = None,
+    runtime_cookie_probes: bool = False,
 ) -> bool:
     """Require a correlated raw read and its key in the matching request bucket."""
     source = str(parameter.get("source") or "").upper()
@@ -193,7 +199,13 @@ def runtime_parameter_is_accepted(
         observed_count = int(parameter.get("observed_count"))
     except (TypeError, ValueError):
         return False
-    if source not in _DIRECT_RUNTIME_SOURCES or not isinstance(path, list) or len(path) != 1 or not isinstance(path[0], str):
+    if (
+        source not in _DIRECT_RUNTIME_SOURCES
+        or (source == "COOKIE" and not runtime_cookie_probes)
+        or not isinstance(path, list)
+        or len(path) != 1
+        or not isinstance(path[0], str)
+    ):
         return False
     if not path[0] or helper_depth < 0 or observed_count < 1:
         return False
@@ -284,8 +296,10 @@ def normalize_runtime_evidence(
     uopz_artifact: Mapping[str, Any],
     zend_artifact: Mapping[str, Any],
     registry: Mapping[str, Any],
+    *,
+    runtime_cookie_probes: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return only direct, value-free GET/POST evidence with complete Pass 1 correlation."""
+    """Return direct, value-free runtime evidence with complete Pass 1 correlation."""
     identity = canonical_identity(candidate)
     proof = correlate_pass1_artifact(
         candidate,
@@ -350,8 +364,17 @@ def normalize_runtime_evidence(
             or not isinstance(path[0], str)
             or not path[0]
             or source not in _DIRECT_RUNTIME_SOURCES
+            or (source == "COOKIE" and not runtime_cookie_probes)
             or observed_count < 1
             or path[0] in fixed
+        ):
+            continue
+        configured_cookie_names = candidate.get("configured_cookie_names")
+        if (
+            source == "COOKIE"
+            and not candidate.get("probe_variant")
+            and isinstance(configured_cookie_names, (set, frozenset))
+            and path[0] in configured_cookie_names
         ):
             continue
         operations = _runtime_parameter_operations(
@@ -362,9 +385,9 @@ def normalize_runtime_evidence(
         )
         if operations is None:
             continue
-        if not operations.intersection({"isset", "read"}):
+        if not operations.intersection({"empty", "isset", "read"}):
             continue
-        location = {"GET": "query", "POST": "form"}.get(source)
+        location = {"GET": "query", "POST": "form", "COOKIE": "cookie"}.get(source)
         if source == "REQUEST":
             request_headers = dict(request_headers)
             content_type = uopz_artifact.get("content_type") or uopz_artifact.get("request_content_type")
@@ -381,7 +404,7 @@ def normalize_runtime_evidence(
             if resolved is None:
                 continue
             source, location = resolved
-        elif source not in {"GET", "POST"}:
+        elif source not in {"GET", "POST", "COOKIE"}:
             continue
         name = path[0]
         request_has_key = _runtime_request_contains(
@@ -399,6 +422,7 @@ def normalize_runtime_evidence(
             request_method=zend_method or str(identity["resolved_method"]),
             operations=operations,
             request_has_key=request_has_key,
+            runtime_cookie_probes=runtime_cookie_probes,
         )
         row = {
             "name": name,
@@ -421,7 +445,7 @@ def normalize_runtime_evidence(
                 "candidate_status": "pending_probe",
                 "candidate_reason": (
                     "request_key_missing" if "read" in operations and not request_has_key
-                    else "isset_without_correlated_read"
+                    else "guard_without_correlated_read"
                 ),
                 "access_forms": sorted(operations),
             })
@@ -676,6 +700,7 @@ def candidate_from_seed_item(
     raw_entrypoint_type = str(seed_item.get("entrypoint_type") or seed.get("entrypoint_type") or "").lower()
     body = seed.get("body") if isinstance(seed.get("body"), Mapping) else {}
     query = seed.get("query_params") if isinstance(seed.get("query_params"), Mapping) else {}
+    cookies = seed.get("cookies") if isinstance(seed.get("cookies"), Mapping) else {}
     hook_name = str(seed_item.get("hook_name") or "")
     entrypoint_type = _canonical_entrypoint_type(raw_entrypoint_type, hook_name)
     action = str(seed_item.get("action") or body.get("action") or query.get("action") or _ajax_action(hook_name) or "")
@@ -703,6 +728,8 @@ def candidate_from_seed_item(
         "legacy_run_id": legacy_run_id,
         "pass1_request_id": str(seed_item.get("pass1_request_id") or seed.get("pass1_request_id") or ""),
         "fixed_bootstrap": fixed_bootstrap,
+        "configured_cookie_names": {str(name) for name in cookies if str(name)},
+        "probe_variant": seed.get("probe_variant") is True,
     }
 
 

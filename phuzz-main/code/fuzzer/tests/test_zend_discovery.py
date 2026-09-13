@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
+import shutil
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -43,10 +46,12 @@ from hook_energy.seed_generation.zend_runtime.bridge_cli import (
     main,
     verify_pass2_contract,
     _materialize_ajax_runtime_probes,
+    _runtime_candidate_diagnostics,
 )
 from seed_generation.pipeline.pipeline import _rest_parameter_policy
 from seed_generation.source_assisted.source_materializer import materialize_plugin_source
 from seed_generation.parameters.parameter_seeds import build_parameter_seed
+from seed_generation.config.config_exporter import export_seed_configs
 from instrumentation.zend.rest.runtime import canonical_rest_parameter_name
 from seed_generation.source_assisted.input_extractor import InputSignatureExtractor
 
@@ -60,6 +65,87 @@ class StaticExtractor:
 
 
 class ZendDiscoveryTests(unittest.TestCase):
+    def test_fresh_docker_fixture_records_direct_nested_and_local_reads(self) -> None:
+        docker = shutil.which("docker")
+        if docker is None:
+            self.skipTest("Docker is not available")
+        image_name = "hookphuzz-zend"
+        image = subprocess.run(
+            [docker, "image", "inspect", image_name, "--format", "{{.Id}}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if image.returncode != 0:
+            self.skipTest(f"{image_name} image is not built")
+
+        fixture = FUZZER_DIR / "tests" / "fixtures" / "hookphuzz-direct-argument-fixture.php"
+        registry = FUZZER_DIR / "tests" / "fixtures" / "hookphuzz-direct-argument-registry.json"
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            volume_result = subprocess.run(
+                [docker, "volume", "create", "hookphuzz-direct-argument-test"],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(volume_result.returncode, 0, volume_result.stderr)
+            volume = volume_result.stdout.strip()
+            command = [
+                docker, "run", "--rm", "--entrypoint", "php",
+                "-e", "HTTP_X_FUZZER_COVID=direct-argument-run",
+                "-e", "HTTP_X_HOOKPHUZZ_RUN_ID=direct-argument-run",
+                "-e", "REQUEST_METHOD=POST",
+                "-e", "REQUEST_URI=/direct-argument",
+                "-e", "TARGET_APP_PATH=/tmp",
+                "-e", "FUZZER_HOOK_OUTPUT_DIR=/shared/hook-coverage",
+                "-v", f"{fixture.as_posix()}:/tmp/hookphuzz-direct-argument-fixture.php:ro",
+                "-v", f"{registry.as_posix()}:/tmp/hookphuzz-direct-argument-registry.json:ro",
+                "-v", f"{volume}:/shared",
+                image_name,
+                "-d", "auto_prepend_file=/var/www/fuzzer/hook_coverage/uopz_hook_wp.php",
+                "-d", "hookphuzz_opcode.target_callbacks_file=/tmp/hookphuzz-direct-argument-registry.json",
+                "/tmp/hookphuzz-direct-argument-fixture.php",
+            ]
+            try:
+                run = subprocess.run(command, capture_output=True, text=True, timeout=120)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                artifact_result = subprocess.run(
+                    [docker, "run", "--rm", "--entrypoint", "cat", "-v", f"{volume}:/shared",
+                     image_name, "/shared/opcode-events/direct-argument-run.json"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(artifact_result.returncode, 0, artifact_result.stderr)
+                artifact = json.loads(artifact_result.stdout)
+            finally:
+                subprocess.run([docker, "volume", "rm", volume], capture_output=True, text=True, timeout=30)
+
+        summary = next(
+            row for row in artifact.get("callback_summaries", [])
+            if row.get("callback") == "hookphuzz_direct_argument_fixture"
+        )
+        parameters = {
+            (row.get("source"), tuple(row.get("path", [])), tuple(row.get("access_forms", [])))
+            for row in summary.get("unique_parameters", [])
+        }
+        self.assertTrue(any(source == "POST" and path == ("direct",) and "read" in forms for source, path, forms in parameters))
+        self.assertTrue(any(source == "POST" and path == ("data",) and "read" in forms for source, path, forms in parameters))
+        self.assertTrue(any(source == "POST" and path == ("helper",) and "read" in forms for source, path, forms in parameters))
+        self.assertTrue(any(source == "POST" and path == ("nested", "leaf") and "read" in forms for source, path, forms in parameters))
+        self.assertTrue(any(source == "POST" and path == ("local",) and "read" in forms for source, path, forms in parameters))
+        self.assertTrue(any(path == ("guard",) and "isset" in forms for _, path, forms in parameters))
+        self.assertTrue(any(path == ("empty_guard",) and "empty" in forms for _, path, forms in parameters))
+        events = artifact.get("events", [])
+        self.assertTrue(any(
+            row.get("source") == "POST" and row.get("path") == ["data"]
+            and row.get("operation") == "read"
+            and row.get("callback_context", {}).get("depth") == 0
+            for row in events
+        ))
+        self.assertTrue(any(
+            row.get("source") == "POST" and row.get("path") == ["helper"]
+            and row.get("operation") == "read"
+            and row.get("callback_context", {}).get("depth") == 1
+            and row.get("callback_context", {}).get("current_function") == "hookphuzz_direct_argument_helper"
+            for row in events
+        ))
+
     def test_canonical_rest_parameter_name_uses_bracket_notation_for_bucket_paths(self) -> None:
         cases = [
             ("GET", ["GET", "search"], "search", "search"),
@@ -163,7 +249,63 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertEqual(evidence[0]["helper_depth"], 5)
         self.assertFalse(evidence[0]["fuzzable"])
         self.assertEqual(evidence[0]["candidate_status"], "pending_probe")
-        self.assertEqual(evidence[0]["candidate_reason"], "isset_without_correlated_read")
+        self.assertEqual(evidence[0]["candidate_reason"], "guard_without_correlated_read")
+
+    def test_helper_empty_is_retained_as_candidate_without_becoming_fuzzable(self) -> None:
+        candidate = self.pass1_candidate()
+        uopz = self.pass1_artifact(
+            candidate,
+            request_params={
+                "query_params": {},
+                "body_params": {"action": "demo_fetch_items"},
+            },
+        )
+        registry = {"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}}
+        zend = {
+            "run_id": "legacy-1",
+            "request_id": "pass1-1",
+            "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{
+                "callback": "Demo::fetch",
+                "unique_parameters": [{
+                    "source": "POST", "path": ["user"],
+                    "access_forms": ["empty"], "helper_depth": 0, "observed_count": 1,
+                }],
+            }],
+            "events": [{
+                "source": "POST", "path": ["user"], "operation": "empty",
+                "callback_context": {
+                    "attributed": True, "root_callback": "Demo::fetch", "depth": 0,
+                },
+            }],
+        }
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["name"], "user")
+        self.assertFalse(evidence[0]["fuzzable"])
+        self.assertEqual(evidence[0]["candidate_status"], "pending_probe")
+        self.assertEqual(evidence[0]["candidate_reason"], "guard_without_correlated_read")
+
+    def test_runtime_candidate_diagnostics_accepts_empty_as_supported_guard(self) -> None:
+        count, reasons = _runtime_candidate_diagnostics(
+            {
+                "callback_summaries": [{
+                    "callback": "Demo::fetch",
+                    "unique_parameters": [{
+                        "source": "POST", "path": ["user"],
+                        "access_forms": ["empty"], "observed_count": 1,
+                    }],
+                }],
+            },
+            "Demo::fetch",
+            fixed_parameters={},
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(reasons, {})
 
     def test_helper_read_with_key_in_exact_request_bucket_is_accepted(self) -> None:
         candidate = self.pass1_candidate()
@@ -333,6 +475,52 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertEqual(accepted_result["new_parameters"][0]["helper_depth"], 5)
         self.assertTrue(accepted_result["new_parameters"][0]["fuzzable"])
 
+    def test_convergence_preserves_not_admitted_candidate_after_probe(self) -> None:
+        item = self.raw_seed_item()
+        item["seed"]["body"]["action"] = "demo_fetch_items"
+        registry = {"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}}
+        uopz = self.pass1_artifact_for_raw(item)
+        uopz["request_params"] = {"body_params": {"action": "demo_fetch_items", "filter_tag": "probe"}}
+        zend = self.zend_artifact_for_raw(item, name="filter_tag")
+        zend["callback_summaries"][0]["unique_parameters"][0]["access_forms"] = ["isset"]
+        zend["callback_summaries"][0]["unique_parameters"][0]["helper_depth"] = 5
+        zend["events"] = [{
+            "source": "POST", "path": ["filter_tag"], "operation": "isset",
+            "callback_context": {"attributed": True, "root_callback": "Demo::fetch", "depth": 5},
+        }]
+        summary = {"runs": [{
+            "hook_name": item["hook_name"], "callback_id": item["callback_id"],
+            "seed_variant_id": "", "callback_reached": True, "matched_artifact": f"{item['pass1_request_id']}.json",
+        }]}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            request_dir, zend_dir = root / "request", root / "zend"
+            request_dir.mkdir()
+            zend_dir.mkdir()
+            (request_dir / f"{item['pass1_request_id']}.json").write_text(json.dumps(uopz), encoding="utf-8")
+            (zend_dir / f"{item['pass1_request_id']}.json").write_text(json.dumps(zend), encoding="utf-8")
+            first = converge_iteration(
+                raw_report={"suggested_seeds": [item]}, pass_run_summary=summary,
+                pass_artifacts_dir=request_dir, zend_events_dir=zend_dir, registry=registry,
+                plugin_slug="demo-plugin", legacy_run_id="legacy-1", known_state={"known_parameters": []},
+            )
+            probe_item = first["merged_suggested_seeds"]["suggested_seeds"][0]
+            probe_summary = copy.deepcopy(summary)
+            probe_summary["runs"][0]["seed_variant_id"] = probe_item["seed"]["seed_variant_id"]
+            second = converge_iteration(
+                raw_report={"suggested_seeds": [probe_item]}, pass_run_summary=probe_summary,
+                pass_artifacts_dir=request_dir, zend_events_dir=zend_dir, registry=registry,
+                plugin_slug="demo-plugin", legacy_run_id="legacy-1", known_state={"known_parameters": []},
+            )
+
+        self.assertEqual(first["status"], "CONTINUE", first)
+        self.assertEqual(second["status"], "CONTINUE")
+        self.assertEqual(second["new_parameters"], [])
+        self.assertEqual(second["runtime_pending_count"], 1)
+        self.assertEqual(second["observed_parameters"][0]["candidate_status"], "pending_probe")
+        self.assertEqual(len(second["pending_probes"]), 1)
+        self.assertEqual(second["pending_probes"][0]["name"], "filter_tag")
+
     def test_convergence_identity_accepts_helper_depth_without_accepting_pending_candidate(self) -> None:
         accepted = {
             "name": "filter_tag", "path": ["filter_tag"], "source": "POST", "location": "form",
@@ -377,6 +565,157 @@ class ZendDiscoveryTests(unittest.TestCase):
             [item["seed"]["body"].get("filter_tag") for item in merged["suggested_seeds"]],
             [None, "probe"],
         )
+
+    def test_runtime_cookie_evidence_is_opt_in_and_uses_names_only_membership(self) -> None:
+        candidate = self.pass1_candidate()
+        request = self.pass1_artifact(
+            candidate,
+            request_params={
+                "query_params": {},
+                "body_params": {"action": "demo_fetch_items"},
+                "cookies": ["fixture_cookie"],
+            },
+        )
+        registry = {
+            "schema_version": 1,
+            "callback_map": {"ajax-public": "Demo::fetch"},
+        }
+        zend = {
+            "schema_version": 3,
+            "run_id": "legacy-1",
+            "request_id": "pass1-1",
+            "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{
+                "callback": "Demo::fetch",
+                "unique_parameters": [{
+                    "source": "COOKIE", "path": ["fixture_cookie"],
+                    "helper_depth": 0, "observed_count": 1,
+                    "access_forms": ["read"],
+                }],
+            }],
+            "events": [{
+                "source": "COOKIE", "path": ["fixture_cookie"], "operation": "read",
+                "callback_context": {
+                    "attributed": True, "root_callback": "Demo::fetch", "depth": 0,
+                },
+            }],
+        }
+
+        self.assertEqual(normalize_runtime_evidence(candidate, request, zend, registry), [])
+        evidence = normalize_runtime_evidence(
+            candidate, request, zend, registry, runtime_cookie_probes=True,
+        )
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["source"], "COOKIE")
+        self.assertEqual(evidence[0]["location"], "cookie")
+        self.assertTrue(evidence[0]["fuzzable"])
+
+        request["request_params"]["cookies"] = []
+        pending = normalize_runtime_evidence(
+            candidate, request, zend, registry, runtime_cookie_probes=True,
+        )
+        self.assertEqual(pending[0]["candidate_status"], "pending_probe")
+        self.assertFalse(pending[0]["fuzzable"])
+
+        guard = json.loads(json.dumps(zend))
+        guard["callback_summaries"][0]["unique_parameters"][0]["access_forms"] = ["isset"]
+        guard["events"][0]["operation"] = "isset"
+        request["request_params"]["cookies"] = ["fixture_cookie"]
+        guard_only = normalize_runtime_evidence(
+            candidate, request, guard, registry, runtime_cookie_probes=True,
+        )
+        self.assertEqual(guard_only[0]["candidate_reason"], "guard_without_correlated_read")
+        self.assertFalse(guard_only[0]["fuzzable"])
+
+    def test_ajax_cookie_probe_is_materialized_only_when_enabled(self) -> None:
+        report = {"suggested_seeds": [{
+            "hook_name": "wp_ajax_nopriv_demo_fetch_items",
+            "callback_id": "ajax-public",
+            "seed": {
+                "method": "POST", "resolved_method": "POST",
+                "path": "/wp-admin/admin-ajax.php",
+                "body": {"action": "demo_fetch_items"}, "query_params": {},
+                "headers": {}, "cookies": {}, "fixed_params": ["action"],
+                "fuzzable_params": [],
+            },
+        }]}
+        candidate = {
+            "name": "fixture_cookie", "source": "COOKIE", "location": "cookie",
+            "helper_depth": 0, "run_id": "legacy-1", "request_id": "request-1",
+        }
+
+        merged, probes = _materialize_ajax_runtime_probes(report, [candidate])
+        self.assertEqual(probes, [])
+        self.assertEqual(merged["suggested_seeds"], [])
+
+        merged, probes = _materialize_ajax_runtime_probes(
+            report, [candidate], runtime_cookie_probes=True,
+        )
+        self.assertEqual(len(probes), 1)
+        seed = merged["suggested_seeds"][0]["seed"]
+        self.assertEqual(seed["cookies"], {"fixture_cookie": "HOOKPHUZZ_COOKIE_PROBE"})
+        self.assertEqual(seed["fixed_params"], ["action", "fixture_cookie"])
+        self.assertEqual(merged["suggested_seeds"][0]["probe_request"]["location"], "cookie")
+
+    def test_cookie_runtime_convergence_exports_cookie_fuzz_and_preserves_post_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            item = self.raw_seed_item()
+            item["seed"]["cookies"] = {}
+            item["seed"]["body"]["fixture_cookie"] = "body"
+            item["pass1_request_id"] = "cookie-request"
+            request = self.pass1_artifact_for_raw(item)
+            request["request_params"] = {
+                "body_params": {"term": "preserve"},
+                "cookies": ["fixture_cookie"],
+            }
+            zend = self.zend_artifact_for_raw(item, source="COOKIE", name="fixture_cookie")
+            # The fixture artifact intentionally omits cookie values; membership is name-only.
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            (uopz_dir / "cookie-request.json").write_text(json.dumps(request), encoding="utf-8")
+            (zend_dir / "cookie-request.json").write_text(json.dumps(zend), encoding="utf-8")
+            summary = {"legacy_run_id": "legacy-1", "runs": [{
+                "hook_name": item["hook_name"], "callback_id": item["callback_id"],
+                "seed_variant_id": "", "callback_reached": True,
+                "matched_artifact": "cookie-request.json",
+            }]}
+            registry = prepare_callback_registry(self.registry(), "demo-plugin")
+
+            first = converge_iteration(
+                raw_report={"suggested_seeds": [item]}, pass_run_summary=summary,
+                pass_artifacts_dir=uopz_dir, zend_events_dir=zend_dir,
+                registry=registry, plugin_slug="demo-plugin", legacy_run_id="legacy-1",
+                known_state={"known_parameters": []}, runtime_cookie_probes=True,
+            )
+            self.assertEqual(first["new_parameters"][0]["source"], "COOKIE")
+            self.assertEqual(first["new_parameters"][0]["location"], "cookie")
+
+            second = converge_iteration(
+                raw_report={"suggested_seeds": [item]}, pass_run_summary=summary,
+                pass_artifacts_dir=uopz_dir, zend_events_dir=zend_dir,
+                registry=registry, plugin_slug="demo-plugin", legacy_run_id="legacy-1",
+                known_state={"known_parameters": first["new_parameters"]},
+                runtime_cookie_probes=True,
+            )
+            seed = second["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]
+            self.assertEqual(seed["cookies"], {"fixture_cookie": "FUZZ"})
+            self.assertEqual(seed["body"]["fixture_cookie"], "body")
+            self.assertEqual(seed["fuzzable_params"], ["fixture_cookie"])
+            self.assertEqual(seed["input_params"][0]["source"], "COOKIE")
+            self.assertEqual(seed["input_params"][0]["location"], "cookie")
+
+            export_dir = root / "configs"
+            export_seed_configs(
+                second["merged_suggested_seeds"], output_config_dir=export_dir,
+            )
+            configs = list(export_dir.glob("*.json"))
+            self.assertEqual(len(configs), 1)
+            config = json.loads(configs[0].read_text(encoding="utf-8"))
+            self.assertIn("fixture_cookie", config["cookies"]["fuzz"])
+            self.assertNotIn("fixture_cookie", config.get("body_params", {}).get("fuzz", []))
 
     def test_admin_post_probe_is_retained_as_correlated_post_runtime_evidence(self) -> None:
         candidate = {
@@ -3285,13 +3624,71 @@ class ZendDiscoveryTests(unittest.TestCase):
                 {"accepted": 0, "total": 1},
             )
 
-            request["request_params"]["body_params"]["filter_tag"] = "probe"
-            zend["events"][0]["operation"] = "isset"
-            zend["callback_summaries"][0]["unique_parameters"][0]["access_forms"] = ["isset"]
-            (uopz_dir / "helper-pass2.json").write_text(json.dumps(request), encoding="utf-8")
-            (zend_dir / "helper-pass2.json").write_text(json.dumps(zend), encoding="utf-8")
+    def test_pass2_cookie_requires_opt_in_read_and_name_membership(self) -> None:
+        raw = self.raw_seed_item()
+        raw["seed"]["zend_canonical_callback"] = "Demo::fetch"
+        raw["seed"]["cookies"] = {"fixture_cookie": "FUZZ"}
+        raw["seed"]["input_params"] = [{
+            "name": "fixture_cookie", "path": ["fixture_cookie"],
+            "source": "COOKIE", "location": "cookie", "fuzzable": True,
+            "evidence_kind": "zend_runtime",
+        }]
+        raw["seed"]["fuzzable_params"] = ["fixture_cookie"]
+        raw["pass1_request_id"] = "cookie-pass2"
+        run = {"legacy_run_id": "legacy-1", "runs": [{
+            "hook_name": raw["hook_name"], "callback_id": raw["callback_id"],
+            "callback_reached": True, "matched_artifact": "cookie-pass2.json",
+            "resolved_method": "POST",
+        }]}
+        request = self.pass1_artifact_for_raw(raw)
+        request["request_id"] = "cookie-pass2"
+        request["request_params"] = {"cookies": ["fixture_cookie"]}
+        zend = self.zend_artifact_for_raw(raw, source="COOKIE", name="fixture_cookie")
+        zend["request_id"] = "cookie-pass2"
+        zend["events"] = [{
+            "source": "COOKIE", "path": ["fixture_cookie"], "operation": "read",
+            "callback_context": {
+                "attributed": True, "root_callback": "Demo::fetch", "depth": 0,
+            },
+        }]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+            (uopz_dir / "cookie-pass2.json").write_text(json.dumps(request), encoding="utf-8")
+            (zend_dir / "cookie-pass2.json").write_text(json.dumps(zend), encoding="utf-8")
+            report = {"suggested_seeds": [raw]}
+
             self.assertEqual(
-                verify_pass2_contract(run, {"suggested_seeds": [raw]}, zend_dir, pass2_artifacts_dir=uopz_dir),
+                verify_pass2_contract(
+                    run, report, zend_dir, pass2_artifacts_dir=uopz_dir,
+                    runtime_cookie_probes=True,
+                ),
+                {"accepted": 1, "total": 1},
+            )
+            zend["request_id"] = "wrong-cookie-pass2"
+            (zend_dir / "cookie-pass2.json").write_text(json.dumps(zend), encoding="utf-8")
+            self.assertEqual(
+                verify_pass2_contract(
+                    run, report, zend_dir, pass2_artifacts_dir=uopz_dir,
+                    runtime_cookie_probes=True,
+                ),
+                {"accepted": 0, "total": 1},
+            )
+            zend["request_id"] = "cookie-pass2"
+            (zend_dir / "cookie-pass2.json").write_text(json.dumps(zend), encoding="utf-8")
+            self.assertEqual(
+                verify_pass2_contract(run, report, zend_dir, pass2_artifacts_dir=uopz_dir),
+                {"accepted": 0, "total": 0},
+            )
+            request["request_params"]["cookies"] = []
+            (uopz_dir / "cookie-pass2.json").write_text(json.dumps(request), encoding="utf-8")
+            self.assertEqual(
+                verify_pass2_contract(
+                    run, report, zend_dir, pass2_artifacts_dir=uopz_dir,
+                    runtime_cookie_probes=True,
+                ),
                 {"accepted": 0, "total": 1},
             )
 

@@ -53,7 +53,7 @@ from seed_generation.config.config_exporter import (
 from seed_generation.convergence.convergence import materialize_convergence_seeds
 from discovery.entrypoints.entrypoints import seed_template_for_callback
 from discovery.entrypoints.method_resolution import resolve_http_methods
-from zend_discovery.engine import runtime_parameter_is_accepted
+from zend_discovery.engine import prepare_callback_registry, runtime_parameter_is_accepted
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
@@ -81,6 +81,14 @@ class OnlineLinkedError(ValueError):
     """A coordinator transition cannot be completed safely."""
 
 
+class ReplayArtifactError(RuntimeError):
+    """A replay artifact could not be loaded, correlated, or persisted."""
+
+    def __init__(self, stage: str, detail: str) -> None:
+        super().__init__(detail)
+        self.stage = stage
+
+
 class OnlineLinkedCoordinator:
     """Coordinate immutable online versions without changing worker configs."""
 
@@ -97,6 +105,7 @@ class OnlineLinkedCoordinator:
         legacy_run_id: str,
         max_seconds: int,
         max_versions: int,
+        runtime_cookie_probes: bool = False,
         registry: Mapping[str, Any] | None = None,
         registry_path: Path | None = None,
         service: str = "fuzzer-wordpress-plugin",
@@ -132,6 +141,7 @@ class OnlineLinkedCoordinator:
         self.legacy_run_id = legacy_run_id
         self.max_seconds = max_seconds
         self.max_versions = max_versions
+        self.runtime_cookie_probes = bool(runtime_cookie_probes)
         self.service = service
         self.run_command = run_command
         self.list_artifacts = list_artifacts
@@ -172,6 +182,7 @@ class OnlineLinkedCoordinator:
             "legacy_run_id": legacy_run_id,
             "max_seconds": max_seconds,
             "max_versions": max_versions,
+            "runtime_cookie_probes": self.runtime_cookie_probes,
             "campaign_deadline": self.campaign_deadline,
             "campaign_status": "running" if self.campaign_deadline is not None else None,
             "versions": [],
@@ -236,9 +247,9 @@ class OnlineLinkedCoordinator:
                     return 1
                 for evidence in self.read_new_runtime_evidence(deadline=deadline):
                     self.advance_online_version(evidence, deadline=deadline)
-                    if self.state["terminal_reason"] == "WORKER_STOP_FAILED" or not self._active_container:
+                    if self.state["terminal_status"] == "NOT_VERIFIED" or not self._active_container:
                         break
-                if self.state["terminal_reason"] == "WORKER_STOP_FAILED" or not self._active_container:
+                if self.state["terminal_status"] == "NOT_VERIFIED" or not self._active_container:
                     break
                 worker_exit_code = self._worker_exit_code()
                 if worker_exit_code is not None:
@@ -249,7 +260,7 @@ class OnlineLinkedCoordinator:
                 remaining = deadline - self.clock()
                 if remaining > 0:
                     self.sleeper(min(0.5, remaining))
-            self._stop_active_worker("BUDGET_EXPIRED")
+            self._stop_active_worker(self.state["terminal_reason"] or "BUDGET_EXPIRED")
             self._mark_campaign_expired_if_needed()
             if self.state["terminal_status"] is None:
                 self.state["terminal_status"] = "BOUNDED_ONLINE_COMPLETE"
@@ -447,13 +458,16 @@ class OnlineLinkedCoordinator:
                 raise OnlineLinkedError("V0_REPLAY_PROCESS_FAILED")
             request_dir = self.run_dir / "versions" / "v0" / "probe" / "request"
             zend_dir = request_dir.parent / "zend"
-            self._save_replay_artifacts(result_row, request_dir, zend_dir)
+            self._save_replay_artifacts(
+                {**result_row, "_strict_correlation": False}, request_dir, zend_dir,
+            )
             reason = "V0_PROVENANCE_NOT_VERIFIED"
             observation = self.converge_fn(
                 raw_report=self._reports["v0"], pass_run_summary=report,
                 pass_artifacts_dir=request_dir, zend_events_dir=zend_dir, registry=self.registry,
                 plugin_slug=self.plugin_slug, legacy_run_id=version["worker_run_id"],
                 known_state={"known_parameters": []}, candidate_key=self._target_key,
+                runtime_cookie_probes=self.runtime_cookie_probes,
             )
             readiness["convergence"] = observation
             if observation.get("status") == "REPLAY_FAILED" or observation.get("runtime_block_reason") or observation.get("missing_parameters"):
@@ -463,8 +477,11 @@ class OnlineLinkedCoordinator:
                 raise OnlineLinkedError(reason)
             if version["config_type"] == "fuzzing_ready":
                 expected = copy.deepcopy(self._reports["v0"])
-                expected["suggested_seeds"][0]["seed"]["zend_canonical_callback"] = version["canonical_callback"]
-                verification = self.verify_pass2_fn(report, expected, zend_dir, pass2_artifacts_dir=request_dir)
+                expected["suggested_seeds"][0]["seed"]["zend_canonical_callback"] = self._expected_callback(version)
+                verification = self.verify_pass2_fn(
+                    report, expected, zend_dir, pass2_artifacts_dir=request_dir,
+                    runtime_cookie_probes=self.runtime_cookie_probes,
+                )
                 readiness["pass2_verification"] = verification
                 if not verification.get("total") or verification.get("accepted") != verification["total"]:
                     raise OnlineLinkedError("V0_PASS2_NOT_VERIFIED")
@@ -760,6 +777,7 @@ class OnlineLinkedCoordinator:
                 legacy_run_id=str(parent["worker_run_id"]),
                 known_state={"known_parameters": parent.get("known_parameters", [])},
                 candidate_key=self._target_key,
+                runtime_cookie_probes=self.runtime_cookie_probes,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             self._record_event({
@@ -837,6 +855,11 @@ class OnlineLinkedCoordinator:
                 "request_id": evidence.get("request_id"),
             })
             return None
+        new_parameters = [
+            self._inherit_callback_identity(parameter, parent)
+            if isinstance(parameter, Mapping) else parameter
+            for parameter in new_parameters
+        ]
         evidence_by_parameter = result.get("parameter_evidence")
         for parameter in new_parameters:
             parameter_evidence = evidence
@@ -876,7 +899,11 @@ class OnlineLinkedCoordinator:
             "parameters": [dict(parameter) for parameter in new_parameters],
         }
         discovery = self._record_event(discovery)
-        proposed_parameters = list(result.get("known_parameters") or [])
+        proposed_parameters = [
+            self._inherit_callback_identity(parameter, parent)
+            if isinstance(parameter, Mapping) else parameter
+            for parameter in (result.get("known_parameters") or [])
+        ]
         materialize_candidate_key = str(result.get("candidate_key") or self._target_key).split("::", 1)[0]
         try:
             materialized = self.materialize_fn(
@@ -981,7 +1008,10 @@ class OnlineLinkedCoordinator:
         params = request.get("request_params") if isinstance(request, Mapping) else None
         params = params if isinstance(params, Mapping) else {}
         # Ignore request IDs and metadata; preserve input types and array order.
-        inputs = {bucket: params.get(bucket, {}) for bucket in ("query_params", "body_params", "json_params")}
+        inputs = {
+            bucket: params.get(bucket, {})
+            for bucket in ("query_params", "body_params", "json_params", "cookies")
+        }
         input_hash = hashlib.sha256(
             json.dumps(inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         ).hexdigest()
@@ -1054,9 +1084,35 @@ class OnlineLinkedCoordinator:
         child handoff keeps the remaining budget.
         """
         pending = convergence.get("pending_probes")
-        candidates = pending if isinstance(pending, list) else [probe]
+        initial_candidates = pending if isinstance(pending, list) and pending else [probe]
+        queue: list[dict[str, Any]] = []
+        queued_keys: set[str] = set()
+
+        def enqueue(
+            candidate: Mapping[str, Any],
+            candidate_convergence: Mapping[str, Any],
+            candidate_evidence: Mapping[str, Any],
+        ) -> None:
+            if not isinstance(candidate, Mapping):
+                return
+            dedupe_key = self._probe_context_key(parent, candidate, candidate_evidence)
+            if dedupe_key in queued_keys:
+                return
+            queued_keys.add(dedupe_key)
+            queue.append({
+                "candidate": copy.deepcopy(dict(candidate)),
+                "convergence": copy.deepcopy(dict(candidate_convergence)),
+                "evidence": copy.deepcopy(dict(candidate_evidence)),
+            })
+
+        for candidate in initial_candidates:
+            enqueue(candidate, convergence, evidence)
+        probe_deadline = None
+        if deadline is not None:
+            started = self.clock()
+            probe_deadline = started + max(0.0, (deadline - started) / 2)
         accepted = [
-            dict(item) for item in convergence.get("new_parameters", [])
+            self._inherit_callback_identity(item, parent) for item in convergence.get("new_parameters", [])
             if isinstance(item, Mapping)
         ] if isinstance(convergence.get("new_parameters"), list) else []
         parameter_evidence: dict[tuple[str, str, str], Mapping[str, Any]] = {}
@@ -1064,31 +1120,65 @@ class OnlineLinkedCoordinator:
             parameter_evidence[_parameter_key(parameter)] = evidence
         last_result: Mapping[str, Any] | None = convergence if accepted else None
         last_evidence: Mapping[str, Any] | None = evidence if accepted else None
-        for candidate in candidates:
-            if not isinstance(candidate, Mapping):
-                continue
-            if accepted and deadline is not None:
-                # Admit proven evidence before spending the deadline on optional probes.
+        deferred: list[dict[str, Any]] = []
+        if accepted and probe_deadline is not None:
+            deferred = [dict(item["candidate"]) for item in queue]
+            queue = []
+        index = 0
+        while index < len(queue):
+            queue_item = queue[index]
+            index += 1
+            candidate = queue_item["candidate"]
+            candidate_convergence = queue_item["convergence"]
+            candidate_evidence = queue_item["evidence"]
+            if probe_deadline is not None and self.clock() >= probe_deadline:
+                deferred = [dict(item["candidate"]) for item in queue[index:]]
                 break
             outcome = self._run_pending_probe_once(
-                parent=parent, evidence=evidence, raw_report=raw_report,
-                convergence=convergence, probe=candidate, seed=seed, deadline=deadline,
+                parent=parent, evidence=candidate_evidence, raw_report=raw_report,
+                convergence=candidate_convergence, probe=candidate,
+                seed=seed, deadline=probe_deadline,
             )
             if not isinstance(outcome, Mapping) or outcome.get("status") != "accepted":
+                if isinstance(outcome, Mapping) and outcome.get("status") == "pending":
+                    pending_result = outcome.get("result")
+                    pending_candidates = pending_result.get("pending_probes") if isinstance(pending_result, Mapping) else None
+                    if isinstance(pending_candidates, list) and isinstance(pending_result, Mapping):
+                        pending_evidence = outcome.get("evidence")
+                        pending_evidence = (
+                            pending_evidence if isinstance(pending_evidence, Mapping) else candidate_evidence
+                        )
+                        for item in pending_candidates:
+                            enqueue(item, pending_result, pending_evidence)
                 if self.state.get("terminal_status") or (
                     not self._active_container and
                     (deadline is not None and self.clock() >= deadline)
                 ):
+                    break
+                if probe_deadline is not None and self.clock() >= probe_deadline:
+                    deferred = [dict(item["candidate"]) for item in queue[index:]]
                     break
                 continue
             parameter = outcome.get("parameter")
             probe_evidence = outcome.get("evidence")
             if not isinstance(parameter, Mapping) or not isinstance(probe_evidence, Mapping):
                 continue
+            parameter_key = _parameter_key(parameter)
+            if parameter_key in parameter_evidence:
+                continue
             accepted.append(dict(parameter))
-            parameter_evidence[_parameter_key(parameter)] = probe_evidence
+            parameter_evidence[parameter_key] = probe_evidence
             last_result = outcome.get("result") if isinstance(outcome.get("result"), Mapping) else None
             last_evidence = probe_evidence
+        for candidate in deferred:
+            self._record_event({
+                "kind": "PARAMETER_PROBE",
+                "status": "DEFERRED",
+                "reason": "PROBE_BUDGET_RESERVED_FOR_CHILD",
+                "version": parent["version"],
+                "request_id": candidate.get("request_id") or evidence.get("request_id"),
+                "candidate": candidate,
+            })
         if not accepted or last_result is None or last_evidence is None:
             return None
         final_result = dict(last_result)
@@ -1096,7 +1186,8 @@ class OnlineLinkedCoordinator:
         existing = parent.get("known_parameters", [])
         existing = [dict(item) for item in existing if isinstance(item, Mapping)] if isinstance(existing, list) else []
         final_result["known_parameters"] = existing + accepted
-        final_result["pending_probes"] = []
+        final_result.pop("pending_probes", None)
+        final_result["deferred_probes"] = deferred
         final_result["parameter_evidence"] = parameter_evidence
         final_result["base_evidence"] = evidence
         final_result["candidate_key"] = str(convergence.get("candidate_key") or self._target_key)
@@ -1326,8 +1417,16 @@ class OnlineLinkedCoordinator:
                 or str(probe_zend.get("run_id") or probe_zend.get("legacy_run_id") or "") != probe_run_id
             ):
                 raise OnlineLinkedError("PROBE_ARTIFACT_CORRELATION_FAILED")
+        except ReplayArtifactError as exc:
+            return self._finish_probe_failure(
+                parent, evidence, attempt, "PROBE_ARTIFACT_CORRELATION_FAILED", deadline,
+                detail=str(exc), extra={"artifact_stage": exc.stage},
+            )
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
-            return self._finish_probe_failure(parent, evidence, attempt, "PROBE_ARTIFACT_CORRELATION_FAILED", deadline, detail=str(exc))
+            return self._finish_probe_failure(
+                parent, evidence, attempt, "PROBE_ARTIFACT_CORRELATION_FAILED", deadline,
+                detail=str(exc), extra={"artifact_stage": "id_correlation"},
+            )
 
         probe_evidence = {
             "version": parent["version"], "worker_run_id": probe_run_id,
@@ -1344,23 +1443,41 @@ class OnlineLinkedCoordinator:
                 pass_artifacts_dir=request_dir, zend_events_dir=zend_dir, registry=self.registry,
                 plugin_slug=self.plugin_slug, legacy_run_id=probe_run_id,
                 known_state={"known_parameters": parent.get("known_parameters", [])}, candidate_key=None,
+                runtime_cookie_probes=self.runtime_cookie_probes,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONVERGENCE_FAILED", deadline, detail=str(exc))
         probe_parameters = probe_result.get("new_parameters") if isinstance(probe_result, Mapping) else None
-        if not isinstance(probe_parameters, list) or not probe_parameters:
+        observed_parameters = probe_result.get("observed_parameters") if isinstance(probe_result, Mapping) else None
+        all_probe_parameters = []
+        if isinstance(probe_parameters, list):
+            all_probe_parameters.extend(probe_parameters)
+        if isinstance(observed_parameters, list):
+            all_probe_parameters.extend(observed_parameters)
+        if not all_probe_parameters:
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_NO_CORRELATED_READ", deadline)
         target_key = _parameter_key(probe)
         matching = [
-            parameter for parameter in probe_parameters
+            parameter for parameter in all_probe_parameters
             if isinstance(parameter, Mapping)
             and _parameter_key(parameter) == target_key
             and parameter.get("fuzzable") is True
         ]
+        pending_matching = [
+            parameter for parameter in all_probe_parameters
+            if isinstance(parameter, Mapping)
+            and _parameter_key(parameter) == target_key
+            and parameter.get("fuzzable") is not True
+        ]
         unexpected = [
             dict(parameter) for parameter in probe_parameters
             if isinstance(parameter, Mapping) and _parameter_key(parameter) != target_key
-        ]
+        ] if isinstance(probe_parameters, list) else []
+        if not matching and pending_matching:
+            parameter = self._inherit_callback_identity(pending_matching[0], parent)
+            return self._finish_probe_pending(
+                parent, evidence, attempt, probe_evidence, probe_result, parameter,
+            )
         if not matching:
             if unexpected:
                 attempt["unexpected_parameters"] = unexpected
@@ -1368,7 +1485,7 @@ class OnlineLinkedCoordinator:
                 parent, evidence, attempt, "PROBE_TARGET_MISMATCH", deadline,
                 extra={"unexpected_parameters": unexpected},
             )
-        parameter = matching[0]
+        parameter = self._inherit_callback_identity(matching[0], parent)
         if not self._probe_admission_complete(parameter, probe_evidence, parent):
             return self._finish_probe_failure(
                 parent, evidence, attempt, "PROBE_PROVENANCE_INCOMPLETE", deadline,
@@ -1394,6 +1511,39 @@ class OnlineLinkedCoordinator:
             "parameter": dict(parameter),
             "evidence": probe_evidence,
             "result": probe_result,
+        }
+
+    def _finish_probe_pending(
+        self,
+        parent: dict[str, Any],
+        evidence: Mapping[str, Any],
+        attempt: dict[str, Any],
+        probe_evidence: Mapping[str, Any],
+        probe_result: Mapping[str, Any],
+        parameter: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        attempt.update(status="pending", reason="CORRELATED_CANDIDATE_NOT_ADMITTED")
+        attempt["probe_request_id"] = probe_evidence.get("request_id")
+        timing = dict(attempt.get("timing") or {})
+        timing["verify"] = round(self.clock() - float(attempt.pop("_verify_started_at", self.clock())), 3)
+        timing["total"] = round(self.clock() - float(attempt.pop("_started_at", self.clock())), 3)
+        attempt["timing"] = timing
+        self._record_event({
+            "kind": "PARAMETER_PROBE", "status": "PENDING",
+            "reason": "CORRELATED_CANDIDATE_NOT_ADMITTED",
+            "version": parent["version"], "worker_run_id": attempt.get("probe_run_id"),
+            "request_id": probe_evidence.get("request_id") or evidence.get("request_id"),
+            "probe_id": attempt.get("probe_id"), "candidate": dict(attempt.get("candidate") or {}),
+            "parameter": dict(parameter), "timing": timing,
+            "candidate_status": parameter.get("candidate_status"),
+            "candidate_reason": parameter.get("candidate_reason"),
+        })
+        self._write_state()
+        return {
+            "status": "pending",
+            "parameter": dict(parameter),
+            "evidence": dict(probe_evidence),
+            "result": dict(probe_result),
         }
 
     def _finish_probe_failure(
@@ -1693,8 +1843,14 @@ class OnlineLinkedCoordinator:
             "timing": dict(sender_result.get("timing") or {}),
         }
         artifact_error = ""
+        artifact_stage = ""
         try:
-            self._save_replay_artifacts(replay_row, request_dir, zend_dir)
+            self._save_replay_artifacts(
+                {**replay_row, "_strict_correlation": False}, request_dir, zend_dir,
+            )
+        except ReplayArtifactError as exc:
+            artifact_error = str(exc)
+            artifact_stage = exc.stage
         except (OSError, RuntimeError, ValueError) as exc:
             artifact_error = str(exc)
         try:
@@ -1703,6 +1859,7 @@ class OnlineLinkedCoordinator:
                 merged_report,
                 zend_dir,
                 pass2_artifacts_dir=request_dir,
+                runtime_cookie_probes=self.runtime_cookie_probes,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             verification = {"accepted": 0, "total": 0, "error": str(exc)}
@@ -1727,6 +1884,8 @@ class OnlineLinkedCoordinator:
         replay_result["timing"].setdefault("handoff", 0.0)
         if artifact_error:
             replay_result["artifact_error"] = artifact_error
+            if artifact_stage:
+                replay_result["artifact_stage"] = artifact_stage
         child["replay_result"] = replay_result
         self.state.setdefault("replay_results", []).append(replay_result)
 
@@ -2039,7 +2198,12 @@ class OnlineLinkedCoordinator:
         self._write_state()
         return stopped
 
-    def _save_replay_artifacts(self, row: Mapping[str, Any], request_dir: Path, zend_dir: Path) -> None:
+    def _save_replay_artifacts(
+        self, row: Mapping[str, Any], request_dir: Path, zend_dir: Path,
+        *, strict_correlation: bool | None = None,
+    ) -> None:
+        if strict_correlation is None:
+            strict_correlation = bool(row.get("_strict_correlation", True))
         names = set()
         matched = str(row.get("matched_artifact") or "")
         if matched:
@@ -2047,19 +2211,75 @@ class OnlineLinkedCoordinator:
         names.update(str(name) for name in row.get("request_artifacts", []) if str(name))
         for name in names:
             if Path(name).name != name:
+                if strict_correlation:
+                    raise ReplayArtifactError("id_correlation", "artifact name is not a file name")
                 continue
             payload = row.get("request_payload") if name == matched else None
             if payload is None:
-                payload = self.load_artifact(name)
-            self._copy_json(request_dir / name, payload)
+                try:
+                    payload = self.load_artifact(name)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise ReplayArtifactError("sender_payload", "request payload loader failed") from exc
+            if strict_correlation:
+                self._validate_artifact_payload(payload, name, row, zend=False)
+            try:
+                self._copy_json(request_dir / name, payload)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ReplayArtifactError("request_write", "request artifact write failed") from exc
             zend_name = str(row.get("zend_artifact") or "") if name == matched else ""
             if zend_name and Path(zend_name).name == zend_name:
-                self._copy_json(zend_dir / zend_name, row.get("zend_payload"))
+                zend_payload = row.get("zend_payload")
+                if zend_payload is None:
+                    try:
+                        zend_payload = self.load_zend_artifact(zend_name)
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        raise ReplayArtifactError("sender_payload", "Zend payload loader failed") from exc
+                if strict_correlation:
+                    self._validate_artifact_payload(zend_payload, zend_name, row, zend=True)
+                try:
+                    self._copy_json(zend_dir / zend_name, zend_payload)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise ReplayArtifactError("zend_write", "Zend artifact write failed") from exc
             else:
+                if name != matched:
+                    continue
+                if zend_name:
+                    if strict_correlation:
+                        raise ReplayArtifactError("id_correlation", "Zend artifact name is not a file name")
+                    continue
                 zend_names = self.list_zend_artifacts()
                 exact = [candidate for candidate in zend_names if Path(candidate).name == candidate and Path(candidate).stem == Path(name).stem]
-                if len(exact) == 1:
-                    self._copy_json(zend_dir / exact[0], self.load_zend_artifact(exact[0]))
+                if len(exact) != 1:
+                    if strict_correlation:
+                        raise ReplayArtifactError("id_correlation", "request and Zend artifact IDs do not match")
+                    continue
+                try:
+                    zend_payload = self.load_zend_artifact(exact[0])
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise ReplayArtifactError("sender_payload", "Zend payload loader failed") from exc
+                if strict_correlation:
+                    self._validate_artifact_payload(zend_payload, exact[0], row, zend=True)
+                try:
+                    self._copy_json(zend_dir / exact[0], zend_payload)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise ReplayArtifactError("zend_write", "Zend artifact write failed") from exc
+
+    @staticmethod
+    def _validate_artifact_payload(
+        payload: Any, name: str, row: Mapping[str, Any], *, zend: bool,
+    ) -> None:
+        if not isinstance(payload, Mapping):
+            raise ReplayArtifactError("sender_payload", "artifact payload is missing")
+        if str(payload.get("request_id") or "") != Path(name).stem:
+            raise ReplayArtifactError("id_correlation", "artifact request ID does not match its name")
+        expected_run_id = str(row.get("legacy_run_id") or "")
+        actual_run_id = str(
+            (payload.get("run_id") if zend else None)
+            or payload.get("legacy_run_id")
+            or ""
+        )
+        if expected_run_id and actual_run_id and actual_run_id != expected_run_id:
+            raise ReplayArtifactError("id_correlation", "artifact run ID does not match the replay")
 
     def _write_config(self, version: str, config: Mapping[str, Any], *, replay: bool = False) -> Path:
         filename = f"{version}-replay.json" if replay else f"{version}-config.json"
@@ -2118,15 +2338,53 @@ class OnlineLinkedCoordinator:
             or parent.get("worker_run_id")
             or ""
         )
+        expected_callback = self._expected_callback(parent)
+        parent_callback_id = str(parent.get("callback_id") or "")
+        parameter_callback_id = str(parameter.get("callback_id") or "")
+        request = evidence.get("request")
+        if isinstance(request, Mapping):
+            request_callback_id = str(request.get("callback_id") or "")
+            request_hook_name = str(request.get("hook_name") or "")
+            request_auth_context = str(request.get("auth_context") or "")
+            request_metadata = request.get("metadata")
+            if isinstance(request_metadata, Mapping):
+                request_auth_context = request_auth_context or str(request_metadata.get("auth_context") or "")
+            if (
+                (request_callback_id and request_callback_id != parent_callback_id)
+                or (request_hook_name and request_hook_name != str(parent.get("hook_name") or ""))
+                or (request_auth_context and request_auth_context != str(parent.get("auth_context") or ""))
+            ):
+                return False
         return (
             all(str(value or "").strip() for value in required)
             and str(parameter.get("request_id")) == str(evidence.get("request_id"))
             and str(parameter.get("run_id")) == evidence_run_id
             and str(parameter.get("plugin_slug")) == self.plugin_slug
             and str(parameter.get("request_method")).upper() == str(parent.get("resolved_method") or "").upper()
+            and (not parent_callback_id or parameter_callback_id == parent_callback_id)
             and _canonical_callback_name(parameter.get("canonical_callback"))
-            == _canonical_callback_name(parent.get("canonical_callback"))
+            == _canonical_callback_name(expected_callback)
         )
+
+    def _expected_callback(self, parent: Mapping[str, Any]) -> str:
+        callback_map = self.registry.get("callback_map")
+        if not isinstance(callback_map, Mapping):
+            callback_map = prepare_callback_registry(self.registry, self.plugin_slug).get("callback_map", {})
+        expected = callback_map.get(str(parent.get("callback_id") or ""))
+        return str(expected or parent.get("canonical_callback") or "")
+
+    def _inherit_callback_identity(
+        self, parameter: Mapping[str, Any], parent: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Fill legacy parameter rows with the already-verified parent identity."""
+        normalized = dict(parameter)
+        parent_callback_id = str(parent.get("callback_id") or "")
+        if parent_callback_id and not str(normalized.get("callback_id") or ""):
+            expected = _canonical_callback_name(self._expected_callback(parent))
+            actual = _canonical_callback_name(normalized.get("canonical_callback"))
+            if expected and actual == expected:
+                normalized["callback_id"] = parent_callback_id
+        return normalized
 
     def _probe_admission_complete(
         self, parameter: Mapping[str, Any], evidence: Mapping[str, Any], parent: Mapping[str, Any],
@@ -2136,7 +2394,7 @@ class OnlineLinkedCoordinator:
         request = evidence.get("request")
         zend = evidence.get("zend")
         source = str(parameter.get("source") or "").upper()
-        location = str(parameter.get("location") or "")
+        location = str(parameter.get("location") or "").lower()
         request_method = str(parent.get("resolved_method") or "").upper()
         artifact_method = str(
             (request.get("http_method") if isinstance(request, Mapping) else "")
@@ -2149,14 +2407,17 @@ class OnlineLinkedCoordinator:
             isinstance(request, Mapping)
             and isinstance(zend, Mapping)
             and request.get("target_plugin") == self.plugin_slug
-            and (source, location) in {("GET", "query"), ("POST", "form")}
+            and (source, location) in ({("GET", "query"), ("POST", "form")} | (
+                {("COOKIE", "cookie")} if self.runtime_cookie_probes else set()
+            ))
             and artifact_method == request_method
             and runtime_parameter_is_accepted(
                 parameter,
                 request,
                 zend,
-                canonical_callback=_canonical_callback_name(parent.get("canonical_callback")),
+                canonical_callback=_canonical_callback_name(self._expected_callback(parent)),
                 request_method=str(parent.get("resolved_method") or ""),
+                runtime_cookie_probes=self.runtime_cookie_probes,
             )
         )
 
@@ -2288,7 +2549,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
         "candidates": [],
         "expansion_events": [],
     }
-    failed = False
+    skipped = False
     queue: list[tuple[int, Mapping[str, Any], str]] = []
     queued_ids: set[str] = set()
     for index, raw_item in enumerate(items, start=1):
@@ -2314,10 +2575,6 @@ def run_online_linked(args: argparse.Namespace) -> int:
         slug = _candidate_slug(raw_item, index)
         candidate_run_id = f"{args.legacy_run_id}-candidate-{slug}"
         candidate_input = candidate_input_dir / f"{slug}.json"
-        candidate_input.write_text(
-            json.dumps({**payload, "suggested_seeds": [dict(raw_item)]}, indent=2) + "\n",
-            encoding="utf-8",
-        )
         candidate_record = {
             "index": index,
             "hook_name": str(raw_item.get("hook_name") or ""),
@@ -2329,6 +2586,10 @@ def run_online_linked(args: argparse.Namespace) -> int:
         if isinstance(raw_item.get("lineage"), Mapping):
             candidate_record["lineage"] = dict(raw_item["lineage"])
         try:
+            candidate_input.write_text(
+                json.dumps({**payload, "suggested_seeds": [dict(raw_item)]}, indent=2) + "\n",
+                encoding="utf-8",
+            )
             coordinator = OnlineLinkedCoordinator(
                 suggested_seeds=candidate_input,
                 bootstrap_config=Path(args.bootstrap_config) if args.bootstrap_config else None,
@@ -2338,13 +2599,14 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 legacy_run_id=candidate_run_id,
                 max_seconds=args.max_seconds,
                 max_versions=args.max_versions,
+                runtime_cookie_probes=bool(getattr(args, "runtime_cookie_probes", False)),
                 registry_path=batch_registry,
                 service=args.service,
                 load_finding_artifact=load_finding_artifact,
                 campaign_deadline=campaign_deadline,
             )
             result = coordinator.run()
-            failed = failed or result != 0
+            skipped = skipped or result != 0 or coordinator.state.get("terminal_status") == "NOT_VERIFIED"
             candidate_record.update({
                 "exit_code": result,
                 "state_path": str(coordinator.state_path),
@@ -2376,15 +2638,14 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 if bool(getattr(args, "sync_registry", False)):
                     try:
                         _sync_callback_registry_to_web(batch_registry)
-                    except (OSError, RuntimeError, ValueError) as exc:
+                    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                         batch_state["expansion_events"].append({
                             "reason": "CALLBACK_REGISTRY_REFRESH_FAILED",
                             "identity": child_identity,
                             "detail": str(exc),
                             "lineage": dict(child.get("lineage") or {}),
                         })
-                        failed = True
-                        batch_state["campaign_status"] = "NOT_VERIFIED"
+                        skipped = True
                         continue
                     if time.monotonic() >= campaign_deadline:
                         batch_state["campaign_status"] = "CAMPAIGN_BUDGET_EXPIRED"
@@ -2397,14 +2658,15 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 queued_ids.add(child_identity)
                 queue.append((next_index, dict(child), "runtime_registration"))
                 next_index += 1
-        except (OSError, ValueError) as exc:
-            failed = True
+        except Exception as exc:
+            # Candidate-local failures must not discard the remaining batch.
+            skipped = True
             candidate_record.update({
                 "exit_code": 2,
-                "state_path": "",
+                "state_path": candidate_record.get("state_path", ""),
                 "terminal_status": "NOT_VERIFIED",
-                "terminal_reason": f"CANDIDATE_SETUP_FAILED: {exc}",
-                "versions": 0,
+                "terminal_reason": f"CANDIDATE_FAILED: {type(exc).__name__}: {exc}",
+                "versions": candidate_record.get("versions", 0),
             })
         batch_state["candidates"].append(candidate_record)
 
@@ -2412,11 +2674,12 @@ def run_online_linked(args: argparse.Namespace) -> int:
         batch_state["campaign_status"] = "CAMPAIGN_BUDGET_EXPIRED"
         batch_state["expansion_events"].append({"reason": "CAMPAIGN_BUDGET_EXPIRED"})
     if batch_state["campaign_status"] == "running":
-        batch_state["campaign_status"] = "complete"
+        batch_state["campaign_status"] = "complete_with_skips" if skipped else "complete"
 
     batch_state_path = batch_dir / "batch-state.json"
     _write_json(batch_state_path, batch_state)
     print(f"Online-linked batch state: {batch_state_path}")
+    print(f"Online-linked campaign status: {batch_state['campaign_status']}")
     print(f"Online-linked candidates: {len(batch_state['candidates'])}")
     print(
         "Online-linked terminal statuses: "
@@ -2428,7 +2691,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
-    return 1 if failed else 0
+    return 0
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -2445,6 +2708,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-candidates", type=int, choices=range(1, 129), default=32)
     parser.add_argument("--campaign-seconds", type=int, choices=range(1, 86401), default=3600)
     parser.add_argument("--sync-registry", action="store_true")
+    parser.add_argument("--runtime-cookie-probes", action="store_true")
     parser.add_argument("--service", default="fuzzer-wordpress-plugin")
     return parser
 
