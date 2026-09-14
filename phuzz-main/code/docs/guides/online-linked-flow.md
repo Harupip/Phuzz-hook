@@ -52,7 +52,7 @@ Sơ đồ biểu diễn đường đi thành công và nhánh phục hồi chín
 | 1 | Khởi tạo Docker, plugin, instrumentation và run ID | Có trong wrapper. HTTP 200 và bật biến môi trường chưa chứng minh Zend/UOPZ đã tạo evidence hợp lệ. |
 | 2 | Truy cập entrypoint, thu hook/route đăng ký trong runtime | Có bootstrap và hook đăng ký runtime; online-linked đọc registration trong request artifact, xác minh parent/request ID, cập nhật registry và queue HTTP child. Internal/ambiguous registrations vẫn blocked. |
 | 3 | Request khởi đầu đúng endpoint, method, auth | Có chuyển seed thành request/config và các gate. Chưa tự chuẩn bị đầy đủ auth, nonce, dữ liệu ứng dụng cho mọi plugin; replay probe không đồng nghĩa đã xác minh method/ngữ cảnh. |
-| 4 | Replay tìm tham số đúng callback, nguồn input | Có ghép exact request ID/run ID/plugin và convergence kiểm tra provenance. Raw direct-argument read giữ provenance từ root `FETCH_FUNC_ARG`; chỉ nhận evidence có raw `read` hợp lệ. |
+| 4 | Replay tìm tham số đúng callback, nguồn input | Có ghép exact request ID/run ID/plugin và convergence kiểm tra provenance. Raw direct-argument read giữ provenance từ root `FETCH_FUNC_ARG`; direct `read` hoặc guard `isset`/`empty` có key trong request bucket đều có thể được nhận. |
 | 5 | Tạo, kiểm chứng config đầu; xử lý chưa có tham số | Có `replay_only` và `fuzzing_ready`; v0 phải qua replay callback/provenance và Pass 2 trước khi fuzz. Seed không có tham số chỉ chạy probe/replay bounded hoặc ghi blocked. |
 | 6 | Chạy PHUZZ khi config đủ điều kiện | Có cho candidate đang được xử lý. Worker con phải qua replay/Pass 2 và còn ngân sách. |
 | 7 | Thu coverage, lỗi, tham số mới, so sánh khi fuzz | Có trong fuzzer và instrumentation; coordinator đọc cặp request/Zend. |
@@ -84,7 +84,7 @@ Một `add_action()` mới có thể chỉ là hook nội bộ, không có URL g
 
 Online-linked có thể bật khám phá COOKIE bằng `--runtime-cookie-probes`. Mặc định tùy chọn này tắt, nên generated/static discovery và các lệnh online-linked không truyền cờ vẫn giữ policy cũ; `parameter_seeds.py` vẫn block COOKIE tĩnh trên diện rộng.
 
-Khi bật, chỉ COOKIE có raw read được gán đúng callback và request artifact cùng `run_id`/`request_id` mới được nhận. Artifact chỉ lưu danh sách tên cookie, không lưu giá trị. `isset`/`empty` không đủ để admission và sẽ tạo candidate pending để probe; probe dùng marker synthetic, rồi phải vượt lại callback/read/request và Pass 2. COOKIE được giữ ở mapping `COOKIE` → `cookie` → seed/config `cookies`, nên không nhập với POST trùng tên.
+Khi bật, chỉ COOKIE có runtime access được gán đúng callback và request artifact cùng `run_id`/`request_id` mới được nhận. Artifact chỉ lưu danh sách tên cookie, không lưu giá trị. `isset`/`empty` không có key tương ứng vẫn là candidate pending; khi probe đã materialize đúng key và giữ exact correlation, guard có thể được admission. Guard không bị đổi tên thành `read`; probe marker synthetic vẫn không phải observed value. COOKIE được giữ ở mapping `COOKIE` → `cookie` → seed/config `cookies`, nên không nhập với POST trùng tên.
 
 Giá trị cookie do setup quản lý, nhất là login cookie, không được lấy từ artifact để fuzz hoặc ghi đè. Exporter/request preparation vẫn gửi cookie qua bucket riêng; verifier kiểm tra membership tên cookie cùng callback, raw read và exact artifact IDs. Wrapper PowerShell chưa đổi; cờ được truyền ở coordinator online-linked.
 
@@ -92,13 +92,13 @@ Giá trị cookie do setup quản lý, nhất là login cookie, không được 
 
 Khi một probe chưa đủ điều kiện admission nhưng đã có artifact correlate được, coordinator giữ outcome `pending` gồm `candidate`, convergence report và evidence nguồn. Mỗi queue item có bản sao riêng; không dùng report hoặc request/Zend evidence của probe cuối cho các candidate trước đó.
 
-Ví dụ: probe `a` có thể phát hiện candidate `c`; `c` được chạy với merged seed report và evidence của `a`, trong khi candidate `b` đã có trong queue vẫn giữ report/evidence ban đầu. Candidate mới chỉ được giữ pending cho tới khi có correlated raw read đúng callback/request/run và bucket; không tự admit `unexpected_parameters`.
+Ví dụ: probe `a` có thể phát hiện candidate `c`; `c` được chạy với merged seed report và evidence của `a`, trong khi candidate `b` đã có trong queue vẫn giữ report/evidence ban đầu. Candidate mới chỉ được giữ pending cho tới khi có correlated runtime `read` hoặc guard access đúng callback/request/run và bucket; không tự admit `unexpected_parameters`.
 
 Dedupe dùng parent/callback/context, source/location và toàn bộ input request (`query_params`, `body_params`, `json_params`, `cookies`), bỏ qua request ID và metadata. Vì vậy cùng candidate với input mới có thể retry trong `MAX_PROBE_ATTEMPTS`; cycle hoặc cùng input không lặp vô hạn. Deadline probe là phần ngân sách riêng, phần còn lại dành cho export/replay/handoff child; accepted evidence vẫn được giữ nếu probe sau timeout hoặc thất bại.
 
 ### Direct argument và Zend raw-read evidence
 
-Fixture direct-argument dùng lời gọi thật `hookphuzz_runtime_sink($_POST['data'])`, một helper depth riêng, direct/local reads và các control `isset`/`empty`. Với PHP compile thành root `FETCH_FUNC_ARG` rồi `FETCH_DIM_FUNC_ARG`, extension phải giữ provenance từ root fetch tới dimension read; `isset` hoặc `empty` không được đổi thành `read`.
+Fixture direct-argument dùng lời gọi thật `hookphuzz_runtime_sink($_POST['data'])`, một helper depth riêng, direct/local reads và các control `isset`/`empty`. Với PHP compile thành root `FETCH_FUNC_ARG` rồi `FETCH_DIM_FUNC_ARG`, extension phải giữ provenance từ root fetch tới dimension read; `isset` hoặc `empty` không được đổi thành `read`, nhưng correlated guard có thể được dùng như presence input.
 
 Fresh Docker gate sau rebuild extension ghi đủ `data`, `helper`, `direct`, `nested` và `local` raw `read`, đồng thời giữ `guard` là `isset` và `empty_guard` là `empty`, với `dropped_event_count=0`. Chi tiết version, image/source parity, opcode dump và raw event summary nằm trong [results report](../../../../docs/superpowers/plans/2026-09-13-online-linked-luna-results.md).
 
@@ -154,7 +154,23 @@ fuzzer/output/online-linked/<batch-run-id>/callback-registry.json
 
 Lỗi hoặc timeout riêng của candidate được ghi `NOT_VERIFIED` và không hủy hàng đợi còn lại. Giới hạn `OnlineMaxCandidates` và `OnlineCampaignTimeoutSeconds` vẫn áp dụng; lỗi đầu vào chung hoặc không ghi được batch state vẫn làm CLI thất bại.
 
-## 6. Source map và kiểm chứng
+## 6. Final configs
+
+Cuối batch, config được gom vào thư mục phẳng:
+
+```text
+fuzzer/output/online-linked/<batch-run-id>/final-configs/fuzzer-config.<hook>.<identity-hash>.json
+```
+
+Mỗi candidate lấy phiên bản mới nhất qua replay và Pass 2 (`accepted == total > 0`),
+chỉ nhận `fuzzing_ready`. Nếu phiên bản mới bị loại thì xét phiên bản cũ hơn.
+File copy nguyên byte, giữ metadata/auth và tham số. Không tạo manifest.
+Terminal in đường dẫn, số file và lý do bỏ qua; không có config vẫn là kết quả hợp lệ.
+Lỗi ghi xuất trả lỗi, giữ batch-state và file nguồn. Không ghi đè thư mục đã tồn tại.
+Nếu ghi lỗi giữa chừng, thư mục có thể chứa một phần config; xem lỗi terminal.
+Đây là tổng hợp artifact đã lưu, không chạy lại replay hoặc fuzzing.
+
+## 7. Source map và kiểm chứng
 
 | Thành phần | Source |
 | --- | --- |

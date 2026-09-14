@@ -1,4 +1,5 @@
 import copy
+import io
 import json
 import os
 import shutil
@@ -9,6 +10,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import redirect_stderr
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
@@ -783,7 +785,11 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 callback_registry=str(registry),
                 service="fuzzer-wordpress-plugin",
             )
-            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator):
+            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch(
+                        "hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                        return_value=0,
+                    ):
                 self.assertEqual(run_online_linked(args), 0)
 
             self.assertEqual(len(calls), 2)
@@ -829,7 +835,11 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="run",
                     max_seconds=1, max_versions=2, callback_registry=str(registry), service="fuzzer-wordpress-plugin",
                 )
-                with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", Candidate):
+                with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", Candidate), \
+                        patch(
+                            "hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                            return_value=0,
+                        ):
                     result = run_online_linked(args)
                 state = json.loads((root / "output/online-linked/run/batch-state.json").read_text())
                 self.assertEqual([row["callback_id"] for row in state["candidates"]], ["first", "last"])
@@ -891,7 +901,11 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 callback_registry=str(registry),
                 service="fuzzer-wordpress-plugin",
             )
-            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator):
+            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch(
+                        "hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                        return_value=0,
+                    ):
                 self.assertEqual(run_online_linked(args), 0)
 
             self.assertEqual(len(calls), 2)
@@ -904,6 +918,10 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             calls.clear()
             args.sync_registry = True
             with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch(
+                        "hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                        return_value=0,
+                    ), \
                     patch("hook_energy.seed_generation.online_linked_coordinator._sync_callback_registry_to_web",
                           side_effect=subprocess.TimeoutExpired("docker cp", 30)):
                 self.assertEqual(run_online_linked(args), 0)
@@ -956,6 +974,10 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 callback_registry=str(registry), service="fuzzer-wordpress-plugin", sync_registry=True,
             )
             with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch(
+                        "hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                        return_value=0,
+                    ), \
                     patch("hook_energy.seed_generation.online_linked_coordinator._sync_callback_registry_to_web") as sync, \
                     patch("hook_energy.seed_generation.online_linked_coordinator.time.monotonic", side_effect=[0.0, 0.0, 2.0]):
                 self.assertEqual(run_online_linked(args), 0)
@@ -965,6 +987,130 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             batch_state = json.loads((root / "output" / "online-linked" / "run" / "batch-state.json").read_text(encoding="utf-8"))
             self.assertEqual(batch_state["campaign_status"], "CAMPAIGN_BUDGET_EXPIRED")
             self.assertEqual(len(batch_state["candidates"]), 1)
+
+    def test_batch_exports_once_after_final_batch_state_for_vulnerability_and_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            suggested = root / "suggested.json"
+            suggested.write_text(
+                json.dumps(
+                    {
+                        "suggested_seeds": [
+                            {"hook_name": "wp_ajax_first", "callback_id": "cb-first", "seed": {}},
+                            {"hook_name": "wp_ajax_second", "callback_id": "cb-second", "seed": {}},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = root / "registry.json"
+            registry.write_text("{}", encoding="utf-8")
+            calls = []
+            export_calls = []
+
+            class FakeCoordinator:
+                def __init__(self, **kwargs):
+                    calls.append(kwargs)
+                    self.state_path = root / f"state-{len(calls)}.json"
+                    self.state = {
+                        "terminal_status": "VULN_FOUND" if len(calls) == 1 else "BOUNDED_ONLINE_COMPLETE",
+                        "terminal_reason": "VULN_FOUND" if len(calls) == 1 else "BUDGET_EXPIRED",
+                        "versions": [],
+                    }
+
+                def run(self):
+                    return 0
+
+            def export(batch_state_path):
+                export_calls.append(
+                    (
+                        Path(batch_state_path),
+                        json.loads(Path(batch_state_path).read_text(encoding="utf-8")),
+                    )
+                )
+                return 0
+
+            args = SimpleNamespace(
+                suggested_seeds=str(suggested),
+                bootstrap_config="",
+                config_root=str(root / "configs"),
+                output_root=str(root / "output"),
+                plugin_slug="fixture",
+                legacy_run_id="run",
+                max_seconds=1,
+                max_versions=2,
+                max_candidates=2,
+                campaign_seconds=10,
+                callback_registry=str(registry),
+                service="fuzzer-wordpress-plugin",
+            )
+            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch("hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                          create=True,
+                          side_effect=export):
+                self.assertEqual(run_online_linked(args), 0)
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(export_calls), 1)
+            self.assertTrue(export_calls[0][0].is_file())
+            self.assertEqual(len(export_calls[0][1]["candidates"]), 2)
+
+    def test_batch_export_failure_keeps_batch_state_and_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            suggested = root / "suggested.json"
+            suggested.write_text(
+                json.dumps(
+                    {
+                        "suggested_seeds": [
+                            {"hook_name": "wp_ajax_only", "callback_id": "cb-only", "seed": {}}
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = root / "registry.json"
+            registry.write_text("{}", encoding="utf-8")
+
+            class FakeCoordinator:
+                def __init__(self, **kwargs):
+                    self.state_path = root / "state.json"
+                    self.state = {
+                        "terminal_status": "VULN_FOUND",
+                        "terminal_reason": "VULN_FOUND",
+                        "versions": [],
+                    }
+
+                def run(self):
+                    return 0
+
+            args = SimpleNamespace(
+                suggested_seeds=str(suggested),
+                bootstrap_config="",
+                config_root=str(root / "configs"),
+                output_root=str(root / "output"),
+                plugin_slug="fixture",
+                legacy_run_id="run",
+                max_seconds=1,
+                max_versions=2,
+                callback_registry=str(registry),
+                service="fuzzer-wordpress-plugin",
+            )
+            error_output = io.StringIO()
+            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch(
+                        "hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                        create=True,
+                        side_effect=OSError("disk full"),
+                    ), redirect_stderr(error_output):
+                result = run_online_linked(args)
+
+            batch_path = root / "output" / "online-linked" / "run" / "batch-state.json"
+            self.assertEqual(result, 2)
+            self.assertTrue(batch_path.is_file())
+            self.assertEqual(len(json.loads(batch_path.read_text(encoding="utf-8"))["candidates"]), 1)
+            self.assertIn("EXPORT_FAILED", error_output.getvalue())
+            self.assertIn("disk full", error_output.getvalue())
 
     def test_worker_vulnerability_exit_stops_current_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2317,6 +2463,27 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             invalid["request"]["request_params"]["query_params"] = {}
             self.assertFalse(coordinator._probe_admission_complete(parameter, invalid, parent))
 
+    def test_probe_admission_accepts_correlated_request_guard_after_transport_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            parent = {"canonical_callback": "Fixture->handle", "resolved_method": "POST"}
+            parameter = {
+                "name": "task", "path": ["task"], "source": "POST", "location": "form",
+                "helper_depth": 2, "observed_count": 1, "evidence_kind": "zend_runtime",
+                "request_id": "probe-request", "run_id": "probe-run", "plugin_slug": "fixture",
+                "canonical_callback": "Fixture::handle", "request_method": "POST",
+                "fuzzable": True, "access_forms": ["isset"],
+            }
+            evidence = {
+                "request_id": "probe-request", "worker_run_id": "probe-run",
+                "request": {"target_plugin": "fixture", "http_method": "POST",
+                            "request_params": {"body_params": {"task": "probe"}}},
+                "zend": {"events": [{"source": "REQUEST", "path": ["task"], "operation": "isset",
+                         "callback_context": {"attributed": True, "root_callback": "Fixture::handle", "depth": 2}}]},
+            }
+
+            self.assertTrue(coordinator._probe_admission_complete(parameter, evidence, parent))
+
     def test_probe_admission_uses_registry_callback_identity_and_registration(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator = self.make_coordinator(Path(tmp), [])
@@ -2591,9 +2758,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertEqual(cookie_rows["fixture_cookie"]["value"], "source-cookie")
                 self.assertIn("fixture_cookie", child["cookies"]["fuzz"])
                 invalid_cases = []
-                missing_read = copy.deepcopy(evidence)
-                missing_read["zend"]["events"][0]["operation"] = "isset"
-                invalid_cases.append(("missing read", parameter, missing_read))
+                unsupported_operation = copy.deepcopy(evidence)
+                unsupported_operation["zend"]["events"][0]["operation"] = "write"
+                invalid_cases.append(("unsupported operation", parameter, unsupported_operation))
                 absent_cookie = copy.deepcopy(evidence)
                 absent_cookie["request"]["request_params"]["cookies"] = {}
                 invalid_cases.append(("cookie absent", parameter, absent_cookie))

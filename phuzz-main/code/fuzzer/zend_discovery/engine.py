@@ -21,6 +21,7 @@ BLOCKED_NEEDS_RECIPE = "BLOCKED_NEEDS_RECIPE"
 READ_ACTION = re.compile(r"(?:get|list|fetch|search|load|view)", re.IGNORECASE)
 PERSISTENCE_FORBIDDEN_KEY = re.compile(r"(?:authorization|cookie|password|secret|token|pass2)", re.IGNORECASE)
 _DIRECT_RUNTIME_SOURCES = {"GET", "POST", "REQUEST", "COOKIE"}
+_VALUE_OR_GUARD_OPERATIONS = {"empty", "isset", "read"}
 
 
 def _safe_int(value: Any) -> int:
@@ -191,7 +192,7 @@ def runtime_parameter_is_accepted(
     request_has_key: bool | None = None,
     runtime_cookie_probes: bool = False,
 ) -> bool:
-    """Require a correlated raw read and its key in the matching request bucket."""
+    """Require a correlated read/guard access and its key in the matching request bucket."""
     source = str(parameter.get("source") or "").upper()
     path = parameter.get("path")
     try:
@@ -216,7 +217,7 @@ def runtime_parameter_is_accepted(
             canonical_callback=canonical_callback,
             helper_depth=helper_depth,
         )
-    if not operations or "read" not in operations:
+    if not operations or not operations.intersection(_VALUE_OR_GUARD_OPERATIONS):
         return False
     if request_has_key is None:
         request_params, request_headers = _runtime_request_details(uopz_artifact)
@@ -352,6 +353,7 @@ def normalize_runtime_evidence(
         if not isinstance(parameter, Mapping):
             continue
         source = str(parameter.get("source") or "").upper()
+        runtime_source = source
         path = parameter.get("path")
         try:
             helper_depth = int(parameter.get("helper_depth"))
@@ -440,6 +442,8 @@ def normalize_runtime_evidence(
             "canonical_callback": canonical_callback,
             "request_method": zend_method,
         }
+        if accepted and (runtime_source == "REQUEST" or "read" not in operations):
+            row["access_forms"] = sorted(operations)
         if not accepted:
             row.update({
                 "candidate_status": "pending_probe",

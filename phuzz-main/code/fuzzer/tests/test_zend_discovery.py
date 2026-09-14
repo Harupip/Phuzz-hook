@@ -251,6 +251,42 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertEqual(evidence[0]["candidate_status"], "pending_probe")
         self.assertEqual(evidence[0]["candidate_reason"], "guard_without_correlated_read")
 
+    def test_isset_with_correlated_request_key_is_admitted_for_fuzzing(self) -> None:
+        candidate = self.pass1_candidate()
+        uopz = self.pass1_artifact(
+            candidate,
+            request_params={
+                "query_params": {},
+                "body_params": {"action": "demo_fetch_items", "filter_tag": "probe"},
+            },
+        )
+        registry = {"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}}
+        zend = {
+            "run_id": "legacy-1",
+            "request_id": "pass1-1",
+            "request_method": "POST",
+            "target_loading": {"load_status": "loaded", "file_target_count": 1},
+            "callback_summaries": [{
+                "callback": "Demo::fetch",
+                "unique_parameters": [{
+                    "source": "POST", "path": ["filter_tag"],
+                    "access_forms": ["isset"], "helper_depth": 5, "observed_count": 1,
+                }],
+            }],
+            "events": [{
+                "source": "POST", "path": ["filter_tag"], "operation": "isset",
+                "callback_context": {
+                    "attributed": True, "root_callback": "Demo::fetch", "depth": 5,
+                },
+            }],
+        }
+
+        evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
+
+        self.assertEqual(len(evidence), 1)
+        self.assertTrue(evidence[0]["fuzzable"])
+        self.assertNotIn("candidate_status", evidence[0])
+
     def test_helper_empty_is_retained_as_candidate_without_becoming_fuzzable(self) -> None:
         candidate = self.pass1_candidate()
         uopz = self.pass1_artifact(
@@ -475,7 +511,7 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertEqual(accepted_result["new_parameters"][0]["helper_depth"], 5)
         self.assertTrue(accepted_result["new_parameters"][0]["fuzzable"])
 
-    def test_convergence_preserves_not_admitted_candidate_after_probe(self) -> None:
+    def test_convergence_admits_isset_candidate_when_request_key_is_present(self) -> None:
         item = self.raw_seed_item()
         item["seed"]["body"]["action"] = "demo_fetch_items"
         registry = {"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}}
@@ -499,27 +535,16 @@ class ZendDiscoveryTests(unittest.TestCase):
             zend_dir.mkdir()
             (request_dir / f"{item['pass1_request_id']}.json").write_text(json.dumps(uopz), encoding="utf-8")
             (zend_dir / f"{item['pass1_request_id']}.json").write_text(json.dumps(zend), encoding="utf-8")
-            first = converge_iteration(
+            result = converge_iteration(
                 raw_report={"suggested_seeds": [item]}, pass_run_summary=summary,
                 pass_artifacts_dir=request_dir, zend_events_dir=zend_dir, registry=registry,
                 plugin_slug="demo-plugin", legacy_run_id="legacy-1", known_state={"known_parameters": []},
             )
-            probe_item = first["merged_suggested_seeds"]["suggested_seeds"][0]
-            probe_summary = copy.deepcopy(summary)
-            probe_summary["runs"][0]["seed_variant_id"] = probe_item["seed"]["seed_variant_id"]
-            second = converge_iteration(
-                raw_report={"suggested_seeds": [probe_item]}, pass_run_summary=probe_summary,
-                pass_artifacts_dir=request_dir, zend_events_dir=zend_dir, registry=registry,
-                plugin_slug="demo-plugin", legacy_run_id="legacy-1", known_state={"known_parameters": []},
-            )
 
-        self.assertEqual(first["status"], "CONTINUE", first)
-        self.assertEqual(second["status"], "CONTINUE")
-        self.assertEqual(second["new_parameters"], [])
-        self.assertEqual(second["runtime_pending_count"], 1)
-        self.assertEqual(second["observed_parameters"][0]["candidate_status"], "pending_probe")
-        self.assertEqual(len(second["pending_probes"]), 1)
-        self.assertEqual(second["pending_probes"][0]["name"], "filter_tag")
+        self.assertEqual(result["status"], "CONTINUE", result)
+        self.assertEqual(result["new_parameters"][0]["name"], "filter_tag")
+        self.assertTrue(result["new_parameters"][0]["fuzzable"])
+        self.assertEqual(result.get("pending_probes", []), [])
 
     def test_convergence_identity_accepts_helper_depth_without_accepting_pending_candidate(self) -> None:
         accepted = {
@@ -625,8 +650,8 @@ class ZendDiscoveryTests(unittest.TestCase):
         guard_only = normalize_runtime_evidence(
             candidate, request, guard, registry, runtime_cookie_probes=True,
         )
-        self.assertEqual(guard_only[0]["candidate_reason"], "guard_without_correlated_read")
-        self.assertFalse(guard_only[0]["fuzzable"])
+        self.assertTrue(guard_only[0]["fuzzable"])
+        self.assertNotIn("candidate_reason", guard_only[0])
 
     def test_ajax_cookie_probe_is_materialized_only_when_enabled(self) -> None:
         report = {"suggested_seeds": [{
@@ -3554,7 +3579,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual(result["status"], "REPLAY_FAILED")
             self.assertEqual([row["name"] for row in result["missing_parameters"]], ["age"])
 
-    def test_pass2_helper_parameter_requires_correlated_read_and_request_key(self) -> None:
+    def test_pass2_helper_parameter_requires_correlated_runtime_access_and_request_key(self) -> None:
         raw = {
             "plugin_slug": "demo-plugin",
             "entrypoint_type": "ajax_authenticated",
@@ -3616,6 +3641,15 @@ class ZendDiscoveryTests(unittest.TestCase):
                 run, {"suggested_seeds": [raw]}, zend_dir, pass2_artifacts_dir=uopz_dir,
             )
             self.assertEqual(accepted, {"accepted": 1, "total": 1})
+
+            guard = copy.deepcopy(zend)
+            guard["callback_summaries"][0]["unique_parameters"][0]["access_forms"] = ["isset"]
+            guard["events"][0]["operation"] = "isset"
+            (zend_dir / "helper-pass2.json").write_text(json.dumps(guard), encoding="utf-8")
+            self.assertEqual(
+                verify_pass2_contract(run, {"suggested_seeds": [raw]}, zend_dir, pass2_artifacts_dir=uopz_dir),
+                {"accepted": 1, "total": 1},
+            )
 
             request["request_params"]["body_params"].pop("filter_tag")
             (uopz_dir / "helper-pass2.json").write_text(json.dumps(request), encoding="utf-8")

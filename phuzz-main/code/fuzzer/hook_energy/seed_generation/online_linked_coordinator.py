@@ -39,6 +39,7 @@ from hook_energy.seed_generation.online_config_runner import (
     config_hash,
     validate_v0_config,
 )
+from hook_energy.seed_generation.online_linked_export import export_online_linked_batch
 from hook_energy.seed_generation.zend_runtime.bridge_cli import (
     converge_iteration,
     list_convergence_targets,
@@ -2396,6 +2397,12 @@ class OnlineLinkedCoordinator:
         source = str(parameter.get("source") or "").upper()
         location = str(parameter.get("location") or "").lower()
         request_method = str(parent.get("resolved_method") or "").upper()
+        access_forms = parameter.get("access_forms")
+        operations = {
+            str(value).strip().lower()
+            for value in access_forms
+            if str(value).strip()
+        } if isinstance(access_forms, list) else None
         artifact_method = str(
             (request.get("http_method") if isinstance(request, Mapping) else "")
             or (request.get("method") if isinstance(request, Mapping) else "")
@@ -2417,6 +2424,7 @@ class OnlineLinkedCoordinator:
                 zend,
                 canonical_callback=_canonical_callback_name(self._expected_callback(parent)),
                 request_method=str(parent.get("resolved_method") or ""),
+                operations=operations,
                 runtime_cookie_probes=self.runtime_cookie_probes,
             )
         )
@@ -2678,6 +2686,11 @@ def run_online_linked(args: argparse.Namespace) -> int:
 
     batch_state_path = batch_dir / "batch-state.json"
     _write_json(batch_state_path, batch_state)
+    try:
+        export_online_linked_batch(batch_state_path)
+    except Exception as exc:
+        print(f"EXPORT_FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
     print(f"Online-linked batch state: {batch_state_path}")
     print(f"Online-linked campaign status: {batch_state['campaign_status']}")
     print(f"Online-linked candidates: {len(batch_state['candidates'])}")
