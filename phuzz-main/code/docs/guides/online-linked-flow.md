@@ -96,6 +96,52 @@ Ví dụ: probe `a` có thể phát hiện candidate `c`; `c` được chạy v�
 
 Dedupe dùng parent/callback/context, source/location và toàn bộ input request (`query_params`, `body_params`, `json_params`, `cookies`), bỏ qua request ID và metadata. Vì vậy cùng candidate với input mới có thể retry trong `MAX_PROBE_ATTEMPTS`; cycle hoặc cùng input không lặp vô hạn. Deadline probe là phần ngân sách riêng, phần còn lại dành cho export/replay/handoff child; accepted evidence vẫn được giữ nếu probe sau timeout hoặc thất bại.
 
+### Batch artifact reader và evidence gate
+
+`online_linked_evidence.read_runtime_batch()` đọc request/Zend theo một lần `docker compose exec -T web php -r`; PHP trả đúng một envelope `pairs` + `stats`. Reader chỉ nhận JSON object hợp lệ, giữ nguyên kiểu scalar/object/list, kiểm tra `request_id`, tên file, `run_id`/`legacy_run_id` và `target_plugin`; lỗi transport, timeout hoặc payload hỏng đều fail closed. File `.json.tmp.*` không được coi là artifact cuối. Payload được chuyển dưới dạng JSON gốc trong envelope rồi decode bằng Python, tránh mất độ chính xác số nguyên lớn khi PHP encode lại.
+
+Coordinator dùng reader này cho polling worker; production path không còn list/load từng file. `state.json` ghi `evidence_scan` gồm số file, số cặp, missing Zend, invalid payload, thời gian transport và ngân sách còn lại. Cặp chưa có Zend chỉ là `RETRY`; chỉ cặp correlate đầy đủ mới được đánh dấu seen và chuyển vào admission.
+
+Sau khi v0 replay và callback/provenance đã đạt (thêm Pass 2 nếu v0 là `fuzzing_ready`; v0 `replay_only` chỉ được phép probe), cặp request/Zend exact của v0 được giữ với `evidence_origin: v0_gate`. Coordinator khởi động worker trước, kiểm tra parent container, rồi đưa chính cặp gate đó qua `_handle_convergence_result()` trước polling batch đầu tiên. Probe lần đầu ghi `evidence_origin`, `request_id`, `remaining_budget_seconds` và `first_probe_delay_seconds`; origin `worker_poll` chỉ xuất hiện với evidence đọc từ batch sau đó. Parent checks, auth/provenance, deadline, replay và Pass 2 vẫn là điều kiện admission; gate không thay thế chúng.
+
+### Review và sửa bổ sung ngày 2026-09-14
+
+Bản tối ưu thay việc gọi Docker đọc từng artifact bằng batch reader và tái dùng evidence gate sau worker startup. Review bổ sung đã sửa:
+
+- **Giới hạn version:** gate kiểm tra `max_versions` trước khi xử lý convergence, tránh tạo thêm probe/child qua nhánh bỏ qua giới hạn của polling.
+- **Dọn worker khi gate dừng:** nhánh terminal ngay sau gate gọi `_stop_active_worker()`, tránh để container tiếp tục chạy khi coordinator đã trả về.
+- **Callback phụ:** evidence gate đi qua `_discover_runtime_candidates()` trước khi đánh dấu đã xử lý, giữ khả năng mở rộng callback từ runtime registry.
+- **Độ chính xác payload:** PHP chuyển chuỗi JSON gốc qua `request_json`/`zend_json`; Python decode thành payload. Không encode lại giá trị request bằng kiểu số PHP, tránh làm tròn số nguyên lớn.
+- **Kiểm tra parent:** khi caller truyền timeout, `docker inspect` trả nonzero hoặc output không hợp lệ phải báo `ParentInspectionError/PARENT_INSPECT_FAILED`; không coi trạng thái không xác định là parent còn chạy. Giữ hành vi legacy cho caller không truyền timeout.
+- **Tên artifact:** host bắt buộc request và Zend có đuôi `.json`, bên cạnh kiểm tra basename, ID và loại file tạm.
+
+Regression mới đã chạy đỏ trước sửa cho worker cleanup, giới hạn version/gate discovery, raw payload transport và parent inspection. Fixture parent đang chạy được sửa để trả `running` thay vì chuỗi rỗng.
+
+Kết quả kiểm chứng tại lần review này:
+
+| Suite | Pass | Fail | Skip |
+|---|---:|---:|---:|
+| `test_online_linked_coordinator.py` (lần cuối) | 89 | 0 | 0 |
+| `test_online_linked_evidence.py` | 3 | 0 | 0 |
+| `test_online_linked_export.py` | 6 | 0 | 0 |
+| `test_generated_config_runner.py` | 39 | 0 | 0 |
+| `test_probe_sender.py` | 15 | 0 | 0 |
+| **Tổng test riêng biệt** | **152** | **0** | **0** |
+
+Các suite chạy qua `python -m unittest discover -s tests -p <pattern>` tại `phuzz-main/code/fuzzer`, với outer subprocess timeout 180 giây. Coordinator được chạy lại sau sửa parent inspection: 89 test, 85.258 giây; tổng trên không cộng trùng các lần rerun. Kiểm tra PHP thật trong container với fixture tạm giữ nguyên số `18446744073709551617`, object rỗng và array rỗng. `git diff --check` đạt.
+
+**Giới hạn bằng chứng:** chưa chạy lại campaign guest/auth sau các sửa bổ sung này. Artifact Luna trước review cho guest `cd9e607f2df97986` và auth `af97f05239823e82` có v1 replay Pass 2 `accepted=1,total=1`, nhưng kết thúc lần lượt `BUDGET_EXPIRED` và `RUNTIME_BATCH_READ_FAILED`. Những artifact đó không chứng minh runtime của bản sửa cuối. Verdict runtime vẫn **PARTIAL**, chưa chứng minh fuzz/coverage/CmpLog hoặc vulnerability discovery toàn tuyến.
+
+### Hết budget khi đang đọc evidence (sửa bổ sung 2026-09-14)
+
+Lượt `20260914T163603Z` có guest kết thúc `RUNTIME_BATCH_READ_FAILED` với detail `RUNTIME_BATCH_TIMEOUT`, dù đã tạo v1 và đạt replay Pass 2. Auth kết thúc ngoài bước đọc nên nhận `BOUNDED_ONLINE_COMPLETE`. Số đếm terminal vì vậy phụ thuộc thời điểm hết budget.
+
+Đã tách `RuntimeBatchTimeout` khỏi lỗi transport khác. Chỉ timeout transport khi đồng hồ đã chạm deadline candidate mới được phân loại `BOUNDED_ONLINE_COMPLETE/BUDGET_EXPIRED`. Hết budget trước polling hoặc output đến sau deadline cũng kết thúc bounded; output muộn không được admit. Timeout khi còn budget, lỗi Docker và output hỏng vẫn là `NOT_VERIFIED`. Không đổi một lỗi terminal đã ghi trước đó thành thành công bounded.
+
+Khi dừng do budget, giữ status và bằng chứng của version đã xác minh; worker vẫn được dừng theo lifecycle hiện có. `evidence_scan.last_attempt_complete=false` và `last_reason` ghi lượt đọc chưa hoàn tất; số đếm/thời gian scan trước đó, nếu có, thuộc lượt thành công trước. Bounded chỉ là hết thời gian chạy, không phải bằng chứng fuzz PASS. Không sửa ngược artifact cũ.
+
+Regression bao phủ timeout tại deadline, output muộn, hết giờ trước polling, timeout sớm và lỗi Docker; kiểm tra không admit/mark-seen output muộn và không mất known_parameters. Suite `test_online_linked*.py`: 99 pass / 0 fail / 0 skip, 36.005 giây, outer timeout 180 giây. Regression output muộn và exception timeout cụ thể được kiểm tra lại sau khi siết assertion; `git diff --check` đạt. Chưa chạy lại campaign guest/auth sau thay đổi phân loại này.
+
 ### Direct argument và Zend raw-read evidence
 
 Fixture direct-argument dùng lời gọi thật `hookphuzz_runtime_sink($_POST['data'])`, một helper depth riêng, direct/local reads và các control `isset`/`empty`. Với PHP compile thành root `FETCH_FUNC_ARG` rồi `FETCH_DIM_FUNC_ARG`, extension phải giữ provenance từ root fetch tới dimension read; `isset` hoặc `empty` không được đổi thành `read`, nhưng correlated guard có thể được dùng như presence input.
@@ -177,6 +223,7 @@ Nếu ghi lỗi giữa chừng, thư mục có thể chứa một phần config;
 | Chọn mode | [phuzz.ps1](../../phuzz.ps1) |
 | Docker, bootstrap, export seed/registry | [run-wordpress-phuzz.ps1](../../scripts/wordpress/run-wordpress-phuzz.ps1) |
 | Vòng phiên bản, handoff, deadline, state | [online_linked_coordinator.py](../../fuzzer/hook_energy/seed_generation/online_linked_coordinator.py) |
+| Batch request/Zend evidence reader | [online_linked_evidence.py](../../fuzzer/hook_energy/seed_generation/online_linked_evidence.py) |
 | Coordinator online cũ, kiểm tra cấu trúc v0 | [online_config_runner.py](../../fuzzer/hook_energy/seed_generation/online_config_runner.py) |
 | Convergence và Pass 2 | [bridge_cli.py](../../fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py) |
 | Materialization và exporter | [convergence.py](../../fuzzer/seed_generation/convergence/convergence.py), [config_exporter.py](../../fuzzer/seed_generation/config/config_exporter.py) |

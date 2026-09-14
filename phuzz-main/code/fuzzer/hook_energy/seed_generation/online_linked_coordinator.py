@@ -39,6 +39,7 @@ from hook_energy.seed_generation.online_config_runner import (
     config_hash,
     validate_v0_config,
 )
+from hook_energy.seed_generation.online_linked_evidence import RuntimeBatchTimeout, read_runtime_batch
 from hook_energy.seed_generation.online_linked_export import export_online_linked_batch
 from hook_energy.seed_generation.zend_runtime.bridge_cli import (
     converge_iteration,
@@ -66,6 +67,7 @@ ReplayRunner = Callable[..., dict[str, Any]]
 ProbeSender = Callable[..., dict[str, Any]]
 Pass2Verifier = Callable[..., dict[str, int]]
 ConfigBuilder = Callable[..., tuple[str, dict[str, Any]]]
+RuntimeBatchReader = Callable[..., dict[str, Any]]
 
 
 def _parameter_key(parameter: Any) -> tuple[str, str, str]:
@@ -116,6 +118,7 @@ class OnlineLinkedCoordinator:
         load_finding_artifact: ArtifactLoader | None = None,
         list_zend_artifacts: ArtifactLister = list_zend_artifacts,
         load_zend_artifact: ArtifactLoader = _load_zend_artifact,
+        runtime_batch_reader: RuntimeBatchReader = read_runtime_batch,
         build_config_fn: ConfigBuilder = build_config_for_seed_item,
         list_targets_fn: TargetLister = list_convergence_targets,
         converge_fn: ConvergeRunner = converge_iteration,
@@ -150,6 +153,7 @@ class OnlineLinkedCoordinator:
         self.load_finding_artifact = load_finding_artifact
         self.list_zend_artifacts = list_zend_artifacts
         self.load_zend_artifact = load_zend_artifact
+        self.runtime_batch_reader = runtime_batch_reader
         self.build_config_fn = build_config_fn
         self.list_targets_fn = list_targets_fn
         self.converge_fn = converge_fn
@@ -195,6 +199,7 @@ class OnlineLinkedCoordinator:
             "workers": [],
             "terminal_status": None,
             "terminal_reason": None,
+            "evidence_scan": {},
         }
         self.state_path = self.run_dir / "state.json"
         self.events_path = self.run_dir / "events.jsonl"
@@ -204,7 +209,11 @@ class OnlineLinkedCoordinator:
         self._target_key = ""
         self._active_version = ""
         self._active_container = ""
+        self._worker_started_at: dict[str, float] = {}
         self._seen_pairs: set[tuple[str, str]] = set()
+        self._gate_evidence: dict[str, Any] | None = None
+        self._gate_convergence: dict[str, Any] | None = None
+        self._gate_evidence_consumed = False
         self._failure = False
 
     def run(self) -> int:
@@ -239,6 +248,12 @@ class OnlineLinkedCoordinator:
                 self.state["terminal_reason"] = version.get("terminal_reason") or "V0_WORKER_START_FAILED"
                 self._write_state()
                 return 1
+            self._consume_gate_evidence(version, deadline=deadline)
+            if not self._active_container or self.state["terminal_status"] in {"VULN_FOUND", "NOT_VERIFIED"}:
+                self._stop_active_worker(self.state["terminal_reason"] or "GATE_PROCESSING_STOPPED")
+                self._mark_campaign_expired_if_needed()
+                self._write_state()
+                return 1 if self._failure else 0
 
             while self.clock() < deadline:
                 worker_exit_code = self._observe_parent_exit()
@@ -488,6 +503,20 @@ class OnlineLinkedCoordinator:
                     raise OnlineLinkedError("V0_PASS2_NOT_VERIFIED")
             else:
                 readiness["probe_only"] = True
+            gate_evidence = self._load_gate_evidence(
+                version, result_row, request_dir, zend_dir, observation,
+            )
+            if gate_evidence is None:
+                raise OnlineLinkedError("V0_PROVENANCE_NOT_VERIFIED")
+            self._gate_evidence = gate_evidence
+            self._gate_convergence = copy.deepcopy(dict(observation))
+            version["gate_evidence"] = {
+                "origin": "v0_gate",
+                "request_id": gate_evidence["request_id"],
+                "request_name": gate_evidence["request_name"],
+                "zend_name": gate_evidence["zend_name"],
+                "consumed": False,
+            }
             readiness["passed"] = True
             return True
         except (OSError, RuntimeError, ValueError) as exc:
@@ -495,60 +524,127 @@ class OnlineLinkedCoordinator:
             self.state.update(terminal_status="NOT_VERIFIED", terminal_reason=str(exc) if isinstance(exc, OnlineLinkedError) else reason)
             return False
 
+    def _load_gate_evidence(
+        self,
+        version: Mapping[str, Any],
+        result_row: Mapping[str, Any],
+        request_dir: Path,
+        zend_dir: Path,
+        convergence: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        request_name = str(result_row.get("matched_artifact") or "")
+        if Path(request_name).name != request_name or Path(request_name).suffix != ".json":
+            return None
+        request_path = request_dir / request_name
+        if not request_path.is_file():
+            return None
+        zend_name = str(result_row.get("zend_artifact") or "")
+        if Path(zend_name).name != zend_name or Path(zend_name).stem != Path(request_name).stem:
+            zend_paths = [path for path in zend_dir.glob("*.json") if path.stem == Path(request_name).stem]
+            if len(zend_paths) != 1:
+                return None
+            zend_name = zend_paths[0].name
+        zend_path = zend_dir / zend_name
+        if not zend_path.is_file():
+            return None
+        request = json.loads(request_path.read_text(encoding="utf-8-sig"))
+        zend = json.loads(zend_path.read_text(encoding="utf-8-sig"))
+        evidence = self._correlate_runtime_pair(
+            version,
+            {
+                "request_name": request_name,
+                "request": request,
+                "zend_name": zend_name,
+                "zend": zend,
+            },
+        )
+        if evidence is None:
+            return None
+        convergence_request_id = str(convergence.get("request_id") or "").strip()
+        if convergence_request_id and convergence_request_id != evidence["request_id"]:
+            return None
+        evidence["evidence_origin"] = "v0_gate"
+        return evidence
+
     def read_new_runtime_evidence(self, *, deadline: float | None = None) -> list[dict[str, Any]]:
-        """Read exact-ID request/Zend pairs for the active worker."""
+        """Read one bounded batch, then apply host-side evidence admission."""
 
         version = self._version(self._active_version)
         if version is None:
             return []
-        request_names = self.list_artifacts()
+        remaining = self.max_seconds if deadline is None else deadline - self.clock()
+        if remaining <= 0:
+            self._reject_runtime_batch(version, "BUDGET_EXPIRED")
+            return []
+        started_at = self.clock()
+        try:
+            batch = self.runtime_batch_reader(
+                run_id=str(version.get("worker_run_id") or ""),
+                plugin_slug=self.plugin_slug,
+                timeout=remaining,
+                run_command=self.run_command,
+            )
+        except Exception as exc:
+            reason = "BUDGET_EXPIRED" if (
+                isinstance(exc, RuntimeBatchTimeout)
+                and deadline is not None and self.clock() >= deadline
+            ) else "RUNTIME_BATCH_READ_FAILED"
+            self._reject_runtime_batch(version, reason, detail=str(exc))
+            return []
+        if deadline is not None and self.clock() >= deadline:
+            self._reject_runtime_batch(version, "BUDGET_EXPIRED")
+            return []
+        if not isinstance(batch, Mapping) or not isinstance(batch.get("pairs"), list):
+            self._reject_runtime_batch(version, "RUNTIME_BATCH_INVALID_OUTPUT")
+            return []
+
+        stats = dict(batch.get("stats") or {}) if isinstance(batch.get("stats"), Mapping) else {}
+        stats["paired_count"] = len(batch["pairs"])
+        stats["transport_duration_seconds"] = round(max(0.0, self.clock() - started_at), 3)
+        stats["version"] = str(version["version"])
+        stats["worker_run_id"] = str(version.get("worker_run_id") or "")
+        stats["remaining_budget"] = max(0.0, remaining)
+        stats["last_attempt_complete"] = True
+        self.state["evidence_scan"] = stats
+        if int(stats.get("missing_zend") or 0) > 0:
+            self._record_event({
+                "kind": "EVIDENCE_SCAN", "status": "RETRY",
+                "reason": "ZEND_ARTIFACT_MISSING",
+                "version": version["version"],
+                "worker_run_id": version.get("worker_run_id"),
+                "missing_zend": int(stats["missing_zend"]),
+            })
+        if int(stats.get("invalid_payloads") or 0) > 0:
+            self._record_event({
+                "kind": "EVIDENCE_SCAN", "status": "REJECTED",
+                "reason": "RUNTIME_BATCH_INVALID_PAYLOAD",
+                "version": version["version"],
+                "worker_run_id": version.get("worker_run_id"),
+                "invalid_payloads": int(stats["invalid_payloads"]),
+            })
+
         evidence: list[dict[str, Any]] = []
-        for request_name in sorted(request_names):
+        for pair in batch["pairs"]:
             if deadline is not None and self.clock() >= deadline:
-                break
-            if Path(request_name).name != request_name:
+                self._reject_runtime_batch(version, "BUDGET_EXPIRED")
+                return []
+            if not isinstance(pair, Mapping):
+                stats["invalid_payloads"] = int(stats.get("invalid_payloads") or 0) + 1
+                stats["last_reason"] = "HOST_CORRELATION_REJECTED"
                 continue
-            request_payload = self.load_artifact(request_name)
-            if not isinstance(request_payload, Mapping):
+            runtime_evidence = self._correlate_runtime_pair(version, pair)
+            if runtime_evidence is None:
                 continue
-            request_id = str(request_payload.get("request_id") or "").strip()
-            if not request_id or Path(request_name).stem != request_id:
-                continue
-            request_run_id = str(request_payload.get("legacy_run_id") or request_payload.get("run_id") or "").strip()
-            if request_run_id != str(version.get("worker_run_id") or ""):
-                continue
-            if str(request_payload.get("target_plugin") or "").strip() != self.plugin_slug:
-                continue
-            zend_names = self.list_zend_artifacts()
-            matches = [
-                name for name in zend_names
-                if Path(name).name == name and Path(name).stem == request_id
-            ]
-            if len(matches) != 1:
-                continue
-            zend_name = matches[0]
+            runtime_evidence["evidence_origin"] = "worker_poll"
+            request_name = runtime_evidence["request_name"]
+            request_payload = runtime_evidence["request"]
+            request_id = runtime_evidence["request_id"]
             pair_key = (str(version["version"]), request_id)
             if pair_key in self._seen_pairs:
                 continue
-            zend_payload = self.load_zend_artifact(zend_name)
-            if not isinstance(zend_payload, Mapping):
-                continue
-            if str(zend_payload.get("request_id") or "") != request_id:
-                continue
-            zend_run_id = str(zend_payload.get("run_id") or zend_payload.get("legacy_run_id") or "").strip()
-            if zend_run_id != str(version.get("worker_run_id") or ""):
-                continue
-            runtime_evidence = {
-                "version": str(version["version"]),
-                "worker_run_id": str(version["worker_run_id"]),
-                "request_name": request_name,
-                "request_id": request_id,
-                "request": dict(request_payload),
-                "zend_name": zend_name,
-                "zend": dict(zend_payload),
-            }
             if deadline is not None and self.clock() >= deadline:
-                break
+                self._reject_runtime_batch(version, "BUDGET_EXPIRED")
+                return []
             discovered = self._discover_runtime_candidates(runtime_evidence, deadline=deadline)
             explicit_callback = str(request_payload.get("callback_id") or "").strip()
             explicit_hook = str(request_payload.get("hook_name") or "").strip()
@@ -572,11 +668,133 @@ class OnlineLinkedCoordinator:
                     "callback_id": explicit_callback,
                     "hook_name": explicit_hook,
                 })
-                self._seen_pairs.add((str(version["version"]), request_id))
+                self._seen_pairs.add(pair_key)
                 continue
             self._seen_pairs.add(pair_key)
             evidence.append(runtime_evidence)
+        self._write_state()
         return evidence
+
+    def _correlate_runtime_pair(
+        self, version: Mapping[str, Any], pair: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        request_name = str(pair.get("request_name") or "")
+        zend_name = str(pair.get("zend_name") or "")
+        request_payload = pair.get("request")
+        zend_payload = pair.get("zend")
+        if (
+            Path(request_name).name != request_name
+            or Path(request_name).suffix != ".json"
+            or Path(zend_name).suffix != ".json"
+            or Path(zend_name).name != zend_name
+            or not isinstance(request_payload, Mapping)
+            or not isinstance(zend_payload, Mapping)
+        ):
+            return None
+        request_id = str(request_payload.get("request_id") or "").strip()
+        if (
+            not request_id
+            or Path(request_name).stem != request_id
+            or Path(zend_name).stem != request_id
+            or ".tmp" in request_id
+            or re.fullmatch(r"[A-Za-z0-9_.-]+", request_id) is None
+        ):
+            return None
+        worker_run_id = str(version.get("worker_run_id") or "")
+        request_run_id = str(request_payload.get("legacy_run_id") or request_payload.get("run_id") or "").strip()
+        if request_run_id != worker_run_id:
+            return None
+        if str(request_payload.get("target_plugin") or "").strip() != self.plugin_slug:
+            return None
+        if str(zend_payload.get("request_id") or "").strip() != request_id:
+            return None
+        zend_run_id = str(zend_payload.get("run_id") or zend_payload.get("legacy_run_id") or "").strip()
+        if zend_run_id != worker_run_id:
+            return None
+        return {
+            "version": str(version["version"]),
+            "worker_run_id": worker_run_id,
+            "request_name": request_name,
+            "request_id": request_id,
+            "request": dict(request_payload),
+            "zend_name": zend_name,
+            "zend": dict(zend_payload),
+        }
+
+    def _reject_runtime_batch(
+        self, version: Mapping[str, Any], reason: str, *, detail: str = "",
+    ) -> None:
+        budget_expired = reason == "BUDGET_EXPIRED"
+        # Budget exhaustion stops observation, but does not revoke verified evidence.
+        if budget_expired and self.state["terminal_status"] is not None:
+            return
+        version_record = self._version(str(version.get("version") or ""))
+        if version_record is not None:
+            if not budget_expired:
+                version_record["status"] = "not_verified"
+            version_record["terminal_reason"] = reason
+        if not budget_expired:
+            self._failure = True
+        self.state["terminal_status"] = "BOUNDED_ONLINE_COMPLETE" if budget_expired else "NOT_VERIFIED"
+        self.state["terminal_reason"] = reason
+        self.state["evidence_scan"].update(last_attempt_complete=False, last_reason=reason)
+        self._record_event({
+            "kind": "EVIDENCE_SCAN", "status": "REJECTED", "reason": reason,
+            "version": version.get("version"),
+            "worker_run_id": version.get("worker_run_id"),
+            **({"detail": detail} if detail else {}),
+        })
+
+    def _consume_gate_evidence(self, version: Mapping[str, Any], *, deadline: float) -> None:
+        if self._gate_evidence_consumed or self._gate_evidence is None or self._gate_convergence is None:
+            return
+        if not self._active_container:
+            return
+        remaining = deadline - self.clock()
+        if remaining <= 0:
+            self._reject_runtime_batch(version, "BUDGET_EXPIRED")
+            return
+        try:
+            parent_exit_code = self._observe_parent_exit(timeout=remaining)
+        except (ParentInspectionTimeout, ParentInspectionError) as exc:
+            reason = "PARENT_CHECK_TIMEOUT" if isinstance(exc, ParentInspectionTimeout) else "PARENT_CHECK_ERROR"
+            self._reject_runtime_batch(version, reason, detail=str(exc))
+            return
+        if parent_exit_code is not None:
+            return
+        if self.clock() >= deadline:
+            self._reject_runtime_batch(version, "BUDGET_EXPIRED")
+            return
+        parent = self._version(str(version["version"]))
+        if parent is None:
+            return
+        raw_report = self._reports.get(str(parent["version"]))
+        if raw_report is None:
+            self._reject_runtime_batch(version, "V0_PROVENANCE_NOT_VERIFIED")
+            return
+        self._gate_evidence["evidence_origin"] = "v0_gate"
+        self._discover_runtime_candidates(self._gate_evidence, deadline=deadline)
+        if 1 + len(self.state["attempts"]) >= self.max_versions:
+            self._record_event({
+                "kind": "PARAMETER_DISCOVERY", "status": "REJECTED",
+                "reason": "VERSION_LIMIT_REACHED", "version": parent["version"],
+                "request_id": self._gate_evidence["request_id"],
+            })
+        elif self.clock() < deadline:
+            self._handle_convergence_result(
+                parent=parent,
+                evidence=self._gate_evidence,
+                raw_report=raw_report,
+                result=self._gate_convergence,
+                seed=parent["seed_item"],
+                deadline=deadline,
+            )
+        self._gate_evidence_consumed = True
+        gate_meta = parent.get("gate_evidence")
+        if isinstance(gate_meta, dict):
+            gate_meta["consumed"] = True
+        self._seen_pairs.add((str(parent["version"]), str(self._gate_evidence["request_id"])))
+        self._write_state()
 
     def _discover_runtime_candidates(
         self, evidence: Mapping[str, Any], *, deadline: float | None = None,
@@ -1244,6 +1462,17 @@ class OnlineLinkedCoordinator:
 
         probe_id = f"p{len(attempts) + 1}"
         probe_run_id = f"{parent['worker_run_id']}-probe-{probe_id}"
+        evidence_origin = str(evidence.get("evidence_origin") or "worker_poll")
+        remaining_budget = None if deadline is None else max(0.0, deadline - self.clock())
+        first_probe_for_version = not any(
+            isinstance(item, Mapping) and item.get("parent_version") == parent["version"]
+            for item in attempts
+        )
+        first_probe_delay = None
+        if first_probe_for_version:
+            worker_started_at = self._worker_started_at.get(str(parent["version"]))
+            if worker_started_at is not None:
+                first_probe_delay = max(0.0, self.clock() - worker_started_at)
         probe_root = self.run_dir / "versions" / str(parent["version"]) / "probe" / probe_id
         generated_dir = self.config_dir / "versions" / str(parent["version"]) / "probe" / probe_id / "exported"
         generated_summary_path = probe_root / "generated_config_summary.json"
@@ -1251,6 +1480,9 @@ class OnlineLinkedCoordinator:
             "probe_id": probe_id, "parent_version": parent["version"],
             "request_id": evidence.get("request_id"), "status": "exporting",
             "candidate": dict(probe), "probe_run_id": probe_run_id, "dedupe_key": dedupe_key,
+            "evidence_origin": evidence_origin,
+            "remaining_budget_seconds": remaining_budget,
+            "first_probe_delay_seconds": first_probe_delay,
             "_started_at": self.clock(),
         }
         attempts.append(attempt)
@@ -1314,6 +1546,9 @@ class OnlineLinkedCoordinator:
             "version": parent["version"], "worker_run_id": parent["worker_run_id"],
             "request_id": evidence.get("request_id"), "probe_id": probe_id,
             "probe_run_id": probe_run_id, "candidate": dict(probe),
+            "evidence_origin": evidence_origin,
+            "remaining_budget_seconds": attempt.get("remaining_budget_seconds"),
+            "first_probe_delay_seconds": attempt.get("first_probe_delay_seconds"),
         })
         probe_seed = probe_item.get("seed") if isinstance(probe_item.get("seed"), Mapping) else {}
         probe_row = {
@@ -1505,6 +1740,9 @@ class OnlineLinkedCoordinator:
             "request_id": probe_evidence["request_id"], "probe_id": probe_id,
             "hook_name": probe_row["hook_name"], "candidate": dict(probe), "parameter": dict(parameter),
             "timing": timing,
+            "evidence_origin": attempt.get("evidence_origin"),
+            "remaining_budget_seconds": attempt.get("remaining_budget_seconds"),
+            "first_probe_delay_seconds": attempt.get("first_probe_delay_seconds"),
             **({"unexpected_parameters": unexpected} if unexpected else {}),
         })
         return {
@@ -1536,6 +1774,9 @@ class OnlineLinkedCoordinator:
             "request_id": probe_evidence.get("request_id") or evidence.get("request_id"),
             "probe_id": attempt.get("probe_id"), "candidate": dict(attempt.get("candidate") or {}),
             "parameter": dict(parameter), "timing": timing,
+            "evidence_origin": attempt.get("evidence_origin"),
+            "remaining_budget_seconds": attempt.get("remaining_budget_seconds"),
+            "first_probe_delay_seconds": attempt.get("first_probe_delay_seconds"),
             "candidate_status": parameter.get("candidate_status"),
             "candidate_reason": parameter.get("candidate_reason"),
         })
@@ -1579,6 +1820,11 @@ class OnlineLinkedCoordinator:
             "probe_run_id": attempt.get("probe_run_id") if attempt else None,
             "parameter": (attempt.get("candidate") or {}).get("name") if attempt else None,
             "timing": timing,
+            "evidence_origin": attempt.get("evidence_origin") if attempt else str(evidence.get("evidence_origin") or "worker_poll"),
+            "remaining_budget_seconds": attempt.get("remaining_budget_seconds") if attempt else (
+                None if deadline is None else max(0.0, deadline - self.clock())
+            ),
+            "first_probe_delay_seconds": attempt.get("first_probe_delay_seconds") if attempt else None,
             **(dict(extra) if isinstance(extra, Mapping) else {}),
             **({"detail": detail} if detail else {}),
         })
@@ -2091,6 +2337,7 @@ class OnlineLinkedCoordinator:
         version["worker_status"] = "started"
         version["status"] = "replaying" if version.get("config_type") == "replay_only" else "fuzzing"
         self._active_container = container_name
+        self._worker_started_at[version_name] = self.clock()
         self.state["workers"].append({
             "version": version_name,
             "container_name": container_name,
@@ -2126,13 +2373,17 @@ class OnlineLinkedCoordinator:
                 raise ParentInspectionError("PARENT_INSPECT_FAILED") from exc
             return None
         if int(getattr(result, "returncode", 1)) != 0:
+            if timeout is not None:
+                raise ParentInspectionError("PARENT_INSPECT_FAILED")
             return None
         state = str(getattr(result, "stdout", "") or "").strip().lower()
         if state == "running":
             return None
         try:
             return int(state)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            if timeout is not None:
+                raise ParentInspectionError("PARENT_INSPECT_FAILED") from exc
             return None
 
     def _stop_active_worker(self, reason: str) -> None:

@@ -86,6 +86,240 @@ class Clock:
 
 
 class OnlineLinkedCoordinatorTests(unittest.TestCase):
+    def test_poll_deadline_is_bounded_without_losing_verified_version(self):
+        for outcome in ("timeout", "late_output", "before_poll", "early_timeout", "docker_error"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
+                parent["status"] = "fuzzing"
+                parent["known_parameters"] = [{"name": "verified"}]
+                original = copy.deepcopy(parent["known_parameters"])
+                def reader(**kwargs):
+                    coordinator.clock.now = 1.0 if outcome == "early_timeout" else 10.0
+                    if outcome in ("timeout", "early_timeout"):
+                        from hook_energy.seed_generation.online_linked_evidence import RuntimeBatchTimeout
+                        raise RuntimeBatchTimeout("RUNTIME_BATCH_TIMEOUT")
+                    if outcome == "docker_error":
+                        raise RuntimeError("docker failed")
+                    return {"pairs": [{
+                        "request_name": "late.json", "zend_name": "late.json",
+                        "request": {"request_id": "late", "run_id": parent["worker_run_id"],
+                                    "target_plugin": "fixture"},
+                        "zend": {"request_id": "late", "run_id": parent["worker_run_id"]},
+                    }], "stats": {}}
+                coordinator.runtime_batch_reader = reader
+                if outcome == "before_poll":
+                    coordinator.clock.now = 10.0
+                self.assertEqual(coordinator.read_new_runtime_evidence(deadline=10.0), [])
+                failed = outcome in ("early_timeout", "docker_error")
+                self.assertEqual(coordinator.state["terminal_status"],
+                                 "NOT_VERIFIED" if failed else "BOUNDED_ONLINE_COMPLETE")
+                self.assertEqual(coordinator._failure, failed)
+                self.assertEqual(parent["known_parameters"], original)
+                self.assertFalse(coordinator._seen_pairs)
+                if not failed:
+                    self.assertEqual(parent["status"], "fuzzing")
+                    self.assertEqual(coordinator.state["terminal_reason"], "BUDGET_EXPIRED")
+                    self.assertFalse(coordinator.state["evidence_scan"]["last_attempt_complete"])
+
+    def test_runtime_poll_uses_injected_batch_reader_and_preserves_exact_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
+            calls = []
+            pair = {
+                "request_name": "req-v0.json",
+                "request": {
+                    "request_id": "req-v0",
+                    "legacy_run_id": "run-v0",
+                    "target_plugin": "fixture",
+                    "http_method": "POST",
+                    "request_params": {"body_params": {"action": "fixture", "seed": "base"}},
+                },
+                "zend_name": "req-v0.json",
+                "zend": {"request_id": "req-v0", "run_id": "run-v0"},
+            }
+
+            def batch_reader(**kwargs):
+                calls.append(kwargs)
+                return {"pairs": [pair], "stats": {"file_count": 601, "paired_count": 1}}
+
+            coordinator.runtime_batch_reader = batch_reader
+            coordinator.list_artifacts = lambda: self.fail("legacy request listing used")
+            coordinator.load_artifact = lambda _name: self.fail("legacy request loader used")
+            coordinator.list_zend_artifacts = lambda: self.fail("legacy Zend listing used")
+            coordinator.load_zend_artifact = lambda _name: self.fail("legacy Zend loader used")
+
+            evidence = coordinator.read_new_runtime_evidence(deadline=10.0)
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["run_id"], parent["worker_run_id"])
+            self.assertEqual(calls[0]["plugin_slug"], "fixture")
+            self.assertLessEqual(calls[0]["timeout"], 10.0)
+            self.assertEqual([item["request_id"] for item in evidence], ["req-v0"])
+            self.assertEqual(evidence[0]["request"]["request_params"]["body_params"]["seed"], "base")
+            self.assertEqual(evidence[0]["evidence_origin"], "worker_poll")
+            self.assertEqual(coordinator.state["evidence_scan"]["paired_count"], 1)
+
+    def test_runtime_poll_retries_missing_zend_and_dedupes_only_after_admission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, _, _, _ = self.make_probe_context(Path(tmp), [])
+            pair = {
+                "request_name": "req-v0.json",
+                "request": {
+                    "request_id": "req-v0",
+                    "legacy_run_id": "run-v0",
+                    "target_plugin": "fixture",
+                    "http_method": "POST",
+                    "request_params": {"body_params": {}},
+                },
+                "zend_name": "req-v0.json",
+                "zend": {"request_id": "req-v0", "run_id": "run-v0"},
+            }
+            responses = [
+                {"pairs": [], "stats": {"missing_zend": 1, "paired_count": 0}},
+                {"pairs": [
+                    {**pair, "request": {**pair["request"], "request_id": "other"}},
+                    pair,
+                ], "stats": {"paired_count": 2}},
+                {"pairs": [pair], "stats": {"paired_count": 1}},
+            ]
+
+            def batch_reader(**kwargs):
+                return responses.pop(0)
+
+            coordinator.runtime_batch_reader = batch_reader
+            first = coordinator.read_new_runtime_evidence(deadline=10.0)
+            self.assertEqual(first, [])
+            self.assertNotIn(("v0", "req-v0"), coordinator._seen_pairs)
+
+            second = coordinator.read_new_runtime_evidence(deadline=10.0)
+            self.assertEqual([item["request_id"] for item in second], ["req-v0"])
+            self.assertIn(("v0", "req-v0"), coordinator._seen_pairs)
+
+            third = coordinator.read_new_runtime_evidence(deadline=10.0)
+            self.assertEqual(third, [])
+
+    def test_bounded_parent_inspection_rejects_failed_or_invalid_output(self):
+        coordinator = object.__new__(OnlineLinkedCoordinator)
+        coordinator._active_container = "parent"
+        for code, output in ((1, ""), (0, "invalid")):
+            with self.subTest(code=code, output=output):
+                coordinator.run_command = lambda *args, **kwargs: SimpleNamespace(
+                    returncode=code, stdout=output)
+                with self.assertRaisesRegex(RuntimeError, "PARENT_INSPECT_FAILED"):
+                    coordinator._worker_exit_code(timeout=1)
+
+    def test_gate_terminal_failure_stops_started_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            def reject(version, *, deadline):
+                coordinator._reject_runtime_batch(version, "PARENT_CHECK_TIMEOUT")
+            coordinator._consume_gate_evidence = reject
+            self.assertEqual(coordinator.run(), 1)
+            self.assertFalse(coordinator._active_container)
+            self.assertEqual(coordinator.state["workers"][0]["status"], "stopped")
+
+    def test_gate_respects_version_limit_and_discovers_sibling_callbacks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            coordinator.max_versions = 1
+            with patch.object(coordinator, "_handle_convergence_result") as handle, patch.object(
+                coordinator, "_discover_runtime_candidates", return_value=[]
+            ) as discover:
+                coordinator.run()
+            handle.assert_not_called()
+            self.assertTrue(any(call.args[0].get("evidence_origin") == "v0_gate"
+                                for call in discover.call_args_list))
+
+    def test_verified_gate_evidence_starts_probe_after_worker_start_without_new_poll_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(
+                Path(tmp), log, max_seconds=2,
+                request_names={"req-v0.json", "v0-probe.json"},
+                zend_names={"req-v0.json", "v0-probe.json"},
+            )
+            gate_request_id = "v0-probe"
+            probe_items = []
+            pending = []
+            for name in ("a", "b", "c"):
+                variant = f"zend_probe_post_{name}"
+                item = copy.deepcopy(seed_item())
+                item["seed"]["seed_variant_id"] = variant
+                item["seed"]["probe_variant"] = True
+                item["seed"]["body"][name] = f"probe-{name}"
+                probe_items.append(item)
+                pending.append({
+                    "name": name,
+                    "source": "POST",
+                    "location": "form",
+                    "helper_depth": 5,
+                    "seed_variant_id": variant,
+                    "request_id": gate_request_id,
+                    "run_id": "run-v0",
+                    "plugin_slug": "fixture",
+                    "callback_id": "cb-fixture",
+                    "canonical_callback": "fixture_callback",
+                    "request_method": "POST",
+                })
+
+            original_converge = coordinator.converge_fn
+
+            def gate_then_probe(**kwargs):
+                if kwargs["legacy_run_id"] == "run-v0":
+                    log.append("gate_convergence")
+                    return {
+                        "status": "CONTINUE",
+                        "request_id": gate_request_id,
+                        "known_parameters": [],
+                        "new_parameters": [],
+                        "pending_probes": pending,
+                        "merged_suggested_seeds": {"suggested_seeds": probe_items},
+                    }
+                if "-probe-" in kwargs["legacy_run_id"]:
+                    log.append("probe_convergence")
+                    probe_run_id = kwargs["legacy_run_id"]
+                    return {
+                        "status": "CONTINUE",
+                        "request_id": "replay-v1",
+                        "new_parameters": [{
+                            "name": "a",
+                            "path": ["a"],
+                            "source": "POST",
+                            "location": "form",
+                            "helper_depth": 5,
+                            "observed_count": 1,
+                            "access_forms": ["read"],
+                            "evidence_kind": "zend_runtime",
+                            "fuzzable": True,
+                            "request_id": "replay-v1",
+                            "run_id": probe_run_id,
+                            "plugin_slug": "fixture",
+                            "callback_id": "cb-fixture",
+                            "canonical_callback": "fixture_callback",
+                            "request_method": "POST",
+                        }],
+                        "known_parameters": [],
+                        "merged_suggested_seeds": {"suggested_seeds": probe_items},
+                    }
+                return original_converge(**kwargs)
+
+            coordinator.converge_fn = gate_then_probe
+            coordinator.runtime_batch_reader = lambda **kwargs: {
+                "pairs": [],
+                "stats": {"file_count": 603, "paired_count": 0},
+            }
+
+            self.assertEqual(coordinator.run(), 0)
+            probe_start = next(i for i, item in enumerate(log) if item.startswith("sender_timeout:run-v0-probe-p1:"))
+            self.assertLess(log.index("worker_start"), probe_start)
+            self.assertEqual(coordinator.state["probe_attempts"][0]["request_id"], gate_request_id)
+            self.assertEqual(coordinator.state["probe_attempts"][0]["status"], "accepted")
+            self.assertEqual(coordinator.state["probe_attempts"][0]["probe_request_id"], "replay-v1")
+            self.assertEqual(coordinator.state["probe_attempts"][0]["evidence_origin"], "v0_gate")
+            self.assertGreater(coordinator.state["probe_attempts"][0]["remaining_budget_seconds"], 0)
+            self.assertIsNotNone(coordinator.state["probe_attempts"][0]["first_probe_delay_seconds"])
+            self.assertEqual(coordinator.state["evidence_scan"]["paired_count"], 0)
+
     def test_worker_exit_inspect_timeout_is_bounded_and_distinct(self):
         coordinator = object.__new__(OnlineLinkedCoordinator)
         coordinator._active_container = "parent-container"
@@ -1162,6 +1396,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         max_seconds: int = 2,
         campaign_deadline: float | None = None,
         runtime_cookie_probes: bool = False,
+        runtime_batch_reader=None,
     ) -> OnlineLinkedCoordinator:
         item = seed_item()
         raw_report = {"plugin_slug": "fixture", "suggested_seeds": [item]}
@@ -1213,6 +1448,30 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         def load_zend(name):
             log.append("load_zend_artifact")
             return {"request_id": Path(name).stem, "run_id": f"{legacy_run_id}-v0"}
+
+        def default_batch_reader(*, run_id, plugin_slug, timeout, run_command):
+            log.append("runtime_batch_reader")
+            request_names_snapshot = coordinator.list_artifacts()
+            zend_names_snapshot = coordinator.list_zend_artifacts()
+            pairs = []
+            for name in sorted(request_names_snapshot):
+                if name not in zend_names_snapshot:
+                    continue
+                pairs.append({
+                    "request_name": name,
+                    "request": coordinator.load_artifact(name),
+                    "zend_name": name,
+                    "zend": coordinator.load_zend_artifact(name),
+                })
+            return {
+                "pairs": pairs,
+                "stats": {
+                    "file_count": len(request_names_snapshot),
+                    "run_plugin_matches": len(pairs),
+                    "paired_count": len(pairs),
+                    "missing_zend": len(request_names_snapshot - zend_names_snapshot),
+                },
+            }
 
         def converge(**kwargs):
             if kwargs.get("runtime_cookie_probes"):
@@ -1290,6 +1549,18 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 return {'legacy_run_id': kwargs['legacy_run_id'], 'runs': [{
                     **args[0][0], 'callback_reached': True, 'validation_status': 'callback_reached',
                     'process_status': 'replaying', 'matched_artifact': 'v0-probe.json',
+                    'zend_artifact': 'v0-probe.json',
+                    'request_payload': {
+                        'request_id': 'v0-probe',
+                        'legacy_run_id': kwargs['legacy_run_id'],
+                        'target_plugin': 'fixture',
+                        'http_method': 'POST',
+                        'request_params': {'body_params': {'action': 'fixture', 'seed': 'base'}},
+                    },
+                    'zend_payload': {
+                        'request_id': 'v0-probe',
+                        'run_id': kwargs['legacy_run_id'],
+                    },
                 }]}
             log.append("run_generated_configs")
             if replay_error:
@@ -1316,6 +1587,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             return {"accepted": 1, "total": 1} if replay_passes else {"accepted": 0, "total": 0}
 
         def run_command(command, **kwargs):
+            if command[:2] == ["docker", "inspect"]:
+                return subprocess.CompletedProcess(command, 0, "running", "")
             if command[:3] == ["docker", "compose", "run"]:
                 log.append("worker_start")
             elif command[:3] == ["docker", "rm", "-f"]:
@@ -1339,6 +1612,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             load_artifact=load_artifact,
             list_zend_artifacts=list_zend,
             load_zend_artifact=load_zend,
+            runtime_batch_reader=runtime_batch_reader or default_batch_reader,
             converge_fn=converge,
             materialize_fn=materialize,
             export_configs_fn=export_configs,
