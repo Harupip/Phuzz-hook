@@ -979,6 +979,43 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             config = json.loads(Path(child['config_path']).read_text(encoding='utf-8'))
             self.assertIn('detail', config['body_params']['fuzz'])
 
+    def test_batch_prioritizes_ajax_including_runtime_children_with_stable_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hooks = ["rest_route:demo/v1/items", "wp_ajax_first", "admin_post_save", "wp_ajax_nopriv_second"]
+            suggested = root / "suggested.json"
+            suggested.write_text(json.dumps({"suggested_seeds": [
+                {"hook_name": hook, "callback_id": hook, "seed": {}} for hook in hooks
+            ]}), encoding="utf-8")
+            registry = root / "registry.json"
+            registry.write_text("{}", encoding="utf-8")
+            calls = []
+
+            class Candidate:
+                def __init__(self, **kwargs):
+                    item = json.loads(Path(kwargs["suggested_seeds"]).read_text(encoding="utf-8"))["suggested_seeds"][0]
+                    calls.append(item["hook_name"])
+                    self.state_path = root / f"state-{len(calls)}.json"
+                    self.state = {
+                        "terminal_status": "BOUNDED_ONLINE_COMPLETE", "versions": [],
+                        "candidate_queue": [{
+                            "hook_name": "wp_ajax_child", "callback_id": "child", "seed": {},
+                        }] if len(calls) == 1 else [],
+                    }
+
+                def run(self):
+                    return 0
+
+            args = SimpleNamespace(
+                suggested_seeds=str(suggested), bootstrap_config="", config_root=str(root / "configs"),
+                output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="run",
+                max_seconds=1, max_versions=2, callback_registry=str(registry), service="fuzzer-wordpress-plugin",
+            )
+            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", Candidate), \
+                    patch("hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch", return_value=0):
+                self.assertEqual(run_online_linked(args), 0)
+            self.assertEqual(calls, [hooks[1], hooks[3], "wp_ajax_child", hooks[0], hooks[2]])
+
     def test_online_linked_batch_continues_after_candidate_vulnerability(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

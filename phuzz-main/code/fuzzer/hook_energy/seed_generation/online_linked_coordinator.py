@@ -2830,6 +2830,8 @@ def run_online_linked(args: argparse.Namespace) -> int:
             batch_state["campaign_status"] = "CAMPAIGN_BUDGET_EXPIRED"
             batch_state["expansion_events"].append({"reason": "CAMPAIGN_BUDGET_EXPIRED"})
             break
+        # Stable priority also covers AJAX callbacks discovered during the campaign.
+        queue.sort(key=lambda entry: not str(entry[1].get("hook_name") or "").startswith("wp_ajax_"))
         index, raw_item, source = queue.pop(0)
         slug = _candidate_slug(raw_item, index)
         candidate_run_id = f"{args.legacy_run_id}-candidate-{slug}"
