@@ -1,5 +1,6 @@
 import json
 import copy
+import re
 import subprocess
 import sys
 import tempfile
@@ -83,6 +84,32 @@ def build_rest_seed_item(*, method="GET", fuzzable_params=None):
 
 
 class SeedToConfigExporterTests(unittest.TestCase):
+    def test_runtime_nonce_inputs_stay_fixed_to_focus_mutations_on_payload(self):
+        for bucket in ("body", "query_params", "headers", "cookies"):
+            for name in ("nonce", "_wpnonce", "security_nonce", "X-WP-Nonce", "data[nonce]"):
+                with self.subTest(bucket=bucket, name=name):
+                    item = build_seed_item()
+                    item["seed"][bucket][name] = "observed-nonce"
+                    item["seed"]["fuzzable_params"].append(name)
+                    original = copy.deepcopy(item)
+                    _, config = build_config_for_seed_item(item)
+                    section = config["body_params" if bucket == "body" else bucket]
+                    self.assertFalse(any(re.match(selector, name) for selector in section["fuzz"]))
+                    self.assertTrue(any(re.match(selector, name) for selector in section["fixed"]))
+                    self.assertIn({"name": name, "value": "observed-nonce"}, section["data"])
+                    self.assertEqual(config["body_params"]["fuzz"], ["item_id"])
+                    self.assertEqual(item, original)
+
+    def test_nonce_alone_does_not_make_config_fuzzing_ready(self):
+        item = build_seed_item()
+        item["seed"].update(body={"action": "example_lookup", "nonce": "probe"},
+                             query_params={}, fuzzable_params=["nonce"], input_params=[])
+        _, config = build_config_for_seed_item(item)
+        self.assertEqual(config["body_params"]["fixed"], ["action", "nonce"])
+        self.assertEqual(config["body_params"]["fuzz"], [])
+        self.assertEqual(config["config_type"], "replay_only")
+        self.assertFalse(config["metadata"]["fuzzing_ready"])
+
     def test_zend_bridge_replaces_only_accepted_nonempty_seed_without_mutating_raw_report(self):
         accepted_raw = build_seed_item()
         accepted_raw["plugin_slug"] = "demo-plugin"

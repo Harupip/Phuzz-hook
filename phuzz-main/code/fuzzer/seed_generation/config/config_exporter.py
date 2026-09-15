@@ -319,7 +319,8 @@ def _build_param_section(
 
     for name, value in values.items():
         param_name = str(name)
-        if param_name in fuzzable_params and param_name not in fixed_params:
+        # Keep nonce fields stable so mutations target the handler payload.
+        if param_name in fuzzable_params and param_name not in fixed_params and "nonce" not in param_name.lower():
             data.append({"name": param_name, "value": "fuzz"})
             fuzz.append(_selector_for_generated_param(param_name))
         else:
