@@ -18,21 +18,32 @@ param(
     [ValidateRange(1, 30)]
     [int]$GeneratedConfigTimeoutSeconds = 30,
     [ValidateRange(1, 30)]
-    [int]$ZendMaxIterations = 5,
+    [int]$ZendMaxIterations,
     [ValidateRange(1, 120)]
-    [int]$OnlineTimeoutSeconds = 120,
+    [int]$OnlineTimeoutSeconds,
     [ValidateRange(1, 20)]
-    [int]$OnlineMaxVersions = 2,
+    [int]$OnlineMaxVersions,
     [ValidateRange(1, 128)]
-    [int]$OnlineMaxCandidates = 32,
+    [int]$OnlineMaxCandidates,
     [ValidateRange(1, 86400)]
-    [int]$OnlineCampaignTimeoutSeconds = 3600
+    [int]$OnlineCampaignTimeoutSeconds
 )
 
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $PSCommandPath
 $scriptRoot = (Resolve-Path -LiteralPath (Join-Path $scriptDir "..\..")).Path
+$settingsReaderPath = Join-Path $scriptDir "read-phuzz-env.ps1"
+if (-not (Test-Path -LiteralPath $settingsReaderPath -PathType Leaf)) {
+    throw "Missing PHUZZ settings reader: $settingsReaderPath"
+}
+. $settingsReaderPath
+$runtimeSettings = Resolve-PhuzzRuntimeSettings -Path (Join-Path $scriptRoot "phuzz.env") -BoundParameters $PSBoundParameters
+$ZendMaxIterations = $runtimeSettings["ZendMaxIterations"]
+$OnlineTimeoutSeconds = $runtimeSettings["OnlineTimeoutSeconds"]
+$OnlineMaxVersions = $runtimeSettings["OnlineMaxVersions"]
+$OnlineMaxCandidates = $runtimeSettings["OnlineMaxCandidates"]
+$OnlineCampaignTimeoutSeconds = $runtimeSettings["OnlineCampaignTimeoutSeconds"]
 $pluginScript = Join-Path $scriptRoot "web\applications\wordpress\_plugins\download-plugins.ps1"
 $fuzzerService = "fuzzer-wordpress-plugin"
 $webUrl = "http://localhost:8080/"

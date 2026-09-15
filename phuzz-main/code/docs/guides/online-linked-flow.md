@@ -158,10 +158,12 @@ rtk proxy powershell -NoProfile -File .\phuzz.ps1 -Mode online-linked -PluginSlu
 
 Đây là lệnh chạy, không phải tuyên bố plugin đã PASS trên checkout hiện tại. Nếu tên plugin/config khác, thay bằng slug đã kiểm tra trên máy.
 
-- `OnlineTimeoutSeconds`: 1–120 giây, mặc định 60, **cho từng candidate**; không phải timeout toàn batch hay Docker build/bootstrap.
+- Các giá trị thay đổi thường xuyên nằm trong [`phuzz.env`](../../phuzz.env). Comment trong file dùng tiếng Anh ngắn; sửa file này trước khi chạy.
+- CLI flag vẫn được hỗ trợ và override `phuzz.env`; nếu thiếu key, wrapper dùng default trong loader.
+- `OnlineTimeoutSeconds`: 1–120 giây, mặc định 120, **cho từng candidate**; không phải timeout toàn batch hay Docker build/bootstrap.
 - `OnlineMaxVersions`: 1–20, mặc định 2, tính cả `v0` và phiên bản đã tạo nhưng replay thất bại.
 - `OnlineMaxCandidates`: 1–128, mặc định 32, giới hạn candidate cả initial và runtime expansion.
-- `OnlineCampaignTimeoutSeconds`: 1–86400, mặc định 600, wall-clock budget toàn batch; khác timeout từng candidate.
+- `OnlineCampaignTimeoutSeconds`: 1–86400, mặc định 3600, wall-clock budget toàn batch; khác timeout từng candidate.
 - Không bắt đầu xử lý evidence để mở rộng khi deadline đã hết. Sau khi dừng parent, nếu còn dưới 1 giây thì không bắt đầu replay mới.
 - Sau replay, hết ngân sách thì không khởi động worker con hoặc khởi động lại parent.
 - Các lệnh Docker đang thực thi và cleanup vẫn có timeout riêng; thời gian thực tổng cộng có thể vượt ngân sách fuzz. Không coi `60` là giới hạn wall-clock cứng cho toàn lệnh.

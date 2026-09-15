@@ -1,5 +1,7 @@
 import unittest
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -16,11 +18,18 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn("[ValidateSet(\"default\", \"seed-config\", \"generated\", \"zend\", \"online\", \"online-linked\")]", script)
         self.assertIn("[string]$Mode", script)
         self.assertIn("[switch]$UseZendDiscovery", script)
-        self.assertIn("[int]$ZendMaxIterations = 5", script)
-        self.assertIn("[int]$OnlineTimeoutSeconds = 120", script)
-        self.assertIn("[int]$OnlineMaxVersions = 2", script)
-        self.assertIn("[int]$OnlineMaxCandidates = 32", script)
-        self.assertIn("[int]$OnlineCampaignTimeoutSeconds = 3600", script)
+        self.assertIn("[int]$ZendMaxIterations", script)
+        self.assertIn("[int]$OnlineTimeoutSeconds", script)
+        self.assertIn("[int]$OnlineMaxVersions", script)
+        self.assertIn("[int]$OnlineMaxCandidates", script)
+        self.assertIn("[int]$OnlineCampaignTimeoutSeconds", script)
+        env = (CODE_DIR / "phuzz.env").read_text(encoding="utf-8")
+        self.assertIn("ZEND_MAX_ITERATIONS=5", env)
+        self.assertIn("ONLINE_TIMEOUT_SECONDS=120", env)
+        self.assertIn("ONLINE_MAX_VERSIONS=2", env)
+        self.assertIn("ONLINE_MAX_CANDIDATES=32", env)
+        self.assertIn("ONLINE_CAMPAIGN_TIMEOUT_SECONDS=3600", env)
+        self.assertIn("# Max candidates per online-linked campaign.", env)
         self.assertIn("[switch]$DryRun", script)
         self.assertIn("[switch]$Help", script)
         self.assertIn("Read-Host", script)
@@ -219,6 +228,58 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn('"--bootstrap-config", $requiredConfig', script)
         self.assertIn('"HOOKPHUZZ_CMPLOG=1"', (CODE_DIR / "fuzzer" / "hook_energy" / "seed_generation" / "online_linked_coordinator.py").read_text(encoding="utf-8"))
         self.assertIn("$env:COMPOSE_FILE", script)
+
+    def test_guided_wrapper_reads_changeable_settings_from_env_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            temp_runner_dir = temp_root / "scripts" / "wordpress"
+            temp_runner_dir.mkdir(parents=True)
+            shutil.copy2(CODE_DIR / "phuzz.ps1", temp_root / "phuzz.ps1")
+            shutil.copy2(
+                CODE_DIR / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1",
+                temp_runner_dir / "run-wordpress-phuzz.ps1",
+            )
+            shutil.copy2(
+                CODE_DIR / "scripts" / "wordpress" / "read-phuzz-env.ps1",
+                temp_runner_dir / "read-phuzz-env.ps1",
+            )
+            (temp_root / "phuzz.env").write_text(
+                "\n".join(
+                    [
+                        "ZEND_MAX_ITERATIONS=7",
+                        "ONLINE_TIMEOUT_SECONDS=17",
+                        "ONLINE_MAX_VERSIONS=4",
+                        "ONLINE_MAX_CANDIDATES=9",
+                        "ONLINE_CAMPAIGN_TIMEOUT_SECONDS=123",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(temp_root / "phuzz.ps1"),
+                    "-Mode",
+                    "online-linked",
+                    "-PluginSlug",
+                    "demo-plugin",
+                    "-DryRun",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-OnlineTimeoutSeconds 17", result.stdout)
+        self.assertIn("-OnlineMaxVersions 4", result.stdout)
+        self.assertIn("-OnlineMaxCandidates 9", result.stdout)
+        self.assertIn("-OnlineCampaignTimeoutSeconds 123", result.stdout)
 
     def test_guided_wrapper_online_modes_allow_any_local_plugin_zip(self):
         script = (CODE_DIR / "phuzz.ps1").read_text(encoding="utf-8-sig")
@@ -520,8 +581,9 @@ class PhuzzWrapperContractTests(unittest.TestCase):
         self.assertIn("[switch]$RunOnline", script)
         self.assertIn("online_config_runner.py", script)
         self.assertIn("OnlineMaxVersions", script)
-        self.assertIn("[int]$OnlineMaxCandidates = 32", script)
-        self.assertIn("[int]$OnlineCampaignTimeoutSeconds = 3600", script)
+        self.assertIn("[int]$OnlineMaxCandidates", script)
+        self.assertIn("[int]$OnlineCampaignTimeoutSeconds", script)
+        self.assertIn("read-phuzz-env.ps1", script)
         self.assertIn('"--max-candidates", "$OnlineMaxCandidates"', script)
         self.assertIn('"--campaign-seconds", "$OnlineCampaignTimeoutSeconds"', script)
         self.assertIn('"--sync-registry"', script)

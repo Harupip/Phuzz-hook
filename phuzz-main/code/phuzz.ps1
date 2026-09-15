@@ -15,15 +15,15 @@ param(
     [switch]$UseZendDiscovery,
     [switch]$KeepDebugArtifacts,
     [ValidateRange(1, 30)]
-    [int]$ZendMaxIterations = 5,
+    [int]$ZendMaxIterations,
     [ValidateRange(1, 120)]
-    [int]$OnlineTimeoutSeconds = 120,
+    [int]$OnlineTimeoutSeconds,
     [ValidateRange(1, 20)]
-    [int]$OnlineMaxVersions = 2,
+    [int]$OnlineMaxVersions,
     [ValidateRange(1, 128)]
-    [int]$OnlineMaxCandidates = 32,
+    [int]$OnlineMaxCandidates,
     [ValidateRange(1, 86400)]
-    [int]$OnlineCampaignTimeoutSeconds = 3600,
+    [int]$OnlineCampaignTimeoutSeconds,
     [switch]$DryRun,
     [switch]$Help
 )
@@ -72,6 +72,7 @@ Useful options:
   -OnlineMaxVersions <count>       Maximum online config versions including v0. Default: 2.
   -OnlineMaxCandidates <count>     Maximum online-linked candidates per campaign. Default: 32.
   -OnlineCampaignTimeoutSeconds    Maximum online-linked campaign budget. Default: 3600.
+  phuzz.env                        Changeable Zend/online settings; CLI flags override file values.
   -DryRun                          Print the delegated command without running it.
 "@
 }
@@ -200,6 +201,18 @@ if ($Help) {
     Show-Usage
     exit 0
 }
+
+$settingsReaderPath = Join-Path $scriptRoot "scripts\wordpress\read-phuzz-env.ps1"
+if (-not (Test-Path -LiteralPath $settingsReaderPath -PathType Leaf)) {
+    throw "Missing PHUZZ settings reader: $settingsReaderPath"
+}
+. $settingsReaderPath
+$runtimeSettings = Resolve-PhuzzRuntimeSettings -Path (Join-Path $scriptRoot "phuzz.env") -BoundParameters $PSBoundParameters
+$ZendMaxIterations = $runtimeSettings["ZendMaxIterations"]
+$OnlineTimeoutSeconds = $runtimeSettings["OnlineTimeoutSeconds"]
+$OnlineMaxVersions = $runtimeSettings["OnlineMaxVersions"]
+$OnlineMaxCandidates = $runtimeSettings["OnlineMaxCandidates"]
+$OnlineCampaignTimeoutSeconds = $runtimeSettings["OnlineCampaignTimeoutSeconds"]
 
 if ($UseEntrypointPipeline -and $PSBoundParameters.ContainsKey("Mode") -and $Mode -ne "generated") {
     throw "-UseEntrypointPipeline is only supported with -Mode generated."
