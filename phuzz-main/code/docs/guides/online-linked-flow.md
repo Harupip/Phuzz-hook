@@ -202,6 +202,88 @@ fuzzer/output/online-linked/<batch-run-id>/callback-registry.json
 
 Lỗi hoặc timeout riêng của candidate được ghi `NOT_VERIFIED` và không hủy hàng đợi còn lại. Giới hạn `OnlineMaxCandidates` và `OnlineCampaignTimeoutSeconds` vẫn áp dụng; lỗi đầu vào chung hoặc không ghi được batch state vẫn làm CLI thất bại.
 
+### 5.1. Coherent replay-input trial
+
+Khi convergence phát hiện tham số mới, coordinator dựng một context đầy đủ rồi kiểm tra nó qua parent trước khi công bố child. Các lần kiểm tra nằm riêng dưới:
+
+```text
+fuzzer/configs/online-linked/<plugin-slug>/<storage-id>/replay-input-trials/<attempt>/tN.json
+fuzzer/output/online-linked/<storage-id>/replay-input-trials/<attempt>/tN/{request,zend}/
+```
+
+Có tối đa 4 trial cho một attempt: context ban đầu và tối đa 3 điều chỉnh. Trial dùng cùng deadline của candidate, không tiêu hao `OnlineMaxVersions`, không ghi đè parent hay version đã công bố, và không khởi động worker child. Mỗi trial phải có request/Zend pair cùng request ID, run ID, plugin, callback, method, auth context và transport đã chứng minh; callback reached hoặc HTTP status thành công riêng lẻ không đủ. Pass 2 cũng phải đạt `accepted == total > 0` khi toàn bộ expected parameters đã được xác minh.
+
+Chỉ request của trial xác minh đủ toàn bộ expected set mới được dùng làm seed nguyên context cho child. Khi đó coordinator mới ghi `vN-config.json`, tạo replay config, rồi chạy handoff/replay/Pass 2 hiện có. Nếu final gate thất bại, child vẫn `NOT_VERIFIED`; trial thành công không thay thế gate cuối.
+
+CMPLOG chỉ được dùng để điều chỉnh một field đã có transport hợp lệ khi response hợp lệ chỉ thiếu parameter read. Hint sai correlation, transport mơ hồ hoặc field fixed/nhạy cảm bị bỏ qua. Lỗi callback/method/auth/artifact, parent exit/inspection timeout và sender timeout chặn việc tiếp tục thử hint; không được dùng hint để bỏ qua lỗi xác minh. State của trial lưu identity/path/provenance đã lọc; không đưa giá trị cookie/token vào log chẩn đoán. Raw artifact và config có thể chứa dữ liệu request, nên không chia sẻ nguyên gói khi chưa kiểm tra dữ liệu nhạy cảm.
+
+#### Đã sửa gì, và vì sao cần sửa?
+
+Một **probe** là request thử đọc một tham số. Một **trial** là request kiểm tra toàn bộ bộ giá trị định dùng cho config con. Hai tham số đọc được ở hai probe riêng chưa chắc cùng đọc được khi ghép vào một request.
+
+Ca lỗi thực tế trên Show All Comments 7.0.0:
+
+| Bước | Input đáng chú ý | Kết quả |
+| --- | --- | --- |
+| Probe riêng | `post_id=probe`, không gửi `post_type` | Có đọc `post_id`; CMPLOG ghi so sánh với `1`. |
+| Bộ ghép cũ cho v1 | `post_category=probe`, `post_id=probe`, `post_type=probe` | Chỉ đọc `post_category` và `post_type`; mất nhánh đọc `post_id` trong vòng lặp bài viết. |
+| Trial điều chỉnh | Dùng hint `post_type: probe → post` từ CMPLOG của request đã tương quan | Phải gửi request mới và xác minh lại cả ba tham số; hint tự nó không chứng minh thành công. |
+
+Trước sửa, coordinator ghép giá trị từ từng probe rồi tạo v1 ngay. Final replay thiếu `post_id`, Pass 2 đạt `0/1`, v1 bị từ chối. Sau sửa, coordinator kiểm tra và điều chỉnh bộ ghép trước khi tạo v1:
+
+```text
+Probe riêng → bộ input ghép → trial t0
+    ├─ Đủ bằng chứng cho toàn bộ tham số → lấy nguyên request này làm seed
+    └─ Thiếu lần đọc tham số → hint CMPLOG → trial kế tiếp, tối đa t3
+Seed đã xác minh → tạo child immutable → final replay + Pass 2 → start worker
+```
+
+Các giá trị `post` và `1` ở ví dụ là dữ liệu runtime của ca này, không được hardcode trong discovery. CMPLOG trong worker vẫn phục vụ mutation như trước; helper mới sử dụng CMPLOG cho bước chuẩn bị input replay, không tự thêm tham số hoặc thay điều kiện export.
+
+Ba điều chỉnh sau review:
+
+- Trial thất bại không sinh hint mới vẫn phải thử phương án đã có trong queue; chỉ hết queue hoặc hết giới hạn mới dừng tìm kiếm.
+- Không ép response phải là HTTP 200. HTTP 201 không bị loại chỉ vì status; vẫn cần callback, correlation và Pass 2 đạt.
+- Với event `REQUEST`, kiểm tra bucket thực tế thay vì chỉ đếm transport được phép chỉnh. Trùng tên ở query/body phải bị từ chối khi chưa xác định được nguồn duy nhất.
+
+#### Người chạy cần đọc gì khi vẫn bị chặn?
+
+1. Mở `batch-state.json`, lấy `state_path` của đúng candidate guest/auth; không dùng state của lượt khác.
+2. Trong state, đọc `replay_input_trials`: mỗi attempt có `trials`, `missing_parameters`, `pass2_verification`, `queued_adjustments` và đường dẫn artifact. Khi đã chọn được input, xem `selected_trial`.
+3. Đối chiếu request và Zend cùng request/run ID. Có `comparison_events` chỉ chứng minh đã ghi so sánh; cần trial kế tiếp chứng minh giá trị được thử và đủ parameter reads.
+4. Nếu có v1, xem `replay_input_trial` để biết seed đến từ trial nào, rồi kiểm tra `replay_result` và worker status riêng. Trial đạt chưa chứng minh worker đã chạy.
+
+| Reason | Ý nghĩa / bước kiểm tra |
+| --- | --- |
+| `TRIAL_INPUT_SET_NOT_VERIFIED` | Input thiếu lần đọc và không còn phương án trong queue. Xem missing parameters và hint bị loại. |
+| `REPLAY_INPUT_TRIAL_LIMIT_REACHED` | Đã dùng hết tối đa 4 trial; chưa xác minh được bộ input. |
+| `TRIAL_ARTIFACT_CORRELATION_FAILED` / `TRIAL_IDENTITY_CORRELATION_FAILED` | Sai/thiếu bằng chứng tương quan request, run hoặc identity; không chữa bằng đổi giá trị. |
+| `TRIAL_PASS2_VERIFICATION_FAILED` | Verifier chưa xác nhận đầy đủ; không được hạ expected set để ép đạt. |
+| `PARENT_CHECK_TIMEOUT` / `BUDGET_EXPIRED` | Không đủ bằng chứng parent còn hoạt động hoặc đã hết thời gian; không reset budget để chạy tiếp ngầm. |
+| `GATE_NOT_VERIFIED` khi export | Phiên bản không đạt gate/Pass 2 để xuất. v0 `replay_only` có thể đã qua gate khởi động nhưng không có Pass 2, nên vẫn bị bỏ qua. |
+
+#### Chỉ dẫn cho agent bảo trì
+
+| Việc cần lần theo | File / hàm |
+| --- | --- |
+| Ghép input và chỉ công bố child sau trial | [online_linked_coordinator.py](../../fuzzer/hook_energy/seed_generation/online_linked_coordinator.py): `_handle_convergence_result` |
+| Queue, deadline, sender, ghi artifact và xác minh trial | Cùng file: `_verify_replay_input_trials`, `_trial_identity_complete`, `_trial_parameter_verified` |
+| Chọn điều chỉnh một field từ evidence, không IO | [online_linked_replay_inputs.py](../../fuzzer/hook_energy/seed_generation/online_linked_replay_inputs.py): `propose_replay_inputs` |
+| Handoff và gate cuối giữ nguyên vai trò | Coordinator: `handoff_to_next_worker`; [online_linked_export.py](../../fuzzer/hook_energy/seed_generation/online_linked_export.py): `_verified_config` |
+| Regression queue/HTTP/correlation và vòng đời child | [test_online_linked_coordinator.py](../../fuzzer/tests/test_online_linked_coordinator.py) |
+| Regression lọc hint và xung đột REQUEST | [test_online_linked_replay_inputs.py](../../fuzzer/tests/test_online_linked_replay_inputs.py) |
+
+Giữ các bất biến: tối đa 4 trial mỗi attempt, dùng chung deadline candidate, không tính trial thành version; không sửa config đã công bố; không thay auth/fixed field bằng CMPLOG; không thu nhỏ tập expected parameters; không start child trước final gate. Helper phải chọn từ bằng chứng runtime, không đọc source plugin để đoán giá trị. Phạm vi sửa này không thay cờ CLI, default budget hoặc chính sách dừng khi gặp vulnerability.
+
+#### Bằng chứng kiểm chứng ngày 16/09/2026
+
+- **Trước sửa:** batch `show-all-comments-in-one-page-20260916T094450Z`; cả guest/auth `CHILD_REPLAY_FAILED`, v1 Pass 2 `0/1`, thiếu `post_id`.
+- **Runtime sau thêm coherent trial, trước ba điều chỉnh review:** batch `show-all-comments-in-one-page-20260916T113544Z`; guest storage ID `0c51379561f0da05`, auth `ed0dfed029c14162`. Cả hai t0 thiếu read, t1 Pass 2 `1/1`; final v1 replay `1/1`, worker đã khởi động, xuất 2 final config. Campaign ghi `CANDIDATE_BUDGET_EXPIRED`; tín hiệu `VULN_FOUND` không tự chứng minh vulnerability hoặc coverage đầy đủ.
+- **Sau ba điều chỉnh review:** chạy lại 5 suite replay-inputs/coordinator/probe-sender/CMPLOG/exporter: **128 pass, 0 fail, 0 skip**; `git diff --check` đạt. Chưa chạy lại Docker/runtime sau ba điều chỉnh; không dùng batch trước đó làm bằng chứng runtime của bản cuối.
+- Bản tái hiện: ZIP 7.0.0 SHA256 `adc03dffa9192759cf81ecb3599abce19051207fed76d1117cfbbbda1bbb4924`, PHP `b3b65877f6fb0a936edc6efbe1e1cf5dbdbbeedb6b588fa0be6f216f846ca593`. Bản 7.0.1 chưa được chạy lại trong patch này. Cùng Git commit chưa đảm bảo hai máy dùng cùng ZIP plugin.
+
+Artifact nằm dưới `fuzzer/output/online-linked` và không được commit cùng code. Nếu artifact không còn, trạng thái là thiếu bằng chứng để kiểm tra lại, không phải PASS.
+
 ## 6. Final configs
 
 Cuối batch, config được gom vào thư mục phẳng:

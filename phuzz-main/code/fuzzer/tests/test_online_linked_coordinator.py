@@ -10,6 +10,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from contextlib import redirect_stderr
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -23,6 +24,7 @@ if str(FUZZER_DIR) not in __import__("sys").path:
 
 from hook_energy.seed_generation.online_linked_coordinator import (
     OnlineLinkedCoordinator,
+    OnlineLinkedError,
     _batch_candidate_identity,
     run_online_linked,
 )
@@ -72,6 +74,34 @@ def config_for(item: dict, *, include_new: bool = False) -> dict:
         },
         "config_type": "fuzzing_ready",
     }
+
+
+COHERENT_REPLAY_FIXTURE = {
+    "request_id": "trial-request",
+    "run_id": "trial-run",
+    "callback": "fixture_callback",
+    "request_params": {
+        "body_params": {
+            "action": "fixture",
+            "post_category": "probe",
+            "post_id": "probe",
+            "post_type": "probe",
+        }
+    },
+    "reads": ["post_category", "post_type"],
+    "comparison_events": [
+        {
+            "request_id": "trial-request",
+            "run_id": "trial-run",
+            "callback": "fixture_callback",
+            "opcode": "IS_EQUAL",
+            "source": "REQUEST",
+            "path": ["post_type"],
+            "runtime_value": "probe",
+            "comparison_value": "post",
+        }
+    ],
+}
 
 
 class Clock:
@@ -899,8 +929,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             coordinator.export_configs_fn = lambda *args, **kwargs: {'generated': []}
             coordinator.run()
             self.assertEqual(coordinator.state['versions'][0]['known_parameters'], [])
-            self.assertEqual(coordinator.state['attempts'][0]['reason'], 'CHILD_CONFIG_EXPORT_FAILED')
-            self.assertEqual(coordinator.state['attempts'][0]['version'], 'v1')
+            self.assertEqual(coordinator.state['attempts'], [])
+            self.assertEqual(coordinator.state['replay_input_trials'][0]['reason'], 'CHILD_CONFIG_EXPORT_FAILED')
+            self.assertEqual(coordinator.state['replay_input_trials'][0]['status'], 'failed')
             coordinator.export_configs_fn = exporter
             coordinator._active_container = coordinator.state["workers"][0]["container_name"]
             coordinator.state["workers"][0]["status"] = "started"
@@ -919,10 +950,11 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 'request_name': 'retry.json', 'zend_name': 'retry.json', 'request_id': 'retry',
                 'request': request, 'zend': coordinator.load_zend_artifact('retry.json'),
             })
-            self.assertEqual(child['version'], 'v2')
+            self.assertEqual(child['version'], 'v1')
             self.assertEqual(child['status'], 'fuzzing')
             self.assertEqual(coordinator.state['versions'][0]['known_parameters'], [])
-            self.assertIsNone(coordinator.advance_online_version({'request_id': 'third'}))
+            with self.assertRaises(OnlineLinkedError):
+                coordinator.advance_online_version({'request_id': 'third'})
 
     def test_convergence_failure_keeps_missing_parameter_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1556,14 +1588,41 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
         def materialize(*args, **kwargs):
             log.append("materialize_convergence_seeds")
-            return copy.deepcopy(raw_report)
+            materialized = copy.deepcopy(raw_report)
+            items = materialized.get("suggested_seeds")
+            known_parameters = kwargs.get("known_parameters")
+            if isinstance(items, list) and items and isinstance(items[0], Mapping):
+                seed = items[0].setdefault("seed", {})
+                if isinstance(seed, dict) and isinstance(known_parameters, list):
+                    body = seed.setdefault("body", {})
+                    if isinstance(body, dict):
+                        for parameter in known_parameters:
+                            if not isinstance(parameter, Mapping):
+                                continue
+                            name = str(parameter.get("name") or "")
+                            if name and str(parameter.get("source") or "").upper() == "POST":
+                                body.setdefault(name, "fuzz")
+            return materialized
 
         def export_configs(report, *, output_config_dir, summary_path, **kwargs):
             log.append("export_seed_configs")
             output_config_dir = Path(output_config_dir)
             path = output_config_dir / "exported.json"
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(config_for(item, include_new=True)), encoding="utf-8")
+            config = config_for(item, include_new=True)
+            report_items = report.get("suggested_seeds") if isinstance(report, Mapping) else None
+            report_seed = report_items[0].get("seed") if isinstance(report_items, list) and report_items else None
+            if isinstance(report_seed, Mapping) and isinstance(report_seed.get("body"), Mapping):
+                existing_names = {
+                    str(row.get("name") or "")
+                    for row in config["body_params"]["data"]
+                    if isinstance(row, Mapping)
+                }
+                for name, value in report_seed["body"].items():
+                    if str(name) and str(name) not in existing_names:
+                        config["body_params"]["data"].append({"name": str(name), "value": value})
+                        config["body_params"]["fuzz"].append(str(name))
+            path.write_text(json.dumps(config), encoding="utf-8")
             summary = {"generated": [{
                 "config_slug": "online-linked/exported",
                 "config_path": str(path),
@@ -1619,6 +1678,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 log.append("runtime_cookie_probes:verify")
             if args[0].get('legacy_run_id') == f'{legacy_run_id}-v0':
                 log.append('v0_pass2')
+                return {'accepted': 1, 'total': 1}
+            if "replay-input" in str(args[0].get('legacy_run_id') or ''):
+                log.append("trial_pass2")
                 return {'accepted': 1, 'total': 1}
             log.append("verify_pass2_contract")
             return {"accepted": 1, "total": 1} if replay_passes else {"accepted": 0, "total": 0}
@@ -1680,41 +1742,73 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     or (metadata or {}).get("seed_variant_id") or ""
                 ),
             }
-            try:
-                report = coordinator.replay_runner(
-                    [row], timeout_seconds=kwargs["timeout_seconds"], service=coordinator.service,
-                    legacy_run_id=run_id, run_command=coordinator.run_command,
-                    list_artifacts=coordinator.list_artifacts, load_artifact=coordinator.load_artifact,
-                    list_zend_artifacts=coordinator.list_zend_artifacts,
-                    poll_interval_seconds=0, fuzzer_node_id=100, stop_on_callback=True,
-                )
-            except Exception as exc:
-                return {"status": "sender_error", "error": str(exc)}
+            is_trial = "replay-input-trials" in kwargs["config_slug"]
+            is_probe = "-probe-" in run_id
+            if is_trial:
+                report = {"runs": [{}]}
+            else:
+                try:
+                    report = coordinator.replay_runner(
+                        [row], timeout_seconds=kwargs["timeout_seconds"], service=coordinator.service,
+                        legacy_run_id=run_id, run_command=coordinator.run_command,
+                        list_artifacts=coordinator.list_artifacts, load_artifact=coordinator.load_artifact,
+                        list_zend_artifacts=coordinator.list_zend_artifacts,
+                        poll_interval_seconds=0, fuzzer_node_id=100, stop_on_callback=True,
+                    )
+                except Exception as exc:
+                    return {"status": "sender_error", "error": str(exc)}
             old_row = report.get("runs", [{}])[0] if isinstance(report, dict) else {}
-            reached = old_row.get("callback_reached") is True
-            matched = str(old_row.get("matched_artifact") or "")
-            name = str(row.get("seed_variant_id") or "").rsplit("_", 1)[-1] or "seed"
+            reached = True if is_trial else old_row.get("callback_reached") is True
+            name = str(row.get("seed_variant_id") or "").split("zend_probe_post_", 1)[-1] or "seed"
+            artifact_name = (
+                str(old_row.get("matched_artifact") or f"probe-{name}.json")
+                if is_probe
+                else (
+                    f"{kwargs['request_id']}.json"
+                    if is_trial
+                    else str(old_row.get("matched_artifact") or f"{kwargs['request_id']}.json")
+                )
+            )
+            artifact_id = Path(artifact_name).stem
+            body = (
+                {"action": "fixture", name: f"probe-{name}"}
+                if is_probe
+                else {
+                    str(item.get("name")): item.get("value")
+                    for item in config_payload.get("body_params", {}).get("data", [])
+                    if isinstance(item, Mapping) and str(item.get("name") or "")
+                }
+            )
+            auth_context = str(kwargs["expected"].get("auth_context") or "authenticated")
+            helper_depth = 5 if "-probe-" in run_id else 0
             return {
                 "status": "callback_reached" if reached else "request_completed",
                 "callback_reached": reached,
-                "validation_status": old_row.get("validation_status"),
-                "validation_reason": old_row.get("validation_reason", ""),
-                "request_name": matched,
+                "validation_status": "callback_reached" if reached else old_row.get("validation_status"),
+                "validation_reason": "" if reached else old_row.get("validation_reason", ""),
+                "request_name": artifact_name if reached else "",
                 "request": ({
-                    "request_id": Path(matched).stem, "legacy_run_id": run_id,
-                    "target_plugin": "fixture", "http_method": row["resolved_method"],
-                    "request_params": {"body_params": {"action": "fixture", name: f"probe-{name}"}},
-                } if matched else None),
-                "zend_name": matched if matched else old_row.get("zend_artifact"),
+                    "request_id": artifact_id, "legacy_run_id": run_id, "run_id": run_id,
+                    "target_plugin": "fixture", "hook_name": kwargs["expected"]["hook_name"],
+                    "callback_id": kwargs["expected"]["callback_id"], "auth_context": auth_context,
+                    "http_method": row["resolved_method"],
+                    "request_params": {"body_params": body, "headers": {
+                        "X-HookPhuzz-Auth-Context": auth_context,
+                    }},
+                    "response": {"status_code": 200},
+                } if reached else None),
+                "zend_name": artifact_name if reached else "",
                 "zend": ({
-                    "request_id": Path(matched).stem, "run_id": run_id,
+                    "request_id": artifact_id, "run_id": run_id,
+                    "request_method": row["resolved_method"],
                     "callback_summaries": [{"callback": "fixture_callback", "unique_parameters": [{
-                        "source": "POST", "path": [name], "helper_depth": 5,
+                        "name": item_name, "source": "POST", "path": [item_name], "helper_depth": helper_depth,
                         "observed_count": 1, "access_forms": ["read"],
-                    }]}],
-                    "events": [{"source": "POST", "path": [name], "operation": "read",
-                                 "callback_context": {"attributed": True, "root_callback": "fixture_callback", "depth": 5}}],
-                } if matched else None),
+                    } for item_name in body if item_name != "action"]}],
+                    "events": [{"source": "POST", "path": [item_name], "operation": "read",
+                                 "callback_context": {"attributed": True, "root_callback": "fixture_callback", "depth": helper_depth}}
+                                for item_name in body if item_name != "action"],
+                } if reached else None),
                 "timing": {},
             }
 
@@ -1758,6 +1852,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         config_path = coordinator._write_config("v0", config)
         parent = coordinator._new_version("v0", config, config_path, None, None, item)
         parent.update(worker_run_id="run-v0", known_parameters=[])
+        parent["auth_context"] = "guest"
         coordinator._reports["v0"] = {"plugin_slug": "fixture", "suggested_seeds": [item]}
         coordinator._active_version = "v0"
         coordinator._target_key = target_key
@@ -1837,7 +1932,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             current_probe_run_id = run_id
             row = dict(args[0][0])
             if "-probe-" in run_id:
-                name = str(row["seed_variant_id"]).rsplit("_", 1)[-1]
+                name = str(row["seed_variant_id"]).split("zend_probe_post_", 1)[-1]
                 row["hook_name"] = f"probe-{name}"
                 row["matched_artifact"] = f"probe-{name}.json"
                 log.append(f"probe:{name}")
@@ -1852,7 +1947,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             if "-probe-" not in run_id:
                 return {"status": "CONVERGED", "new_parameters": [], "known_parameters": []}
             item_seed = kwargs["raw_report"]["suggested_seeds"][0]["seed"]
-            name = str(item_seed.get("seed_variant_id")).rsplit("_", 1)[-1]
+            name = str(item_seed.get("seed_variant_id")).split("zend_probe_post_", 1)[-1]
             if name not in accepted:
                 return {"status": "CONTINUE", "new_parameters": [], "known_parameters": []}
             target = wrong_target or name
@@ -1875,13 +1970,21 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 raise OSError("child export failed")
             out = Path(kwargs["output_config_dir"])
             out.mkdir(parents=True, exist_ok=True)
-            names_in_config = ["action", "seed", *names]
+            report_seed = report["suggested_seeds"][0].get("seed", {})
+            report_body_names = (
+                [str(name) for name in report_seed.get("body", {}) if str(name)]
+                if isinstance(report_seed, Mapping) and isinstance(report_seed.get("body"), Mapping)
+                else []
+            )
+            names_in_config = list(dict.fromkeys(["action", "seed", *names, *report_body_names]))
             child_config = config_for(item)
             child_config["body_params"]["data"] = [
                 {"name": name, "value": "fixture" if name == "action" else "fuzz"}
                 for name in names_in_config
             ]
-            child_config["body_params"]["fuzz"] = list(names)
+            child_config["body_params"]["fuzz"] = [
+                name for name in names_in_config if name not in {"action", "seed"}
+            ]
             path = out / "child.json"
             path.write_text(json.dumps(child_config), encoding="utf-8")
             Path(kwargs["summary_path"]).write_text(json.dumps({"generated": [{"config_path": str(path)}]}), encoding="utf-8")
@@ -1994,17 +2097,17 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 seed=parent["seed_item"], deadline=None,
             )
 
-            self.assertIsNotNone(result)
+            self.assertIsNotNone(result, json.dumps(coordinator.state, default=str))
             child = coordinator.state["versions"][1]
             child_config = json.loads(Path(child["config_path"]).read_text())
             values = {row["name"]: row["value"] for row in child_config["body_params"]["data"]}
             self.assertEqual(values["a"], "probe-a")
             self.assertEqual(values["b"], "probe-b")
             seed_metadata = child_config["metadata"]["online_request_seed"]
-            self.assertEqual(seed_metadata["evidence_request_ids"], ["req-v0", "probe-a", "probe-b"])
+            self.assertEqual(seed_metadata["evidence_request_ids"], [seed_metadata["request_id"]])
             self.assertEqual(
                 {row["name"]: row["request_id"] for row in seed_metadata["values"] if row["name"] in {"a", "b"}},
-                {"a": "probe-a", "b": "probe-b"},
+                {"a": seed_metadata["request_id"], "b": seed_metadata["request_id"]},
             )
             self.assertEqual(parent["known_parameters"], [])
 
@@ -2071,7 +2174,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     Path(tmp), log, names=("a",), accepted=("a",),
                 )
                 existing = {
-                    "name": "existing", "source": "POST", "location": "form", "helper_depth": 0,
+                    "name": "existing", "path": ["existing"], "source": "POST", "location": "form", "helper_depth": 0,
                     "evidence_kind": "zend_runtime", "fuzzable": True, "observed_count": 1,
                     "request_id": "req-v0", "run_id": "run-v0", "plugin_slug": "fixture",
                     "canonical_callback": "fixture_callback", "request_method": "POST",
@@ -2612,6 +2715,299 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(versions[1]["status"], "fuzzing")
             self.assertIn("new_param", json.dumps(json.loads(Path(versions[1]["config_path"]).read_text())))
 
+    def test_child_waits_for_one_coherent_input_trial_before_worker_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), log,
+                names=("post_category", "post_id", "post_type"),
+                accepted=("post_category", "post_id", "post_type"),
+            )
+            original_export = coordinator.export_configs_fn
+
+            def export_probe_context(report, **kwargs):
+                result = original_export(report, **kwargs)
+                path = Path(result["generated"][0]["config_path"])
+                config = json.loads(path.read_text(encoding="utf-8"))
+                for row in config["body_params"]["data"]:
+                    if row["name"] in {"post_category", "post_id", "post_type"}:
+                        row["value"] = "probe"
+                path.write_text(json.dumps(config), encoding="utf-8")
+                return result
+
+            coordinator.export_configs_fn = export_probe_context
+            original_sender = coordinator.probe_sender
+            trial_inputs: list[dict[str, Any]] = []
+            worker_counts_at_trial: list[int] = []
+
+            def sender(container_name, **kwargs):
+                if "replay-input-trials" not in kwargs["config_slug"]:
+                    return original_sender(container_name, **kwargs)
+                config_path = coordinator.config_root / f'{kwargs["config_slug"]}.json'
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                body = {
+                    row["name"]: (
+                        "probe" if str(row.get("value") or "").startswith("probe-") else row.get("value")
+                    )
+                    for row in config["body_params"]["data"]
+                }
+                trial_inputs.append(body)
+                worker_counts_at_trial.append(
+                    len([row for row in coordinator.state["workers"] if row["version"] == "v1"])
+                )
+                trial_number = len(trial_inputs)
+                request_id = kwargs["request_id"]
+                reads = list(COHERENT_REPLAY_FIXTURE["reads"])
+                if trial_number > 1:
+                    reads.append("post_id")
+                request = {
+                    "request_id": request_id,
+                    "legacy_run_id": kwargs["run_id"],
+                    "run_id": kwargs["run_id"],
+                    "target_plugin": "fixture",
+                    "hook_name": parent["hook_name"],
+                    "callback_id": parent["callback_id"],
+                    "auth_context": parent["auth_context"],
+                    "http_method": "POST",
+                    "request_params": {"body_params": body},
+                }
+                zend = {
+                    "request_id": request_id,
+                    "run_id": kwargs["run_id"],
+                    "request_method": "POST",
+                    "callback_summaries": [{
+                        "callback": "fixture_callback",
+                        "unique_parameters": [{
+                            "source": "POST", "path": [name], "helper_depth": 5,
+                            "observed_count": 1, "access_forms": ["read"],
+                        } for name in reads],
+                    }],
+                    "events": [{
+                        "source": "POST", "path": [name], "operation": "read",
+                        "callback_context": {
+                            "attributed": True, "root_callback": "fixture_callback", "depth": 5,
+                        },
+                    } for name in reads],
+                }
+                if trial_number == 1:
+                    zend["comparison_events"] = [{
+                        **COHERENT_REPLAY_FIXTURE["comparison_events"][0],
+                        "request_id": request_id,
+                        "run_id": kwargs["run_id"],
+                    }]
+                return {
+                    "status": "callback_reached",
+                    "callback_reached": True,
+                    "validation_status": "callback_reached",
+                    "request_name": f"{request_id}.json",
+                    "request": request,
+                    "zend_name": f"{request_id}.json",
+                    "zend": zend,
+                    "timing": {},
+                }
+
+            coordinator.probe_sender = sender
+            result = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence,
+                raw_report=coordinator._reports["v0"], convergence=convergence,
+                probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=None,
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(len(trial_inputs), 2)
+            self.assertEqual(worker_counts_at_trial, [0, 0])
+            self.assertEqual(trial_inputs[0]["post_type"], "probe")
+            self.assertEqual(trial_inputs[1]["post_type"], "post")
+            self.assertEqual(trial_inputs[0]["post_id"], "probe")
+            self.assertEqual(trial_inputs[1]["post_id"], "probe")
+            self.assertEqual(len(coordinator.state["versions"]), 2)
+            self.assertEqual(coordinator.state["versions"][1]["status"], "fuzzing")
+
+    def test_replay_trials_try_queued_good_context_after_bad_context_has_no_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [], names=("a",), accepted=("a",))
+            child_config = config_for(parent["seed_item"])
+            child_config["body_params"]["data"].append({"name": "a", "value": "probe"})
+            child_config["body_params"]["fuzz"].append("a")
+            parameter = {
+                "name": "a", "path": ["a"], "source": "POST", "location": "form",
+                "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
+                "fuzzable": True, "plugin_slug": "fixture", "callback_id": "cb-fixture",
+                "canonical_callback": "fixture_callback", "request_method": "POST",
+            }
+            attempt = {
+                "attempt_id": "attempt-queue", "parent_version": "v0",
+                "expected_parameters": [dict(parameter)], "trials": [],
+            }
+            tried: list[str] = []
+
+            def trial_sender(**kwargs):
+                config = json.loads(Path(kwargs["config_path"]).read_text(encoding="utf-8"))
+                body = {
+                    str(row["name"]): row.get("value")
+                    for row in config["body_params"]["data"]
+                    if isinstance(row, Mapping) and row.get("name")
+                }
+                value = str(body["a"])
+                tried.append(value)
+                request_id = kwargs["request_id"]
+                run_id = kwargs["run_id"]
+                zend = {
+                    "request_id": request_id, "run_id": run_id, "request_method": "POST",
+                    "events": [], "callback_summaries": [],
+                }
+                if len(tried) == 1:
+                    zend["comparison_events"] = [
+                        {
+                            "request_id": request_id, "run_id": run_id, "callback": "fixture_callback",
+                            "opcode": "IS_EQUAL", "source": "POST", "path": ["a"],
+                            "runtime_value": "probe", "comparison_value": "bad",
+                        },
+                        {
+                            "request_id": request_id, "run_id": run_id, "callback": "fixture_callback",
+                            "opcode": "IS_EQUAL", "source": "POST", "path": ["a"],
+                            "runtime_value": "probe", "comparison_value": "good",
+                        },
+                    ]
+                elif value == "good":
+                    zend["events"] = [{
+                        "source": "POST", "path": ["a"], "operation": "read",
+                        "callback_context": {
+                            "attributed": True, "root_callback": "fixture_callback", "depth": 1,
+                        },
+                    }]
+                request = {
+                    "request_id": request_id, "legacy_run_id": run_id, "run_id": run_id,
+                    "target_plugin": "fixture", "hook_name": parent["hook_name"],
+                    "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
+                    "http_method": "POST", "request_params": {"body_params": body},
+                    "response": {"status_code": 200},
+                }
+                return {
+                    "status": "callback_reached", "callback_reached": True,
+                    "validation_status": "callback_reached",
+                    "request_name": f"{request_id}.json", "request": request,
+                    "zend_name": f"{request_id}.json", "zend": zend, "timing": {},
+                }
+
+            coordinator._run_light_sender = trial_sender
+            result = coordinator._verify_replay_input_trials(
+                parent=parent, child_config=child_config, materialized={},
+                expected_parameters=[parameter], attempt=attempt, deadline=None,
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(tried, ["probe", "bad", "good"])
+            self.assertEqual(attempt["trials"][1]["queued_adjustments"], 0)
+            self.assertEqual(attempt["trials"][2]["status"], "verified")
+
+    def test_trial_identity_accepts_201_but_rejects_auth_or_callback_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
+            request = {
+                "target_plugin": "fixture", "hook_name": parent["hook_name"],
+                "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
+                "http_method": "POST", "response": {"status_code": 201},
+            }
+            zend = {"request_method": "POST"}
+
+            self.assertTrue(coordinator._trial_identity_complete(request, zend, parent))
+            for field, value in (("auth_context", "authenticated"), ("callback_id", "other-callback")):
+                with self.subTest(field=field):
+                    mismatched = {**request, field: value}
+                    self.assertFalse(coordinator._trial_identity_complete(mismatched, zend, parent))
+
+    def test_replay_input_trials_are_bounded_and_fail_closed(self):
+        cases = (
+            ("limit", 4, "REPLAY_INPUT_TRIAL_LIMIT_REACHED"),
+            ("no_hint", 1, "TRIAL_INPUT_SET_NOT_VERIFIED"),
+            ("nonprogress", 1, "TRIAL_INPUT_SET_NOT_VERIFIED"),
+            ("deadline", 2, "BUDGET_EXPIRED"),
+            ("parent_exit", 1, "PARENT_WORKER_EXITED_DURING_TRIAL"),
+        )
+        for mode, expected_trials, expected_reason in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [], names=("a",), accepted=("a",))
+                child_config = config_for(parent["seed_item"])
+                child_config["body_params"]["data"].append({"name": "a", "value": "probe"})
+                child_config["body_params"]["fuzz"].append("a")
+                parameter = {
+                    "name": "a", "path": ["a"], "source": "POST", "location": "form",
+                    "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
+                    "fuzzable": True, "plugin_slug": "fixture", "callback_id": "cb-fixture",
+                    "canonical_callback": "fixture_callback", "request_method": "POST",
+                }
+                attempt = {
+                    "attempt_id": "attempt-001", "parent_version": "v0",
+                    "expected_parameters": [dict(parameter)], "trials": [],
+                }
+                coordinator.state["replay_input_trials"].append(attempt)
+                trial_values: list[Any] = []
+
+                def trial_sender(**kwargs):
+                    config = json.loads(Path(kwargs["config_path"]).read_text(encoding="utf-8"))
+                    body = {
+                        str(row["name"]): row.get("value")
+                        for row in config["body_params"]["data"]
+                        if isinstance(row, Mapping) and row.get("name")
+                    }
+                    trial_values.append(body.get("a"))
+                    if mode == "deadline":
+                        coordinator.sleeper(0.6)
+                    if mode == "parent_exit":
+                        return {"status": "parent_stopped", "error": "parent exited"}
+                    request_id = kwargs["request_id"]
+                    run_id = kwargs["run_id"]
+                    comparison = []
+                    if mode in {"limit", "nonprogress", "deadline"}:
+                        comparison_value = body.get("a") if mode == "nonprogress" else f"v{len(trial_values)}"
+                        comparison = [{
+                            "request_id": request_id, "run_id": run_id,
+                            "callback": "fixture_callback", "opcode": "IS_EQUAL",
+                            "source": "POST", "path": ["a"],
+                            "runtime_value": body.get("a"), "comparison_value": comparison_value,
+                        }]
+                    return {
+                        "status": "callback_reached", "callback_reached": True,
+                        "validation_status": "callback_reached",
+                        "request_name": f"{request_id}.json",
+                        "request": {
+                            "request_id": request_id, "legacy_run_id": run_id, "run_id": run_id,
+                            "target_plugin": "fixture", "hook_name": parent["hook_name"],
+                            "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
+                            "http_method": "POST", "request_params": {"body_params": body},
+                            "response": {"status_code": 200},
+                        },
+                        "zend_name": f"{request_id}.json",
+                        "zend": {
+                            "request_id": request_id, "run_id": run_id,
+                            "request_method": "POST", "comparison_events": comparison,
+                            "events": [], "callback_summaries": [],
+                        },
+                        "timing": {},
+                    }
+
+                coordinator._run_light_sender = trial_sender
+                deadline = 1.0 if mode == "deadline" else None
+                result = coordinator._verify_replay_input_trials(
+                    parent=parent, child_config=child_config, materialized={},
+                    expected_parameters=[parameter], attempt=attempt, deadline=deadline,
+                )
+
+                self.assertIsNone(result)
+                self.assertEqual(len(attempt["trials"]), expected_trials)
+                self.assertEqual(attempt["reason"], expected_reason)
+                self.assertEqual(len(coordinator.state["attempts"]), 0)
+                self.assertEqual(trial_values[0], "probe")
+                self.assertNotIn("cookie", json.dumps(attempt).lower())
+                if mode == "limit":
+                    self.assertEqual(trial_values, ["probe", "v1", "v2", "v3"])
+                if mode == "deadline":
+                    self.assertEqual(coordinator.state["replay_input_last_reason"], "BUDGET_EXPIRED")
+                if mode == "parent_exit":
+                    self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
+
     def test_failed_ajax_probe_keeps_parent_without_confirming_parameter(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2726,7 +3122,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
     def test_replay_failure_keeps_parent_without_child_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
             log: list[str] = []
-            coordinator = self.make_coordinator(Path(tmp), log, replay_passes=False)
+            coordinator = self.make_coordinator(Path(tmp), log, replay_passes=False, max_versions=2)
             self.assertNotEqual(coordinator.run(), 0)
             self.assertEqual(len(coordinator.state["versions"]), 2)
             self.assertEqual(coordinator.state["versions"][1]["status"], "replay_failed")
@@ -3001,7 +3397,12 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
             coordinator.replay_runner = reached_callback
             coordinator.verify_pass2_fn = lambda *args, **kwargs: {
-                "accepted": int(args[0].get('legacy_run_id') == 'run-v0'), "total": 1}
+                "accepted": int(
+                    args[0].get('legacy_run_id') == 'run-v0'
+                    or "replay-input" in str(args[0].get('legacy_run_id') or '')
+                ),
+                "total": 1,
+            }
             self.assertNotEqual(coordinator.run(), 0)
             self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
             self.assertEqual(coordinator.state["versions"][1]["terminal_reason"], "PASS2_VERIFICATION_FAILED")
@@ -3029,6 +3430,56 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     "plugin_slug": "fixture", "suggested_seeds": [cookie_item],
                 }
                 coordinator.export_configs_fn = export_seed_configs
+                if admitted:
+                    def cookie_sender(container_name, **kwargs):
+                        config_path = coordinator.config_root / f'{kwargs["config_slug"]}.json'
+                        config = json.loads(config_path.read_text(encoding="utf-8"))
+                        cookies = {
+                            row["name"]: row["value"]
+                            for row in config.get("cookies", {}).get("data", [])
+                            if isinstance(row, Mapping) and row.get("name")
+                        }
+                        request_id = kwargs["request_id"]
+                        run_id = kwargs["run_id"]
+                        return {
+                            "status": "callback_reached",
+                            "callback_reached": True,
+                            "validation_status": "callback_reached",
+                            "request_name": f"{request_id}.json",
+                            "request": {
+                                "request_id": request_id,
+                                "legacy_run_id": run_id,
+                                "target_plugin": "fixture",
+                                "hook_name": parent["hook_name"],
+                                "callback_id": parent["callback_id"],
+                                "auth_context": parent["auth_context"],
+                                "http_method": "POST",
+                                "request_params": {"body_params": {"action": "fixture"}, "cookies": cookies},
+                            },
+                            "zend_name": f"{request_id}.json",
+                            "zend": {
+                                "request_id": request_id,
+                                "run_id": run_id,
+                                "request_method": "POST",
+                                "callback_summaries": [{
+                                    "callback": "fixture_callback",
+                                    "unique_parameters": [{
+                                        "name": "fixture_cookie", "source": "COOKIE",
+                                        "path": ["fixture_cookie"], "helper_depth": 1,
+                                        "observed_count": 1, "access_forms": ["read"],
+                                    }],
+                                }],
+                                "events": [{
+                                    "source": "COOKIE", "path": ["fixture_cookie"],
+                                    "operation": "read",
+                                    "callback_context": {
+                                        "attributed": True, "root_callback": "fixture_callback", "depth": 1,
+                                    },
+                                }],
+                            },
+                            "timing": {},
+                        }
+                    coordinator.probe_sender = cookie_sender
                 parameter = {
                     "name": "fixture_cookie", "path": ["fixture_cookie"],
                     "source": "COOKIE", "location": "cookie", "helper_depth": 1,
