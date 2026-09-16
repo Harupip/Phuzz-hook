@@ -26,7 +26,9 @@ param(
     [ValidateRange(1, 128)]
     [int]$OnlineMaxCandidates,
     [ValidateRange(1, 86400)]
-    [int]$OnlineCampaignTimeoutSeconds
+    [int]$OnlineCampaignTimeoutSeconds,
+    [ValidateRange(0, 100000)]
+    [int]$StopOnVulnCount
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,6 +46,7 @@ $OnlineTimeoutSeconds = $runtimeSettings["OnlineTimeoutSeconds"]
 $OnlineMaxVersions = $runtimeSettings["OnlineMaxVersions"]
 $OnlineMaxCandidates = $runtimeSettings["OnlineMaxCandidates"]
 $OnlineCampaignTimeoutSeconds = $runtimeSettings["OnlineCampaignTimeoutSeconds"]
+$StopOnVulnCount = $runtimeSettings["StopOnVulnCount"]
 $pluginScript = Join-Path $scriptRoot "web\applications\wordpress\_plugins\download-plugins.ps1"
 $fuzzerService = "fuzzer-wordpress-plugin"
 $webUrl = "http://localhost:8080/"
@@ -98,7 +101,8 @@ function New-PluginOverrideFile {
         [string]$PluginSlug,
         [string]$BootstrapConfigSlug,
         [string]$LegacyRunId = "",
-        [switch]$UseZendDiscovery
+        [switch]$UseZendDiscovery,
+        [int]$StopOnVulnCount = 0
     )
 
     $path = Join-Path $env:TEMP ("phuzz-{0}.override.yml" -f $PluginSlug)
@@ -127,6 +131,7 @@ function New-PluginOverrideFile {
         "  ${fuzzerService}:"
         "    environment:"
         "      FUZZER_CONFIG: $BootstrapConfigSlug"
+        "      HOOKPHUZZ_STOP_ON_VULN: $StopOnVulnCount"
     )
     if ($LegacyRunId) {
         $content += "      HOOKPHUZZ_LEGACY_RUN_ID: $LegacyRunId"
@@ -1466,7 +1471,7 @@ if ($UseZendDiscovery) {
 }
 try {
     Write-Host "Using WordPress plugin: $PluginSlug"
-    $overridePath = New-PluginOverrideFile -PluginSlug $PluginSlug -BootstrapConfigSlug $BootstrapConfigSlug -LegacyRunId $legacyRunId -UseZendDiscovery:$UseZendDiscovery
+    $overridePath = New-PluginOverrideFile -PluginSlug $PluginSlug -BootstrapConfigSlug $BootstrapConfigSlug -LegacyRunId $legacyRunId -UseZendDiscovery:$UseZendDiscovery -StopOnVulnCount $StopOnVulnCount
     $composeArgs = Get-ComposeArgs -OverridePath $overridePath
 
     Write-Host "Checking Docker availability"

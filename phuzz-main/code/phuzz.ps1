@@ -24,6 +24,8 @@ param(
     [int]$OnlineMaxCandidates,
     [ValidateRange(1, 86400)]
     [int]$OnlineCampaignTimeoutSeconds,
+    [ValidateRange(0, 100000)]
+    [int]$StopOnVulnCount,
     [switch]$DryRun,
     [switch]$Help
 )
@@ -72,6 +74,7 @@ Useful options:
   -OnlineMaxVersions <count>       Maximum online config versions including v0. Default: 2.
   -OnlineMaxCandidates <count>     Maximum online-linked candidates per campaign. Default: 32.
   -OnlineCampaignTimeoutSeconds    Maximum online-linked campaign budget. Default: 3600.
+  -StopOnVulnCount <count>         Stop after this many vulnerability findings; 0 keeps fuzzing.
   phuzz.env                        Changeable Zend/online settings; CLI flags override file values.
   -DryRun                          Print the delegated command without running it.
 "@
@@ -213,6 +216,7 @@ $OnlineTimeoutSeconds = $runtimeSettings["OnlineTimeoutSeconds"]
 $OnlineMaxVersions = $runtimeSettings["OnlineMaxVersions"]
 $OnlineMaxCandidates = $runtimeSettings["OnlineMaxCandidates"]
 $OnlineCampaignTimeoutSeconds = $runtimeSettings["OnlineCampaignTimeoutSeconds"]
+$StopOnVulnCount = $runtimeSettings["StopOnVulnCount"]
 
 if ($UseEntrypointPipeline -and $PSBoundParameters.ContainsKey("Mode") -and $Mode -ne "generated") {
     throw "-UseEntrypointPipeline is only supported with -Mode generated."
@@ -267,6 +271,7 @@ $runnerParams = [ordered]@{
     PluginSlug = $PluginSlug
     WebTimeoutSeconds = $WebTimeoutSeconds
     SeedWaitSeconds = $SeedWaitSeconds
+    StopOnVulnCount = $StopOnVulnCount
 }
 if ($ForcePlugins) {
     $runnerParams["ForcePlugins"] = $true

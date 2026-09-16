@@ -79,5 +79,6 @@ function Resolve-PhuzzRuntimeSettings {
         OnlineMaxVersions = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineMaxVersions" -Key "ONLINE_MAX_VERSIONS" -Default 2 -Minimum 1 -Maximum 20
         OnlineMaxCandidates = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineMaxCandidates" -Key "ONLINE_MAX_CANDIDATES" -Default 32 -Minimum 1 -Maximum 128
         OnlineCampaignTimeoutSeconds = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineCampaignTimeoutSeconds" -Key "ONLINE_CAMPAIGN_TIMEOUT_SECONDS" -Default 3600 -Minimum 1 -Maximum 86400
+        StopOnVulnCount = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "StopOnVulnCount" -Key "HOOKPHUZZ_STOP_ON_VULN" -Default 0 -Minimum 0 -Maximum 100000
     }
 }

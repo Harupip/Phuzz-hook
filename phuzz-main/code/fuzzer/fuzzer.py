@@ -166,6 +166,13 @@ class Fuzzer:
         self.trace_requests = os.environ.get("PHUZZ_TRACE_REQUESTS", "0") == "1"
         self.request_counter = 0
         self.cmplog_enabled = os.environ.get("HOOKPHUZZ_CMPLOG", "0") == "1"
+        try:
+            self.stop_on_vuln_count = int(os.environ.get("HOOKPHUZZ_STOP_ON_VULN", "0"))
+        except ValueError as exc:
+            raise ValueError("HOOKPHUZZ_STOP_ON_VULN must be a non-negative integer") from exc
+        if self.stop_on_vuln_count < 0:
+            raise ValueError("HOOKPHUZZ_STOP_ON_VULN must be a non-negative integer")
+        self.vulnerability_count = 0
         self.cmplog_hints = []
         self._cmplog_hint_keys = set()
         self.cmplog_seen_artifacts = set()
@@ -801,6 +808,7 @@ class Fuzzer:
                 vuln_id = c.get_paths_hash()
                 if not vuln_id in self.unique_vulnerable_candidates[k]:
                     self.unique_vulnerable_candidates[k].add(vuln_id)
+                self.vulnerability_count += 1
 
                 print(
                     f"{k}: {len(self.vulnerable_candidates[k])} ({len(self.unique_vulnerable_candidates[k])})"
@@ -952,7 +960,7 @@ class Fuzzer:
             #print(energy)
             # This loop is where integer `energy` becomes actual mutation attempts.
             for i in range(energy):
-                if os.path.exists("/sync-tmpfs/vuln_found"):
+                if self.stop_on_vuln_count > 0 and os.path.exists("/sync-tmpfs/vuln_found"):
                     sys.exit(1337)
 
                 mutated_candidate = self.ff_mutate(candidate)
@@ -999,9 +1007,12 @@ class Fuzzer:
                         stop = int(time.time())
                         diff = stop - self.start_time
                         print(f"\n\n\n\n\n\nFound {vuln_type}! in {diff}s\n\n\n\n\n\n")
+                    if self.stop_on_vuln_count > 0 and self.vulnerability_count >= self.stop_on_vuln_count:
+                        stop = int(time.time())
+                        diff = stop - self.start_time
                         with open("/sync-tmpfs/vuln_found", "w") as f:
                             f.write(f"Found by {self.fuzzer_id} in {diff}s")
-                        sys.exit(1337) #TODO: comment me out!
+                        sys.exit(1337)
 
                 if self.ff_is_interesting(mutated_candidate):
                     #print("TP priority / score:", mutated_candidate.priority, mutated_candidate.score)
