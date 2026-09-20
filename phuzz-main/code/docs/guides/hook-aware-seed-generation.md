@@ -1,3 +1,5 @@
+> Historical workflow guide: the generated/zend/online mode commands below were retired on 2026-09-21. Use [online-linked](online-linked-flow.md) for the supported workflow. Library and evidence descriptions remain reference material.
+
 # Runtime Hook Seed Generation
 
 Runtime hook seed generation turns uncovered WordPress callbacks into PHUZZ-compatible HTTP seed suggestions.

@@ -13,8 +13,8 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.online_config_runner import config_hash
-from hook_energy.seed_generation.online_linked_export import (
+from hook_energy.seed_generation.online_common import config_hash
+from online_linked.export import (
     export_online_linked_batch,
 )
 

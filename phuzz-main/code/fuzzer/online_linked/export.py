@@ -6,7 +6,7 @@ import re
 import sys
 from pathlib import Path
 
-from hook_energy.seed_generation.online_config_runner import config_hash
+from hook_energy.seed_generation.online_common import config_hash
 
 
 def export_online_linked_batch(batch_state_path: Path, destination: Path | None = None) -> int:

@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 
-from hook_energy.seed_generation.online_linked_evidence import RuntimeBatchTimeout, read_runtime_batch
+from online_linked.evidence import RuntimeBatchTimeout, read_runtime_batch
 
 
 class RuntimeBatchReaderTests(unittest.TestCase):

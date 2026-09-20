@@ -22,14 +22,14 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.online_linked_coordinator import (
+from online_linked.coordinator import (
     OnlineLinkedCoordinator,
     OnlineLinkedError,
     _batch_candidate_identity,
     run_online_linked,
 )
 from hook_energy.seed_generation.generated_config_runner import STOP_ON_VULN_EXIT_CODE
-from hook_energy.seed_generation.probe_sender import ParentInspectionTimeout
+from online_linked.probe_sender import ParentInspectionTimeout
 from seed_generation.config.config_exporter import SeedConfigSkip, export_seed_configs
 from seed_generation.convergence.convergence import materialize_convergence_seeds
 from zend_discovery.engine import candidate_from_seed_item, canonical_identity_id
@@ -126,7 +126,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 def reader(**kwargs):
                     coordinator.clock.now = 1.0 if outcome == "early_timeout" else 10.0
                     if outcome in ("timeout", "early_timeout"):
-                        from hook_energy.seed_generation.online_linked_evidence import RuntimeBatchTimeout
+                        from online_linked.evidence import RuntimeBatchTimeout
                         raise RuntimeBatchTimeout("RUNTIME_BATCH_TIMEOUT")
                     if outcome == "docker_error":
                         raise RuntimeError("docker failed")
@@ -1043,8 +1043,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="run",
                 max_seconds=1, max_versions=2, callback_registry=str(registry), service="fuzzer-wordpress-plugin",
             )
-            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", Candidate), \
-                    patch("hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch", return_value=0):
+            with patch("online_linked.coordinator.OnlineLinkedCoordinator", Candidate), \
+                    patch("online_linked.coordinator.export_online_linked_batch", return_value=0):
                 self.assertEqual(run_online_linked(args), 0)
             self.assertEqual(calls, [hooks[1], hooks[3], "wp_ajax_child", hooks[0], hooks[2]])
 
@@ -1088,9 +1088,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 callback_registry=str(registry),
                 service="fuzzer-wordpress-plugin",
             )
-            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
                     patch(
-                        "hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                        "online_linked.coordinator.export_online_linked_batch",
                         return_value=0,
                     ):
                 self.assertEqual(run_online_linked(args), 0)
@@ -1138,9 +1138,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="run",
                     max_seconds=1, max_versions=2, callback_registry=str(registry), service="fuzzer-wordpress-plugin",
                 )
-                with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", Candidate), \
+                with patch("online_linked.coordinator.OnlineLinkedCoordinator", Candidate), \
                         patch(
-                            "hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                            "online_linked.coordinator.export_online_linked_batch",
                             return_value=0,
                         ):
                     result = run_online_linked(args)
@@ -1204,9 +1204,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 callback_registry=str(registry),
                 service="fuzzer-wordpress-plugin",
             )
-            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
                     patch(
-                        "hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                        "online_linked.coordinator.export_online_linked_batch",
                         return_value=0,
                     ):
                 self.assertEqual(run_online_linked(args), 0)
@@ -1220,12 +1220,12 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
             calls.clear()
             args.sync_registry = True
-            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
                     patch(
-                        "hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                        "online_linked.coordinator.export_online_linked_batch",
                         return_value=0,
                     ), \
-                    patch("hook_energy.seed_generation.online_linked_coordinator._sync_callback_registry_to_web",
+                    patch("online_linked.coordinator._sync_callback_registry_to_web",
                           side_effect=subprocess.TimeoutExpired("docker cp", 30)):
                 self.assertEqual(run_online_linked(args), 0)
             batch_state = json.loads((root / "output" / "online-linked" / "run" / "batch-state.json").read_text())
@@ -1276,13 +1276,13 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 max_seconds=60, max_versions=2, max_candidates=2, campaign_seconds=1,
                 callback_registry=str(registry), service="fuzzer-wordpress-plugin", sync_registry=True,
             )
-            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
                     patch(
-                        "hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                        "online_linked.coordinator.export_online_linked_batch",
                         return_value=0,
                     ), \
-                    patch("hook_energy.seed_generation.online_linked_coordinator._sync_callback_registry_to_web") as sync, \
-                    patch("hook_energy.seed_generation.online_linked_coordinator.time.monotonic", side_effect=[0.0, 0.0, 2.0]):
+                    patch("online_linked.coordinator._sync_callback_registry_to_web") as sync, \
+                    patch("online_linked.coordinator.time.monotonic", side_effect=[0.0, 0.0, 2.0]):
                 self.assertEqual(run_online_linked(args), 0)
 
             self.assertEqual(len(calls), 1)
@@ -1347,8 +1347,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 callback_registry=str(registry),
                 service="fuzzer-wordpress-plugin",
             )
-            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
-                    patch("hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch("online_linked.coordinator.export_online_linked_batch",
                           create=True,
                           side_effect=export):
                 self.assertEqual(run_online_linked(args), 0)
@@ -1400,9 +1400,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 service="fuzzer-wordpress-plugin",
             )
             error_output = io.StringIO()
-            with patch("hook_energy.seed_generation.online_linked_coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
                     patch(
-                        "hook_energy.seed_generation.online_linked_coordinator.export_online_linked_batch",
+                        "online_linked.coordinator.export_online_linked_batch",
                         create=True,
                         side_effect=OSError("disk full"),
                     ), redirect_stderr(error_output):

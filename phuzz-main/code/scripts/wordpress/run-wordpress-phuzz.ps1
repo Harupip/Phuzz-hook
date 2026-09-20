@@ -1,24 +1,16 @@
+[CmdletBinding()]
 param(
     [ValidatePattern('^[a-zA-Z0-9_.-]+$')]
     [string]$PluginSlug = "show-all-comments-in-one-page",
     [switch]$ForcePlugins,
     [switch]$NoFollowLogs,
-    [switch]$RunGeneratedConfigs,
-    [switch]$RunOnline,
-    [switch]$RunOnlineLinked,
-    [switch]$UseEntrypointPipeline,
     [switch]$UseZendDiscovery,
-    [switch]$KeepDebugArtifacts,
     [ValidatePattern('^[a-zA-Z0-9_./-]+$')]
     [string]$BootstrapConfigSlug = "",
     [ValidateRange(1, 86400)]
     [int]$WebTimeoutSeconds = 240,
     [ValidateRange(1, 86400)]
     [int]$SeedWaitSeconds = 45,
-    [ValidateRange(1, 30)]
-    [int]$GeneratedConfigTimeoutSeconds = 30,
-    [ValidateRange(1, 30)]
-    [int]$ZendMaxIterations,
     [ValidateRange(1, 120)]
     [int]$OnlineTimeoutSeconds,
     [ValidateRange(1, 20)]
@@ -41,7 +33,6 @@ if (-not (Test-Path -LiteralPath $settingsReaderPath -PathType Leaf)) {
 }
 . $settingsReaderPath
 $runtimeSettings = Resolve-PhuzzRuntimeSettings -Path (Join-Path $scriptRoot "phuzz.env") -BoundParameters $PSBoundParameters
-$ZendMaxIterations = $runtimeSettings["ZendMaxIterations"]
 $OnlineTimeoutSeconds = $runtimeSettings["OnlineTimeoutSeconds"]
 $OnlineMaxVersions = $runtimeSettings["OnlineMaxVersions"]
 $OnlineMaxCandidates = $runtimeSettings["OnlineMaxCandidates"]
@@ -51,31 +42,9 @@ $pluginScript = Join-Path $scriptRoot "web\applications\wordpress\_plugins\downl
 $fuzzerService = "fuzzer-wordpress-plugin"
 $webUrl = "http://localhost:8080/"
 
-if ($UseEntrypointPipeline -and -not $RunGeneratedConfigs) {
-    throw "-UseEntrypointPipeline requires -RunGeneratedConfigs."
-}
-if (($RunOnline -or $RunOnlineLinked) -and $RunGeneratedConfigs) {
-    throw "-RunOnline and -RunOnlineLinked cannot be combined with -RunGeneratedConfigs."
-}
-if ($RunOnline -and $RunOnlineLinked) {
-    throw "-RunOnline and -RunOnlineLinked cannot be combined."
-}
-if ($UseZendDiscovery -and -not ($RunGeneratedConfigs -or $RunOnline -or $RunOnlineLinked)) {
-    throw "-UseZendDiscovery requires -RunGeneratedConfigs."
-}
-if ($UseZendDiscovery -and $UseEntrypointPipeline) {
-    throw "-UseZendDiscovery uses the legacy generated flow and cannot be combined with -UseEntrypointPipeline."
-}
-if (($RunOnline -or $RunOnlineLinked) -and -not $UseZendDiscovery) {
-    throw "-RunOnline and -RunOnlineLinked require -UseZendDiscovery."
-}
-
+$UseZendDiscovery = $true
 if (-not $BootstrapConfigSlug) {
-    if ($RunGeneratedConfigs -or $RunOnline -or $RunOnlineLinked) {
-        $BootstrapConfigSlug = "wordpress/bootstrap-generated"
-    } else {
-        $BootstrapConfigSlug = "wordpress/$PluginSlug"
-    }
+    $BootstrapConfigSlug = "wordpress/bootstrap-generated"
 }
 
 function Get-ComposeArgs {
@@ -156,35 +125,6 @@ function Assert-PathExists {
     if (-not (Test-Path $Path)) {
         throw "Missing required file: $Path`n$Hint"
     }
-}
-
-function Test-ZendPass1BatchUsable {
-    param(
-        [string]$SummaryPath,
-        [int]$ExitCode
-    )
-
-    Assert-PathExists -Path $SummaryPath -Hint "The generated config runner did not write its summary."
-    try {
-        $summary = Get-Content -LiteralPath $SummaryPath -Raw | ConvertFrom-Json
-    } catch {
-        throw "Generated hook config batch summary is unreadable: $SummaryPath"
-    }
-    if (-not $summary.counts) {
-        throw "Generated hook config batch summary has no counts: $SummaryPath"
-    }
-
-    $callbackReached = [int]$summary.counts.callback_reached
-    if ($ExitCode -eq 0) {
-        return [pscustomobject]@{ Status = "PASS"; Summary = $summary }
-    }
-    if ($callbackReached -gt 0) {
-        Write-Warning ("Zend Pass 1 partial: exit_code={0}, callback_reached={1}, runner_error={2}, process_failed={3}; continuing with proven callbacks. Summary: {4}" -f `
-            $ExitCode, $callbackReached, [int]$summary.counts.runner_error, [int]$summary.counts.process_failed, $SummaryPath)
-        return [pscustomobject]@{ Status = "PARTIAL"; Summary = $summary }
-    }
-
-    throw "Generated hook config batch failed before producing any callback proof. See $SummaryPath"
 }
 
 function Wait-ForWebReady {
@@ -639,362 +579,47 @@ function Add-LearnPressNonceToSuggestedSeeds {
     $document | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $SuggestedSeedsPath -Encoding UTF8
 }
 
-function Write-LearnPressFinalProof {
-    param(
-        [string]$ProofPath,
-        [string]$SuggestedSeedsPath,
-        [string]$ConfigSummaryPath,
-        [string]$RunSummaryPath
-    )
-
-    $proof = Get-Content -LiteralPath $ProofPath -Raw | ConvertFrom-Json
-    $seeds = Get-Content -LiteralPath $SuggestedSeedsPath -Raw | ConvertFrom-Json
-    $targetSeed = @($seeds.suggested_seeds | Where-Object { $_.hook_name -eq $proof.hook_name -and $_.callback_id -eq $proof.callback_id }) | Select-Object -First 1
-    $summary = Get-Content -LiteralPath $ConfigSummaryPath -Raw | ConvertFrom-Json
-    $generated = @($summary.generated | Where-Object { $_.hook_name -eq $proof.hook_name -and $_.callback_id -eq $proof.callback_id })
-    if ($generated.Count -ne 1) { throw "LearnPress admin-post proof blocked: final generated config count was $($generated.Count)." }
-    $config = Get-Content -LiteralPath $generated[0].config_path -Raw | ConvertFrom-Json
-    $run = Get-Content -LiteralPath $RunSummaryPath -Raw | ConvertFrom-Json
-    $runRow = @($run.runs | Where-Object { $_.hook_name -eq $proof.hook_name -and $_.callback_id -eq $proof.callback_id }) | Select-Object -First 1
-    $fixed = @($config.body_params.fixed)
-    $fuzz = @($config.body_params.fuzz)
-    if ($fixed -notcontains "action" -or $fixed -notcontains "_nonce" -or $fuzz.Count -lt 1) {
-        throw "LearnPress admin-post proof blocked: final config did not keep action/_nonce fixed with a fuzzable observed parameter."
-    }
-    if (-not $runRow -or $runRow.callback_reached -ne $true) {
-        throw "LearnPress admin-post proof blocked: final replay did not reach the exact callback."
-    }
-    $unrelated = @($seeds.suggested_seeds | Where-Object { $_.hook_name -match '^admin_post(_nopriv)?_' -and $_.hook_name -ne $proof.hook_name -and $_.generation_status -eq "ambiguous_http_method" })
-    $proof.fixed_params = @("action", "_nonce")
-    $proof.fuzzable_params = @($fuzz)
-    $proof.generated_config = 1
-    $proof.final_replay = [ordered]@{
-        status = "PASS"
-        callback_reached = $true
-        matched_artifact = [string]$runRow.matched_artifact
-        config_path = [string]$generated[0].config_path
-        method = "POST"
-        action_correlation_exact = $true
-        parameter_path_matched = $true
-        strict_nonce_mode = $proof.strict_nonce_mode
-    }
-    $proof.unrelated_admin_post_fail_closed = ($unrelated.Count -ge 1)
-    $proof.acceptance = [ordered]@{
-        registered = 1
-        direct_http_candidate = 1
-        generated_config = 1
-        method = "POST"
-        action_correlation_exact = $true
-        nonce_auth_recorded = $true
-        callback_reached = $true
-        parameter_path_matched = $true
-        final_replay = "PASS"
-        unrelated_admin_post_fail_closed = ($unrelated.Count -ge 1)
-    }
-    $proof | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $ProofPath -Encoding UTF8
-}
-
 function Export-LiveSeedSuggestions {
     param(
         [string]$ScriptRoot,
         [int]$WaitSeconds,
         [string[]]$ComposeArgs,
-        [string]$PluginSlug,
-        [switch]$UseEntrypointPipeline,
-        [switch]$RuntimeParametersOnly,
-        [string]$OutputDir = ""
+        [string]$OutputDir
     )
 
     $webContainerId = (& $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] ps -q web).Trim()
     if (-not $webContainerId) {
         throw "Could not resolve the running web container for seed export."
     }
-
     $coverageFileInContainer = "/shared-tmpfs/hook-coverage/total_coverage.json"
-    $coverageSnapshot = Join-Path ([System.IO.Path]::GetTempPath()) "phuzz-live-total-coverage.json"
-    if (-not $OutputDir) {
-        $OutputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
-    }
-    $outputDir = $OutputDir
-    $exportCli = Join-Path $ScriptRoot "fuzzer\cli\export_seeds.py"
+    $coverageSnapshot = Join-Path $OutputDir "runtime_coverage_snapshot.json"
     $zendRuntimeExportCli = Join-Path $ScriptRoot "fuzzer\cli\export_zend_seeds.py"
-    $pipelineCli = Join-Path $ScriptRoot "fuzzer\cli\entrypoint_pipeline.py"
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     $snapshotReady = $false
-    $pluginSourceTempRoot = $null
 
-    try {
-        Write-Host "Waiting for live hook coverage snapshot to export suggested seeds"
-        while ((Get-Date) -lt $deadline) {
-            try {
-                $snapshot = docker exec $webContainerId sh -c "cat $coverageFileInContainer" 2>$null
-                if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($snapshot)) {
-                    $snapshot | Set-Content -Path $coverageSnapshot -Encoding UTF8
-                    $snapshotOutput = Join-Path $outputDir "runtime_coverage_snapshot.json"
-                    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-                    $snapshot | Set-Content -Path $snapshotOutput -Encoding UTF8
-                    $snapshotReady = $true
-                    break
-                }
-            } catch {
+    Write-Host "Waiting for live hook coverage snapshot to export suggested seeds"
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $snapshot = docker exec $webContainerId sh -c "cat $coverageFileInContainer" 2>$null
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($snapshot)) {
+                $snapshot | Set-Content -Path $coverageSnapshot -Encoding UTF8
+                New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+                $snapshotReady = $true
+                break
             }
-
-            Start-Sleep -Seconds 5
+        } catch {
         }
 
-        if (-not $snapshotReady) {
-            throw "Timed out waiting for live hook coverage snapshot at $coverageFileInContainer."
-        }
-
-        $sourceArgs = @()
-        $pluginSourceTempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("phuzz-plugin-source-{0}" -f ([guid]::NewGuid().ToString("N")))
-        $hostSourceRoot = Join-Path $pluginSourceTempRoot $PluginSlug
-        $unresolvedSourceReason = $null
-
-        if (-not $RuntimeParametersOnly) {
-            New-Item -ItemType Directory -Path $hostSourceRoot -Force | Out-Null
-            try {
-                docker cp "${webContainerId}:/var/www/html/wp-content/plugins/$PluginSlug/." $hostSourceRoot
-                if ($LASTEXITCODE -ne 0) {
-                    $unresolvedSourceReason = "source_copy_failed"
-                } elseif (-not (Get-ChildItem -LiteralPath $hostSourceRoot -Recurse -Filter *.php -File -ErrorAction SilentlyContinue | Select-Object -First 1)) {
-                    $unresolvedSourceReason = "no_php_files"
-                } else {
-                    $sourceArgs = @(
-                        "--container-source-root", "/var/www/html/wp-content/plugins/$PluginSlug",
-                        "--host-source-root", $hostSourceRoot,
-                        "--source-root", $hostSourceRoot
-                    )
-                }
-            } catch {
-                $unresolvedSourceReason = "source_copy_failed"
-            }
-
-            if ($unresolvedSourceReason) {
-                Write-Warning "Plugin source unavailable for seed extraction: $unresolvedSourceReason"
-                $sourceArgs = @("--unresolved-source-reason", $unresolvedSourceReason)
-            }
-        }
-
-        if ($UseEntrypointPipeline) {
-            $outputConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-config\$PluginSlug"
-            Write-Host "Running entrypoint pipeline into $outputDir"
-            $pipelineArgs = @(
-                $pipelineCli,
-                "--coverage-file", $coverageSnapshot,
-                "--plugin-slug", $PluginSlug,
-                "--output-dir", $outputDir,
-                "--output-config-dir", $outputConfigDir,
-                "--minimal-artifacts"
-            )
-            if ($RuntimeParametersOnly) {
-                $pipelineArgs += "--runtime-parameters-only"
-            } else {
-                $pipelineArgs += $sourceArgs
-            }
-            python @pipelineArgs
-        } else {
-            Write-Host "Exporting hook_gap_report.json and suggested_seeds.* to $outputDir"
-            if ($RuntimeParametersOnly) {
-                $exportArgs = @($zendRuntimeExportCli, "--coverage-file", $coverageSnapshot, "--output-dir", $outputDir)
-            } else {
-                $exportArgs = @($exportCli, "--coverage-file", $coverageSnapshot, "--output-dir", $outputDir)
-                $exportArgs += $sourceArgs
-            }
-            python @exportArgs
-        }
-        if ($LASTEXITCODE -ne 0) {
-            throw "Seed export failed."
-        }
-    } finally {
-        if ($pluginSourceTempRoot -and (Test-Path -LiteralPath $pluginSourceTempRoot)) {
-            try {
-                Remove-Item -LiteralPath $pluginSourceTempRoot -Recurse -Force -ErrorAction Stop
-            } catch {
-                Write-Warning "Plugin source temp cleanup failed: $($_.Exception.Message)"
-            }
-        }
-    }
-}
-
-function Convert-LiveSeedSuggestionsToConfigs {
-    param(
-        [string]$ScriptRoot,
-        [string]$PluginSlug,
-        [string]$OutputConfigDir = "",
-        [string]$SummaryPath = "",
-        [string]$SuggestedSeeds = "",
-        [switch]$ReplayOnly,
-        [switch]$RestRouteFallback
-    )
-
-    $seedOutputDir = Join-Path $ScriptRoot "fuzzer\output\seed_generation"
-    if (-not $SuggestedSeeds) {
-        $SuggestedSeeds = Join-Path $seedOutputDir "suggested_seeds.json"
-    }
-    if (-not $OutputConfigDir) {
-        $OutputConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-config\$PluginSlug"
-    }
-    if (-not $SummaryPath) {
-        $SummaryPath = Join-Path $seedOutputDir "generated_config_summary.json"
-    }
-    $configCli = Join-Path $ScriptRoot "fuzzer\cli\seed_to_config.py"
-
-    Assert-PathExists -Path $SuggestedSeeds -Hint "Run hook seed export before converting seeds into PHUZZ configs."
-
-    Write-Host "Converting supported suggested seeds into PHUZZ configs"
-    $configArgs = @(
-        $configCli,
-        "--suggested-seeds", $SuggestedSeeds,
-        "--output-config-dir", $OutputConfigDir,
-        "--summary", $SummaryPath
-    )
-    if ($ReplayOnly) {
-        $configArgs += "--replay-only"
-    }
-    if ($RestRouteFallback) {
-        $configArgs += "--rest-route-fallback"
-    }
-    python @configArgs
-}
-
-function Write-EntrypointPluginProofFile {
-    param(
-        [string]$SeedOutputDir,
-        [string]$PluginSlug,
-        [string]$RunnerLog
-    )
-
-    $pipelinePath = Join-Path $SeedOutputDir "entrypoint_pipeline_summary.json"
-    $configPath = Join-Path $SeedOutputDir "generated_config_summary.json"
-    $runPath = Join-Path $SeedOutputDir "generated_config_run_summary.json"
-    if (-not (Test-Path -LiteralPath $pipelinePath)) {
-        return
+        Start-Sleep -Seconds 5
     }
 
-    $proofDir = Join-Path $SeedOutputDir "entrypoint-proof"
-    New-Item -ItemType Directory -Path $proofDir -Force | Out-Null
-    $proofPath = Join-Path $proofDir "PLUGIN_GENERATION_PROOF.md"
-    $pipeline = Get-Content -LiteralPath $pipelinePath -Raw | ConvertFrom-Json
-    $run = $null
-    if (Test-Path -LiteralPath $runPath) {
-        $run = Get-Content -LiteralPath $runPath -Raw | ConvertFrom-Json
+    if (-not $snapshotReady) {
+        throw "Timed out waiting for live hook coverage snapshot at $coverageFileInContainer."
     }
 
-    $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add("# Entrypoint generated plugin proof")
-    $lines.Add("")
-    $lines.Add("Plugin: ``$PluginSlug``")
-    $lines.Add("")
-    $lines.Add("## Counters")
-    $lines.Add("")
-    $lines.Add(("- registered: {0}" -f $pipeline.summary.registered))
-    $lines.Add(("- direct_http_candidates: {0}" -f $pipeline.summary.direct_http_candidates))
-    $lines.Add(("- generated: {0}" -f $pipeline.summary.generated))
-    $lines.Add(("- ambiguous_http_method: {0}" -f $pipeline.summary.ambiguous_http_method))
-    $lines.Add("")
-    $lines.Add("## Generated configs")
-    $lines.Add("")
-
-    foreach ($entry in @($pipeline.entrypoints | Where-Object { $_.config_status -eq "generated" })) {
-        $lines.Add(("### [{0}] {1}" -f $entry.method, $entry.hook_name))
-        $lines.Add("")
-        $lines.Add(("- callback: ``{0}``" -f $entry.callback_repr))
-        $lines.Add(("- action: ``{0}``" -f $entry.action))
-        foreach ($param in @($entry.parameters)) {
-            if ($param.name) {
-                $lines.Add(("- param: ``{0}`` from ``{1}`` as ``{2}``" -f $param.name, $param.source, $param.location))
-            }
-        }
-        $lines.Add(("- config_slug: ``{0}``" -f $entry.config_slug))
-        $lines.Add(("- config_path: ``{0}``" -f $entry.config_path))
-        $lines.Add("")
-    }
-
-    if ($run) {
-        $lines.Add("## Replay")
-        $lines.Add("")
-        $lines.Add(("- callback_reached: {0}/{1}" -f $run.counts.callback_reached, $run.counts.total))
-        foreach ($row in @($run.runs)) {
-            if ($row.matched_artifact) {
-                $lines.Add(("- matched_artifact: ``{0}``" -f $row.matched_artifact))
-            }
-        }
-        $lines.Add("")
-    }
-
-    $lines.Add("## Source artifacts")
-    $lines.Add("")
-    $lines.Add(("- runtime coverage snapshot: ``{0}``" -f (Join-Path $SeedOutputDir "runtime_coverage_snapshot.json")))
-    $lines.Add(("- pipeline summary: ``{0}``" -f $pipelinePath))
-    $lines.Add(("- config summary: ``{0}``" -f $configPath))
-    $lines.Add(("- replay summary: ``{0}``" -f $runPath))
-    if ($RunnerLog) {
-        $lines.Add(("- replay log: ``{0}``" -f $RunnerLog))
-    }
-
-    $lines | Set-Content -LiteralPath $proofPath -Encoding UTF8
-    Write-Host "Entrypoint plugin proof file: $proofPath"
-}
-
-function Copy-GeneratedRequestArtifacts {
-    param(
-        [string[]]$ComposeArgs,
-        [string]$RunSummaryPath,
-        [string]$OutputDir
-    )
-
-    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-    $summary = Get-Content -LiteralPath $RunSummaryPath -Raw | ConvertFrom-Json
-    $names = New-Object System.Collections.Generic.HashSet[string]
-    foreach ($row in @($summary.runs)) {
-        if ($row.matched_artifact) {
-            [void]$names.Add([string]$row.matched_artifact)
-        }
-        foreach ($name in @($row.request_artifacts)) {
-            if ($name) {
-                [void]$names.Add([string]$name)
-            }
-        }
-    }
-    foreach ($name in $names) {
-        if ([System.IO.Path]::GetFileName($name) -ne $name) {
-            throw "Invalid generated request artifact name: $name"
-        }
-        $target = Join-Path $OutputDir $name
-        & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] exec -T web cat "/shared-tmpfs/hook-coverage/requests/$name" |
-            Set-Content -LiteralPath $target -Encoding UTF8
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not copy generated request artifact: $name"
-        }
-    }
-}
-
-function Copy-ZendOpcodeArtifacts {
-    param(
-        [string[]]$ComposeArgs,
-        [string]$RunSummaryPath,
-        [string]$OutputDir
-    )
-
-    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-    $summary = Get-Content -LiteralPath $RunSummaryPath -Raw | ConvertFrom-Json
-    $names = New-Object System.Collections.Generic.HashSet[string]
-    foreach ($row in @($summary.runs)) {
-        if ($row.matched_artifact) {
-            [void]$names.Add([string]$row.matched_artifact)
-        }
-    }
-    foreach ($name in $names) {
-        if ([System.IO.Path]::GetFileName($name) -ne $name) {
-            throw "Invalid Zend opcode artifact name: $name"
-        }
-        $target = Join-Path $OutputDir $name
-        & $ComposeArgs[0] $ComposeArgs[1..($ComposeArgs.Count - 1)] exec -T web cat "/shared/opcode-events/$name" |
-            Set-Content -LiteralPath $target -Encoding UTF8
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not copy Zend opcode artifact: $name"
-        }
+    python $zendRuntimeExportCli --coverage-file $coverageSnapshot --output-dir $OutputDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "Seed export failed."
     }
 }
 
@@ -1032,432 +657,6 @@ function Initialize-ZendCallbackRegistry {
     docker cp $registryPath "${webContainerId}:/shared/hookphuzz-callback-registry.json"
     if ($LASTEXITCODE -ne 0) {
         throw "Could not copy Zend callback registry into web container."
-    }
-}
-
-function Invoke-ZendDiscoveryBridge {
-    param(
-        [string]$ScriptRoot,
-        [string]$PluginSlug,
-        [string]$LegacyRunId,
-        [string]$SeedOutputDir,
-        [string]$Pass1RunSummary,
-        [string[]]$ComposeArgs
-    )
-
-    $pluginZip = Join-Path $ScriptRoot "web\applications\wordpress\_plugins\$PluginSlug.zip"
-    $rawSuggestedSeeds = Join-Path $SeedOutputDir "suggested_seeds.json"
-    $registry = Join-Path $SeedOutputDir "runtime_coverage_snapshot.json"
-    $bridgeWorkDir = Join-Path (Join-Path $SeedOutputDir "zend-bridge") $LegacyRunId
-    $logsDir = Join-Path $bridgeWorkDir "logs"
-    $pass1ArtifactsDir = Join-Path $logsDir "pass1-uopz"
-    $zendEventsDir = Join-Path $logsDir "pass1-zend"
-    $zendOutputRoot = Join-Path $ScriptRoot "fuzzer\output\zend-discovery"
-    $mergedSuggestedSeeds = Join-Path $SeedOutputDir "zend_merged_suggested_seeds.json"
-    $outputConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-config\$PluginSlug"
-    $finalConfigSummary = Join-Path $SeedOutputDir "generated_config_summary.json"
-    $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_runtime\bridge_cli.py"
-
-    Copy-GeneratedRequestArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $Pass1RunSummary -OutputDir $pass1ArtifactsDir
-    Copy-ZendOpcodeArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $Pass1RunSummary -OutputDir $zendEventsDir
-
-    Write-Host "Running offline Zend enrichment bridge"
-    python $bridgeCli `
-        --plugin-zip $pluginZip `
-        --plugin-slug $PluginSlug `
-        --legacy-run-id $LegacyRunId `
-        --registry $registry `
-        --raw-suggested-seeds $rawSuggestedSeeds `
-        --pass1-run-summary $Pass1RunSummary `
-        --pass1-artifacts-dir $pass1ArtifactsDir `
-        --zend-events-dir $zendEventsDir `
-        --zend-output-root $zendOutputRoot `
-        --merged-suggested-seeds $mergedSuggestedSeeds `
-        --output-config-dir $outputConfigDir `
-        --generated-config-summary $finalConfigSummary
-    if ($LASTEXITCODE -ne 0) {
-        throw "Zend enrichment bridge failed."
-    }
-
-    $zendEnrichedSeeds = Join-Path (Join-Path $zendOutputRoot $LegacyRunId) "zend_enriched_seeds.json"
-    Write-Host "Zend enriched seeds: $zendEnrichedSeeds"
-    Write-Host "Zend merged suggested seeds: $mergedSuggestedSeeds"
-}
-
-function Invoke-ZendPass2Verification {
-    param(
-        [string]$ScriptRoot,
-        [string]$LegacyRunId,
-        [string]$SeedOutputDir,
-        [string]$Pass2RunSummary,
-        [string[]]$ComposeArgs
-    )
-
-    $bridgeWorkDir = Join-Path (Join-Path $SeedOutputDir "zend-bridge") $LegacyRunId
-    $logsDir = Join-Path $bridgeWorkDir "logs"
-    $pass2ArtifactsDir = Join-Path $logsDir "pass2-uopz"
-    $pass2ZendEventsDir = Join-Path $logsDir "pass2-zend"
-    $mergedSuggestedSeeds = Join-Path $SeedOutputDir "zend_merged_suggested_seeds.json"
-    $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_runtime\bridge_cli.py"
-
-    Copy-GeneratedRequestArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $Pass2RunSummary -OutputDir $pass2ArtifactsDir
-    Copy-ZendOpcodeArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $Pass2RunSummary -OutputDir $pass2ZendEventsDir
-
-    python $bridgeCli `
-        --operation verify-pass2 `
-        --pass2-run-summary $Pass2RunSummary `
-        --merged-suggested-seeds $mergedSuggestedSeeds `
-        --zend-events-dir $pass2ZendEventsDir `
-        --pass2-artifacts-dir $pass2ArtifactsDir
-    if ($LASTEXITCODE -ne 0) {
-        throw "Zend Pass 2 runtime verification failed. See $Pass2RunSummary"
-    }
-}
-
-function Invoke-ZendArtifactRetention {
-    param(
-        [string]$ScriptRoot,
-        [string]$SeedOutputDir,
-        [string]$LegacyRunId,
-        [string]$TerminalStatus,
-        [string]$FinalConfigSummary,
-        [string]$FinalRunSummary,
-        [string]$ZendDiscoveryRunDir,
-        [switch]$KeepDebugArtifacts
-    )
-
-    $retentionCli = Join-Path $ScriptRoot "fuzzer\artifacts\retention\generated_runs.py"
-    $runDir = Join-Path (Join-Path $SeedOutputDir "zend-bridge") $LegacyRunId
-    $retentionArgs = @(
-        $retentionCli,
-        "--run-dir", $runDir,
-        "--terminal-status", $TerminalStatus,
-        "--seed-output-dir", $SeedOutputDir,
-        "--merged-suggested-seeds", (Join-Path $SeedOutputDir "zend_merged_suggested_seeds.json"),
-        "--final-config-summary", $FinalConfigSummary,
-        "--final-run-summary", $FinalRunSummary,
-        "--zend-discovery-run-dir", $ZendDiscoveryRunDir
-    )
-    if ($KeepDebugArtifacts) {
-        $retentionArgs += "--keep-debug-artifacts"
-    }
-
-    python @retentionArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "Zend artifact retention failed. Debug artifacts were not safely finalized."
-    }
-}
-
-function Publish-ZendDirectorySnapshot {
-    param(
-        [string]$SourceDir,
-        [string]$TargetDir
-    )
-
-    if (-not (Test-Path -LiteralPath $SourceDir)) {
-        throw "Cannot publish missing directory: $SourceDir"
-    }
-    $parent = Split-Path -Parent $TargetDir
-    New-Item -ItemType Directory -Path $parent -Force | Out-Null
-    $tempDir = "$TargetDir.t"
-    $oldDir = "$TargetDir.o"
-    if (Test-Path -LiteralPath $tempDir) {
-        Remove-Item -LiteralPath $tempDir -Recurse -Force
-    }
-    if (Test-Path -LiteralPath $oldDir) {
-        Remove-Item -LiteralPath $oldDir -Recurse -Force
-    }
-    Copy-Item -LiteralPath $SourceDir -Destination $tempDir -Recurse -Force
-    try {
-        if (Test-Path -LiteralPath $TargetDir) {
-            Move-Item -LiteralPath $TargetDir -Destination $oldDir -Force
-        }
-        Move-Item -LiteralPath $tempDir -Destination $TargetDir -Force
-        if (Test-Path -LiteralPath $oldDir) {
-            Remove-Item -LiteralPath $oldDir -Recurse -Force
-        }
-    } catch {
-        if ((Test-Path -LiteralPath $oldDir) -and -not (Test-Path -LiteralPath $TargetDir)) {
-            Move-Item -LiteralPath $oldDir -Destination $TargetDir -Force
-        }
-        if (Test-Path -LiteralPath $tempDir) {
-            Remove-Item -LiteralPath $tempDir -Recurse -Force
-        }
-        throw
-    }
-}
-
-function Get-ZendTargetDirectoryName {
-    param([string]$CandidateKey)
-
-    if ($CandidateKey.Length -gt 16) {
-        return $CandidateKey.Substring(0, 16)
-    }
-    return $CandidateKey
-}
-
-function Publish-ZendAggregateTargetState {
-    param(
-        [object[]]$Targets,
-        [string]$SnapshotName,
-        [string]$OutputDir
-    )
-
-    $stage = Join-Path (Split-Path -Parent $OutputDir) ("$SnapshotName-t")
-    if (Test-Path -LiteralPath $stage) {
-        Remove-Item -LiteralPath $stage -Recurse -Force
-    }
-    New-Item -ItemType Directory -Path $stage -Force | Out-Null
-    foreach ($target in @($Targets)) {
-        $candidateKey = [string]$target.candidate_key
-        $targetDirectoryName = if ($target.target_directory) { [string]$target.target_directory } else { Get-ZendTargetDirectoryName -CandidateKey $candidateKey }
-        $source = Join-Path (Join-Path (Join-Path (Split-Path -Parent $OutputDir) "targets") $targetDirectoryName) $SnapshotName
-        if (Test-Path -LiteralPath $source) {
-            Copy-Item -LiteralPath $source -Destination (Join-Path $stage $targetDirectoryName) -Recurse -Force
-        }
-    }
-    Publish-ZendDirectorySnapshot -SourceDir $stage -TargetDir $OutputDir
-    Remove-Item -LiteralPath $stage -Recurse -Force
-}
-
-function Invoke-ZendConvergence {
-    param(
-        [string]$ScriptRoot,
-        [string]$PluginSlug,
-        [string]$LegacyRunId,
-        [string]$SeedOutputDir,
-        [string]$InitialRunSummary,
-        [int]$TimeoutSeconds,
-        [int]$MaxIterations,
-        [string[]]$ComposeArgs
-    )
-
-    $bridgeWorkDir = Join-Path (Join-Path $SeedOutputDir "zend-bridge") $LegacyRunId
-    $targetsDir = Join-Path $bridgeWorkDir "targets"
-    $rootCurrentDir = Join-Path $bridgeWorkDir "current"
-    $rootFinalDir = Join-Path $bridgeWorkDir "final"
-    $historyPath = Join-Path $bridgeWorkDir "zend_convergence_summary.json"
-    $rawSuggestedSeeds = Join-Path $SeedOutputDir "suggested_seeds.json"
-    $registry = Join-Path $bridgeWorkDir "hookphuzz-callback-registry.json"
-    $bridgeCli = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\zend_runtime\bridge_cli.py"
-    $generatedConfigRunner = Join-Path $ScriptRoot "fuzzer\hook_energy\seed_generation\generated_config_runner.py"
-    $finalConfigDir = Join-Path $ScriptRoot "fuzzer\configs\generated-config\$PluginSlug"
-    $finalConfigSummary = Join-Path $SeedOutputDir "generated_config_summary.json"
-    $finalMergedSuggestedSeeds = Join-Path $SeedOutputDir "zend_merged_suggested_seeds.json"
-    $initialConfigSummary = Join-Path $bridgeWorkDir "pass1-generated_config_summary.json"
-    $targetsPath = Join-Path $bridgeWorkDir "zend_convergence_targets.json"
-    $targetResults = @()
-    $finalSeedReports = @()
-
-    python $bridgeCli `
-        --operation list-targets `
-        --plugin-slug $PluginSlug `
-        --legacy-run-id $LegacyRunId `
-        --raw-suggested-seeds $rawSuggestedSeeds `
-        --generated-config-summary $initialConfigSummary `
-        --pass1-run-summary $InitialRunSummary `
-        --targets-output $targetsPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "REPLAY_FAILED: Zend convergence target listing failed."
-    }
-    $targetList = Get-Content -LiteralPath $targetsPath -Raw | ConvertFrom-Json
-    $targets = @($targetList.targets)
-    if ($targets.Count -eq 0) {
-        throw "REPLAY_FAILED: no generated Zend convergence targets"
-    }
-
-    try {
-        foreach ($candidate in @($targets)) {
-            $targetCandidateKey = [string]$candidate.candidate_key
-            $targetDirectoryName = ""
-            $targetHistory = @()
-            try {
-                if (-not $targetCandidateKey) {
-                    throw "REPLAY_FAILED: Zend convergence target is missing candidate_key"
-                }
-                $targetDirectoryName = Get-ZendTargetDirectoryName -CandidateKey $targetCandidateKey
-                $candidate | Add-Member -NotePropertyName "target_directory" -NotePropertyValue $targetDirectoryName -Force
-                $targetDir = Join-Path $targetsDir $targetDirectoryName
-                $targetIterationsDir = Join-Path $targetDir "i"
-                $targetCurrentDir = Join-Path $targetDir "cur"
-                $targetFinalDir = Join-Path $targetDir "fin"
-                $statePath = Join-Path $targetDir "state.json"
-                $targetHistoryPath = Join-Path $targetDir "summary.json"
-                $seenRequestIds = New-Object System.Collections.Generic.HashSet[string]
-                $seenConfigHashes = New-Object System.Collections.Generic.HashSet[string]
-                $currentRunSummary = $InitialRunSummary
-                $currentSeeds = $rawSuggestedSeeds
-                $converged = $false
-                New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-                @{ known_parameters = @() } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding UTF8
-
-                for ($iteration = 0; $iteration -lt $MaxIterations; $iteration++) {
-                    $iterationDir = Join-Path $targetIterationsDir "$iteration"
-                    $uopzDir = Join-Path $iterationDir "uopz"
-                    $zendDir = Join-Path $iterationDir "zend"
-                    $nextStatePath = Join-Path $iterationDir "state.json"
-                    $mergedSeedsPath = Join-Path $iterationDir "seeds.json"
-                    $replayConfigDir = Join-Path $iterationDir "cfg"
-                    $replayConfigSummary = Join-Path $iterationDir "cfg.json"
-                    New-Item -ItemType Directory -Path $iterationDir -Force | Out-Null
-                    Copy-GeneratedRequestArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $currentRunSummary -OutputDir $uopzDir
-                    Copy-ZendOpcodeArtifacts -ComposeArgs $ComposeArgs -RunSummaryPath $currentRunSummary -OutputDir $zendDir
-
-                    python $bridgeCli `
-                        --operation converge-iteration `
-                        --plugin-slug $PluginSlug `
-                        --legacy-run-id $LegacyRunId `
-                        --candidate-key $targetCandidateKey `
-                        --registry $registry `
-                        --raw-suggested-seeds $currentSeeds `
-                        --pass1-run-summary $currentRunSummary `
-                        --pass1-artifacts-dir $uopzDir `
-                        --zend-events-dir $zendDir `
-                        --convergence-state $statePath `
-                        --convergence-state-output $nextStatePath `
-                        --convergence-merged-seeds $mergedSeedsPath `
-                        --output-config-dir $replayConfigDir `
-                        --generated-config-summary $replayConfigSummary
-                    if ($LASTEXITCODE -ne 0) {
-                        throw "REPLAY_FAILED: Zend convergence correlation failed for $targetCandidateKey iteration $iteration"
-                    }
-
-                    $state = Get-Content -LiteralPath $nextStatePath -Raw | ConvertFrom-Json
-                    if ($state.status -eq "REPLAY_FAILED") {
-                        throw "REPLAY_FAILED: Zend convergence lost known runtime parameters for $targetCandidateKey iteration $iteration"
-                    }
-                    $requestId = [string]$state.request_id
-                    if (-not $requestId -or -not $seenRequestIds.Add($requestId)) {
-                        throw "REPLAY_FAILED: matched artifact request ID is missing or duplicated"
-                    }
-                    if ($targetCandidateKey -ne [string]$state.candidate_key) {
-                        throw "REPLAY_FAILED: canonical candidate key changed across convergence iterations"
-                    }
-                    $targetHistory += [pscustomobject]@{
-                        iteration = $iteration
-                        candidate_key = $targetCandidateKey
-                        request_id = $requestId
-                        known_before = @($state.known_before)
-                        observed_parameters = @($state.observed_parameters)
-                        new_parameters = @($state.new_parameters)
-                        missing_parameters = @($state.missing_parameters)
-                        known_parameters = @($state.known_parameters)
-                        replay_summary = $currentRunSummary
-                    }
-                    @{ legacy_run_id = $LegacyRunId; candidate_key = $targetCandidateKey; status = [string]$state.status; iterations = $targetHistory } |
-                        ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $targetHistoryPath -Encoding UTF8
-                    Publish-ZendDirectorySnapshot -SourceDir $iterationDir -TargetDir $targetCurrentDir
-                    Publish-ZendAggregateTargetState -Targets $targets -SnapshotName "current" -OutputDir $rootCurrentDir
-
-                    if ($state.status -eq "CONVERGED") {
-                        Publish-ZendDirectorySnapshot -SourceDir $iterationDir -TargetDir $targetFinalDir
-                        $finalSeedReports += (Join-Path $targetFinalDir "seeds.json")
-                        $converged = $true
-                        break
-                    }
-                    if ($iteration -ge ($MaxIterations - 1)) {
-                        throw "ITERATION_LIMIT: new runtime parameters remain after iteration $iteration"
-                    }
-                    $replaySummary = Get-Content -LiteralPath $replayConfigSummary -Raw | ConvertFrom-Json
-                    if (@($replaySummary.generated).Count -ne 1) {
-                        throw "REPLAY_FAILED: Phase 2 requires exactly one generated candidate per target"
-                    }
-                    $configPath = [string]$replaySummary.generated[0].config_path
-                    $configHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
-                    if (-not $seenConfigHashes.Add($configHash)) {
-                        throw "REPEATED_CONFIG: canonical generated config hash repeated"
-                    }
-                    $currentSeeds = $mergedSeedsPath
-                    $statePath = $nextStatePath
-                    $currentRunSummary = Join-Path $iterationDir "run.json"
-                    python $generatedConfigRunner `
-                        --generated-config-summary $replayConfigSummary `
-                        --output-file $currentRunSummary `
-                        --timeout-seconds $TimeoutSeconds `
-                        --service $fuzzerService `
-                        --stop-on-callback `
-                        --legacy-run-id $LegacyRunId
-                    if ($LASTEXITCODE -ne 0) {
-                        throw "REPLAY_FAILED: generated convergence replay failed. See $currentRunSummary"
-                    }
-                }
-                if (-not $converged) {
-                    throw "ITERATION_LIMIT: target did not converge within $MaxIterations iterations"
-                }
-                $targetResults += [pscustomobject]@{
-                    candidate_key = $targetCandidateKey
-                    target_directory = $targetDirectoryName
-                    status = "CONVERGED"
-                    current = $targetCurrentDir
-                    final = $targetFinalDir
-                    iterations = $targetHistory
-                }
-            } catch {
-                $failure = $_.Exception.Message
-                $targetResults += [pscustomobject]@{
-                    candidate_key = $targetCandidateKey
-                    target_directory = $targetDirectoryName
-                    status = "FAILED"
-                    error = $failure
-                    iterations = $targetHistory
-                }
-                Write-Warning "Zend convergence target failed; continuing with remaining targets: $targetCandidateKey - $failure"
-            }
-            @{ legacy_run_id = $LegacyRunId; status = "IN_PROGRESS"; targets = $targetResults } |
-                ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $historyPath -Encoding UTF8
-        }
-        if ($finalSeedReports.Count -eq 0) {
-            throw "REPLAY_FAILED: no Zend convergence target completed successfully"
-        }
-        Publish-ZendAggregateTargetState -Targets $targets -SnapshotName "final" -OutputDir $rootFinalDir
-        $combinedTemp = Join-Path $bridgeWorkDir "zend_merged_suggested_seeds.final.tmp.json"
-        $combineArgs = @(
-            $bridgeCli,
-            "--operation", "combine-final",
-            "--merged-suggested-seeds", $combinedTemp,
-            "--expected-count", "$($finalSeedReports.Count)"
-        )
-        foreach ($report in $finalSeedReports) {
-            $combineArgs += @("--final-seed-report", $report)
-        }
-        python @combineArgs
-        if ($LASTEXITCODE -ne 0) {
-            throw "REPLAY_FAILED: could not combine final Zend convergence seed reports"
-        }
-        Move-Item -LiteralPath $combinedTemp -Destination $finalMergedSuggestedSeeds -Force
-        Convert-LiveSeedSuggestionsToConfigs `
-            -ScriptRoot $ScriptRoot `
-            -PluginSlug $PluginSlug `
-            -SuggestedSeeds $finalMergedSuggestedSeeds `
-            -OutputConfigDir $finalConfigDir `
-            -SummaryPath $finalConfigSummary `
-            -RestRouteFallback
-        $finalRunSummary = Join-Path $bridgeWorkDir "final-generated_config_run_summary.json"
-        python $generatedConfigRunner `
-            --generated-config-summary $finalConfigSummary `
-            --output-file $finalRunSummary `
-            --timeout-seconds $TimeoutSeconds `
-            --service $fuzzerService `
-            --legacy-run-id $LegacyRunId
-        if ($LASTEXITCODE -ne 0) {
-            throw "REPLAY_FAILED: final generated convergence replay failed. See $finalRunSummary"
-        }
-        Invoke-ZendPass2Verification `
-            -ScriptRoot $ScriptRoot `
-            -LegacyRunId $LegacyRunId `
-            -SeedOutputDir $SeedOutputDir `
-            -Pass2RunSummary $finalRunSummary `
-            -ComposeArgs $ComposeArgs
-        $convergenceStatus = if (@($targetResults | Where-Object { $_.status -ne "CONVERGED" }).Count -gt 0) { "CONVERGED_PARTIAL" } else { "CONVERGED" }
-        @{ legacy_run_id = $LegacyRunId; status = $convergenceStatus; targets = $targetResults; current = $rootCurrentDir; final = $rootFinalDir } |
-            ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $historyPath -Encoding UTF8
-        return [pscustomobject]@{ ConfigSummary = $finalConfigSummary; RunSummary = $finalRunSummary; HistoryPath = $historyPath; Status = $convergenceStatus }
-    } catch {
-        $failure = $_.Exception.Message
-        $status = if ($failure -match "ITERATION_LIMIT") { "ITERATION_LIMIT" } elseif ($failure -match "REPEATED_CONFIG") { "REPEATED_CONFIG" } else { "REPLAY_FAILED" }
-        @{ legacy_run_id = $LegacyRunId; status = $status; error = $failure; targets = $targetResults; current = $rootCurrentDir } |
-            ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $historyPath -Encoding UTF8
-        throw
     }
 }
 
@@ -1523,282 +722,35 @@ try {
         }
     }
 
-    $onlineSeedOutputDir = ""
-    if ($RunOnline -or $RunOnlineLinked) {
-        $onlineSeedOutputDir = Join-Path $scriptRoot ("fuzzer\output\online-seed-generation\{0}" -f $legacyRunId)
-        New-Item -ItemType Directory -Path $onlineSeedOutputDir -Force | Out-Null
-    }
-    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -PluginSlug $PluginSlug -UseEntrypointPipeline:$UseEntrypointPipeline -RuntimeParametersOnly:$UseZendDiscovery -OutputDir $onlineSeedOutputDir
+    $onlineSeedOutputDir = Join-Path $scriptRoot ("fuzzer\output\online-seed-generation\{0}" -f $legacyRunId)
+    New-Item -ItemType Directory -Path $onlineSeedOutputDir -Force | Out-Null
+    Export-LiveSeedSuggestions -ScriptRoot $scriptRoot -WaitSeconds $SeedWaitSeconds -ComposeArgs $composeArgs -OutputDir $onlineSeedOutputDir
     if ($learnPressProof) {
         Add-LearnPressNonceToSuggestedSeeds `
-            -SuggestedSeedsPath (Join-Path $scriptRoot "fuzzer\output\seed_generation\suggested_seeds.json") `
+            -SuggestedSeedsPath (Join-Path $onlineSeedOutputDir "suggested_seeds.json") `
             -Proof $learnPressProof
     }
-    if (-not $UseEntrypointPipeline -and -not ($RunOnline -or $RunOnlineLinked)) {
-        Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug
-    }
-
-    if ($RunOnlineLinked) {
-        Initialize-ZendCallbackRegistry `
-            -ScriptRoot $scriptRoot `
-            -PluginSlug $PluginSlug `
-            -SeedOutputDir $onlineSeedOutputDir `
-            -LegacyRunId $legacyRunId `
-            -ComposeArgs $composeArgs
-        $seedOutputDir = $onlineSeedOutputDir
-        $suggestedSeedsPath = Join-Path $seedOutputDir "suggested_seeds.json"
-        $onlineConfigRoot = Join-Path $scriptRoot "fuzzer\configs"
-        $onlineLinkedRunner = Join-Path $scriptRoot "fuzzer\hook_energy\seed_generation\online_linked_coordinator.py"
-        $callbackRegistry = Join-Path (Join-Path (Join-Path $seedOutputDir "zend-bridge") $legacyRunId) "hookphuzz-callback-registry.json"
-        Assert-PathExists -Path $onlineLinkedRunner -Hint "The online-linked Zend coordinator is missing from this checkout."
-        Assert-PathExists -Path $suggestedSeedsPath -Hint "The online-linked seed export is missing."
-        Assert-PathExists -Path $callbackRegistry -Hint "The online-linked callback registry is missing."
-
-        Write-Host "Stopping bootstrap fuzzer before immutable online-linked v0 starts"
-        Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("stop", "--timeout", "30", $fuzzerService)
-        Write-Host "Starting bounded online-linked Zend discovery"
-        $onlineLinkedArgs = @(
-            $onlineLinkedRunner,
-            "--suggested-seeds", $suggestedSeedsPath,
-            "--bootstrap-config", $requiredConfig,
-            "--config-root", $onlineConfigRoot,
-            "--output-root", (Join-Path $scriptRoot "fuzzer\output"),
-            "--plugin-slug", $PluginSlug,
-            "--legacy-run-id", $legacyRunId,
-            "--callback-registry", $callbackRegistry,
-            "--max-seconds", "$OnlineTimeoutSeconds",
-            "--max-versions", "$OnlineMaxVersions",
-            "--max-candidates", "$OnlineMaxCandidates",
-            "--campaign-seconds", "$OnlineCampaignTimeoutSeconds",
-            "--sync-registry",
-            "--service", $fuzzerService
-        )
-        $previousComposeFile = $env:COMPOSE_FILE
-        $env:COMPOSE_FILE = "docker-compose.yml;$overridePath"
-        try {
-            python @onlineLinkedArgs
-            $onlineLinkedExitCode = $LASTEXITCODE
-        } finally {
-            if ($null -eq $previousComposeFile) {
-                Remove-Item Env:COMPOSE_FILE -ErrorAction SilentlyContinue
-            } else {
-                $env:COMPOSE_FILE = $previousComposeFile
-            }
-        }
-        $onlineLinkedStatePath = Join-Path (Join-Path (Join-Path $scriptRoot "fuzzer\output\online-linked") $legacyRunId) "batch-state.json"
-        Write-Host "Online-linked state: $onlineLinkedStatePath"
-        if ($onlineLinkedExitCode -ne 0) {
-            throw "Online-linked Zend discovery failed. See $onlineLinkedStatePath"
-        }
-    } elseif ($RunOnline) {
-        Initialize-ZendCallbackRegistry `
-            -ScriptRoot $scriptRoot `
-            -PluginSlug $PluginSlug `
-            -SeedOutputDir $onlineSeedOutputDir `
-            -LegacyRunId $legacyRunId `
-            -ComposeArgs $composeArgs
-        $seedOutputDir = $onlineSeedOutputDir
-        $suggestedSeedsPath = Join-Path $seedOutputDir "suggested_seeds.json"
-        $onlineConfigRoot = Join-Path $scriptRoot "fuzzer\configs"
-        $onlineRunner = Join-Path $scriptRoot "fuzzer\hook_energy\seed_generation\online_config_runner.py"
-        Assert-PathExists -Path $onlineRunner -Hint "The online Zend coordinator is missing from this checkout."
-
-        Write-Host "Stopping bootstrap fuzzer before immutable online v0 starts"
-        Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("stop", "--timeout", "30", $fuzzerService)
-        Write-Host "Starting bounded online Zend discovery"
-        $onlineArgs = @(
-            $onlineRunner,
-            "--suggested-seeds", $suggestedSeedsPath,
-            "--bootstrap-config", $requiredConfig,
-            "--config-root", $onlineConfigRoot,
-            "--output-root", $seedOutputDir,
-            "--plugin-slug", $PluginSlug,
-            "--legacy-run-id", $legacyRunId,
-            "--max-seconds", "$OnlineTimeoutSeconds",
-            "--max-versions", "$OnlineMaxVersions",
-            "--service", $fuzzerService
-        )
-        python @onlineArgs
-        $onlineExitCode = $LASTEXITCODE
-        $onlineLineagePath = Join-Path (Join-Path $seedOutputDir "online") (Join-Path $legacyRunId "lineage.json")
-        Write-Host "Online lineage: $onlineLineagePath"
-        if ($onlineExitCode -ne 0) {
-            throw "Online Zend discovery failed. See $onlineLineagePath"
-        }
-    } elseif ($RunGeneratedConfigs) {
-        $seedOutputDir = Join-Path $scriptRoot "fuzzer\output\seed_generation"
-        $generatedConfigSummary = Join-Path $seedOutputDir "generated_config_summary.json"
-        $generatedRunSummary = Join-Path $seedOutputDir "generated_config_run_summary.json"
-        $zendRetentionReady = $false
-        $zendTerminalStatus = ""
-        $zendAuthPartialExpected = $false
-        $zendFinalConfigSummary = ""
-        $zendFinalRunSummary = ""
-        if ($UseZendDiscovery) {
-            $bridgeWorkDir = Join-Path (Join-Path $seedOutputDir "zend-bridge") $legacyRunId
-            $pass1ConfigDir = Join-Path $bridgeWorkDir "pass1-configs"
-            $generatedConfigSummary = Join-Path $bridgeWorkDir "pass1-generated_config_summary.json"
-            $generatedRunSummary = Join-Path $bridgeWorkDir "pass1-generated_config_run_summary.json"
-            Initialize-ZendCallbackRegistry `
-                -ScriptRoot $scriptRoot `
-                -PluginSlug $PluginSlug `
-                -SeedOutputDir $seedOutputDir `
-                -LegacyRunId $legacyRunId `
-                -ComposeArgs $composeArgs
-            Convert-LiveSeedSuggestionsToConfigs `
-                -ScriptRoot $scriptRoot `
-                -PluginSlug $PluginSlug `
-                -OutputConfigDir $pass1ConfigDir `
-                -SummaryPath $generatedConfigSummary `
-                -ReplayOnly `
-                -RestRouteFallback
-        }
-        $generatedConfigRunner = Join-Path $scriptRoot "fuzzer\hook_energy\seed_generation\generated_config_runner.py"
-        $generatedRunnerLog = $null
-
-        Write-Host "Stopping default fuzzer before generated config batch"
-        Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("stop", "--timeout", "30", $fuzzerService)
-
-        Write-Host "Running generated hook configs sequentially"
-        if ($UseEntrypointPipeline) {
-            $generatedLogDir = Join-Path $seedOutputDir "entrypoint-proof\logs"
-            New-Item -ItemType Directory -Path $generatedLogDir -Force | Out-Null
-            $generatedRunnerLog = Join-Path $generatedLogDir "generated_config_runner.log"
-            $generatedRunnerStdout = Join-Path $generatedLogDir "generated_config_runner.stdout.log"
-            $generatedRunnerStderr = Join-Path $generatedLogDir "generated_config_runner.stderr.log"
-            $generatedArgs = @(
-                $generatedConfigRunner,
-                "--generated-config-summary", $generatedConfigSummary,
-                "--output-file", $generatedRunSummary,
-                "--timeout-seconds", $GeneratedConfigTimeoutSeconds,
-                "--service", $fuzzerService
-            )
-            if ($legacyRunId) {
-                $generatedArgs += @("--legacy-run-id", $legacyRunId)
-            }
-            $generatedProcess = Start-Process `
-                -FilePath "python" `
-                -ArgumentList $generatedArgs `
-                -Wait `
-                -PassThru `
-                -WindowStyle Hidden `
-                -RedirectStandardOutput $generatedRunnerStdout `
-                -RedirectStandardError $generatedRunnerStderr
-            $generatedExitCode = $generatedProcess.ExitCode
-            Get-Content -LiteralPath $generatedRunnerStdout, $generatedRunnerStderr -ErrorAction SilentlyContinue |
-                Set-Content -LiteralPath $generatedRunnerLog -Encoding UTF8
-        } else {
-            $generatedArgs = @(
-                $generatedConfigRunner,
-                "--generated-config-summary", $generatedConfigSummary,
-                "--output-file", $generatedRunSummary,
-                "--timeout-seconds", "$GeneratedConfigTimeoutSeconds",
-                "--service", $fuzzerService
-            )
-            if ($legacyRunId) {
-                $generatedArgs += @("--legacy-run-id", $legacyRunId)
-            }
-            if ($UseZendDiscovery) {
-                $generatedArgs += "--stop-on-callback"
-            }
-            python @generatedArgs
-            $generatedExitCode = $LASTEXITCODE
-        }
-        if ($UseEntrypointPipeline) {
-            Write-EntrypointPluginProofFile -SeedOutputDir $seedOutputDir -PluginSlug $PluginSlug -RunnerLog $generatedRunnerLog
-        }
-        $pass1Batch = $null
-        if ($UseZendDiscovery) {
-            $pass1Batch = Test-ZendPass1BatchUsable -SummaryPath $generatedRunSummary -ExitCode $generatedExitCode
-        } elseif ($generatedExitCode -ne 0) {
-            throw "Generated hook config batch failed. See $generatedRunSummary"
-        }
-        if ($UseZendDiscovery) {
-            $pass1RunSummary = $pass1Batch.Summary
-            $zendAuthPartialExpected = [int]$pass1RunSummary.counts.expected_auth_skip -gt 0
-        }
-
-        if ($UseZendDiscovery) {
-            $zendCandidateCount = @((Get-Content -LiteralPath $generatedConfigSummary -Raw | ConvertFrom-Json).generated).Count
-            if ($zendCandidateCount -gt 0) {
-                $convergence = Invoke-ZendConvergence `
-                    -ScriptRoot $scriptRoot `
-                    -PluginSlug $PluginSlug `
-                    -LegacyRunId $legacyRunId `
-                    -SeedOutputDir $seedOutputDir `
-                    -InitialRunSummary $generatedRunSummary `
-                    -TimeoutSeconds $GeneratedConfigTimeoutSeconds `
-                    -MaxIterations $ZendMaxIterations `
-                    -ComposeArgs $composeArgs
-                $generatedConfigSummary = $convergence.ConfigSummary
-                $generatedRunSummary = $convergence.RunSummary
-                $zendRetentionReady = $true
-                $zendTerminalStatus = if ($pass1Batch.Status -eq "PARTIAL" -or $convergence.Status -eq "CONVERGED_PARTIAL") { "PASS_PARTIAL_RUNNER_ERRORS" } elseif ($zendAuthPartialExpected) { "PASS_PARTIAL_AUTH_EXPECTED" } else { "PASS" }
-                $zendFinalConfigSummary = $generatedConfigSummary
-                $zendFinalRunSummary = $generatedRunSummary
-                Write-Host "Zend convergence summary: $($convergence.HistoryPath)"
-            } else {
-                Invoke-ZendDiscoveryBridge `
-                    -ScriptRoot $scriptRoot `
-                    -PluginSlug $PluginSlug `
-                    -LegacyRunId $legacyRunId `
-                    -SeedOutputDir $seedOutputDir `
-                    -Pass1RunSummary $generatedRunSummary `
-                    -ComposeArgs $composeArgs
-
-                $generatedConfigSummary = Join-Path $seedOutputDir "generated_config_summary.json"
-                $generatedRunSummary = Join-Path $seedOutputDir "pass2-generated_config_run_summary.json"
-                python $generatedConfigRunner `
-                    --generated-config-summary $generatedConfigSummary `
-                    --output-file $generatedRunSummary `
-                    --timeout-seconds $GeneratedConfigTimeoutSeconds `
-                    --service $fuzzerService `
-                    --legacy-run-id $legacyRunId
-                $generatedExitCode = $LASTEXITCODE
-                if ($generatedExitCode -ne 0) {
-                    throw "Generated hook config Pass 2 failed. See $generatedRunSummary"
-                }
-                Invoke-ZendPass2Verification `
-                    -ScriptRoot $scriptRoot `
-                    -LegacyRunId $legacyRunId `
-                    -SeedOutputDir $seedOutputDir `
-                    -Pass2RunSummary $generatedRunSummary `
-                    -ComposeArgs $composeArgs
-            }
-        }
-
-        if ($learnPressProof -and $zendFinalConfigSummary -and $zendFinalRunSummary) {
-            Write-LearnPressFinalProof `
-                -ProofPath $learnPressProof.proof_path `
-                -SuggestedSeedsPath (Join-Path $seedOutputDir "suggested_seeds.json") `
-                -ConfigSummaryPath $zendFinalConfigSummary `
-                -RunSummaryPath $zendFinalRunSummary
-        }
-
-        if ($UseZendDiscovery -and $zendRetentionReady) {
-            Invoke-ZendArtifactRetention `
-                -ScriptRoot $scriptRoot `
-                -SeedOutputDir $seedOutputDir `
-                -LegacyRunId $legacyRunId `
-                -TerminalStatus $zendTerminalStatus `
-                -FinalConfigSummary $zendFinalConfigSummary `
-                -FinalRunSummary $zendFinalRunSummary `
-                -ZendDiscoveryRunDir (Join-Path (Join-Path $scriptRoot "fuzzer\output\zend-discovery") $legacyRunId) `
-                -KeepDebugArtifacts:$KeepDebugArtifacts
-        }
-
-        Write-Host "Generated config run summary: $generatedRunSummary"
-    } elseif ($NoFollowLogs) {
-        Write-Host "PHUZZ started. To follow logs later, run:"
-        Write-Host "  docker compose logs -f $fuzzerService"
-        Write-Host "Suggested seed artifacts:"
-        Write-Host "  $scriptRoot\fuzzer\output\seed_generation"
-        Write-Host "Generated hook config artifacts:"
-        Write-Host "  $scriptRoot\fuzzer\configs\generated-config\$PluginSlug"
-    } else {
-        Write-Host "Following fuzzer logs. Press Ctrl+C to stop following without stopping containers."
-        Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("logs", "-f", $fuzzerService)
-    }
+    Initialize-ZendCallbackRegistry `
+        -ScriptRoot $scriptRoot `
+        -PluginSlug $PluginSlug `
+        -SeedOutputDir $onlineSeedOutputDir `
+        -LegacyRunId $legacyRunId `
+        -ComposeArgs $composeArgs
+    . (Join-Path $scriptDir "invoke-online-linked.ps1")
+    Invoke-OnlineLinked `
+        -ScriptRoot $scriptRoot `
+        -PluginSlug $PluginSlug `
+        -LegacyRunId $legacyRunId `
+        -SuggestedSeedsPath (Join-Path $onlineSeedOutputDir "suggested_seeds.json") `
+        -BootstrapConfig $requiredConfig `
+        -CallbackRegistry (Join-Path (Join-Path (Join-Path $onlineSeedOutputDir "zend-bridge") $legacyRunId) "hookphuzz-callback-registry.json") `
+        -Service $fuzzerService `
+        -OnlineTimeoutSeconds $OnlineTimeoutSeconds `
+        -OnlineMaxVersions $OnlineMaxVersions `
+        -OnlineMaxCandidates $OnlineMaxCandidates `
+        -OnlineCampaignTimeoutSeconds $OnlineCampaignTimeoutSeconds `
+        -OverridePath $overridePath `
+        -ComposeArgs $composeArgs
 } finally {
     if ($overridePath -and (Test-Path -LiteralPath $overridePath)) {
         Remove-Item -LiteralPath $overridePath -Force

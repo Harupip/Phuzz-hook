@@ -23,7 +23,8 @@ except ModuleNotFoundError as exc:
     if "'fuzzer' is not a package" not in str(exc):
         raise
     fuzzer = importlib.import_module("fuzzer")
-from hook_energy.seed_generation import generated_config_runner, probe_sender
+from hook_energy.seed_generation import generated_config_runner
+from online_linked import probe_sender
 from seed_generation.config.config_exporter import export_seed_configs
 
 
@@ -58,6 +59,10 @@ class ProbeSenderTests(unittest.TestCase):
         command = calls[0][0]
         self.assertEqual(command[:2], ["docker", "exec"])
         self.assertIn("HOOKPHUZZ_LEGACY_RUN_ID=probe-run", command)
+        self.assertIn("online_linked.probe_sender", command)
+        self.assertNotIn("/app/fuzzer.py", command)
+        self.assertEqual(command[command.index("python") + 1:command.index("python") + 3],
+                         ["-m", "online_linked.probe_sender"])
         self.assertIn("--request-id", command)
         self.assertIn("request-1", command)
         self.assertIn("--config-path", command)
@@ -265,7 +270,7 @@ class ProbeSenderTests(unittest.TestCase):
             },
         }
 
-        prepare = getattr(fuzzer, "prepare_request_from_config", None)
+        prepare = getattr(probe_sender, "prepare_request_from_config", None)
         self.assertIsNotNone(prepare)
         with patch.object(fuzzer, "Fuzzer", side_effect=AssertionError("sender must not construct Fuzzer")):
             prepared = prepare(config, request_id="probe-request", run_id="probe-run")
@@ -296,7 +301,7 @@ class ProbeSenderTests(unittest.TestCase):
             "body_params": {"data": [{"name": "enabled", "value": False}, {"name": "count", "value": 0}]},
         }
         with patch.object(fuzzer, "Fuzzer", side_effect=AssertionError("sender must not construct Fuzzer")):
-            prepared = fuzzer.prepare_request_from_config(config, request_id="request-2", run_id="run-2")
+            prepared = probe_sender.prepare_request_from_config(config, request_id="request-2", run_id="run-2")
         query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(prepared.url).query))
         body = dict(urllib.parse.parse_qsl(prepared.body))
         self.assertEqual(query, {"existing": "1", "page": "0"})

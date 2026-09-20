@@ -741,77 +741,8 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
             script.index("./wp-cli.phar plugin install ./_plugins/${WP_TARGET_PLUGIN}.zip --activate"),
         )
 
-    def test_wordpress_runner_exposes_and_wires_opt_in_batch_mode(self):
-        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
-        script = script_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("[switch]$RunGeneratedConfigs", script)
-        self.assertIn("[switch]$UseZendDiscovery", script)
-        self.assertIn("-UseZendDiscovery requires -RunGeneratedConfigs.", script)
-        self.assertIn("HOOKPHUZZ_LEGACY_RUN_ID: $LegacyRunId", script)
-        self.assertIn("[string]$PluginSlug = \"show-all-comments-in-one-page\"", script)
-        self.assertIn('$safePluginSlug = ($PluginSlug -replace "[^A-Za-z0-9._-]", "-").Trim("-")', script)
-        self.assertIn('$legacyRunId = $safePluginSlug + "-" + (Get-Date -Format "yyyyMMddTHHmmssZ")', script)
-        self.assertNotIn('$legacyRunId = "legacy-" +', script)
-        self.assertIn("[ValidateRange(1, 30)]", script)
-        self.assertIn("[int]$GeneratedConfigTimeoutSeconds = 30", script)
-        self.assertIn("[int]$ZendMaxIterations", script)
-        self.assertIn("read-phuzz-env.ps1", script)
-        self.assertIn("$GeneratedConfigTimeoutSeconds", script)
-        self.assertIn("fuzzer\\configs\\{0}.json", script)
-        self.assertIn("fuzzer\\configs\\generated-config\\$PluginSlug", script)
-        self.assertIn("Convert-LiveSeedSuggestionsToConfigs -ScriptRoot $scriptRoot -PluginSlug $PluginSlug", script)
-        self.assertIn("-RuntimeParametersOnly:$UseZendDiscovery", script)
-        self.assertIn('"--runtime-parameters-only"', script)
-        self.assertIn("wordpress/$PluginSlug", script)
-        self.assertIn("wordpress/bootstrap-generated", script)
-        self.assertIn("web\\applications\\wordpress\\_plugins\\$PluginSlug.zip", script)
-        self.assertIn("WP_TARGET_PLUGIN: $PluginSlug", script)
-        self.assertIn("FUZZER_CONFIG: $BootstrapConfigSlug", script)
-        self.assertIn("if ($RunGeneratedConfigs)", script)
-        self.assertIn("Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @(\"stop\", \"--timeout\", \"30\", $fuzzerService)", script)
-        self.assertIn("generated_config_runner.py", script)
-        self.assertIn("--generated-config-summary", script)
-        self.assertIn("--output-file", script)
-        self.assertIn("--timeout-seconds", script)
-        self.assertIn("--legacy-run-id", script)
-        self.assertIn("--stop-on-callback", script)
 
-    def test_wordpress_runner_wires_success_only_artifact_retention(self):
-        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
-        script = script_path.read_text(encoding="utf-8-sig")
-        wrapper = (FUZZER_DIR.parent / "phuzz.ps1").read_text(encoding="utf-8-sig")
-
-        self.assertIn("[switch]$KeepDebugArtifacts", script)
-        self.assertIn("generated_runs.py", script)
-        self.assertIn("seed_generation\\zend_runtime\\bridge_cli.py", script)
-        self.assertIn("artifacts\\retention\\generated_runs.py", script)
-        self.assertIn("--terminal-status", script)
-        self.assertIn("--final-config-summary", script)
-        self.assertIn("--final-run-summary", script)
-        self.assertIn("--zend-discovery-run-dir", script)
-        self.assertIn("--keep-debug-artifacts", script)
-        self.assertIn("Invoke-ZendArtifactRetention", script)
-        self.assertLess(
-            script.index("Invoke-ZendArtifactRetention"),
-            script.index('Write-Host "Generated config run summary:'),
-        )
-        self.assertIn("[switch]$KeepDebugArtifacts", wrapper)
-        self.assertIn('$runnerParams["KeepDebugArtifacts"] = $true', wrapper)
-
-    def test_wordpress_runner_has_zend_owned_two_pass_bridge(self):
-        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
-        script = script_path.read_text(encoding="utf-8-sig")
-
-        self.assertIn("Invoke-ZendDiscoveryBridge", script)
-        self.assertIn("pass1-generated_config_run_summary.json", script)
-        self.assertIn("zend_enriched_seeds.json", script)
-        self.assertIn("zend_merged_suggested_seeds.json", script)
-        self.assertIn("--operation\", \"combine-final\"", script)
-        self.assertIn("Move-Item -LiteralPath $combinedTemp -Destination $finalMergedSuggestedSeeds -Force", script)
-        self.assertIn("pass2-generated_config_run_summary.json", script)
-        self.assertIn("mkdir -p /shared/opcode-events && chown www-data:www-data /shared/opcode-events", script)
-        self.assertNotIn("zend-runner-summary", script)
 
     def test_zend_discovery_bootstraps_rest_routes_before_seed_export(self):
         script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
@@ -838,80 +769,12 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
             script.index("Export-LiveSeedSuggestions"),
         )
 
-    def test_zend_discovery_replay_uses_rest_route_fallback_configs(self):
-        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
-        script = script_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("[switch]$RestRouteFallback", script)
-        self.assertIn("--rest-route-fallback", script)
-        self.assertIn("-ReplayOnly `\n                -RestRouteFallback", script)
-        self.assertIn("-SummaryPath $finalConfigSummary `\n            -RestRouteFallback", script)
 
-    def test_zend_convergence_uses_short_filesystem_target_dirs_without_shortening_identity(self):
-        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
-        script = script_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("function Get-ZendTargetDirectoryName", script)
-        self.assertIn('$CandidateKey.Substring(0, 16)', script)
-        self.assertIn("$targetDirectoryName = Get-ZendTargetDirectoryName -CandidateKey $targetCandidateKey", script)
-        self.assertIn("$targetDir = Join-Path $targetsDir $targetDirectoryName", script)
-        self.assertIn('$targetIterationsDir = Join-Path $targetDir "i"', script)
-        self.assertIn('$replayConfigDir = Join-Path $iterationDir "cfg"', script)
-        self.assertIn('$replayConfigSummary = Join-Path $iterationDir "cfg.json"', script)
-        self.assertIn('$finalSeedReports += (Join-Path $targetFinalDir "seeds.json")', script)
-        self.assertNotIn('Join-Path $targetFinalDir "merged_suggested_seeds.json"', script)
-        self.assertIn('$currentRunSummary = Join-Path $iterationDir "run.json"', script)
-        self.assertIn("target_directory = $targetDirectoryName", script)
-        self.assertIn("--candidate-key $targetCandidateKey", script)
-        self.assertIn("candidate_key = $targetCandidateKey", script)
-        self.assertIn('$tempDir = "$TargetDir.t"', script)
-        self.assertIn('$oldDir = "$TargetDir.o"', script)
-        self.assertIn('("$SnapshotName-t")', script)
-        self.assertNotIn('$TargetDir.tmp.$([guid]', script)
-        self.assertNotIn('$SnapshotName.tmp.$([guid]', script)
 
-    def test_wordpress_runner_converges_zend_candidates_independently_and_preserves_stage1_fallback(self):
-        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
-        script = script_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("function Invoke-ZendConvergence", script)
-        self.assertIn("foreach ($candidate in @($targets))", script)
-        self.assertIn("--operation list-targets", script)
-        self.assertIn("--pass1-run-summary $InitialRunSummary", script)
-        self.assertIn("--candidate-key $targetCandidateKey", script)
-        self.assertIn("$targetCurrentDir", script)
-        self.assertIn("$targetFinalDir", script)
-        self.assertNotIn("$zendCandidateCount -eq 1", script)
-        self.assertIn("Invoke-ZendConvergence", script)
-        self.assertIn("Invoke-ZendDiscoveryBridge", script)
-        self.assertIn("Invoke-ZendPass2Verification", script)
-        self.assertIn("candidate_key", script)
-        self.assertIn("REPLAY_FAILED", script)
-        self.assertIn("REPEATED_CONFIG", script)
-        self.assertIn("PASS_PARTIAL_AUTH_EXPECTED", script)
-
-    def test_wordpress_runner_continues_zend_after_partial_pass1_batch(self):
-        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
-        script = script_path.read_text(encoding="utf-8-sig")
-
-        self.assertIn("Test-ZendPass1BatchUsable", script)
-        self.assertIn("callback_reached", script)
-        self.assertIn("PASS_PARTIAL_RUNNER_ERRORS", script)
-        self.assertIn("$finalSeedReports.Count", script)
-        self.assertIn("status = \"FAILED\"", script)
-
-    def test_zend_artifact_copy_uses_only_callback_matched_request(self):
-        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
-        script = script_path.read_text(encoding="utf-8-sig")
-        zend_copy = script[
-            script.index("function Copy-ZendOpcodeArtifacts"):
-            script.index("function Initialize-ZendCallbackRegistry")
-        ]
-
-        self.assertIn("if ($row.matched_artifact)", zend_copy)
-        self.assertNotIn("request_artifacts", zend_copy)
-
-    def test_wordpress_runner_uses_shared_bootstrap_config_for_generated_mode(self):
+    def test_wordpress_runner_uses_shared_bootstrap_config_for_linked_mode(self):
         runner_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
         runner = runner_path.read_text(encoding="utf-8-sig")
         config_path = FUZZER_DIR / "configs" / "wordpress" / "bootstrap-generated.json"
@@ -926,25 +789,7 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertEqual(config["methods"], ["GET"])
         self.assertEqual(config["query_params"]["fuzz"], ["hookphuzz_probe"])
 
-    def test_wordpress_runner_maps_copied_plugin_source_into_seed_export(self):
-        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
-        script = script_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("docker cp", script)
-        self.assertIn("--container-source-root", script)
-        self.assertIn("/var/www/html/wp-content/plugins/$PluginSlug", script)
-        self.assertIn("--host-source-root", script)
-        self.assertIn("--source-root", script)
-        self.assertIn("--unresolved-source-reason", script)
-        self.assertIn("source_copy_failed", script)
-        self.assertIn("no_php_files", script)
-
-    def test_wordpress_runner_source_temp_cleanup_is_best_effort(self):
-        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
-        script = script_path.read_text(encoding="utf-8-sig")
-
-        self.assertIn("Plugin source temp cleanup failed", script)
-        self.assertIn("Remove-Item -LiteralPath $pluginSourceTempRoot -Recurse -Force -ErrorAction Stop", script)
 
 
 

@@ -1,3 +1,5 @@
+> Historical workflow guide: the generated/zend/online mode commands below were retired on 2026-09-21. Use [online-linked](online-linked-flow.md) for the supported workflow. Library and evidence descriptions remain reference material.
+
 # Zend Runtime Discovery Stage 1 and Phase 2
 
 Stage 1 la mode Zend rieng cho generated WordPress flow. Muc tieu la lay parameter fuzzing tu bang chung Zend runtime, khong lay tu static regex/source scan.

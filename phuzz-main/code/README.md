@@ -1,6 +1,8 @@
 PHUZZ
 ========================
 
+The supported WordPress workflow is now **online-linked**. Run `pwsh -File .\phuzz.ps1 -PluginSlug <local-plugin-slug>` from this directory; Zend discovery is enabled automatically. Use `-DryRun` to inspect settings. The old `default`, `seed-config`, `generated`, `zend` and `online` modes have been removed. See the [online-linked guide](docs/guides/online-linked-flow.md). The component descriptions below also document the underlying PHUZZ libraries and tools.
+
 ![PHUZZ overview](../doc/phuzz-overview.png)
 
 ## Requirements

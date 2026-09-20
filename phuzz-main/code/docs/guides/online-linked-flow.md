@@ -98,7 +98,7 @@ Dedupe dùng parent/callback/context, source/location và toàn bộ input reque
 
 ### Batch artifact reader và evidence gate
 
-`online_linked_evidence.read_runtime_batch()` đọc request/Zend theo một lần `docker compose exec -T web php -r`; PHP trả đúng một envelope `pairs` + `stats`. Reader chỉ nhận JSON object hợp lệ, giữ nguyên kiểu scalar/object/list, kiểm tra `request_id`, tên file, `run_id`/`legacy_run_id` và `target_plugin`; lỗi transport, timeout hoặc payload hỏng đều fail closed. File `.json.tmp.*` không được coi là artifact cuối. Payload được chuyển dưới dạng JSON gốc trong envelope rồi decode bằng Python, tránh mất độ chính xác số nguyên lớn khi PHP encode lại.
+`online_linked.evidence.read_runtime_batch()` đọc request/Zend theo một lần `docker compose exec -T web php -r`; PHP trả đúng một envelope `pairs` + `stats`. Reader chỉ nhận JSON object hợp lệ, giữ nguyên kiểu scalar/object/list, kiểm tra `request_id`, tên file, `run_id`/`legacy_run_id` và `target_plugin`; lỗi transport, timeout hoặc payload hỏng đều fail closed. File `.json.tmp.*` không được coi là artifact cuối. Payload được chuyển dưới dạng JSON gốc trong envelope rồi decode bằng Python, tránh mất độ chính xác số nguyên lớn khi PHP encode lại.
 
 Coordinator dùng reader này cho polling worker; production path không còn list/load từng file. `state.json` ghi `evidence_scan` gồm số file, số cặp, missing Zend, invalid payload, thời gian transport và ngân sách còn lại. Cặp chưa có Zend chỉ là `RETRY`; chỉ cặp correlate đầy đủ mới được đánh dấu seen và chuyển vào admission.
 
@@ -150,10 +150,31 @@ Fresh Docker gate sau rebuild extension ghi đủ `data`, `helper`, `direct`, `n
 
 ## 4. Cách chạy và ngân sách
 
+Từ 2026-09-21, `online-linked` là workflow duy nhất và là mặc định. Các mode
+`default`, `seed-config`, `generated`, `zend`, `online` đã bị bỏ. Không còn menu
+chọn mode; gọi không tham số vẫn chọn plugin tương tác. Khi có `-PluginSlug`
+hoặc `-DryRun`, lệnh không hỏi tương tác. Zend luôn bật; `-UseZendDiscovery`
+và `-NoFollowLogs` vẫn được nhận để các lệnh linked cũ tiếp tục chạy.
+Các tùy chọn `-UseEntrypointPipeline`, `-GeneratedConfigTimeoutSeconds`,
+`-ZendMaxIterations`, `-KeepDebugArtifacts` và setting `ZEND_MAX_ITERATIONS`
+đã được bỏ vì chỉ phục vụ mode cũ.
+
+Từ 2026-09-20, mã riêng của mode nằm trong package `fuzzer/online_linked/`.
+Lệnh `phuzz.ps1 -Mode online-linked` vẫn giữ nguyên; wrapper gọi
+`scripts/wordpress/invoke-online-linked.ps1`, rồi `python -m online_linked`.
+Launcher giữ thư mục làm việc ở `phuzz-main/code` để Docker Compose phân giải
+đúng đường dẫn, và chỉ thêm import path cho tiến trình này. Probe trong worker
+chạy bằng `python -m online_linked.probe_sender` từ `/app`.
+
+Phần chọn config ban đầu, hash và ghi artifact dùng chung nằm trong
+`hook_energy/seed_generation/online_common.py`. Package linked không khởi tạo
+coordinator của mode `online` cũ. Zend, CmpLog, convergence, Pass 2 và request/auth
+vẫn là các dịch vụ dùng chung; định dạng config/state và thư mục đầu ra không đổi.
+
 Từ `phuzz-main/code`, cần có Docker, `wp-cli.phar`, ZIP plugin và bootstrap config tương ứng. Ví dụ cho plugin đã có sẵn cục bộ:
 
 ```powershell
-rtk proxy powershell -NoProfile -File .\phuzz.ps1 -Mode online-linked -PluginSlug nmedia-user-file-uploader -UseZendDiscovery -OnlineTimeoutSeconds 60 -OnlineMaxVersions 3 -NoFollowLogs
+rtk proxy pwsh -NoProfile -File .\phuzz.ps1 -PluginSlug nmedia-user-file-uploader -OnlineTimeoutSeconds 60 -OnlineMaxVersions 3
 ```
 
 Đây là lệnh chạy, không phải tuyên bố plugin đã PASS trên checkout hiện tại. Nếu tên plugin/config khác, thay bằng slug đã kiểm tra trên máy.
@@ -266,10 +287,10 @@ Ba điều chỉnh sau review:
 
 | Việc cần lần theo | File / hàm |
 | --- | --- |
-| Ghép input và chỉ công bố child sau trial | [online_linked_coordinator.py](../../fuzzer/hook_energy/seed_generation/online_linked_coordinator.py): `_handle_convergence_result` |
+| Ghép input và chỉ công bố child sau trial | [coordinator.py](../../fuzzer/online_linked/coordinator.py): `_handle_convergence_result` |
 | Queue, deadline, sender, ghi artifact và xác minh trial | Cùng file: `_verify_replay_input_trials`, `_trial_identity_complete`, `_trial_parameter_verified` |
-| Chọn điều chỉnh một field từ evidence, không IO | [online_linked_replay_inputs.py](../../fuzzer/hook_energy/seed_generation/online_linked_replay_inputs.py): `propose_replay_inputs` |
-| Handoff và gate cuối giữ nguyên vai trò | Coordinator: `handoff_to_next_worker`; [online_linked_export.py](../../fuzzer/hook_energy/seed_generation/online_linked_export.py): `_verified_config` |
+| Chọn điều chỉnh một field từ evidence, không IO | [replay_inputs.py](../../fuzzer/online_linked/replay_inputs.py): `propose_replay_inputs` |
+| Handoff và gate cuối giữ nguyên vai trò | Coordinator: `handoff_to_next_worker`; [export.py](../../fuzzer/online_linked/export.py): `_verified_config` |
 | Regression queue/HTTP/correlation và vòng đời child | [test_online_linked_coordinator.py](../../fuzzer/tests/test_online_linked_coordinator.py) |
 | Regression lọc hint và xung đột REQUEST | [test_online_linked_replay_inputs.py](../../fuzzer/tests/test_online_linked_replay_inputs.py) |
 
@@ -306,9 +327,12 @@ Nếu ghi lỗi giữa chừng, thư mục có thể chứa một phần config;
 | --- | --- |
 | Chọn mode | [phuzz.ps1](../../phuzz.ps1) |
 | Docker, bootstrap, export seed/registry | [run-wordpress-phuzz.ps1](../../scripts/wordpress/run-wordpress-phuzz.ps1) |
-| Vòng phiên bản, handoff, deadline, state | [online_linked_coordinator.py](../../fuzzer/hook_energy/seed_generation/online_linked_coordinator.py) |
-| Batch request/Zend evidence reader | [online_linked_evidence.py](../../fuzzer/hook_energy/seed_generation/online_linked_evidence.py) |
-| Coordinator online cũ, kiểm tra cấu trúc v0 | [online_config_runner.py](../../fuzzer/hook_energy/seed_generation/online_config_runner.py) |
+| Launcher riêng của linked | [invoke-online-linked.ps1](../../scripts/wordpress/invoke-online-linked.ps1) |
+| Vòng phiên bản, handoff, deadline, state | [coordinator.py](../../fuzzer/online_linked/coordinator.py) |
+| Batch request/Zend evidence reader | [evidence.py](../../fuzzer/online_linked/evidence.py) |
+| Probe, replay-input, final export | [probe_sender.py](../../fuzzer/online_linked/probe_sender.py), [replay_inputs.py](../../fuzzer/online_linked/replay_inputs.py), [export.py](../../fuzzer/online_linked/export.py) |
+| Chọn v0, kiểm tra config, hash và artifact helpers dùng chung | [online_common.py](../../fuzzer/hook_energy/seed_generation/online_common.py) |
+| Coordinator online cũ | [online_config_runner.py](../../fuzzer/hook_energy/seed_generation/online_config_runner.py) |
 | Convergence và Pass 2 | [bridge_cli.py](../../fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py) |
 | Materialization và exporter | [convergence.py](../../fuzzer/seed_generation/convergence/convergence.py), [config_exporter.py](../../fuzzer/seed_generation/config/config_exporter.py) |
 | Root fetch provenance và raw events | [hookphuzz_opcode.c](../../fuzzer/zend_discovery/extension/hookphuzz_opcode.c), [direct-argument fixture](../../fuzzer/tests/fixtures/hookphuzz-direct-argument-fixture.php) |

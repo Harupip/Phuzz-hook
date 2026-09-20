@@ -18,10 +18,45 @@ from hook_energy.seed_generation.generated_config_runner import (
 )
 from seed_generation.verification.seed_validator import evaluate_artifact_payloads
 try:
-    from fuzzer import prepare_request_from_config
+    from fuzzer import _prepare_request
 except ImportError:
-    from fuzzer.fuzzer import prepare_request_from_config
+    from fuzzer.fuzzer import _prepare_request
 
+
+def _config_request_params(config):
+    params = {bucket: {} for bucket in ('headers', 'cookies', 'query_params', 'body_params')}
+    for bucket in params:
+        section = config.get(bucket) or {}
+        if not isinstance(section, dict):
+            raise ValueError(f'Config parsing error: invalid {bucket}')
+        for item in section.get('data', []):
+            if not isinstance(item, dict) or not item.get('name'):
+                raise ValueError(f'Config parsing error: invalid {bucket} data')
+            if 'value' in item:
+                value = item['value']
+            elif item.get('seeds'):
+                value = item['seeds'][0]
+            else:
+                raise ValueError(f"Neither seeds nor value for param {item['name']}")
+            params[bucket][item['name']] = value
+    return params
+
+
+def prepare_request_from_config(config, *, request_id, run_id):
+    params = _config_request_params(config)
+    metadata = config.get('metadata') or {}
+    methods = config.get('methods') or []
+    http_method = str(metadata.get('resolved_method') or (methods[0] if methods else '')).upper()
+    return _prepare_request(
+        config,
+        base_url=config['target'],
+        http_method=http_method,
+        fuzz_params={bucket: {} for bucket in params},
+        fixed_params=params,
+        request_id=str(request_id),
+        run_id=str(run_id),
+        force_run_id=True,
+    )
 
 class ParentInspectionTimeout(RuntimeError):
     """Parent status could not be inspected within the sender deadline."""
@@ -53,7 +88,7 @@ def run_in_container(
         "docker", "exec",
         "-e", f"HOOKPHUZZ_LEGACY_RUN_ID={run_id}",
         container_name,
-        "python", "/app/fuzzer.py", "--online-linked-probe",
+        "python", "-m", "online_linked.probe_sender",
         "--config-path", f"/app/configs/{config_path.as_posix()}.json",
         "--request-id", str(request_id),
         "--run-id", str(run_id),

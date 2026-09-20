@@ -14,10 +14,6 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-FUZZER_DIR = Path(__file__).resolve().parents[2]
-if str(FUZZER_DIR) not in sys.path:
-    sys.path.insert(0, str(FUZZER_DIR))
-
 from hook_energy.seed_generation.generated_config_runner import (
     STOP_ON_VULN_EXIT_CODE,
     list_request_artifacts,
@@ -26,22 +22,22 @@ from hook_energy.seed_generation.generated_config_runner import (
     load_request_artifact,
     run_generated_configs,
 )
-from hook_energy.seed_generation.probe_sender import (
+from online_linked.probe_sender import (
     ParentInspectionError,
     ParentInspectionTimeout,
     run_in_container,
 )
-from hook_energy.seed_generation.online_config_runner import (
-    OnlineCoordinator,
+from hook_energy.seed_generation.online_common import (
+    select_v0,
     _load_zend_artifact,
     _write_exclusive_json,
     _write_json,
     config_hash,
     validate_v0_config,
 )
-from hook_energy.seed_generation.online_linked_evidence import RuntimeBatchTimeout, read_runtime_batch
-from hook_energy.seed_generation.online_linked_export import export_online_linked_batch
-from hook_energy.seed_generation.online_linked_replay_inputs import propose_replay_inputs
+from online_linked.evidence import RuntimeBatchTimeout, read_runtime_batch
+from online_linked.export import export_online_linked_batch
+from online_linked.replay_inputs import propose_replay_inputs
 from hook_energy.seed_generation.zend_runtime.bridge_cli import (
     converge_iteration,
     list_convergence_targets,
@@ -2956,17 +2952,7 @@ class OnlineLinkedCoordinator:
         if selected is None:
             if self.bootstrap_config is None or not self.bootstrap_config.is_file():
                 return None
-            legacy_selector = OnlineCoordinator(
-                suggested_seeds=self.suggested_seeds,
-                bootstrap_config=self.bootstrap_config,
-                config_root=self.config_root,
-                output_root=self.output_root,
-                plugin_slug=self.plugin_slug,
-                legacy_run_id=f"{self.legacy_run_id}-v0",
-                max_seconds=self.max_seconds,
-                max_versions=self.max_versions,
-            )
-            selected = legacy_selector._select_v0()
+            selected = select_v0(self.suggested_seeds, self.bootstrap_config)
             if selected is None:
                 return None
         self._targets = self.list_targets_fn(

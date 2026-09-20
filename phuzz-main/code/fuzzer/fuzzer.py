@@ -114,41 +114,6 @@ def _prepare_request(
     return req.prepare()
 
 
-def _config_request_params(config):
-    params = {bucket: {} for bucket in ('headers', 'cookies', 'query_params', 'body_params')}
-    for bucket in params:
-        section = config.get(bucket) or {}
-        if not isinstance(section, dict):
-            raise ValueError(f'Config parsing error: invalid {bucket}')
-        for item in section.get('data', []):
-            if not isinstance(item, dict) or not item.get('name'):
-                raise ValueError(f'Config parsing error: invalid {bucket} data')
-            if 'value' in item:
-                value = item['value']
-            elif item.get('seeds'):
-                value = item['seeds'][0]
-            else:
-                raise ValueError(f"Neither seeds nor value for param {item['name']}")
-            params[bucket][item['name']] = value
-    return params
-
-
-def prepare_request_from_config(config, *, request_id, run_id):
-    params = _config_request_params(config)
-    metadata = config.get('metadata') or {}
-    methods = config.get('methods') or []
-    http_method = str(metadata.get('resolved_method') or (methods[0] if methods else '')).upper()
-    return _prepare_request(
-        config,
-        base_url=config['target'],
-        http_method=http_method,
-        fuzz_params={bucket: {} for bucket in params},
-        fixed_params=params,
-        request_id=str(request_id),
-        run_id=str(run_id),
-        force_run_id=True,
-    )
-
 class Fuzzer:
     def __init__(self, fuzzer_id, config_only=False):
 
@@ -1051,11 +1016,6 @@ class Fuzzer:
 
 if __name__ == "__main__":
     #time.sleep(10)
-
-    if "--online-linked-probe" in sys.argv:
-        from hook_energy.seed_generation.probe_sender import main as probe_main
-        probe_index = sys.argv.index("--online-linked-probe")
-        raise SystemExit(probe_main(sys.argv[probe_index + 1:]))
 
     if "FUZZER_SEED" in os.environ:
         random_seed = int(os.environ["FUZZER_SEED"])
