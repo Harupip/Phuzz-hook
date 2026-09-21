@@ -65,6 +65,19 @@ function Invoke-Compose {
     }
 }
 
+function Reset-ZendRuntimeArtifacts {
+    param([string[]]$ComposeArgs)
+
+    $resetCommand = @"
+set -eu
+rm -rf -- /shared-tmpfs/hook-coverage /shared-tmpfs/fuzzer-findings /shared/opcode-events /shared/hookphuzz-callback-registry.json
+mkdir -p /shared-tmpfs/hook-coverage/requests /shared-tmpfs/fuzzer-findings /shared/opcode-events
+chown -R www-data:www-data /shared-tmpfs/hook-coverage /shared-tmpfs/fuzzer-findings /shared/opcode-events
+"@
+    Write-Host "Resetting Zend runtime artifacts for this campaign"
+    Invoke-Compose -ComposeArgs $ComposeArgs -AdditionalArgs @("exec", "-T", "web", "sh", "-lc", $resetCommand)
+}
+
 function New-PluginOverrideFile {
     param(
         [string]$PluginSlug,
@@ -703,6 +716,10 @@ try {
 
     Write-Host "Waiting for WordPress to answer with HTTP 200"
     Wait-ForWebReady -Url $webUrl -TimeoutSeconds $WebTimeoutSeconds
+
+    if ($UseZendDiscovery) {
+        Reset-ZendRuntimeArtifacts -ComposeArgs $composeArgs
+    }
 
     Write-Host "Starting fuzzer container"
     Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("up", "-d", $fuzzerService, "--build")

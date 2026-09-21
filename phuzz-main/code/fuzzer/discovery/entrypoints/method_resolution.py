@@ -79,18 +79,22 @@ def resolve_http_methods(
             evidence={"parameter_sources": sources, "source_exact_methods": exact_methods, "observed_request_method": observed_method},
         )]
 
-    if exact_methods:
+    source_methods = list(exact_methods)
+    if "REQUEST" in sources and "GET" not in source_methods and not observed:
+        source_methods.insert(0, "GET")
+
+    if source_methods:
         evidence = {"parameter_sources": sources, "source_exact_methods": exact_methods}
         return [
             _resolved_decision(
                 method,
-                candidates=exact_methods,
-                confidence="source_exact",
+                candidates=source_methods,
+                confidence="source_exact" if method in exact_methods else "default_get",
                 evidence=evidence,
                 observed_method=observed_method,
                 route_methods=[],
             )
-            for method in exact_methods
+            for method in source_methods
         ]
 
     if observed:

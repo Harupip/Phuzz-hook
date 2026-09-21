@@ -59,9 +59,9 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
         seed_item = seed_report["suggested_seeds"][0]
         self.assertEqual(row["source_resolution"]["status"], "zip_mapped")
         self.assertEqual(seed_item["source_resolution"]["status"], "zip_mapped")
-        self.assertIsNone(seed_item["seed"]["method"])
-        self.assertEqual(seed_item["seed"]["method_confidence"], "ambiguous")
-        self.assertEqual(seed_item["seed"]["unresolved_params"]["item_id"], "FUZZ")
+        self.assertEqual(seed_item["seed"]["method"], "GET")
+        self.assertEqual(seed_item["seed"]["method_confidence"], "default_get")
+        self.assertEqual(seed_item["seed"]["query_params"]["item_id"], "FUZZ")
 
     def test_wp_ajax_seed_keeps_action_fixed_and_adds_extracted_fuzzable_params(self) -> None:
         payload = {
@@ -108,7 +108,7 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
         self.assertEqual(public["seed_priority"], "highest")
         self.assertEqual(auth["seed_priority"], "high")
         self.assertEqual(public["seed"]["body"]["action"], "example_lookup")
-        self.assertEqual(public["seed"]["body"]["orderby"], "FUZZ")
+        self.assertEqual(public["seed"]["query_params"]["orderby"], "FUZZ")
         self.assertEqual(public["seed"]["body"]["sid"], "FUZZ")
         self.assertEqual(public["seed"]["query_params"]["cnt"], "FUZZ")
         self.assertEqual(public["seed"]["fixed_params"], ["action"])
@@ -147,7 +147,7 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
         self.assertNotIn("avatar", seed["body"])
         self.assertNotIn("avatar", seed["fuzzable_params"])
 
-    def test_request_params_follow_request_method_default(self) -> None:
+    def test_request_params_use_query_for_get_and_post(self) -> None:
         generator = LiveHookSeedGenerator()
 
         post_seed = generator._attach_fuzzable_params(
@@ -169,8 +169,8 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
             [{"name": "token", "source": "REQUEST"}],
         )
 
-        self.assertEqual(post_seed["body"]["token"], "FUZZ")
-        self.assertNotIn("token", post_seed["query_params"])
+        self.assertEqual(post_seed["query_params"]["token"], "FUZZ")
+        self.assertNotIn("token", post_seed["body"])
         self.assertEqual(get_seed["query_params"]["token"], "FUZZ")
         self.assertNotIn("token", get_seed["body"])
 

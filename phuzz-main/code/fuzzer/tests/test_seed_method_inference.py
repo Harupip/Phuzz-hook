@@ -17,7 +17,7 @@ if str(FUZZER_DIR) not in sys.path:
 
 from core.candidate import Candidate
 from discovery.entrypoints.method_resolution import normalize_http_methods, resolve_http_methods
-from seed_generation.config.config_exporter import SeedConfigSkip, build_config_for_seed_item
+from seed_generation.config.config_exporter import build_config_for_seed_item
 from seed_generation.source_assisted.static_generator import StaticSeedGenerator as LiveHookSeedGenerator
 from seed_generation.skeleton.importer import HookSeedImporter
 from seed_generation.verification.seed_validator import build_validation_request
@@ -69,6 +69,42 @@ def fixture_payload() -> dict:
 
 
 class MethodInferenceTests(unittest.TestCase):
+    def test_mixed_sources_export_separate_get_and_post_configs(self) -> None:
+        generator = LiveHookSeedGenerator()
+        for query_source in ("GET", "REQUEST"):
+            with self.subTest(query_source=query_source):
+                seeds, _ = generator._generate_seed_templates(
+                    "wp_ajax_demo", True, "uncovered",
+                    [{"source": query_source, "name": "q"},
+                     {"source": "POST", "name": "payload"}],
+                )
+                self.assertEqual([seed["method"] for seed in seeds], ["GET", "POST"])
+                configs = [build_config_for_seed_item({
+                    "hook_name": "wp_ajax_demo", "callback_id": "mixed", "seed": seed,
+                }) for seed in seeds]
+                self.assertNotEqual(configs[0][0], configs[1][0])
+                for (_, config), method in zip(configs, ("GET", "POST")):
+                    self.assertEqual(config["methods"], [method])
+                    self.assertIn("q", config["query_params"]["fuzz"])
+                    if method == "GET":
+                        self.assertNotIn("body_params", config)
+                    else:
+                        self.assertIn("payload", config["body_params"]["fuzz"])
+
+    def test_post_superglobal_is_not_placed_in_non_post_route_body(self) -> None:
+        for method in ("GET", "PUT", "PATCH", "DELETE"):
+            seeds, _ = LiveHookSeedGenerator()._generate_seed_templates(
+                "rest_route:fixture/v1/demo", True, "uncovered",
+                [{"source": "POST", "name": "payload"},
+                 {"source": "REQUEST", "name": "q"}],
+                {"entrypoint_type": "rest_route", "namespace": "fixture/v1",
+                 "route": "/demo", "methods": [method]},
+            )
+            self.assertEqual(seeds[0]["method"], method)
+            self.assertNotIn("payload", seeds[0]["body"])
+            self.assertNotIn("payload", seeds[0]["fuzzable_params"])
+            self.assertEqual(seeds[0]["query_params"]["q"], "FUZZ")
+
     def setUp(self) -> None:
         self.gap, self.report = LiveHookSeedGenerator().build_reports(fixture_payload())
         self.rows = self.report["suggested_seeds"]
@@ -82,14 +118,15 @@ class MethodInferenceTests(unittest.TestCase):
 
         self.assertEqual(
             methods,
-            {"GET": 4, "POST": 4, "PUT": 1, "PATCH": 1, "DELETE": 1, "OPTIONS": 1, None: 2},
+            {"GET": 5, "POST": 4, "PUT": 1, "PATCH": 1, "DELETE": 1, "OPTIONS": 1, None: 1},
         )
         self.assertEqual(
             sources,
             {
                 "route_declared": 8,
                 "source_exact": 4,
-                "ambiguous": 2,
+                "default_get": 1,
+                "ambiguous": 1,
             },
         )
         self.assertEqual(self.report["schema_version"], "hook-seed-suggestions-v2")
@@ -103,10 +140,10 @@ class MethodInferenceTests(unittest.TestCase):
 
         self.assertEqual(get_seed["query_params"], {"action": "fixture_get", "id": "FUZZ"})
         self.assertEqual(post_seed["body"], {"action": "fixture_post", "id": "FUZZ"})
-        self.assertIsNone(request["method"])
-        self.assertEqual(request["candidate_methods"], [])
-        self.assertEqual(request["method_confidence"], "ambiguous")
-        self.assertEqual(request["unresolved_params"]["id"], "FUZZ")
+        self.assertEqual(request["method"], "GET")
+        self.assertEqual(request["candidate_methods"], ["GET"])
+        self.assertEqual(request["method_confidence"], "default_get")
+        self.assertEqual(request["query_params"]["id"], "FUZZ")
         self.assertEqual(mixed["GET"]["query_params"]["a"], "FUZZ")
         self.assertEqual(mixed["POST"]["body"]["b"], "FUZZ")
         self.assertEqual(cookie["cookies"], {"session": "FUZZ"})
@@ -161,8 +198,8 @@ class MethodInferenceTests(unittest.TestCase):
             LiveHookSeedGenerator().write_artifacts(fixture_payload(), Path(tmp_dir))
             report = json.loads((Path(tmp_dir) / "method_inference_report.json").read_text())
         self.assertEqual(report["total_seeds"], 14)
-        self.assertEqual(report["fallback"], 0)
-        self.assertEqual(report["unresolved"], 2)
+        self.assertEqual(report["fallback"], 1)
+        self.assertEqual(report["unresolved"], 1)
         self.assertEqual(report["expanded_variants"], 2)
 
     def test_importer_prefers_v2_suggestions_and_reads_v1_without_provenance(self) -> None:
@@ -180,13 +217,13 @@ class MethodInferenceTests(unittest.TestCase):
             imported = importer.import_from_handoff()
             self.assertEqual(
                 len(imported.authenticated_queue) + len(imported.unauthenticated_queue),
-                12,
+                13,
             )
             self.assertIn("source_exact", {
                 item.method_source
                 for item in imported.authenticated_queue + imported.unauthenticated_queue
             })
-            self.assertEqual(len(imported.manual_analysis_queue), 2)
+            self.assertEqual(len(imported.manual_analysis_queue), 1)
 
             legacy = self.gap["callbacks"][0]
             legacy["seed"].pop("method_source", None)
@@ -233,13 +270,15 @@ class MethodInferenceTests(unittest.TestCase):
             self.assertEqual(decision["resolved_method"], method)
             self.assertEqual(decision["method_confidence"], "runtime_observed")
 
-    def test_request_without_runtime_evidence_is_ambiguous_and_not_exportable(self) -> None:
+    def test_request_without_runtime_evidence_defaults_to_exportable_get(self) -> None:
         item = next(row for row in self.rows if row["callback_id"] == "request-only")
         decision = item["seed"]
-        self.assertIsNone(decision["resolved_method"])
-        self.assertEqual(decision["candidate_methods"], [])
-        with self.assertRaisesRegex(SeedConfigSkip, "ambiguous_http_method"):
-            build_config_for_seed_item(item)
+        self.assertEqual(decision["resolved_method"], "GET")
+        self.assertEqual(decision["candidate_methods"], ["GET"])
+        _, config = build_config_for_seed_item(item)
+        self.assertEqual(config["methods"], ["GET"])
+        self.assertIn("id", config["query_params"]["fuzz"])
+        self.assertNotIn("body_params", config)
 
     def test_runtime_evidence_must_match_expected_request_and_plugin(self) -> None:
         expected = {
@@ -255,12 +294,14 @@ class MethodInferenceTests(unittest.TestCase):
             runtime_observation=observed,
             expected_callback=expected,
         )[0]
-        self.assertEqual(decision["method_confidence"], "ambiguous")
+        self.assertEqual(decision["method_confidence"], "default_get")
+        self.assertIsNone(decision["observed_request_method"])
 
     def test_ajax_prefix_alone_does_not_force_post(self) -> None:
         decision = LiveHookSeedGenerator()._method_decisions("wp_ajax_demo", {}, [])[0]
         self.assertIsNone(decision["method"])
         self.assertEqual(decision["method_confidence"], "ambiguous")
+        self.assertIsNone(decision["observed_request_method"])
 
     def test_rest_declared_methods_and_constants_are_preserved(self) -> None:
         self.assertEqual(

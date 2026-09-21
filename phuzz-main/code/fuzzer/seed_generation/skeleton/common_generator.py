@@ -395,7 +395,9 @@ class SeedGeneratorBase:
             if source == "REQUEST" and method_status != "resolved":
                 seed.setdefault("unresolved_params", {})[name] = "FUZZ"
                 continue
-            if source == "GET" or (source == "REQUEST" and request_method == "GET"):
+            if source == "POST" and request_method != "POST":
+                continue
+            if source in {"GET", "REQUEST"}:
                 target = seed["query_params"]
             elif source == "COOKIE":
                 target = seed["cookies"]
@@ -432,6 +434,7 @@ class SeedGeneratorBase:
                 "route_declared",
                 "runtime_observed",
                 "source_exact",
+                "default_get",
                 "ambiguous",
                 "legacy_artifact",
             )
@@ -440,7 +443,7 @@ class SeedGeneratorBase:
             "total_seeds": len(rows),
             "methods": method_counts,
             "method_sources": source_counts,
-            "fallback": 0,
+            "fallback": sources.get("default_get", 0),
             "unresolved": sources.get("ambiguous", 0),
             "expanded_variants": sum(1 for count in grouped.values() if count > 1),
             "representative_seeds": [

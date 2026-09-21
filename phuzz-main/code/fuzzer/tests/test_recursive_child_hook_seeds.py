@@ -61,6 +61,24 @@ def coverage(*callbacks):
 
 
 class RecursiveChildHookSeedTests(unittest.TestCase):
+    def test_mixed_child_exports_distinct_method_variants(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source = Path(tmp_dir) / "child.php"
+            source.write_text("<?php\nfunction child_callback() {\n"
+                              "return [$_GET['q'], $_REQUEST['r'], $_POST['p']];\n}\n")
+            report = build_recursive_seed_report([coverage(child(
+                source_file=str(source), start_line=2, end_line=4,
+                _executed_callback=None,
+            ))])
+        seeds = [item["seed"] for item in report["suggested_seeds"]]
+        self.assertEqual([seed["method"] for seed in seeds], ["GET", "POST"])
+        self.assertEqual(seeds[0]["body"], {})
+        self.assertEqual(seeds[1]["body"]["p"], "FUZZ")
+        for seed in seeds:
+            self.assertEqual(seed["query_params"]["q"], "FUZZ")
+            self.assertEqual(seed["query_params"]["r"], "FUZZ")
+            self.assertNotIn("methods", seed)
+
     def test_level_one_child_generates_seed_with_provenance(self):
         report = build_recursive_seed_report([coverage(child())])
 
