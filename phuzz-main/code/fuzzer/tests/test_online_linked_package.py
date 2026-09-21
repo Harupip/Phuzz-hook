@@ -70,7 +70,7 @@ Write-Output ('RESULT=' + ($global:captured | ConvertTo-Json -Compress -Depth 5)
                     payload = json.loads(next(line[7:] for line in result.stdout.splitlines() if line.startswith('RESULT=')))
                     self.assertEqual(payload['python'][:2], ['-m', 'online_linked'])
                     self.assertEqual(list(map(str, payload['stop'][-4:])), ['stop', '--timeout', '30', 'fuzzer-test'])
-                    self.assertEqual(payload['cwd'], str(root))
+                    self.assertTrue(Path(payload['cwd']).samefile(root))
                     self.assertIn(str(root / 'fuzzer'), payload['pythonpath'])
                     self.assertEqual(payload['compose'], 'docker-compose.yml;' + str(root / 'override.yml'))
                     for flag, value in [('--max-seconds', '17'), ('--max-versions', '3'),

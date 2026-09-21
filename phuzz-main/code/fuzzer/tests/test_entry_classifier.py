@@ -263,7 +263,7 @@ class EntryClassifierTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     sys.executable,
-                    str(FUZZER_DIR / "hook_energy" / "entry_classifier.py"),
+                    str(FUZZER_DIR / "discovery" / "entrypoints" / "classifier.py"),
                     "--input-file",
                     str(input_file),
                     "--output-dir",

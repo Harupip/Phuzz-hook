@@ -9,7 +9,6 @@ if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
 from core.utils import get_file_path as canonical_get_file_path
-from utils import get_file_path as legacy_get_file_path
 
 
 class CoreModulePathTests(unittest.TestCase):
@@ -17,7 +16,6 @@ class CoreModulePathTests(unittest.TestCase):
         expected = f"{os.path.realpath(FUZZER_DIR)}/resources"
 
         self.assertEqual(canonical_get_file_path("/resources"), expected)
-        self.assertEqual(legacy_get_file_path("/resources"), expected)
 
 
 if __name__ == "__main__":

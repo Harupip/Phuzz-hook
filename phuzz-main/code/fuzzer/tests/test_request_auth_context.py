@@ -41,7 +41,7 @@ $GLOBALS['__uopz_request'] = [];
         module_root = Path(__file__).resolve().parents[1]
         if str(module_root) not in sys.path:
             sys.path.insert(0, str(module_root))
-        fuzzer_module = importlib.import_module('fuzzer.fuzzer')
+        fuzzer_module = importlib.import_module('fuzzer')
         sender = object.__new__(fuzzer_module.Fuzzer)
         sender.config = {'metadata': {'hook_name': 'wp_ajax_nopriv_demo'}}
         empty = {'query_params': {}, 'body_params': {}, 'cookies': {}, 'headers': {}}

@@ -127,19 +127,19 @@ Run:
 
 ```powershell
 cd C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\phuzz-main\code\fuzzer
-python -m hook_energy.seed_generation.export_cli --coverage-file output\total_coverage.json --output-dir output\seed_generation
+python -m cli.export_seeds --coverage-file output\total_coverage.json --output-dir output\seed_generation
 ```
 
 Direct script mode also works:
 
 ```powershell
-python hook_energy\seed_generation\export_cli.py --coverage-file output\total_coverage.json --output-dir output\seed_generation
+python cli\export_seeds.py --coverage-file output\total_coverage.json --output-dir output\seed_generation
 ```
 
 Convert unauth-capable and authenticated seed suggestions into PHUZZ config JSON:
 
 ```powershell
-python hook_energy\seed_generation\seed_to_config_cli.py --suggested-seeds output\seed_generation\suggested_seeds.json --output-config-dir configs\generated-config\<plugin> --summary output\seed_generation\generated_config_summary.json
+python -m cli.seed_to_config --suggested-seeds output\seed_generation\suggested_seeds.json --output-config-dir configs\generated-config\<plugin> --summary output\seed_generation\generated_config_summary.json
 ```
 
 Generated configs can be run later with `FUZZER_CONFIG=generated-config/<plugin>/<config-slug>`. Authenticated configs rely on the existing WordPress UOPZ overrides for login, capability, and nonce checks. The converter does not perform login automation or start fuzzing the generated configs.
@@ -459,8 +459,10 @@ This validation proves that a generated entrypoint candidate can be replayed and
 
 Run against one candidate from `entrypoint_candidates.json`:
 
+Run from `phuzz-main/code/fuzzer` (the fuzzer root):
+
 ```powershell
-python hook_energy\seed_validator.py `
+python -m seed_generation.verification.seed_validator `
   --base-url http://localhost:8080 `
   --candidate-file output\entry_classifier\entrypoint_candidates.json `
   --candidate-id cb-public `

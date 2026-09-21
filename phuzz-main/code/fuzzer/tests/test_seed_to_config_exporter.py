@@ -19,7 +19,7 @@ from seed_generation.config.config_exporter import (
     export_seed_configs,
     _force_replay_only,
 )
-from hook_energy.seed_generation.zend_runtime.bridge import merge_enriched_seeds
+from seed_generation.convergence.convergence import merge_enriched_seeds
 from zend_discovery.engine import canonical_identity, canonical_identity_id, candidate_from_seed_item
 
 
@@ -848,7 +848,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     sys.executable,
-                    str(FUZZER_DIR / "hook_energy" / "seed_generation" / "seed_to_config_cli.py"),
+                    str(FUZZER_DIR / "cli" / "seed_to_config.py"),
                     "--suggested-seeds",
                     str(suggested),
                     "--output-config-dir",

@@ -237,7 +237,7 @@ class SeedValidatorTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     sys.executable,
-                    str(FUZZER_DIR / "hook_energy" / "seed_validator.py"),
+                    str(FUZZER_DIR / "seed_generation" / "verification" / "seed_validator.py"),
                     "--base-url",
                     "http://web",
                     "--candidate-file",

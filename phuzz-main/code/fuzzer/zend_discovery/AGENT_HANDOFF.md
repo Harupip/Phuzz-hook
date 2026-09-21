@@ -387,9 +387,7 @@ Implemented pieces:
 - `convergence.py`: Phase 2 known-parameter identity, seed materialization, and merge logic.
 - `extension/`: Zend-owned PHP extension source used by `web/Dockerfile.zend`.
 
-Legacy bridge state:
-
-- `seed_generation/convergence/compat.py` is the Zend convergence compatibility bridge; `hook_energy/seed_generation/zend_runtime/bridge.py` preserves the legacy import path.
+Convergence callers use `seed_generation/convergence/convergence.py` directly; the former compatibility bridge files are removed by the current cleanup.
 - `hook_energy/seed_generation/zend_runtime/bridge_cli.py` owns Zend CLI orchestration.
 - `scripts/wordpress/run-wordpress-phuzz.ps1` still owns Docker lifecycle, Pass 1/Pass 2 replay, config export, and artifact collection.
 

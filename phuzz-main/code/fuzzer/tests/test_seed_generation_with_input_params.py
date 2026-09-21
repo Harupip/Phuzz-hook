@@ -415,7 +415,7 @@ class SeedGenerationWithInputParamsTests(unittest.TestCase):
         self.assertEqual(args.source_root, "src/example-plugin")
 
     def test_export_cli_can_run_as_direct_script(self) -> None:
-        script = FUZZER_DIR / "hook_energy" / "seed_generation" / "export_cli.py"
+        script = FUZZER_DIR / "cli" / "export_seeds.py"
         result = subprocess.run(
             [sys.executable, str(script), "--help"],
             cwd=FUZZER_DIR,

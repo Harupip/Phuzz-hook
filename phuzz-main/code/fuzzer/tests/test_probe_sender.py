@@ -394,12 +394,13 @@ class ProbeSenderTests(unittest.TestCase):
                 }), encoding="utf-8")
                 result = probe_sender.send_and_wait(
                     config_path, request_id="redirect-request", run_id="redirect-run",
-                    timeout_seconds=0.2,
+                    # Test redirect handling, not sub-second scheduling on a busy host.
+                    timeout_seconds=2,
                     expected={"hook_name": "wp_ajax_fixture", "callback_id": "cb-fixture",
                               "method": "POST", "auth_context": "guest"},
                     request_dir=root / "requests", zend_dir=root / "zend",
                 )
-                self.assertEqual(result["response_status"], 302)
+                self.assertEqual(result["response_status"], 302, result)
         finally:
             server.shutdown()
             server.server_close()

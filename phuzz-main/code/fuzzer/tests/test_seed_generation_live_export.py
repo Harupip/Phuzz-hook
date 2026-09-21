@@ -221,9 +221,8 @@ class SeedGeneratorTests(unittest.TestCase):
     def test_zend_runtime_generator_is_source_free(self) -> None:
         runtime_source = (
             Path(__file__).resolve().parents[1]
-            / "hook_energy"
             / "seed_generation"
-            / "zend_runtime"
+            / "skeleton"
             / "candidate_generator.py"
         ).read_text(encoding="utf-8")
 

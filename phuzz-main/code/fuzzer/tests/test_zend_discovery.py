@@ -4172,15 +4172,6 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertNotIn("generated_config_runner", engine_source)
         self.assertNotIn("run_discovery", engine_source)
 
-    def test_legacy_zend_bridge_is_only_compatibility_reexports(self) -> None:
-        bridge_source = (FUZZER_DIR / "hook_energy" / "seed_generation" / "zend_runtime" / "bridge.py").read_text(encoding="utf-8")
-        compat_source = (FUZZER_DIR / "seed_generation" / "convergence" / "compat.py").read_text(encoding="utf-8")
-
-        self.assertIn("from seed_generation.convergence.compat import", bridge_source)
-        self.assertIn("from .convergence import", compat_source)
-        self.assertNotIn("def materialize_convergence_seeds", compat_source)
-        self.assertNotIn("REST_JSON", compat_source)
-
     def test_zend_dockerfile_uses_only_zend_owned_extension_source(self) -> None:
         dockerfile = (FUZZER_DIR.parent / "web" / "Dockerfile.zend").read_text(encoding="utf-8")
 

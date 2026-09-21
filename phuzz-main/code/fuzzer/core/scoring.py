@@ -163,7 +163,7 @@ class PhuzzScoringFormula(ScoringFormula):
         hit_counter=0
         debug_enabled = _score_debug_enabled()
         for path in candidate.new_paths:
-            filename, lines = path.split('::::')  #phuzz-main/code/fuzzer/utils.py:50  -  stringify_hit_or_line
+            filename, lines = path.split('::::')  # core/utils.py:51 - stringify_hit_or_line
             underscore_count = lines.count("_")
             hit_counter += underscore_count
             if debug_enabled:
