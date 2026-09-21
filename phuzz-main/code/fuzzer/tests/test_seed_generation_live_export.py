@@ -374,7 +374,7 @@ class SeedGeneratorTests(unittest.TestCase):
 
         seed = next(item["seed"] for item in seed_report["suggested_seeds"] if item["seed"]["method"] == "POST")
         self.assertEqual(seed["body"]["action"], "vx_form_save_api_settings")
-        self.assertEqual(seed["body"]["vx_nonce"], "fuzz")
+        self.assertEqual(seed["query_params"]["vx_nonce"], "fuzz")
         self.assertEqual(seed["body"]["cfx_settings[alert_emails]"], "FUZZ")
         self.assertNotIn("cfx_settings", seed["body"])
         self.assertIn("vx_nonce", seed["fixed_params"])

@@ -25,6 +25,8 @@ REQUESTS_DIR = "/shared-tmpfs/hook-coverage/requests"
 FINDING_ARTIFACT_DIR = "/shared-tmpfs/fuzzer-findings"
 ZEND_ARTIFACTS_DIR = "/shared/opcode-events"
 STOP_ON_VULN_EXIT_CODE = 1337 % 256
+ARTIFACT_READ_ATTEMPTS = 3
+ARTIFACT_RETRY_DELAY_SECONDS = 0.05
 METHOD_PROVENANCE_FIELDS = (
     "resolved_method",
     "candidate_methods",
@@ -71,7 +73,7 @@ def load_generated_configs(path: Path) -> list[dict[str, Any]]:
 
 def list_request_artifacts() -> set[str]:
     result = subprocess.run(
-        ["docker", "compose", "exec", "-T", "web", "sh", "-lc", f"find {REQUESTS_DIR} -maxdepth 1 -type f -printf '%f\\n'"],
+        ["docker", "compose", "exec", "-T", "web", "sh", "-lc", f"find {REQUESTS_DIR} -maxdepth 1 -type f -name '*.json' -printf '%f\\n'"],
         timeout=30,
         check=False,
         capture_output=True,
@@ -79,7 +81,7 @@ def list_request_artifacts() -> set[str]:
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "Could not list hook coverage request artifacts")
-    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    return _stable_artifact_names(result.stdout)
 
 
 def load_request_artifact(name: str) -> Any:
@@ -114,7 +116,7 @@ def load_finding_artifact(name: str) -> Any:
 
 def list_zend_artifacts() -> set[str]:
     result = subprocess.run(
-        ["docker", "compose", "exec", "-T", "web", "sh", "-lc", f"find {ZEND_ARTIFACTS_DIR} -maxdepth 1 -type f -printf '%f\\n'"],
+        ["docker", "compose", "exec", "-T", "web", "sh", "-lc", f"find {ZEND_ARTIFACTS_DIR} -maxdepth 1 -type f -name '*.json' -printf '%f\\n'"],
         timeout=30,
         check=False,
         capture_output=True,
@@ -122,7 +124,30 @@ def list_zend_artifacts() -> set[str]:
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "Could not list Zend opcode artifacts")
-    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    return _stable_artifact_names(result.stdout)
+
+
+def _stable_artifact_names(output: str) -> set[str]:
+    """Keep only finalized JSON artifacts; writers expose temporary files during rename."""
+    return {
+        name
+        for name in (line.strip() for line in output.splitlines())
+        if name and name.endswith(".json") and ".tmp" not in name
+    }
+
+
+def _load_artifact_with_retry(load_artifact: ArtifactLoader, name: str) -> Any:
+    """Tolerate a short read/list race while an artifact is being finalized."""
+    last_error: Exception | None = None
+    for attempt in range(ARTIFACT_READ_ATTEMPTS):
+        try:
+            return load_artifact(name)
+        except (OSError, RuntimeError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+            last_error = exc
+            if attempt + 1 == ARTIFACT_READ_ATTEMPTS:
+                raise
+            time.sleep(ARTIFACT_RETRY_DELAY_SECONDS)
+    raise RuntimeError(f"Could not read artifact: {name}") from last_error
 
 
 def read_correlated_artifact_pair(
@@ -349,7 +374,7 @@ def run_generated_configs(
 
         try:
             new_artifacts = sorted(list_artifacts() - artifacts_before)
-            artifact_payloads = [(name, load_artifact(name)) for name in new_artifacts]
+            artifact_payloads = [(name, _load_artifact_with_retry(load_artifact, name)) for name in new_artifacts]
         except Exception as exc:
             runs.append(_runner_error_row(config, container_name, started_at, str(exc)))
             continue
@@ -560,7 +585,7 @@ def _run_until_callback(
         while True:
             new_artifacts = sorted(list_artifacts() - artifacts_before)
             for name in new_artifacts:
-                payload = load_artifact(name)
+                payload = _load_artifact_with_retry(load_artifact, name)
                 stop_reason = _stop_reason_for_request_artifact(
                     candidate,
                     name,

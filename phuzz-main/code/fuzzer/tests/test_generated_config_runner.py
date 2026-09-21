@@ -366,7 +366,12 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
 
     @patch("hook_energy.seed_generation.generated_config_runner.subprocess.run")
     def test_list_request_artifacts_uses_web_shared_tmpfs(self, run_command):
-        run_command.return_value = subprocess.CompletedProcess([], 0, "b.json\na.json\n", "")
+        run_command.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            "b.json\na.json\n1789917600-request.json.tmp.715a3213\nnotes.txt\n",
+            "",
+        )
 
         self.assertEqual(list_request_artifacts(), {"a.json", "b.json"})
         command = run_command.call_args.args[0]
@@ -376,7 +381,12 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
 
     @patch("hook_energy.seed_generation.generated_config_runner.subprocess.run")
     def test_list_zend_artifacts_uses_web_shared_tmpfs(self, run_command):
-        run_command.return_value = subprocess.CompletedProcess([], 0, "b.json\na.json\n", "")
+        run_command.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            "b.json\na.json\n.1789917600.123.tmp\nnotes.txt\n",
+            "",
+        )
 
         self.assertEqual(list_zend_artifacts(), {"a.json", "b.json"})
         command = run_command.call_args.args[0]
@@ -392,6 +402,38 @@ class GeneratedConfigRunnerTests(unittest.TestCase):
             run_command.call_args.args[0],
             ["docker", "compose", "exec", "-T", "web", "cat", "/shared-tmpfs/hook-coverage/requests/one.json"],
         )
+
+    @patch("hook_energy.seed_generation.generated_config_runner.time.sleep")
+    def test_runner_retries_transient_artifact_read(self, sleep):
+        runner = FakeRunner([completed(0)])
+        artifacts = FakeArtifacts([set(), {"request-one.json"}], {})
+        payload = {
+            "response": {"status_code": 200},
+            "hook_coverage": {
+                "registered_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                "executed_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                "blindspot_callbacks": {},
+            },
+        }
+        attempts = {"count": 0}
+
+        def load_artifact(name):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError(f"artifact not ready: {name}.tmp.123")
+            return payload
+
+        report = run_generated_configs(
+            [generated_config()],
+            timeout_seconds=5,
+            run_command=runner,
+            list_artifacts=artifacts.list,
+            load_artifact=load_artifact,
+        )
+
+        self.assertEqual(report["runs"][0]["validation_status"], "callback_reached")
+        self.assertEqual(attempts["count"], 2)
+        sleep.assert_called_once()
 
     def test_load_generated_configs_preserves_entries_and_order(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -822,6 +864,20 @@ class GeneratedConfigPowerShellContractTests(unittest.TestCase):
         self.assertLess(
             script.index("Invoke-ZendRestRouteBootstrap"),
             script.index("Export-LiveSeedSuggestions"),
+        )
+
+    def test_zend_runner_resets_shared_runtime_artifacts_before_starting_fuzzer(self):
+        script_path = FUZZER_DIR.parent / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn("function Reset-ZendRuntimeArtifacts", script)
+        self.assertIn("/shared-tmpfs/hook-coverage", script)
+        self.assertIn("/shared/opcode-events", script)
+        self.assertIn("/shared/hookphuzz-callback-registry.json", script)
+        self.assertIn("Reset-ZendRuntimeArtifacts -ComposeArgs $composeArgs", script)
+        self.assertLess(
+            script.index("Reset-ZendRuntimeArtifacts -ComposeArgs $composeArgs"),
+            script.index('Write-Host "Starting fuzzer container"'),
         )
 
     def test_zend_fixture_sends_exact_admin_post_action_request_before_seed_export(self):

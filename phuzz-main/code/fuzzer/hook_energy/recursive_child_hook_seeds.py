@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -13,6 +14,7 @@ if __package__ in (None, ""):
     from discovery.entrypoints.entrypoints import rest_seed_template, seed_template_for_callback
     from discovery.entrypoints.method_resolution import resolve_http_methods
     from seed_generation.config.config_exporter import export_seed_configs
+    from seed_generation.skeleton.common_generator import SeedGeneratorBase
     from seed_generation.source_assisted.input_extractor import InputSignatureExtractor
     from seed_generation.verification.seed_validator import validate_candidate
 else:
@@ -20,6 +22,7 @@ else:
     from discovery.entrypoints.entrypoints import rest_seed_template, seed_template_for_callback
     from discovery.entrypoints.method_resolution import resolve_http_methods
     from seed_generation.config.config_exporter import export_seed_configs
+    from seed_generation.skeleton.common_generator import SeedGeneratorBase
     from seed_generation.source_assisted.input_extractor import InputSignatureExtractor
     from seed_generation.verification.seed_validator import validate_candidate
 
@@ -60,11 +63,14 @@ def build_recursive_seed_report(
             seen.add(identity)
 
             provenance = _provenance(callback, level)
-            seed, reason = _seed_for_callback(callback, extractor)
-            if seed is None:
+            seeds, reason = _seeds_for_callback(callback, extractor)
+            if not seeds:
                 manual.append({**provenance, "generation_status": "manual_analysis_required", "reason": reason})
             else:
-                generated.append({**provenance, "generation_status": "supported_http_seed", "seed": seed})
+                generated.extend(
+                    {**provenance, "generation_status": "supported_http_seed", "seed": seed}
+                    for seed in seeds
+                )
 
     generated.sort(key=lambda item: (item["hook_level"], item["child_hook_name"], item["callback_id"]))
     manual.sort(key=lambda item: (item["hook_level"], item["child_hook_name"], item["callback_id"]))
@@ -275,9 +281,10 @@ def _identity(callback: Mapping[str, Any]) -> str:
 
 def _item_identity(item: Mapping[str, Any]) -> str:
     stable_id = str(item.get("stable_id") or "").strip()
+    method = str((item.get("seed") or {}).get("method") or "")
     if stable_id:
-        return f"stable:{stable_id}"
-    return f"callback:{item.get('child_hook_name', '')}:{item.get('callback_id', '')}"
+        return f"stable:{stable_id}:{method}"
+    return f"callback:{item.get('child_hook_name', '')}:{item.get('callback_id', '')}:{method}"
 
 
 def _provenance(callback: Mapping[str, Any], hook_level: int) -> dict[str, Any]:
@@ -299,16 +306,16 @@ def _provenance(callback: Mapping[str, Any], hook_level: int) -> dict[str, Any]:
     }
 
 
-def _seed_for_callback(
+def _seeds_for_callback(
     callback: Mapping[str, Any],
     extractor: InputSignatureExtractor,
-) -> tuple[dict[str, Any] | None, str]:
+) -> tuple[list[dict[str, Any]], str]:
     classified = _classify_callback(_normalize_callback(dict(callback)), 1)
     seed = seed_template_for_callback(str(callback.get("hook_name") or ""), callback)
     if seed is None and str(callback.get("hook_name") or "") == "rest_api_init":
         seed = rest_seed_template(callback)
     if seed is None:
-        return None, str(classified.get("reason") or "Unsupported child hook")
+        return [], str(classified.get("reason") or "Unsupported child hook")
 
     input_params = extractor.extract(dict(callback)).get("input_params", [])
     decisions = resolve_http_methods(
@@ -325,41 +332,18 @@ def _seed_for_callback(
         ),
         expected_callback=callback,
     )
-    decision = decisions[0]
-    if decision["method_status"] != "resolved":
-        return None, "HTTP method is ambiguous without source, route, or correlated runtime evidence"
-    seed.update(decision)
-    if len(decisions) > 1:
-        seed["methods"] = decision["candidate_methods"]
-    method = str(decision["resolved_method"])
-    seed.setdefault("headers", {})
-    seed.setdefault("query_params", {})
-    seed.setdefault("cookies", {})
-    seed.setdefault("fuzzable_params", [])
-    seed.setdefault("discovered_file_params", [])
-    action = seed["body"].pop("action", seed["query_params"].pop("action", None))
-    if action is not None:
-        target = seed["query_params"] if method in {"GET", "DELETE", "OPTIONS", "HEAD"} else seed["body"]
-        target["action"] = action
-    seed["input_params"] = input_params
-    for item in input_params:
-        name = str(item.get("name") or "").strip()
-        source = str(item.get("source") or "REQUEST").upper()
-        if not name or name in seed["fixed_params"]:
-            continue
-        if source == "FILES":
-            seed["discovered_file_params"].append(item)
-            continue
-        target = (
-            seed["query_params"]
-            if source == "GET" or (source == "REQUEST" and method == "GET")
-            else seed["cookies"]
-            if source == "COOKIE"
-            else seed["body"]
-        )
-        target.setdefault(name, "FUZZ")
-        seed["fuzzable_params"].append(name)
-    return seed, "supported_http_seed"
+    if decisions[0]["method_status"] != "resolved":
+        return [], "HTTP method is ambiguous without source, route, or correlated runtime evidence"
+    generator = SeedGeneratorBase()
+    variants = []
+    for decision in decisions:
+        variant = copy.deepcopy(seed)
+        variant.pop("methods", None)
+        variant.update(decision)
+        variant.setdefault("headers", {})
+        generator._place_action_for_method(variant)
+        variants.append(generator._attach_fuzzable_params(variant, input_params))
+    return variants, "supported_http_seed"
 
 
 def _candidate_from_seed(item: Mapping[str, Any]) -> dict[str, Any]:
