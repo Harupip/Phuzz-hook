@@ -1002,14 +1002,17 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator.run(), 0)
             parent, child = coordinator.state['versions']
             self.assertEqual(coordinator.config_hash(Path(parent['config_path'])), parent['config_hash'])
-            for path in (child['config_path'], child['replay_config_path']):
-                config = json.loads(Path(path).read_text(encoding='utf-8'))
-                body = {row['name']: row['value'] for row in config['body_params']['data']}
-                self.assertEqual(body['mode'], 'deep')
-                self.assertEqual(body['detail'], 'observed')
-                self.assertEqual(body['action'], 'fixture')
-            config = json.loads(Path(child['config_path']).read_text(encoding='utf-8'))
-            self.assertIn('detail', config['body_params']['fuzz'])
+            child_config = json.loads(Path(child['config_path']).read_text(encoding='utf-8'))
+            child_body = {row['name']: row['value'] for row in child_config['body_params']['data']}
+            self.assertEqual(child_body['mode'], 'fuzz')
+            self.assertEqual(child_body['detail'], 'fuzz')
+            self.assertEqual(child_body['action'], 'fixture')
+            self.assertIn('detail', child_config['body_params']['fuzz'])
+            replay_config = json.loads(Path(child['replay_config_path']).read_text(encoding='utf-8'))
+            replay_body = {row['name']: row['value'] for row in replay_config['body_params']['data']}
+            self.assertEqual(replay_body['mode'], 'deep')
+            self.assertEqual(replay_body['detail'], 'observed')
+            self.assertEqual(replay_body['action'], 'fixture')
 
     def test_batch_prioritizes_ajax_including_runtime_children_with_stable_order(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2088,7 +2091,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertIn("PROBE_BUDGET_EXHAUSTED", json.dumps(coordinator.state["events"]))
             self.assertEqual(parent["known_parameters"], [])
 
-    def test_two_successful_probes_keep_each_value_in_child_config(self):
+    def test_two_successful_probes_use_fuzz_values_in_child_but_keep_replay_values(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), [], accepted=("a", "b"))
             result = coordinator._run_pending_probe(
@@ -2101,8 +2104,12 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             child = coordinator.state["versions"][1]
             child_config = json.loads(Path(child["config_path"]).read_text())
             values = {row["name"]: row["value"] for row in child_config["body_params"]["data"]}
-            self.assertEqual(values["a"], "probe-a")
-            self.assertEqual(values["b"], "probe-b")
+            self.assertEqual(values["a"], "fuzz")
+            self.assertEqual(values["b"], "fuzz")
+            replay_config = json.loads(Path(child["replay_config_path"]).read_text())
+            replay_values = {row["name"]: row["value"] for row in replay_config["body_params"]["data"]}
+            self.assertEqual(replay_values["a"], "probe-a")
+            self.assertEqual(replay_values["b"], "probe-b")
             seed_metadata = child_config["metadata"]["online_request_seed"]
             self.assertEqual(seed_metadata["evidence_request_ids"], [seed_metadata["request_id"]])
             self.assertEqual(
@@ -2128,7 +2135,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                              ["v0", "v1"])
             child = json.loads(Path(coordinator.state["versions"][1]["config_path"]).read_text())
             values = {p["name"]: p["value"] for p in child["body_params"]["data"]}
-            self.assertEqual((values["a"], values["b"]), ("probe-a", "probe-b"))
+            self.assertEqual((values["a"], values["b"]), ("fuzz", "fuzz"))
             self.assertEqual(parent["known_parameters"], [])
 
     def test_accepted_probe_survives_later_probe_failure(self):
@@ -2147,7 +2154,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual([item["status"] for item in coordinator.state["probe_attempts"]], ["accepted", "failed"])
             child = json.loads(Path(coordinator.state["versions"][1]["config_path"]).read_text())
             values = {row["name"]: row["value"] for row in child["body_params"]["data"]}
-            self.assertEqual(values["a"], "probe-a")
+            self.assertEqual(values["a"], "fuzz")
             self.assertEqual(parent["known_parameters"], [])
 
     def test_probe_target_mismatch_is_not_admitted(self):
@@ -3517,7 +3524,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertIsNotNone(result)
                 child = json.loads(Path(coordinator.state["versions"][1]["config_path"]).read_text())
                 cookie_rows = {row["name"]: row for row in child["cookies"]["data"]}
-                self.assertEqual(cookie_rows["fixture_cookie"]["value"], "source-cookie")
+                self.assertEqual(cookie_rows["fixture_cookie"]["value"], "fuzz")
                 self.assertIn("fixture_cookie", child["cookies"]["fuzz"])
                 invalid_cases = []
                 unsupported_operation = copy.deepcopy(evidence)

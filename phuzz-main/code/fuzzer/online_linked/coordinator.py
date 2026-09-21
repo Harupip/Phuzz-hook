@@ -77,6 +77,29 @@ def _parameter_key(parameter: Any) -> tuple[str, str, str]:
     )
 
 
+def _replace_fuzzable_values_with_placeholder(config: dict[str, Any]) -> None:
+    """Use PHUZZ's fuzz sentinel in the published fuzzing config only."""
+    for section_name in ("query_params", "body_params", "headers", "cookies"):
+        section = config.get(section_name)
+        if not isinstance(section, Mapping):
+            continue
+        data = section.get("data")
+        fixed = section.get("fixed", [])
+        fuzz = section.get("fuzz", [])
+        if not isinstance(data, list) or not isinstance(fixed, list) or not isinstance(fuzz, list):
+            continue
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "")
+            if not name:
+                continue
+            is_fixed = any(re.match(str(selector), name) for selector in fixed)
+            is_fuzzable = any(re.match(str(selector), name) for selector in fuzz)
+            if is_fuzzable and not is_fixed:
+                row["value"] = "fuzz"
+
+
 class OnlineLinkedError(ValueError):
     """A coordinator transition cannot be completed safely."""
 
@@ -1246,6 +1269,8 @@ class OnlineLinkedCoordinator:
             if isinstance(metadata, dict):
                 metadata.pop("online_request_seed", None)
             self._restore_request_values(child_config, selected_trial, parent)
+            replay_config = copy.deepcopy(child_config)
+            _replace_fuzzable_values_with_placeholder(child_config)
             child_path = self._write_config(next_version, child_config)
             child = self._new_version(next_version, child_config, child_path, parent, discovery["event_id"], seed)
             child["known_parameters"] = proposed_parameters
@@ -1256,7 +1281,6 @@ class OnlineLinkedCoordinator:
                 "run_id": selected_trial.get("run_id"),
             }
             self._reports[next_version] = copy.deepcopy(materialized)
-            replay_config = copy.deepcopy(child_config)
             self.force_replay_only_fn(replay_config)
             replay_path = self._write_config(next_version, replay_config, replay=True)
             child["replay_config_path"] = str(replay_path)
