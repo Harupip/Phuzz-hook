@@ -2,6 +2,8 @@
 
 Run commands from `phuzz-main/code` unless a guide says otherwise. The root scripts are stable wrappers; the files under `scripts/` contain the implementation and are easier to debug.
 
+Settings: CLI flags override `phuzz.env`, then loader defaults. Candidate/version/time caps are separate; see [budget and failure reference](../docs/guides/online-linked-flow.md). Matrix/benchmark commands below are separate legacy tooling, not additional online-linked modes or runtime proof.
+
 ## Recommended Commands
 
 | Command | Purpose | Output |

@@ -2926,6 +2926,80 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertNotIn("name", merged_seed["body"])
             self.assertEqual(merged_seed["fuzzable_params"], [])
 
+    def test_branch_transition_keeps_target_callback_proof_separate_from_guard_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            first = self.raw_seed_item()
+            second = copy.deepcopy(first)
+            first["pass1_request_id"] = "branch-guard"
+            second["pass1_request_id"] = "branch-body"
+            uopz_dir, zend_dir = root / "uopz", root / "zend"
+            uopz_dir.mkdir()
+            zend_dir.mkdir()
+
+            first_uopz = self.pass1_artifact_for_raw(first)
+            first_uopz["request_params"] = {"body_params": {"guard_value": "probe"}}
+            first_zend = self.zend_artifact_for_raw(first, name="guard_value")
+            first_zend["callback_summaries"][0]["unique_parameters"][0]["access_forms"] = ["empty"]
+            first_zend["events"] = [{
+                "source": "POST", "path": ["guard_value"], "operation": "empty",
+                "callback_context": {"attributed": True, "root_callback": "Demo::fetch", "depth": 0},
+            }]
+
+            second_uopz = self.pass1_artifact_for_raw(second)
+            second_uopz["request_params"] = {"body_params": {"body_candidate": "probe"}}
+            second_zend = self.zend_artifact_for_raw(second, name="body_candidate")
+            second_zend["callback_summaries"].append({
+                "callback": "Demo::bootstrap",
+                "unique_parameters": [{
+                    "source": "POST", "path": ["guard_value"], "helper_depth": 0,
+                    "observed_count": 1, "access_forms": ["read"],
+                }],
+            })
+            second_zend["events"] = [
+                {
+                    "source": "POST", "path": ["body_candidate"], "operation": "read",
+                    "callback_context": {"attributed": True, "root_callback": "Demo::fetch", "depth": 0},
+                },
+                {
+                    "source": "POST", "path": ["guard_value"], "operation": "read",
+                    "callback_context": {"attributed": True, "root_callback": "Demo::bootstrap", "depth": 0},
+                },
+            ]
+            (uopz_dir / "branch-guard.json").write_text(json.dumps(first_uopz), encoding="utf-8")
+            (zend_dir / "branch-guard.json").write_text(json.dumps(first_zend), encoding="utf-8")
+            (uopz_dir / "branch-body.json").write_text(json.dumps(second_uopz), encoding="utf-8")
+            (zend_dir / "branch-body.json").write_text(json.dumps(second_zend), encoding="utf-8")
+
+            registry = prepare_callback_registry(self.registry(), "demo-plugin")
+            first_result = converge_iteration(
+                raw_report={"suggested_seeds": [first]},
+                pass_run_summary={"legacy_run_id": "legacy-1", "runs": [{
+                    "hook_name": first["hook_name"], "callback_id": first["callback_id"],
+                    "seed_variant_id": "", "callback_reached": True,
+                    "matched_artifact": "branch-guard.json",
+                }]},
+                pass_artifacts_dir=uopz_dir, zend_events_dir=zend_dir,
+                registry=registry, plugin_slug="demo-plugin", legacy_run_id="legacy-1",
+                known_state={"known_parameters": []},
+            )
+            second_result = converge_iteration(
+                raw_report={"suggested_seeds": [second]},
+                pass_run_summary={"legacy_run_id": "legacy-1", "runs": [{
+                    "hook_name": second["hook_name"], "callback_id": second["callback_id"],
+                    "seed_variant_id": "", "callback_reached": True,
+                    "matched_artifact": "branch-body.json",
+                }]},
+                pass_artifacts_dir=uopz_dir, zend_events_dir=zend_dir,
+                registry=registry, plugin_slug="demo-plugin", legacy_run_id="legacy-1",
+                known_state={"known_parameters": first_result["known_parameters"]},
+            )
+
+            self.assertEqual(first_result["new_parameters"][0]["name"], "guard_value")
+            self.assertEqual([row["name"] for row in second_result["observed_parameters"]], ["body_candidate"])
+            self.assertEqual([row["name"] for row in second_result["missing_parameters"]], ["guard_value"])
+            self.assertEqual(second_result["status"], "REPLAY_FAILED")
+
     def test_convergence_iteration_probes_correlated_get_param_names_before_converging(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

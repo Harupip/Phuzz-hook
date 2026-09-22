@@ -53,6 +53,15 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
 
 
 def _verified_config(version: dict) -> bytes:
+    content, config = _verified_base(version)
+    if (version.get("config_type") != "fuzzing_ready" or config.get("config_type") != "fuzzing_ready"
+            or version.get("probe_variant") is True
+            or (config.get("metadata") or {}).get("probe_variant") is True):
+        raise ValueError("NOT_FUZZING_READY")
+    return content
+
+
+def _verified_base(version: dict) -> tuple[bytes, dict]:
     gate = version.get("readiness" if version["version"] == "v0" else "replay_result") or {}
     pass2 = gate.get("pass2_verification") or {}
     accepted, total = pass2.get("accepted"), pass2.get("total")
@@ -69,10 +78,6 @@ def _verified_config(version: dict) -> bytes:
         raise ValueError("PROBE_OR_REPLAY")
     content = path.read_bytes()
     config = json.loads(content.decode("utf-8-sig"))
-    if (version.get("config_type") != "fuzzing_ready" or config.get("config_type") != "fuzzing_ready"
-            or version.get("probe_variant") is True
-            or (config.get("metadata") or {}).get("probe_variant") is True):
-        raise ValueError("NOT_FUZZING_READY")
     if config_hash(config) != version.get("config_hash"):
         raise ValueError("CONFIG_HASH_MISMATCH")
-    return content
+    return content, config

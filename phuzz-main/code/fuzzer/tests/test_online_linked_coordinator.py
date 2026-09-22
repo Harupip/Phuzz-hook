@@ -2108,7 +2108,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(values["b"], "fuzz")
             replay_config = json.loads(Path(child["replay_config_path"]).read_text())
             replay_values = {row["name"]: row["value"] for row in replay_config["body_params"]["data"]}
-            self.assertEqual(replay_values["a"], "probe-a")
+            self.assertEqual(replay_values["a"], "fuzz")
             self.assertEqual(replay_values["b"], "probe-b")
             seed_metadata = child_config["metadata"]["online_request_seed"]
             self.assertEqual(seed_metadata["evidence_request_ids"], [seed_metadata["request_id"]])
@@ -2117,6 +2117,370 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 {"a": seed_metadata["request_id"], "b": seed_metadata["request_id"]},
             )
             self.assertEqual(parent["known_parameters"], [])
+
+    def test_noncooccurring_probe_candidates_are_not_promoted_as_one_union(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), [], names=("guard_value", "body_candidate"),
+                accepted=("guard_value", "body_candidate"),
+            )
+
+            result = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence,
+                raw_report=coordinator._reports["v0"], convergence=convergence,
+                probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=None,
+            )
+
+            self.assertIsNotNone(result, json.dumps(coordinator.state, default=str))
+            child_names = {
+                item["name"] for item in coordinator.state["versions"][1]["known_parameters"]
+            }
+            self.assertEqual(len(child_names), 1)
+            retained_names = {
+                item["name"] for item in coordinator.state.get("pending_runtime_candidates", [])
+            }
+            self.assertEqual(child_names | retained_names, {"guard_value", "body_candidate"})
+
+    def test_remaining_runtime_candidate_is_reprocessed_on_fresh_child_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), [], names=("a", "b"), accepted=("a", "b"),
+            )
+
+            child = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence,
+                raw_report=coordinator._reports["v0"], convergence=convergence,
+                probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=None,
+            )
+            self.assertIsNotNone(child)
+            self.assertEqual(
+                {item["name"] for item in coordinator.state["pending_runtime_candidates"]}, {"a"},
+            )
+
+            fresh_evidence = copy.deepcopy(evidence)
+            fresh_evidence["request_id"] = "child-v1-request"
+            fresh_evidence["worker_run_id"] = "child-v1-run"
+            fresh_evidence["request"] = {
+                "request_id": "child-v1-request",
+                "legacy_run_id": "child-v1-run",
+                "target_plugin": "fixture",
+                "http_method": "POST",
+                "request_params": {"body_params": {"action": "fixture", "seed": "base"}},
+            }
+            a_probe = next(
+                item for item in convergence["pending_probes"] if item["name"] == "a"
+            )
+            a_seed = next(
+                item for item in convergence["merged_suggested_seeds"]["suggested_seeds"]
+                if item["seed"]["seed_variant_id"] == a_probe["seed_variant_id"]
+            )
+            fresh_result = {
+                "status": "CONTINUE",
+                "candidate_key": "candidate-fixture",
+                "new_parameters": [],
+                "known_parameters": [],
+                "pending_probes": [a_probe],
+                "merged_suggested_seeds": {"suggested_seeds": [a_seed]},
+            }
+
+            next_child = coordinator._handle_convergence_result(
+                parent=child, evidence=fresh_evidence,
+                raw_report=coordinator._reports["v0"], result=fresh_result,
+                seed=child["seed_item"], deadline=None,
+            )
+
+            self.assertIsNotNone(next_child, json.dumps(coordinator.state, default=str))
+            self.assertEqual([version["version"] for version in coordinator.state["versions"]], ["v0", "v1", "v2"])
+            self.assertEqual(coordinator.state.get("pending_runtime_candidates"), [])
+            requeued = [
+                event for event in coordinator.state["events"]
+                if event.get("kind") == "PENDING_RUNTIME_CANDIDATE"
+                and event.get("parameter") == "a"
+            ]
+            self.assertEqual([event["status"] for event in requeued], ["REQUEUED"])
+            self.assertEqual(coordinator.state["probe_attempts"][-1]["candidate"]["name"], "a")
+            self.assertEqual(coordinator.state["probe_attempts"][-1]["parent_version"], "v1")
+
+    def test_stale_runtime_candidate_is_retired_on_fresh_child_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), [], names=("a", "b"), accepted=("a", "b"),
+            )
+            child = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence,
+                raw_report=coordinator._reports["v0"], convergence=convergence,
+                probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=None,
+            )
+            self.assertIsNotNone(child)
+
+            fresh_evidence = copy.deepcopy(evidence)
+            fresh_evidence["request_id"] = "child-v1-request"
+            fresh_evidence["worker_run_id"] = "child-v1-run"
+            fresh_evidence["request"] = {
+                "request_id": "child-v1-request",
+                "legacy_run_id": "child-v1-run",
+                "target_plugin": "fixture",
+                "http_method": "POST",
+                "request_params": {"body_params": {"action": "fixture", "seed": "base"}},
+            }
+            coordinator._handle_convergence_result(
+                parent=child, evidence=fresh_evidence,
+                raw_report=coordinator._reports["v0"],
+                result={"status": "CONTINUE", "new_parameters": [], "known_parameters": []},
+                seed=child["seed_item"], deadline=None,
+            )
+
+            self.assertEqual(coordinator.state.get("pending_runtime_candidates"), [])
+            retired = [
+                event for event in coordinator.state["events"]
+                if event.get("kind") == "PENDING_RUNTIME_CANDIDATE"
+                and event.get("parameter") == "a"
+            ]
+            self.assertEqual([event["status"] for event in retired], ["RETIRED"])
+            self.assertEqual(retired[0]["reason"], "NOT_REOBSERVED_ON_CHILD")
+
+    def test_equivalent_branch_proposal_does_not_create_version_but_new_input_does(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, _ = self.make_probe_context(
+                Path(tmp), [], names=("a",), accepted=(),
+            )
+            coordinator.handoff_to_next_worker = lambda *args, **kwargs: True
+            coordinator.max_versions = 4
+            current_nonce = "valid-a"
+            original_export = coordinator.export_configs_fn
+
+            def export_with_fixed_nonce(report, **kwargs):
+                generated = original_export(report, **kwargs)
+                path = Path(str(generated["generated"][0]["config_path"]))
+                child_config = json.loads(path.read_text(encoding="utf-8"))
+                section = child_config["body_params"]
+                section["data"].append({"name": "nonce", "value": current_nonce})
+                section["fixed"].append("nonce")
+                section["fuzz"].append("nonce")
+                path.write_text(json.dumps(child_config), encoding="utf-8")
+                return generated
+
+            coordinator.export_configs_fn = export_with_fixed_nonce
+
+            def branch(name, request_id, run_id):
+                parameter = {
+                    "name": name, "path": [name], "source": "POST", "location": "form",
+                    "helper_depth": 0, "observed_count": 1, "evidence_kind": "zend_runtime",
+                    "fuzzable": True, "request_id": request_id, "run_id": run_id,
+                    "plugin_slug": "fixture", "callback_id": "cb-fixture",
+                    "canonical_callback": "fixture_callback", "request_method": "POST",
+                }
+                current_evidence = copy.deepcopy(evidence)
+                current_evidence["request_id"] = request_id
+                current_evidence["worker_run_id"] = run_id
+                current_evidence["request"] = {
+                    "request_id": request_id, "legacy_run_id": run_id,
+                    "target_plugin": "fixture", "http_method": "POST",
+                    "request_params": {"body_params": {"action": "fixture", name: "probe"}},
+                }
+                return current_evidence, {
+                    "status": "REPLAY_FAILED",
+                    "missing_parameters": [{"name": "guard", "source": "GET", "location": "query"}],
+                    "observed_parameters": [parameter], "new_parameters": [], "known_parameters": [],
+                }
+
+            first_evidence, first_result = branch("a", "request-a", "run-a")
+            first = coordinator._handle_convergence_result(
+                parent=parent, evidence=first_evidence,
+                raw_report=coordinator._reports["v0"], result=first_result,
+                seed=parent["seed_item"], deadline=None,
+            )
+            self.assertIsNotNone(first)
+            self.assertEqual([version["version"] for version in coordinator.state["versions"]], ["v0", "v1"])
+
+            duplicate_evidence, duplicate_result = branch("a", "request-a-new", "run-a-new")
+            duplicate = coordinator._handle_convergence_result(
+                parent=parent, evidence=duplicate_evidence,
+                raw_report=coordinator._reports["v0"], result=duplicate_result,
+                seed=parent["seed_item"], deadline=None,
+            )
+            self.assertIsNone(duplicate)
+            self.assertEqual([version["version"] for version in coordinator.state["versions"]], ["v0", "v1"])
+            self.assertEqual(coordinator.state["replay_input_trials"][-1]["status"], "ignored")
+            self.assertEqual(coordinator.state["replay_input_trials"][-1]["reason"], "NO_SEMANTIC_PROGRESS")
+            self.assertIn("NO_SEMANTIC_PROGRESS", json.dumps(coordinator.state["events"]))
+
+            current_nonce = "valid-b"
+            fixed_changed_evidence, fixed_changed_result = branch("a", "request-a-fixed", "run-a-fixed")
+            fixed_changed = coordinator._handle_convergence_result(
+                parent=parent, evidence=fixed_changed_evidence,
+                raw_report=coordinator._reports["v0"], result=fixed_changed_result,
+                seed=parent["seed_item"], deadline=None,
+            )
+            self.assertIsNotNone(fixed_changed)
+            self.assertEqual([version["version"] for version in coordinator.state["versions"]], ["v0", "v1", "v2"])
+
+            repeated_fixed_evidence, repeated_fixed_result = branch(
+                "a", "request-a-fixed-new", "run-a-fixed-new",
+            )
+            repeated_fixed = coordinator._handle_convergence_result(
+                parent=parent, evidence=repeated_fixed_evidence,
+                raw_report=coordinator._reports["v0"], result=repeated_fixed_result,
+                seed=parent["seed_item"], deadline=None,
+            )
+            self.assertIsNone(repeated_fixed)
+            self.assertEqual(coordinator.state["replay_input_trials"][-1]["reason"], "NO_SEMANTIC_PROGRESS")
+
+            distinct_evidence, distinct_result = branch("b", "request-b", "run-b")
+            distinct = coordinator._handle_convergence_result(
+                parent=parent, evidence=distinct_evidence,
+                raw_report=coordinator._reports["v0"], result=distinct_result,
+                seed=parent["seed_item"], deadline=None,
+            )
+            self.assertIsNotNone(distinct)
+            self.assertEqual(
+                [version["version"] for version in coordinator.state["versions"]],
+                ["v0", "v1", "v2", "v3"],
+            )
+
+    def test_semantic_progress_keeps_fixed_input_and_transport_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, _, _ = self.make_probe_context(
+                Path(tmp), [], names=("a",), accepted=(),
+            )
+            config = config_for(parent["seed_item"])
+            config["body_params"]["data"].append({"name": "mode", "value": "one"})
+            config["body_params"]["fixed"].append("mode")
+            config_path = coordinator._write_config("v1", config)
+            published = coordinator._new_version(
+                "v1", config, config_path, parent, None, parent["seed_item"],
+            )
+            published["known_parameters"] = [{
+                "name": "a", "source": "POST", "location": "form",
+            }]
+
+            known = published["known_parameters"]
+            self.assertEqual(
+                coordinator._published_config_with_same_request(copy.deepcopy(config), known)["version"],
+                "v1",
+            )
+
+            changed_value = copy.deepcopy(config)
+            changed_value["body_params"]["data"][-1]["value"] = "two"
+            self.assertIsNone(coordinator._published_config_with_same_request(changed_value, known))
+
+            changed_transport = copy.deepcopy(config)
+            changed_transport["query_params"] = {
+                "data": [{"name": "a", "value": "fuzz"}],
+                "fixed": [], "fuzz": ["a"], "weight": 1,
+            }
+            self.assertIsNone(coordinator._published_config_with_same_request(
+                changed_transport,
+                [{"name": "a", "source": "GET", "location": "query"}],
+            ))
+
+    def test_config_request_key_matches_fixed_priority_and_selector_patterns(self):
+        def config(*, nonce_value="valid-a", fuzz_value="one", query=False):
+            section = {
+                "data": [
+                    {"name": "nonce", "value": nonce_value},
+                    {"name": "fuzz_token", "value": fuzz_value},
+                ],
+                "fixed": ["nonce"],
+                "fuzz": ["nonce", "fuzz_.*"],
+                "weight": 1,
+            }
+            result = {
+                "target": "http://web/wp-admin/admin-ajax.php",
+                "methods": ["POST"],
+                "body_params": section,
+            }
+            if query:
+                result["query_params"] = result.pop("body_params")
+            return result
+
+        fixed_changed = config(nonce_value="valid-b")
+        self.assertNotEqual(
+            OnlineLinkedCoordinator._config_request_key(config()),
+            OnlineLinkedCoordinator._config_request_key(fixed_changed),
+        )
+        fuzz_changed = config(fuzz_value="two")
+        self.assertEqual(
+            OnlineLinkedCoordinator._config_request_key(config()),
+            OnlineLinkedCoordinator._config_request_key(fuzz_changed),
+        )
+        self.assertNotEqual(
+            OnlineLinkedCoordinator._config_request_key(config()),
+            OnlineLinkedCoordinator._config_request_key(config(query=True)),
+        )
+
+    def test_replay_failed_branch_still_services_independent_pending_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), [], names=("body_candidate",), accepted=("body_candidate",),
+            )
+            failed_branch = {
+                **convergence,
+                "status": "REPLAY_FAILED",
+                "missing_parameters": [{"name": "guard_value", "source": "GET", "location": "query"}],
+                "new_parameters": [],
+                "known_parameters": [],
+                "observed_parameters": [{
+                    **convergence["pending_probes"][0],
+                    "fuzzable": False,
+                    "candidate_status": "pending_probe",
+                }],
+            }
+
+            coordinator._handle_convergence_result(
+                parent=parent, evidence=evidence,
+                raw_report=coordinator._reports["v0"], result=failed_branch,
+                seed=parent["seed_item"], deadline=None,
+            )
+
+            self.assertEqual(
+                [item["candidate"]["name"] for item in coordinator.state["probe_attempts"]],
+                ["body_candidate"],
+            )
+
+    def test_failed_trial_preserves_other_runtime_candidate_and_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), [], names=("guard_value", "body_candidate"),
+                accepted=("guard_value", "body_candidate"),
+            )
+            original_sender = coordinator.probe_sender
+
+            def sender(container_name, **kwargs):
+                result = original_sender(container_name, **kwargs)
+                if "replay-input-trials" not in str(kwargs.get("config_slug") or ""):
+                    return result
+                request = copy.deepcopy(result["request"])
+                zend = copy.deepcopy(result["zend"])
+                request["request_params"]["body_params"].pop("body_candidate", None)
+                zend["callback_summaries"][0]["unique_parameters"] = [
+                    row for row in zend["callback_summaries"][0]["unique_parameters"]
+                    if row["name"] != "body_candidate"
+                ]
+                zend["events"] = [
+                    row for row in zend["events"]
+                    if row["path"] != ["body_candidate"]
+                ]
+                return {**result, "request": request, "zend": zend}
+
+            coordinator.probe_sender = sender
+            result = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence,
+                raw_report=coordinator._reports["v0"], convergence=convergence,
+                probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=None,
+            )
+
+            self.assertIsNotNone(result, json.dumps(coordinator.state, default=str))
+            self.assertIsNone(coordinator.state["terminal_status"])
+            self.assertEqual(
+                {item["name"] for item in result["known_parameters"]}, {"guard_value"},
+            )
+            self.assertEqual(coordinator.state.get("pending_runtime_candidates"), [])
+            self.assertTrue(coordinator._active_container)
 
     def test_bounded_two_probes_keep_independent_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2196,7 +2560,12 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
                 self.assertIsNotNone(result)
                 child_names = {item["name"] for item in coordinator.state["versions"][1]["known_parameters"]}
-                self.assertEqual(child_names, {"existing", "a"} if deadline is None else {"existing"})
+                self.assertEqual(child_names, {"a"} if deadline is None else {"existing"})
+                if deadline is None:
+                    self.assertIn(
+                        "existing",
+                        {item["name"] for item in coordinator.state["pending_runtime_candidates"]},
+                    )
                 self.assertEqual(parent["known_parameters"], [])
                 if deadline is None:
                     self.assertIn("probe:a", log)
@@ -2822,12 +3191,10 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             )
 
             self.assertIsNotNone(result)
-            self.assertEqual(len(trial_inputs), 2)
-            self.assertEqual(worker_counts_at_trial, [0, 0])
+            self.assertEqual(len(trial_inputs), 1)
+            self.assertEqual(worker_counts_at_trial, [0])
             self.assertEqual(trial_inputs[0]["post_type"], "probe")
-            self.assertEqual(trial_inputs[1]["post_type"], "post")
             self.assertEqual(trial_inputs[0]["post_id"], "probe")
-            self.assertEqual(trial_inputs[1]["post_id"], "probe")
             self.assertEqual(len(coordinator.state["versions"]), 2)
             self.assertEqual(coordinator.state["versions"][1]["status"], "fuzzing")
 
@@ -2908,6 +3275,173 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(tried, ["probe", "bad", "good"])
             self.assertEqual(attempt["trials"][1]["queued_adjustments"], 0)
             self.assertEqual(attempt["trials"][2]["status"], "verified")
+
+    def test_replay_trial_uses_current_attributed_depth_for_historical_parameter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
+            child_config = config_for(parent["seed_item"])
+            child_config["query_params"] = {
+                "data": [{"name": "locale", "value": "probe"}],
+                "fixed": [], "fuzz": ["locale"], "weight": 1,
+            }
+            parameter = {
+                "name": "locale", "path": ["locale"], "source": "GET", "location": "query",
+                "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
+                "fuzzable": True, "plugin_slug": "fixture", "callback_id": "cb-fixture",
+                "canonical_callback": "fixture_callback", "request_method": "POST",
+            }
+            attempt = {
+                "attempt_id": "attempt-depth", "parent_version": "v0",
+                "expected_parameters": [dict(parameter)], "trials": [],
+            }
+            original_parameter = copy.deepcopy(parameter)
+            original_parent_parameters = copy.deepcopy(parent["known_parameters"])
+            pass2_runs: list[str] = []
+
+            def verify_pass2(run, *args, **kwargs):
+                pass2_runs.append(str(run["legacy_run_id"]))
+                return {"accepted": 1, "total": 1}
+
+            coordinator.verify_pass2_fn = verify_pass2
+
+            def trial_sender(**kwargs):
+                request_id = kwargs["request_id"]
+                run_id = kwargs["run_id"]
+                return {
+                    "status": "callback_reached", "callback_reached": True,
+                    "validation_status": "callback_reached",
+                    "request_name": f"{request_id}.json",
+                    "request": {
+                        "request_id": request_id, "legacy_run_id": run_id, "run_id": run_id,
+                        "target_plugin": "fixture", "hook_name": parent["hook_name"],
+                        "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
+                        "http_method": "POST",
+                        "request_params": {"query_params": {"locale": "probe"}, "body_params": {"action": "fixture"}},
+                    },
+                    "zend_name": f"{request_id}.json",
+                    "zend": {
+                        "request_id": request_id, "run_id": run_id, "request_method": "POST",
+                        "events": [{
+                            "source": "GET", "path": ["locale"], "operation": "read",
+                            "callback_context": {
+                                "attributed": True, "root_callback": "fixture_callback", "depth": 2,
+                            },
+                        }],
+                    },
+                    "timing": {},
+                }
+
+            coordinator._run_light_sender = trial_sender
+            result = coordinator._verify_replay_input_trials(
+                parent=parent, child_config=child_config, materialized={},
+                expected_parameters=[parameter], attempt=attempt, deadline=None,
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(attempt["status"], "verified")
+            self.assertEqual(attempt["trials"][0]["status"], "verified")
+            self.assertEqual(pass2_runs, [result["run_id"]])
+            self.assertEqual(parameter, original_parameter)
+            self.assertEqual(parent["known_parameters"], original_parent_parameters)
+            self.assertEqual(result["zend"]["events"][0]["callback_context"]["depth"], 2)
+
+    def test_replay_trial_rejects_untrusted_current_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
+            parameter = {
+                "name": "locale", "path": ["locale"], "source": "GET", "location": "query",
+                "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
+                "fuzzable": True, "plugin_slug": "fixture", "request_id": "trial-request",
+                "run_id": "run-v0", "callback_id": "cb-fixture",
+                "canonical_callback": "fixture_callback", "request_method": "POST",
+            }
+            evidence = {
+                "request_id": "trial-request", "worker_run_id": "run-v0",
+                "request": {
+                    "target_plugin": "fixture", "hook_name": parent["hook_name"],
+                    "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
+                    "http_method": "POST",
+                    "request_params": {"query_params": {"locale": "probe"}},
+                },
+                "zend": {
+                    "request_method": "POST", "events": [{
+                        "source": "GET", "path": ["locale"], "operation": "read",
+                        "callback_context": {
+                            "attributed": True, "root_callback": "fixture_callback", "depth": 2,
+                        },
+                    }],
+                },
+            }
+            self.assertTrue(coordinator._trial_parameter_verified(parameter, evidence, parent))
+
+            cases = {}
+            case = copy.deepcopy(evidence)
+            case["zend"]["events"][0]["callback_context"]["root_callback"] = "other_callback"
+            cases["root_callback"] = case
+            case = copy.deepcopy(evidence)
+            case["parameter"] = {**parameter, "source": "POST", "location": "form"}
+            case["request"]["request_params"] = {"body_params": {"locale": "probe"}}
+            cases["source"] = case
+            case = copy.deepcopy(evidence)
+            case["request"]["request_params"] = {"query_params": {}}
+            cases["request_key"] = case
+            case = copy.deepcopy(evidence)
+            case["request"]["auth_context"] = "authenticated"
+            cases["auth"] = case
+            case = copy.deepcopy(evidence)
+            case["zend"]["events"][0]["callback_context"]["depth"] = -1
+            cases["depth"] = case
+            case = copy.deepcopy(evidence)
+            case["parameter"] = {**parameter, "path": ["other"]}
+            cases["path"] = case
+            case = copy.deepcopy(evidence)
+            case["parameter"] = {**parameter, "request_id": "other-request"}
+            cases["request_id"] = case
+            case = copy.deepcopy(evidence)
+            case["parameter"] = {**parameter, "run_id": "other-run"}
+            cases["run_id"] = case
+
+            for name, case in cases.items():
+                with self.subTest(name=name):
+                    candidate = case.pop("parameter", parameter)
+                    self.assertFalse(coordinator._trial_parameter_verified(candidate, case, parent))
+
+    def test_replay_trial_keeps_source_and_depth_from_one_current_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
+            parameter = {
+                "name": "locale", "path": ["locale"], "source": "GET", "location": "query",
+                "helper_depth": 2, "observed_count": 1, "evidence_kind": "zend_runtime",
+                "fuzzable": True, "plugin_slug": "fixture", "request_id": "trial-request",
+                "run_id": "run-v0", "callback_id": "cb-fixture",
+                "canonical_callback": "fixture_callback", "request_method": "POST",
+            }
+            evidence = {
+                "request_id": "trial-request", "worker_run_id": "run-v0",
+                "request": {
+                    "target_plugin": "fixture", "hook_name": parent["hook_name"],
+                    "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
+                    "http_method": "POST",
+                    "request_params": {"query_params": {"locale": "probe"}, "body_params": {"locale": "probe"}},
+                },
+                "zend": {
+                    "request_method": "POST", "events": [
+                        {
+                            "source": "POST", "path": ["locale"], "operation": "read",
+                            "callback_context": {
+                                "attributed": True, "root_callback": "fixture_callback", "depth": 2,
+                            },
+                        },
+                        {
+                            "source": "GET", "path": ["locale"], "operation": "read",
+                            "callback_context": {
+                                "attributed": True, "root_callback": "fixture_callback", "depth": 1,
+                            },
+                        },
+                    ],
+                },
+            }
+            self.assertTrue(coordinator._trial_parameter_verified(parameter, evidence, parent))
 
     def test_trial_identity_accepts_201_but_rejects_auth_or_callback_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:

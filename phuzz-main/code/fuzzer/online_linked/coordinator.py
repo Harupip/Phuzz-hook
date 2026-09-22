@@ -77,6 +77,18 @@ def _parameter_key(parameter: Any) -> tuple[str, str, str]:
     )
 
 
+def _config_name_is_fuzzable(section: Mapping[str, Any], name: str) -> bool:
+    if not name:
+        return False
+    fixed = section.get("fixed", [])
+    fuzz = section.get("fuzz", [])
+    if not isinstance(fixed, list) or not isinstance(fuzz, list):
+        return False
+    is_fixed = any(re.match(str(selector), name) for selector in fixed)
+    is_fuzzable = any(re.match(str(selector), name) for selector in fuzz)
+    return is_fuzzable and not is_fixed
+
+
 def _replace_fuzzable_values_with_placeholder(config: dict[str, Any]) -> None:
     """Use PHUZZ's fuzz sentinel in the published fuzzing config only."""
     for section_name in ("query_params", "body_params", "headers", "cookies"):
@@ -94,9 +106,7 @@ def _replace_fuzzable_values_with_placeholder(config: dict[str, Any]) -> None:
             name = str(row.get("name") or "")
             if not name:
                 continue
-            is_fixed = any(re.match(str(selector), name) for selector in fixed)
-            is_fuzzable = any(re.match(str(selector), name) for selector in fuzz)
-            if is_fuzzable and not is_fixed:
+            if _config_name_is_fuzzable(section, name):
                 row["value"] = "fuzz"
 
 
@@ -215,6 +225,7 @@ class OnlineLinkedCoordinator:
             "attempts": [],
             "probe_attempts": [],
             "replay_input_trials": [],
+            "pending_runtime_candidates": [],
             "candidate_queue": [],
             "queued_candidate_ids": [],
             "events": [],
@@ -1059,14 +1070,39 @@ class OnlineLinkedCoordinator:
         deadline: float | None,
     ) -> dict[str, Any] | None:
         """Admit accepted evidence, or service one pending runtime probe."""
-        if result.get("status") == "REPLAY_FAILED" or result.get("missing_parameters") or result.get("runtime_block_reason"):
+        if result.get("_pending_group_dispatch") is not True:
+            self._reconcile_pending_runtime_candidates(parent, evidence, result)
+        branch_failure = result.get("status") == "REPLAY_FAILED" or bool(result.get("missing_parameters"))
+        if branch_failure or result.get("runtime_block_reason"):
             self._record_event({
                 "kind": "RUNTIME_OBSERVATION", "status": "REJECTED",
                 "reason": result.get("runtime_block_reason") or result.get("status") or "MISSING_PARAMETERS",
                 "missing_parameters": result.get("missing_parameters", []),
                 "version": parent["version"], "request_id": evidence.get("request_id"),
             })
-            return None
+            # A missing field proves that this request is a different branch;
+            # it must not erase a candidate observed in the current request.
+            # Runtime-blocked/auth-invalid evidence remains fail-closed.
+            if result.get("runtime_block_reason"):
+                return None
+            branch_parameters = [
+                dict(parameter) for parameter in (result.get("observed_parameters") or [])
+                if isinstance(parameter, Mapping) and parameter.get("fuzzable") is True
+            ]
+            if not branch_parameters:
+                branch_parameters = [
+                    dict(parameter) for parameter in (result.get("new_parameters") or [])
+                    if isinstance(parameter, Mapping) and parameter.get("fuzzable") is True
+                ]
+            pending_probes = result.get("pending_probes")
+            if not branch_parameters and not isinstance(pending_probes, list):
+                return None
+            result = dict(result)
+            result["_coherent_only"] = True
+            result["new_parameters"] = branch_parameters
+            result["known_parameters"] = branch_parameters
+            result["status"] = "CONTINUE"
+            result["missing_parameters"] = []
 
         pending_probes = result.get("pending_probes")
         if isinstance(pending_probes, list) and pending_probes:
@@ -1242,6 +1278,23 @@ class OnlineLinkedCoordinator:
                 parent, trial_attempt, discovery, "CHILD_CONFIG_BUILD_FAILED", deadline,
                 detail=str(exc), terminal=False,
             )
+        duplicate_parameters = (
+            proposed_parameters if result.get("_pending_group_dispatch") is True else None
+        )
+        duplicate_version = self._published_config_with_same_request(child_config, duplicate_parameters)
+        if duplicate_version is not None:
+            trial_attempt["status"] = "ignored"
+            trial_attempt["reason"] = "NO_SEMANTIC_PROGRESS"
+            self._record_event({
+                "kind": "PARAMETER_DISCOVERY",
+                "status": "IGNORED",
+                "reason": "NO_SEMANTIC_PROGRESS",
+                "version": parent["version"],
+                "request_id": evidence.get("request_id"),
+                "duplicate_of": duplicate_version.get("version"),
+            })
+            self._write_state()
+            return None
         selected_trial = self._verify_replay_input_trials(
             parent=parent,
             child_config=child_config,
@@ -1321,6 +1374,216 @@ class OnlineLinkedCoordinator:
             "location": str(parameter.get("location") or "").lower(),
         }
 
+    @classmethod
+    def _coherent_evidence_key(cls, evidence: Mapping[str, Any]) -> tuple[str, str, str]:
+        request = evidence.get("request")
+        request_params = request.get("request_params") if isinstance(request, Mapping) else {}
+        return (
+            str(evidence.get("request_id") or ""),
+            str(evidence.get("worker_run_id") or evidence.get("run_id") or ""),
+            cls._request_context_key(request_params) if isinstance(request_params, Mapping) else "",
+        )
+
+    def _retain_pending_runtime_candidates(
+        self, groups: Sequence[Mapping[str, Any]], parent: Mapping[str, Any],
+    ) -> None:
+        pending = self.state.setdefault("pending_runtime_candidates", [])
+        if not isinstance(pending, list):
+            pending = []
+            self.state["pending_runtime_candidates"] = pending
+        existing = {
+            (
+                str(item.get("name") or ""),
+                str(item.get("source") or "").upper(),
+                str(item.get("location") or "").lower(),
+                str(item.get("request_id") or ""),
+                str(item.get("run_id") or ""),
+            )
+            for item in pending if isinstance(item, Mapping)
+        }
+        for group in groups:
+            evidence = group.get("evidence") if isinstance(group.get("evidence"), Mapping) else {}
+            request_id = str(evidence.get("request_id") or "")
+            run_id = str(evidence.get("worker_run_id") or evidence.get("run_id") or "")
+            for parameter in group.get("parameters", []):
+                if not isinstance(parameter, Mapping):
+                    continue
+                row = dict(self._safe_parameter_identity(parameter))
+                row.update({
+                    "request_id": request_id,
+                    "run_id": run_id,
+                    "callback_id": str(parameter.get("callback_id") or parent.get("callback_id") or ""),
+                    "canonical_callback": str(
+                        parameter.get("canonical_callback") or parent.get("canonical_callback") or ""
+                    ),
+                    "candidate_status": "pending_runtime_proposal",
+                })
+                key = (
+                    row["name"], row["source"], row["location"], row["request_id"], row["run_id"],
+                )
+                if key in existing:
+                    continue
+                pending.append(row)
+                existing.add(key)
+        if groups:
+            self._write_state()
+
+    def _discard_pending_runtime_candidates(self, groups: Sequence[Mapping[str, Any]]) -> None:
+        pending = self.state.get("pending_runtime_candidates")
+        if not isinstance(pending, list):
+            return
+        discard = set()
+        for group in groups:
+            evidence = group.get("evidence") if isinstance(group.get("evidence"), Mapping) else {}
+            request_id = str(evidence.get("request_id") or "")
+            run_id = str(evidence.get("worker_run_id") or evidence.get("run_id") or "")
+            for parameter in group.get("parameters", []):
+                if not isinstance(parameter, Mapping):
+                    continue
+                identity = self._safe_parameter_identity(parameter)
+                discard.add((
+                    identity["name"], identity["source"], identity["location"], request_id, run_id,
+                ))
+        if not discard:
+            return
+        self.state["pending_runtime_candidates"] = [
+            item for item in pending
+            if not isinstance(item, Mapping) or (
+                str(item.get("name") or ""),
+                str(item.get("source") or "").upper(),
+                str(item.get("location") or "").lower(),
+                str(item.get("request_id") or ""),
+                str(item.get("run_id") or ""),
+            ) not in discard
+        ]
+        self._write_state()
+
+    @staticmethod
+    def _runtime_candidate_key(candidate: Mapping[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(candidate.get("name") or ""),
+            str(candidate.get("source") or "").upper(),
+            str(candidate.get("location") or "").lower(),
+        )
+
+    def _reconcile_pending_runtime_candidates(
+        self,
+        parent: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> None:
+        pending = self.state.get("pending_runtime_candidates")
+        if not isinstance(pending, list) or not pending:
+            return
+        current_request_id = str(evidence.get("request_id") or "")
+        current_run_id = str(evidence.get("worker_run_id") or evidence.get("run_id") or "")
+        if not current_request_id and not current_run_id:
+            return
+        fresh_candidates = []
+        for field in ("pending_probes", "new_parameters", "observed_parameters"):
+            values = result.get(field)
+            if isinstance(values, list):
+                fresh_candidates.extend(item for item in values if isinstance(item, Mapping))
+        remaining = []
+        changed = False
+        for item in pending:
+            if not isinstance(item, Mapping):
+                continue
+            previous_request_id = str(item.get("request_id") or "")
+            previous_run_id = str(item.get("run_id") or "")
+            same_context = (
+                (not current_request_id or current_request_id == previous_request_id)
+                and (not current_run_id or current_run_id == previous_run_id)
+            )
+            if same_context:
+                remaining.append(item)
+                continue
+            key = self._runtime_candidate_key(item)
+            matched = next(
+                (candidate for candidate in fresh_candidates
+                 if self._runtime_candidate_key(candidate) == key),
+                None,
+            )
+            self._record_event({
+                "kind": "PENDING_RUNTIME_CANDIDATE",
+                "status": "REQUEUED" if matched is not None else "RETIRED",
+                "reason": "FRESH_CHILD_CONTEXT" if matched is not None else "NOT_REOBSERVED_ON_CHILD",
+                "version": parent.get("version"),
+                "parameter": key[0],
+                "source": key[1],
+                "location": key[2],
+                "previous_request_id": previous_request_id,
+                "previous_run_id": previous_run_id,
+                "request_id": current_request_id,
+                "run_id": current_run_id,
+            })
+            changed = True
+        if changed:
+            self.state["pending_runtime_candidates"] = remaining
+            self._write_state()
+
+    @staticmethod
+    def _config_request_key(config: Mapping[str, Any]) -> str:
+        semantic: dict[str, Any] = {
+            key: copy.deepcopy(config.get(key))
+            for key in ("target", "methods", "entrypoint_type")
+        }
+        for section_name in ("query_params", "body_params", "json_params", "headers", "cookies"):
+            section = config.get(section_name)
+            if not isinstance(section, Mapping):
+                continue
+            data = copy.deepcopy(section.get("data"))
+            if isinstance(data, list):
+                for row in data:
+                    if (
+                        section_name != "json_params"
+                        and isinstance(row, Mapping)
+                        and _config_name_is_fuzzable(section, str(row.get("name") or ""))
+                    ):
+                        row["value"] = "<fuzzable>"
+            elif isinstance(data, Mapping):
+                for name in data:
+                    if section_name != "json_params" and _config_name_is_fuzzable(section, str(name)):
+                        data[name] = "<fuzzable>"
+            semantic[section_name] = {"data": data}
+        return json.dumps(semantic, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+    def _published_config_with_same_request(
+        self,
+        config: Mapping[str, Any],
+        proposed_parameters: Sequence[Mapping[str, Any]] | None,
+    ) -> dict[str, Any] | None:
+        candidate_key = self._config_request_key(config)
+        candidate_parameters = None
+        if proposed_parameters is not None:
+            candidate_parameters = {
+                tuple(self._safe_parameter_identity(parameter).values())
+                for parameter in proposed_parameters
+                if isinstance(parameter, Mapping)
+            }
+        for version in self.state.get("versions", []):
+            if not isinstance(version, Mapping):
+                continue
+            if candidate_parameters is not None:
+                published_parameters = {
+                    tuple(self._safe_parameter_identity(parameter).values())
+                    for parameter in version.get("known_parameters", [])
+                    if isinstance(parameter, Mapping)
+                }
+                if published_parameters != candidate_parameters:
+                    continue
+            try:
+                # The published config is the normalized proposal. Replay
+                # payloads contain per-trial fuzz mutations and are not
+                # semantic progress by themselves.
+                published_path = version["config_path"]
+                published = json.loads(Path(str(published_path)).read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                continue
+            if self._config_request_key(published) == candidate_key:
+                return dict(version)
+        return None
+
     def _finish_replay_input_attempt(
         self,
         parent: Mapping[str, Any],
@@ -1350,12 +1613,22 @@ class OnlineLinkedCoordinator:
             ],
             **({"detail": detail} if detail else {}),
         })
-        if terminal:
+        pending = self.state.get("pending_runtime_candidates")
+        preserve_pending = (
+            terminal
+            and isinstance(pending, list)
+            and bool(pending)
+            and (deadline is None or self.clock() < deadline)
+            and bool(self._active_container)
+        )
+        if terminal and not preserve_pending:
             self._failure = True
             self.state["terminal_status"] = "NOT_VERIFIED"
             self.state["terminal_reason"] = reason
         else:
             self.state["replay_input_last_reason"] = reason
+            if preserve_pending:
+                attempt["pending_candidates_preserved"] = len(pending)
             self._recover_parent_after_failure(parent, deadline)
         self._write_state()
         return None
@@ -1523,6 +1796,8 @@ class OnlineLinkedCoordinator:
             helper_depth = int(parameter.get("helper_depth"))
         except (TypeError, ValueError):
             return False
+        if helper_depth < 0:
+            return False
         events = zend.get("events")
         matching_events: list[Mapping[str, Any]] = []
         if isinstance(events, list):
@@ -1534,27 +1809,41 @@ class OnlineLinkedCoordinator:
                     continue
                 if _canonical_callback_name(context.get("root_callback")) != expected_callback:
                     continue
-                try:
-                    event_depth = int(context.get("depth"))
-                except (TypeError, ValueError):
-                    continue
-                if event_depth == helper_depth and str(event.get("operation") or "").lower() in {
+                if str(event.get("operation") or "").lower() in {
                     "empty", "isset", "read",
                 }:
                     matching_events.append(event)
-        check_parameter = dict(parameter)
-        check_parameter.pop("access_forms", None)
         if matching_events:
-            if any(str(event.get("source") or "").upper() == "REQUEST" for event in matching_events):
-                check_parameter["source"] = "REQUEST"
-            return runtime_parameter_is_accepted(
-                check_parameter,
-                request,
-                zend,
-                canonical_callback=expected_callback,
-                request_method=str(parent.get("resolved_method") or ""),
-                runtime_cookie_probes=self.runtime_cookie_probes,
-            )
+            # Historical helper depth identifies the parameter; this trial's
+            # attributed event supplies the depth that the verifier must check.
+            for event in matching_events:
+                context = event.get("callback_context")
+                if not isinstance(context, Mapping):
+                    continue
+                try:
+                    current_depth = int(context.get("depth"))
+                except (TypeError, ValueError):
+                    continue
+                check_parameter = dict(parameter)
+                check_parameter.pop("access_forms", None)
+                check_parameter["helper_depth"] = current_depth
+                if str(event.get("source") or "").upper() == "REQUEST":
+                    check_parameter["source"] = "REQUEST"
+                if runtime_parameter_is_accepted(
+                    check_parameter,
+                    request,
+                    zend,
+                    canonical_callback=expected_callback,
+                    request_method=str(parent.get("resolved_method") or ""),
+                    runtime_cookie_probes=self.runtime_cookie_probes,
+                ):
+                    return True
+            return False
+
+        # Raw events are authoritative when present; summaries remain a
+        # compatibility path only for legacy artifacts without raw events.
+        if isinstance(events, list) and events:
+            return False
 
         # Legacy Zend artifacts may only carry callback summaries. They still
         # need an explicit operation; callback reach alone is not evidence.
@@ -2079,11 +2368,18 @@ class OnlineLinkedCoordinator:
             self._inherit_callback_identity(item, parent) for item in convergence.get("new_parameters", [])
             if isinstance(item, Mapping)
         ] if isinstance(convergence.get("new_parameters"), list) else []
-        parameter_evidence: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+        accepted_keys: set[tuple[str, str, str]] = set()
+        accepted_records: list[dict[str, Any]] = []
         for parameter in accepted:
-            parameter_evidence[_parameter_key(parameter)] = evidence
-        last_result: Mapping[str, Any] | None = convergence if accepted else None
-        last_evidence: Mapping[str, Any] | None = evidence if accepted else None
+            key = _parameter_key(parameter)
+            if key in accepted_keys:
+                continue
+            accepted_keys.add(key)
+            accepted_records.append({
+                "parameter": dict(parameter),
+                "evidence": evidence,
+                "result": convergence,
+            })
         deferred: list[dict[str, Any]] = []
         if accepted and probe_deadline is not None:
             deferred = [dict(item["candidate"]) for item in queue]
@@ -2128,12 +2424,14 @@ class OnlineLinkedCoordinator:
             if not isinstance(parameter, Mapping) or not isinstance(probe_evidence, Mapping):
                 continue
             parameter_key = _parameter_key(parameter)
-            if parameter_key in parameter_evidence:
+            if parameter_key in accepted_keys:
                 continue
-            accepted.append(dict(parameter))
-            parameter_evidence[parameter_key] = probe_evidence
-            last_result = outcome.get("result") if isinstance(outcome.get("result"), Mapping) else None
-            last_evidence = probe_evidence
+            accepted_keys.add(parameter_key)
+            accepted_records.append({
+                "parameter": dict(parameter),
+                "evidence": probe_evidence,
+                "result": outcome.get("result") if isinstance(outcome.get("result"), Mapping) else {},
+            })
         for candidate in deferred:
             self._record_event({
                 "kind": "PARAMETER_PROBE",
@@ -2143,22 +2441,59 @@ class OnlineLinkedCoordinator:
                 "request_id": candidate.get("request_id") or evidence.get("request_id"),
                 "candidate": candidate,
             })
-        if not accepted or last_result is None or last_evidence is None:
+        if not accepted_records:
             return None
-        final_result = dict(last_result)
-        final_result["new_parameters"] = accepted
+
+        groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for record in accepted_records:
+            group_key = self._coherent_evidence_key(record["evidence"])
+            group = groups.setdefault(group_key, {
+                "parameters": [], "evidence": record["evidence"], "result": record["result"],
+            })
+            group["parameters"].append(record["parameter"])
+            group["result"] = record["result"]
+        # The latest correlated request is the proposal for the next version.
+        # Earlier candidates remain evidence-backed work, not an input union.
+        chosen_key = next(reversed(groups))
+        ordered_groups = [groups[chosen_key]] + [
+            group for key, group in reversed(list(groups.items())) if key != chosen_key
+        ]
+        self._retain_pending_runtime_candidates(ordered_groups[1:], parent)
+
         existing = parent.get("known_parameters", [])
         existing = [dict(item) for item in existing if isinstance(item, Mapping)] if isinstance(existing, list) else []
-        final_result["known_parameters"] = existing + accepted
-        final_result.pop("pending_probes", None)
-        final_result["deferred_probes"] = deferred
-        final_result["parameter_evidence"] = parameter_evidence
-        final_result["base_evidence"] = evidence
-        final_result["candidate_key"] = str(convergence.get("candidate_key") or self._target_key)
-        return self._handle_convergence_result(
-            parent=parent, evidence=last_evidence, raw_report=raw_report,
-            result=final_result, seed=seed, deadline=deadline,
-        )
+        if convergence.get("_coherent_only") is True:
+            existing = []
+        for group in ordered_groups:
+            # Consume only the proposal currently entering admission. If its
+            # replay-input trial fails, the remaining groups keep the parent
+            # recoverable and are tried as separate coherent proposals.
+            self._discard_pending_runtime_candidates([group])
+            chosen_parameters = [dict(item) for item in group["parameters"]]
+            chosen_evidence = group["evidence"]
+            final_result = dict(group["result"])
+            final_result["new_parameters"] = chosen_parameters
+            final_result["known_parameters"] = existing + chosen_parameters
+            final_result.pop("pending_probes", None)
+            final_result["deferred_probes"] = deferred
+            final_result["parameter_evidence"] = {
+                _parameter_key(parameter): chosen_evidence for parameter in chosen_parameters
+            }
+            final_result["base_evidence"] = chosen_evidence
+            final_result["candidate_key"] = str(convergence.get("candidate_key") or self._target_key)
+            final_result["_pending_group_dispatch"] = True
+            if convergence.get("_coherent_only") is True:
+                final_result["status"] = "CONTINUE"
+                final_result["missing_parameters"] = []
+            child = self._handle_convergence_result(
+                parent=parent, evidence=chosen_evidence, raw_report=raw_report,
+                result=final_result, seed=seed, deadline=deadline,
+            )
+            if child is not None:
+                return child
+            if self.state.get("terminal_status") or not self._active_container:
+                break
+        return None
 
     def _run_pending_probe_once(
         self,

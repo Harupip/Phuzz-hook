@@ -74,6 +74,8 @@ rm -rf -- /shared-tmpfs/hook-coverage /shared-tmpfs/fuzzer-findings /shared/opco
 mkdir -p /shared-tmpfs/hook-coverage/requests /shared-tmpfs/fuzzer-findings /shared/opcode-events
 chown -R www-data:www-data /shared-tmpfs/hook-coverage /shared-tmpfs/fuzzer-findings /shared/opcode-events
 "@
+    # Windows checkouts must not pass CRLF shell commands to the Linux container.
+    $resetCommand = $resetCommand.Replace("`r`n", "`n")
     Write-Host "Resetting Zend runtime artifacts for this campaign"
     Invoke-Compose -ComposeArgs $ComposeArgs -AdditionalArgs @("exec", "-T", "web", "sh", "-lc", $resetCommand)
 }
