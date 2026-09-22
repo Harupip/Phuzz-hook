@@ -8,6 +8,57 @@ CODE_DIR = Path(__file__).resolve().parents[2]
 
 class PhuzzWrapperContractTests(unittest.TestCase):
 
+    def test_comparison_prompt_env_and_success_only_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entrypoint = root / "fuzzer" / "online_linked" / "__main__.py"
+            entrypoint.parent.mkdir(parents=True)
+            entrypoint.touch()
+            for name in ("seeds.json", "registry.json"):
+                (root / name).write_text("{}")
+            probe = root / "probe.ps1"
+            probe.write_text(r'''
+param($CodeDir, $Root, [int]$DiscoveryExit, [int]$ComparisonExit)
+$ErrorActionPreference = "Stop"
+. (Join-Path $CodeDir "scripts/wordpress/read-phuzz-env.ps1")
+. (Join-Path $CodeDir "scripts/wordpress/invoke-online-linked.ps1")
+$settings = Resolve-PhuzzRuntimeSettings -Path (Join-Path $Root "phuzz.env") -BoundParameters @{}
+$global:calls = [Collections.Generic.List[object]]::new()
+function ComposeStub { $global:LASTEXITCODE = 0 }
+function python {
+    $global:calls.Add(@($args))
+    $global:LASTEXITCODE = if ($args -contains "--prompt-batch") { $ComparisonExit } else { $DiscoveryExit }
+}
+$failed = $false
+try {
+    Invoke-OnlineLinked -ScriptRoot $Root -PluginSlug demo -LegacyRunId run-1 `
+        -SuggestedSeedsPath (Join-Path $Root "seeds.json") -BootstrapConfig unused `
+        -CallbackRegistry (Join-Path $Root "registry.json") -Service fuzzer `
+        -OnlineTimeoutSeconds 1 -OnlineMaxVersions 1 -OnlineMaxCandidates 1 `
+        -OnlineCampaignTimeoutSeconds 1 -OverridePath unused -ComposeArgs @("ComposeStub", "compose") `
+        -OnlineComparePrompt ([bool]$settings["OnlineComparePrompt"])
+} catch { $failed = $true }
+@{ calls = @($global:calls.ToArray()); failed = $failed; exit_code = $global:LASTEXITCODE } | ConvertTo-Json -Compress -Depth 5
+''', encoding="utf-8")
+            import json
+
+            for enabled, discovery_exit, comparison_exit in ((0, 0, 0), (1, 0, 0), (1, 0, 1), (1, 0, 2), (1, 7, 0)):
+                with self.subTest(enabled=enabled, discovery_exit=discovery_exit, comparison_exit=comparison_exit):
+                    (root / "phuzz.env").write_text(f"ONLINE_COMPARE_PROMPT={enabled}\n")
+                    result = subprocess.run(
+                        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe), str(CODE_DIR), str(root), str(discovery_exit), str(comparison_exit)],
+                        capture_output=True, text=True, timeout=20,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    state = json.loads(result.stdout.strip().splitlines()[-1])
+                    should_prompt = enabled and discovery_exit == 0
+                    self.assertEqual(len(state["calls"]), 2 if should_prompt else 1)
+                    self.assertEqual(state["failed"], discovery_exit != 0)
+                    self.assertEqual(state["exit_code"], discovery_exit)
+                    if should_prompt:
+                        self.assertEqual(state["calls"][1][:3], ["-m", "fuzzer.config_comparison.online_linked", "--prompt-batch"])
+                        self.assertEqual(Path(state["calls"][1][3]), root / "fuzzer" / "output" / "online-linked" / "run-1")
+
     def test_guided_wrapper_online_linked_mode_forwards_bounded_discovery(self):
         result = subprocess.run(
             [

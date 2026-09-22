@@ -74,6 +74,7 @@ function Resolve-PhuzzRuntimeSettings {
 
     $settings = Read-PhuzzEnv -Path $Path
     return [ordered]@{
+        OnlineComparePrompt = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineComparePrompt" -Key "ONLINE_COMPARE_PROMPT" -Default 0 -Minimum 0 -Maximum 1
         OnlineTimeoutSeconds = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineTimeoutSeconds" -Key "ONLINE_TIMEOUT_SECONDS" -Default 120 -Minimum 1 -Maximum 120
         OnlineMaxVersions = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineMaxVersions" -Key "ONLINE_MAX_VERSIONS" -Default 2 -Minimum 1 -Maximum 20
         OnlineMaxCandidates = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineMaxCandidates" -Key "ONLINE_MAX_CANDIDATES" -Default 32 -Minimum 1 -Maximum 128

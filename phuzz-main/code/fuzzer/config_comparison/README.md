@@ -65,6 +65,45 @@ counts for all five statuses, results, reference errors, and input errors.
 Exit codes are 0 for all matches, 1 for mismatch/no-reference/ambiguity, and 2
 for invalid configs, invalid references, input errors, or invalid arguments.
 
+## Offline comparison of one online-linked final config
+
+`phuzz.env` controls the optional prompt at the end of a successful online-linked
+run: `ONLINE_COMPARE_PROMPT=1` enables it, `0` disables it (missing key defaults
+to disabled). The checked-in env enables it. In an interactive terminal with
+exported final configs, answer `y`, select a numbered final config from that run,
+then enter the experiment reference JSON path. Relative paths are resolved from
+`phuzz-main/code`; absolute paths are also accepted. Enter cancels at each step.
+Redirected/non-interactive input skips the prompt. Comparison results and errors
+are reported separately and do not change the discovery exit status.
+
+After `online-linked` finishes and exports `final-configs`, inspect that
+directory and choose exactly one final JSON plus exactly one experiment
+reference JSON. From `phuzz-main/code`, run:
+
+```text
+rtk proxy python -m fuzzer.config_comparison.online_linked --compare-final-config "PATH_TO_SELECTED_FINAL_CONFIG" --compare-with "PATH_TO_EXPERIMENT_REFERENCE"
+```
+
+The command does not rerun discovery, prompt for a path, start Docker, or
+select another final config. It compares with the existing semantic
+comparator and the fixed entrypoint policy `ignored_metadata_paths={"/metadata"}`:
+the complete top-level metadata subtree is ignored, including unknown nested
+fields. A request parameter actually named `metadata`, authentication values,
+and selectors remain part of the comparison.
+
+For a valid run, the report is written to the run directory as
+`config-comparison.json`. The batch state's other discovery, candidate, and
+vulnerability fields are retained; only `config_comparison` is added or
+replaced with the latest summary. Exit code 0 means `MATCH`, 1 means a
+comparator `MISMATCH`, and 2 means `INVALID`, an input/path error, or an I/O
+error. The report records absolute resolved expected/reference and
+actual/selected-final paths and all status counts.
+
+The existing `config_comparison.cli --policy semantic` contract is unchanged:
+it still ignores only the semantic paths listed in `policy.py`, not every
+metadata field. Whole-`/metadata` ignoring is specific to the offline
+online-linked entrypoint.
+
 Add a new reference by placing a separately curated raw JSON fixture in the
 reference corpus and recording its provenance; do not modify the experiment
 source or use a generated actual snapshot as the expected oracle.

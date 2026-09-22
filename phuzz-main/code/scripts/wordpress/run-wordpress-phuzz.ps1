@@ -766,6 +766,7 @@ try {
         -OnlineMaxVersions $OnlineMaxVersions `
         -OnlineMaxCandidates $OnlineMaxCandidates `
         -OnlineCampaignTimeoutSeconds $OnlineCampaignTimeoutSeconds `
+        -OnlineComparePrompt ([bool]$runtimeSettings["OnlineComparePrompt"]) `
         -OverridePath $overridePath `
         -ComposeArgs $composeArgs
 } finally {

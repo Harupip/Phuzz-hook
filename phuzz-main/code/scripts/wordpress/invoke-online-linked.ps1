@@ -11,6 +11,7 @@ function Invoke-OnlineLinked {
         [Parameter(Mandatory)][int]$OnlineMaxVersions,
         [Parameter(Mandatory)][int]$OnlineMaxCandidates,
         [Parameter(Mandatory)][int]$OnlineCampaignTimeoutSeconds,
+        [bool]$OnlineComparePrompt = $false,
         [Parameter(Mandatory)][string]$OverridePath,
         [Parameter(Mandatory)][string[]]$ComposeArgs
     )
@@ -73,5 +74,17 @@ function Invoke-OnlineLinked {
     Write-Host "Online-linked state: $statePath"
     if ($onlineLinkedExitCode -ne 0) {
         throw "Online-linked Zend discovery failed. See $statePath"
+    }
+    if ($OnlineComparePrompt) {
+        Push-Location $ScriptRoot
+        try {
+            python -m fuzzer.config_comparison.online_linked --prompt-batch (Split-Path -Parent $statePath)
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "Config comparison returned exit code $LASTEXITCODE. Online-linked discovery status is unchanged."
+            }
+        } finally {
+            Pop-Location
+            $global:LASTEXITCODE = $onlineLinkedExitCode
+        }
     }
 }
