@@ -1,16 +1,12 @@
 # Luồng online của HookPhuzz
 
-Cập nhật: 2026-09-13. Tài liệu mô tả `-Mode online-linked` theo mã hiện tại, bao gồm batching probe, provenance/evidence, COOKIE runtime opt-in, direct-argument Zend instrumentation, trạng thái lỗi và kiểm tra ngân sách. Đã có fresh fixture/Docker gates cho các thay đổi này; chưa có lần chạy Docker toàn tuyến với real plugin xác minh tất cả 10 bước.
+Cập nhật: 2026-09-22. Tài liệu mô tả `-Mode online-linked` theo mã hiện tại, bao gồm batching probe, provenance/evidence, COOKIE runtime opt-in, direct-argument Zend instrumentation, coherent replay, trạng thái lỗi và kiểm tra ngân sách. Đã có fresh fixture/Docker gates cho các thay đổi này; chưa có lần chạy Docker toàn tuyến với real plugin xác minh tất cả 10 bước.
 
-Kế hoạch bổ sung: [Online-linked completion](../../../../../docs/superpowers/plans/2026-09-06-online-linked-completion.md). Những phần ghi “còn thiếu” bên dưới là công việc tương lai, không phải tính năng đã hoạt động.
+Kế hoạch bổ sung: [Online-linked completion](../../../../docs/superpowers/plans/2026-09-06-online-linked-completion.md). Những phần ghi “còn thiếu” bên dưới là công việc tương lai, không phải tính năng đã hoạt động.
 
-## 1. Phân biệt các mode
+## 1. Workflow được hỗ trợ
 
-| Mode | Cách chạy hiện tại |
-| --- | --- |
-| `generated` | Xuất config theo pipeline generated; có thể bật `-UseZendDiscovery`. Không bị thay đổi bởi bản sửa vòng đời online-linked. |
-| `online` | Coordinator cũ chọn một target, tạo các phiên bản bất biến; replay gate kiểm tra callback nhưng chưa gọi `verify_pass2_contract()` như online-linked. Không coi hai mode là tương đương. |
-| `online-linked` | Đọc snapshot `suggested_seeds.json`, xử lý từng candidate tuần tự; mỗi candidate có `v0` và các worker con được kiểm tra replay/Pass 2. |
+`online-linked` là workflow WordPress duy nhất và mặc định trên nhánh `feature/separate-online-linked`. `generated`, `online`, `zend`, `default`, `seed-config` không còn là mode CLI. Các thư viện generated replay/Zend vẫn là dependency nội bộ; sự tồn tại của module không có nghĩa mode cũ còn chạy được.
 
 Các đường dẫn source bên dưới tính từ `phuzz-main/code`.
 
@@ -60,19 +56,15 @@ Sơ đồ biểu diễn đường đi thành công và nhánh phục hồi chín
 | 9 | Tạo config khi nhánh/tham số mới, giữ giá trị mở nhánh | Tạo config theo tham số Zend mới, giữ evidence/value riêng cho từng parameter và map COOKIE vào bucket `cookies`. Không tạo config chỉ vì coverage mới. |
 | 10 | Chạy config mới; action mới quay về bước 2, tham số mới về bước 3 | Child parameter config giữ request values rồi replay/Pass 2. Runtime HTTP registration và pending probe được queue với lineage/evidence riêng, dedupe theo context/input, candidate cap và campaign budget; internal/ambiguous child có evidence blocked. |
 
-### Giới hạn giữ giá trị mở nhánh
+### Coherent replay, branch và giá trị input
 
-`advance_online_version()` gọi `materialize_convergence_seeds(..., for_replay=False)`, xuất config rồi sao chép config đó sang replay-only. Materializer thay tham số đã chứng minh bằng `FUZZ`; exporter khởi tạo giá trị fuzz bằng `fuzz`. `_force_replay_only()` chỉ cố định config vừa xuất, không phục hồi giá trị request gốc.
+Coordinator phục hồi giá trị từ request evidence bằng `_restore_request_values`, thử bộ input qua `_verify_replay_input_trials`, rồi giữ một bản replay với giá trị đã chứng minh. Bản config xuất cho fuzz thay giá trị field fuzz bằng `fuzz`; field fixed/nonce giữ nguyên. Selector dùng `re.match`, và fixed thắng fuzz nếu cùng khớp. Không thay toàn bộ chuỗi `probe` thành `fuzz` trong artifact.
 
-Ví dụ kiểm tra bằng helper hiện tại:
+Probe khác request/run/input context được xét như proposal riêng, không tự union toàn bộ input. Khi nhánh mới thiếu parameter cũ, coordinator có thể thử proposal từ observation hiện tại; mọi field xuất vẫn cần coherent verification. Điều này chưa chứng minh mọi chuyển nhánh đều được giải quyết: Imsanity `resumable` còn bị trial từ chối do locale evidence.
 
-```text
-request mở nhánh: mode=deep
-Zend quan sát: mode, detail
-replay con: mode=fuzz, detail=fuzz
-```
+`pending_runtime_candidates` lưu identity còn lại. Khi có evidence mới, `_reconcile_pending_runtime_candidates` đối chiếu lại: field quan sát lại đi theo admission hiện tại (`FRESH_CHILD_CONTEXT`); field không quan sát lại được retire (`NOT_REOBSERVED_ON_CHILD`). Không dùng evidence parent cũ như evidence child. Retire không chứng minh field không tồn tại ở mọi nhánh.
 
-Nếu `detail` chỉ được đọc khi `mode == "deep"`, replay có thể mất nhánh. Cần giữ request chứng cứ và chứng minh replay vẫn tới nhánh trước khi khởi động worker con. Không hard-code `deep` hoặc giá trị của plugin vào thuật toán.
+Proposal có request semantics tương đương bị `NO_SEMANTIC_PROGRESS`, trial ghi `ignored`, không tạo child/replay/version mới. So sánh bỏ metadata và biến động giá trị fuzz; giữ khác biệt fixed value, endpoint, method và transport. Pending-group dispatch còn xét parameter identity. Không suy ra mọi khác biệt coverage phải tạo config.
 
 ### Giới hạn auth và đăng ký hook
 
@@ -146,7 +138,7 @@ Regression bao phủ timeout tại deadline, output muộn, hết giờ trước
 
 Fixture direct-argument dùng lời gọi thật `hookphuzz_runtime_sink($_POST['data'])`, một helper depth riêng, direct/local reads và các control `isset`/`empty`. Với PHP compile thành root `FETCH_FUNC_ARG` rồi `FETCH_DIM_FUNC_ARG`, extension phải giữ provenance từ root fetch tới dimension read; `isset` hoặc `empty` không được đổi thành `read`, nhưng correlated guard có thể được dùng như presence input.
 
-Fresh Docker gate sau rebuild extension ghi đủ `data`, `helper`, `direct`, `nested` và `local` raw `read`, đồng thời giữ `guard` là `isset` và `empty_guard` là `empty`, với `dropped_event_count=0`. Chi tiết version, image/source parity, opcode dump và raw event summary nằm trong [results report](../../../../docs/superpowers/plans/2026-09-13-online-linked-luna-results.md).
+Fresh Docker gate sau rebuild extension ghi đủ `data`, `helper`, `direct`, `nested` và `local` raw `read`, đồng thời giữ `guard` là `isset` và `empty_guard` là `empty`, với `dropped_event_count=0`. Chi tiết version, image/source parity, opcode dump và raw event summary nằm trong `2026-09-13-online-linked-luna-results.md` (report lịch sử không có trong checkout này; chưa xác minh lại số liệu).
 
 ## 4. Cách chạy và ngân sách
 
@@ -174,7 +166,7 @@ vẫn là các dịch vụ dùng chung; định dạng config/state và thư m�
 Từ `phuzz-main/code`, cần có Docker, `wp-cli.phar`, ZIP plugin và bootstrap config tương ứng. Ví dụ cho plugin đã có sẵn cục bộ:
 
 ```powershell
-rtk proxy pwsh -NoProfile -File .\phuzz.ps1 -PluginSlug nmedia-user-file-uploader -OnlineTimeoutSeconds 60 -OnlineMaxVersions 3
+pwsh -NoProfile -File .\phuzz.ps1 -PluginSlug nmedia-user-file-uploader -OnlineTimeoutSeconds 60 -OnlineMaxVersions 3
 ```
 
 Đây là lệnh chạy, không phải tuyên bố plugin đã PASS trên checkout hiện tại. Nếu tên plugin/config khác, thay bằng slug đã kiểm tra trên máy.
@@ -185,6 +177,9 @@ rtk proxy pwsh -NoProfile -File .\phuzz.ps1 -PluginSlug nmedia-user-file-uploade
 - `OnlineMaxVersions`: 1–20, mặc định 2, tính cả `v0` và phiên bản đã tạo nhưng replay thất bại.
 - `OnlineMaxCandidates`: 1–128, mặc định 32, giới hạn candidate cả initial và runtime expansion.
 - `OnlineCampaignTimeoutSeconds`: 1–86400, mặc định 3600, wall-clock budget toàn batch; khác timeout từng candidate.
+- Default trong loader khác giá trị hiện có trong file. Snapshot checkout ngày 2026-09-22: `ONLINE_TIMEOUT_SECONDS=90`, `ONLINE_MAX_VERSIONS=4`, `ONLINE_MAX_CANDIDATES=32`, `ONLINE_CAMPAIGN_TIMEOUT_SECONDS=3600`, `HOOKPHUZZ_STOP_ON_VULN=0`. Luôn đọc effective settings trong batch-state; CLI > phuzz.env > loader default.
+- Version tính theo v0 cộng số child attempt; tăng version không tăng 120 giây trần mỗi candidate. Không có `0=unlimited` cho bốn budget. Tăng campaign budget không tăng budget từng candidate.
+- `StopOnVulnCount` / `HOOKPHUZZ_STOP_ON_VULN`: `0` không dừng theo số finding; các budget và gate khác vẫn hiệu lực.
 - Không bắt đầu xử lý evidence để mở rộng khi deadline đã hết. Sau khi dừng parent, nếu còn dưới 1 giây thì không bắt đầu replay mới.
 - Sau replay, hết ngân sách thì không khởi động worker con hoặc khởi động lại parent.
 - Các lệnh Docker đang thực thi và cleanup vẫn có timeout riêng; thời gian thực tổng cộng có thể vượt ngân sách fuzz. Không coi `60` là giới hạn wall-clock cứng cho toàn lệnh.
@@ -215,6 +210,10 @@ fuzzer/output/online-linked/<batch-run-id>/callback-registry.json
 | `NOT_VERIFIED` / `CHILD_REPLAY_FAILED` | Replay/Pass 2 không đạt. Dừng worker hiện tại ngay, giữ `replay_result`, artifact và lý do của child, rồi chuyển candidate kế tiếp mà không đợi hết budget. |
 | `NOT_VERIFIED` / `CHILD_WORKER_START_FAILED` hoặc `PARENT_WORKER_RESTART_FAILED` | Lỗi khởi động worker; không được ghi thành hoàn thành bình thường. |
 | `not_started_budget_expired` | Config có thể đã được tạo hoặc replay, nhưng worker chưa khởi động vì hết ngân sách. |
+| `VERSION_LIMIT_REACHED` | Hết lượt version; xem max_versions và attempts, không nhầm với số file cuối. |
+| `TRIAL_INPUT_SET_NOT_VERIFIED` / `TRIAL_MISSING_PARAMETER_READS` | Bộ input không vượt coherent trial; đọc missing_parameters và request/Zend cùng trial. Tăng version không tự sửa lỗi này. |
+| `NO_SEMANTIC_PROGRESS` | Proposal tương đương bị bỏ qua; không tiêu thêm child version. |
+| `GATE_NOT_VERIFIED` | Exporter không thấy replay/Pass 2 hợp lệ; khác với lỗi admission ban đầu V0_PREREQUISITE_GATE_FAILED. |
 | `NO_NEW_ZEND_PARAMETER` | Quan sát đó không bổ sung tham số; không chứng minh không còn nhánh chưa khám phá. |
 | `ACTION_EXPANSION_SETUP_REQUIRED` | Registration có thật nhưng thiếu direct-HTTP mapping, method/route evidence hoặc prerequisite replay; không tạo request suy đoán. |
 | `CALLBACK_REGISTRY_REFRESH_FAILED` | Registry child không nạp lại được vào web container; child candidate bị chặn. |
@@ -260,6 +259,8 @@ Seed đã xác minh → tạo child immutable → final replay + Pass 2 → star
 ```
 
 Các giá trị `post` và `1` ở ví dụ là dữ liệu runtime của ca này, không được hardcode trong discovery. CMPLOG trong worker vẫn phục vụ mutation như trước; helper mới sử dụng CMPLOG cho bước chuẩn bị input replay, không tự thêm tham số hoặc thay điều kiện export.
+
+Mỗi proposal chỉ được ghép từ các probe có cùng request/run/input context. Nếu trial của proposal mới nhất thất bại, coordinator bỏ proposal đó nhưng giữ các candidate runtime độc lập còn pending và thử lại qua cùng admission/provenance/replay/Pass 2 gates. Không lấy union field/value từ các request không cùng xuất hiện; khi không còn pending work hợp lệ, parent chết hoặc hết deadline thì kết thúc fail-closed.
 
 Ba điều chỉnh sau review:
 
@@ -332,7 +333,7 @@ Nếu ghi lỗi giữa chừng, thư mục có thể chứa một phần config;
 | Batch request/Zend evidence reader | [evidence.py](../../fuzzer/online_linked/evidence.py) |
 | Probe, replay-input, final export | [probe_sender.py](../../fuzzer/online_linked/probe_sender.py), [replay_inputs.py](../../fuzzer/online_linked/replay_inputs.py), [export.py](../../fuzzer/online_linked/export.py) |
 | Chọn v0, kiểm tra config, hash và artifact helpers dùng chung | [online_common.py](../../fuzzer/hook_energy/seed_generation/online_common.py) |
-| Coordinator online cũ | [online_config_runner.py](../../fuzzer/hook_energy/seed_generation/online_config_runner.py) |
+| Shared online helpers | [online_common.py](../../fuzzer/hook_energy/seed_generation/online_common.py) |
 | Convergence và Pass 2 | [bridge_cli.py](../../fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py) |
 | Materialization và exporter | [convergence.py](../../fuzzer/seed_generation/convergence/convergence.py), [config_exporter.py](../../fuzzer/seed_generation/config/config_exporter.py) |
 | Root fetch provenance và raw events | [hookphuzz_opcode.c](../../fuzzer/zend_discovery/extension/hookphuzz_opcode.c), [direct-argument fixture](../../fuzzer/tests/fixtures/hookphuzz-direct-argument-fixture.php) |
@@ -341,9 +342,17 @@ Nếu ghi lỗi giữa chừng, thư mục có thể chứa một phần config;
 Kiểm tra hồi quy coordinator/runner/wrapper từ `phuzz-main/code`, timeout toàn tiến trình test 180 giây:
 
 ```powershell
-rtk proxy python -c "import subprocess,sys; r=subprocess.run([sys.executable,'-m','unittest','fuzzer.tests.test_online_linked_coordinator','fuzzer.tests.test_online_config_runner','fuzzer.tests.test_phuzz_wrapper_contract','fuzzer.tests.test_generated_config_runner','fuzzer.tests.test_cmplog','fuzzer.tests.test_cmplog_extension'],timeout=180); sys.exit(r.returncode)"
+python -c "import subprocess,sys; r=subprocess.run([sys.executable,'-m','unittest','fuzzer.tests.test_online_linked_coordinator','fuzzer.tests.test_online_common','fuzzer.tests.test_phuzz_wrapper_contract','fuzzer.tests.test_generated_config_runner','fuzzer.tests.test_cmplog','fuzzer.tests.test_cmplog_extension'],timeout=180); sys.exit(r.returncode)"
 ```
 
-Fresh validation ngày 2026-09-13: focused online-linked/Zend/exporter/probe suite đạt `234 tests OK`; full discovery đạt `542 tests`, còn `2 errors` và `1 skipped`. Hai lỗi full-suite được ghi nguyên văn và không được tự phân loại baseline trong [results report](../../../../docs/superpowers/plans/2026-09-13-online-linked-luna-results.md). Đây là unit/contract và fixture gates; chưa thay thế real-plugin end-to-end run có đủ auth/nonce/selector setup.
+Fresh validation ngày 2026-09-13: focused online-linked/Zend/exporter/probe suite đạt `234 tests OK`; full discovery đạt `542 tests`, còn `2 errors` và `1 skipped`. Hai lỗi full-suite được ghi nguyên văn và không được tự phân loại baseline trong `2026-09-13-online-linked-luna-results.md` (report lịch sử không có trong checkout này; chưa xác minh lại số liệu). Đây là unit/contract và fixture gates; chưa thay thế real-plugin end-to-end run có đủ auth/nonce/selector setup.
 
 Khi nghiệm thu phải báo riêng: đăng ký → request đúng ngữ cảnh → callback executed → tham số/provenance → config tạo được → replay/Pass 2 → worker đã chạy → coverage/CmpLog → vulnerability. Không gộp HTTP 200, callback reachability hoặc test mock thành PASS toàn tuyến.
+
+## 8. Snapshot kiểm chứng Imsanity và phần còn thiếu (2026-09-22)
+
+Run `imsanity-20260922T143226Z` có 3 final configs. `get_images` có `resume_id`, `remove_original` có `id`, `resize_image` có `id`. `bulk_complete` không export vì chưa có fuzz field; fixed-only export đã bỏ theo scope người dùng. Không cần cố đạt 4 file như experiment.
+
+Snapshot cũ `imsanity-20260922T143226Z` ghi `resize_image.resumable` bị trial từ chối vì verifier đối chiếu helper depth lịch sử. Fresh run `imsanity-20260922T163751Z` đã xác nhận attempt-005: `_locale`/`wp_lang` có request key, raw read attributed dưới root `imsanity_ajax_resize` ở depth 2 dù parameter history ở depth 1; coherent t0 `verified`, Pass 2 `1/1`, và final config có `resumable=fuzz`. Depth check, source/callback/auth/request gates vẫn giữ nguyên.
+
+P2 selector parity đã review offline: 128 tests pass, 0 fail, 0 skip; không chạy lại campaign sau patch này. Runtime run trên có trước patch P2. Chưa chứng minh full fuzzing PASS hoặc parity đầy đủ với experiment. Chi tiết: [results](../../../../docs/superpowers/plans/2026-09-22-imsanity-branch-replay-results.md).

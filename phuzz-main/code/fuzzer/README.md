@@ -1,3 +1,5 @@
+> Current WordPress entrypoint: `../phuzz.ps1 -PluginSlug <local-slug>`. Online-linked is the only supported workflow. The components below describe shared PHUZZ infrastructure; generic parallel-fuzzer support does not mean online-linked runs multiple active workers for one candidate. See [current flow](../docs/guides/online-linked-flow.md) for replay, export and verification limits.
+
 Fuzzer Component
 ====================
 

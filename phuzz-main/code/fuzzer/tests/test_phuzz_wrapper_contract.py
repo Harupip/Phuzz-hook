@@ -58,6 +58,33 @@ try {
                     if should_prompt:
                         self.assertEqual(state["calls"][1][:3], ["-m", "fuzzer.config_comparison.online_linked", "--prompt-batch"])
                         self.assertEqual(Path(state["calls"][1][3]), root / "fuzzer" / "output" / "online-linked" / "run-1")
+    def test_runtime_reset_sends_unix_line_endings_from_windows_checkout(self):
+        source = (CODE_DIR / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1").read_text(encoding="utf-8-sig")
+        function = source.split("function Reset-ZendRuntimeArtifacts", 1)[1].split("function New-PluginOverrideFile", 1)[0]
+        # Capture the Docker boundary without deleting campaign artifacts.
+        harness = '''
+$ErrorActionPreference = "Stop"
+function Invoke-Compose {
+    param([string[]]$ComposeArgs, [string[]]$AdditionalArgs)
+    if (($AdditionalArgs[0..4] -join ' ') -ne 'exec -T web sh -lc') { throw 'Wrong shell invocation' }
+    $command = $AdditionalArgs[5]
+    if ($command.Contains("`r")) { throw 'CR passed to Unix shell' }
+    if (-not $command.StartsWith("set -eu`n")) { throw 'Missing fail-fast shell options' }
+    if (($command -split "`n").Count -ne 4) { throw 'Lost reset commands' }
+}
+'''
+        harness += "function Reset-ZendRuntimeArtifacts" + function
+        harness += '\nReset-ZendRuntimeArtifacts -ComposeArgs @("docker", "compose")\n'
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script = Path(temp_dir) / "reset-contract.ps1"
+            for newline in ("\n", "\r\n"):
+                with self.subTest(newline=repr(newline)):
+                    script.write_bytes(harness.replace("\n", newline).encode("utf-8"))
+                    result = subprocess.run(
+                        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_guided_wrapper_online_linked_mode_forwards_bounded_discovery(self):
         result = subprocess.run(

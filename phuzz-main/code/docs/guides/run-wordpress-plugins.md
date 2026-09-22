@@ -1,3 +1,18 @@
+# Chạy WordPress trên nhánh online-linked
+
+Cập nhật 2026-09-22. Từ `phuzz-main/code`, đặt ZIP plugin trong `web/applications/wordpress/_plugins/`, rồi chạy:
+
+```powershell
+pwsh -NoProfile -File ./phuzz.ps1 -PluginSlug imsanity -DryRun
+pwsh -NoProfile -File ./phuzz.ps1 -PluginSlug imsanity -OnlineTimeoutSeconds 120 -OnlineMaxVersions 20 -OnlineMaxCandidates 32 -OnlineCampaignTimeoutSeconds 3600
+```
+
+CLI override không sửa phuzz.env. Các budget trên là hữu hạn; dùng process timeout lớn hơn campaign để dành thời gian bootstrap/cleanup. Không tăng budget để bỏ qua replay/provenance failure. Xem [flow và budget](online-linked-flow.md), rồi đọc `batch-state.json` và `final-configs` của đúng run. File count không phải fuzzing PASS.
+
+## Hướng dẫn matrix lịch sử
+
+Phần dưới lưu workflow/config matrix tháng 05-2026. Danh sách plugin và kết quả validate là snapshot cũ, không phải acceptance hiện tại của online-linked. Dùng lệnh phuzz.ps1 bên trên cho workflow hiện hành; không diễn giải matrix PASS thành runtime discovery PASS.
+
 # Cach chay WordPress PHUZZ voi tung plugin
 
 Tai lieu nay dung cho repo:
