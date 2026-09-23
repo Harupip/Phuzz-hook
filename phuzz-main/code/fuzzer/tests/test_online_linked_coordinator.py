@@ -3345,6 +3345,149 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(parent["known_parameters"], original_parent_parameters)
             self.assertEqual(result["zend"]["events"][0]["callback_context"]["depth"], 2)
 
+    def test_trial_parameter_verified_accepts_legacy_summary_only_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
+            parameter = {
+                "name": "legacy_field", "path": ["legacy_field"], "source": "POST", "location": "form",
+                "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
+                "fuzzable": True, "plugin_slug": "fixture", "request_id": "summary-request",
+                "run_id": "run-v0", "callback_id": "cb-fixture",
+                "canonical_callback": "fixture_callback", "request_method": "POST",
+                "access_forms": ["isset"],
+            }
+            evidence = {
+                "request_id": "summary-request", "worker_run_id": "run-v0",
+                "request": {
+                    "target_plugin": "fixture", "hook_name": parent["hook_name"],
+                    "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
+                    "http_method": "POST", "request_params": {"body_params": {"legacy_field": "value"}},
+                },
+                "zend": {
+                    "request_method": "POST", "callback_summaries": [{
+                        "callback": "fixture_callback",
+                        "unique_parameters": [{
+                            "name": "legacy_field", "source": "POST", "access_forms": ["read"],
+                        }],
+                    }],
+                },
+            }
+            original_parameter = copy.deepcopy(parameter)
+            original_evidence = copy.deepcopy(evidence)
+
+            self.assertTrue(coordinator._trial_parameter_verified(parameter, evidence, parent))
+            self.assertEqual(parameter, original_parameter)
+            self.assertEqual(evidence, original_evidence)
+
+            request_summary = copy.deepcopy(evidence)
+            request_summary["zend"]["callback_summaries"][0]["unique_parameters"][0].update({
+                "source": "REQUEST", "path": ["legacy_field"],
+            })
+            self.assertTrue(coordinator._trial_parameter_verified(parameter, request_summary, parent))
+            request_summary["request"]["request_params"]["body_params"] = {}
+            self.assertFalse(coordinator._trial_parameter_verified(parameter, request_summary, parent))
+
+    def test_trial_parameter_verified_legacy_summary_keeps_source_row_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
+            parameter = {
+                "name": "legacy_field", "path": ["legacy_field"], "source": "POST", "location": "form",
+                "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
+                "fuzzable": True, "plugin_slug": "fixture", "request_id": "summary-request",
+                "run_id": "run-v0", "callback_id": "cb-fixture",
+                "canonical_callback": "fixture_callback", "request_method": "POST",
+            }
+            request = {
+                "target_plugin": "fixture", "hook_name": parent["hook_name"],
+                "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
+                "http_method": "POST", "request_params": {"body_params": {"legacy_field": "value"}},
+            }
+
+            def evidence(rows):
+                return {
+                    "request_id": "summary-request", "worker_run_id": "run-v0", "request": copy.deepcopy(request),
+                    "zend": {
+                        "request_method": "POST", "callback_summaries": [{
+                            "callback": "fixture_callback", "unique_parameters": rows,
+                        }],
+                    },
+                }
+
+            post_read = {
+                "name": "legacy_field", "source": "POST", "path": ["legacy_field"], "access_forms": ["read"],
+            }
+            get_read = {
+                "name": "legacy_field", "source": "GET", "path": ["legacy_field"], "access_forms": ["read"],
+            }
+            post_no_operation = {
+                "name": "legacy_field", "source": "POST", "path": ["legacy_field"], "access_forms": [],
+            }
+
+            self.assertTrue(coordinator._trial_parameter_verified(
+                parameter, evidence([post_read, get_read]), parent,
+            ))
+            self.assertTrue(coordinator._trial_parameter_verified(
+                parameter, evidence([get_read, post_read]), parent,
+            ))
+            self.assertFalse(coordinator._trial_parameter_verified(
+                parameter, evidence([get_read, post_no_operation]), parent,
+            ))
+
+    def test_trial_parameter_verified_rejects_invalid_legacy_summary_or_raw_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
+            parameter = {
+                "name": "legacy_field", "path": ["legacy_field"], "source": "POST", "location": "form",
+                "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
+                "fuzzable": True, "plugin_slug": "fixture", "request_id": "summary-request",
+                "run_id": "run-v0", "callback_id": "cb-fixture",
+                "canonical_callback": "fixture_callback", "request_method": "POST",
+            }
+            evidence = {
+                "request_id": "summary-request", "worker_run_id": "run-v0",
+                "request": {
+                    "target_plugin": "fixture", "hook_name": parent["hook_name"],
+                    "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
+                    "http_method": "POST", "request_params": {"body_params": {"legacy_field": "value"}},
+                },
+                "zend": {
+                    "request_method": "POST", "callback_summaries": [{
+                        "callback": "fixture_callback",
+                        "unique_parameters": [{
+                            "name": "legacy_field", "source": "POST", "access_forms": ["read"],
+                        }],
+                    }],
+                },
+            }
+            cases = {}
+            case = copy.deepcopy(evidence)
+            case["zend"]["callback_summaries"][0]["unique_parameters"][0]["access_forms"] = []
+            cases["missing_operation"] = case
+            case = copy.deepcopy(evidence)
+            case["zend"]["callback_summaries"][0]["callback"] = "other_callback"
+            cases["callback"] = case
+            case = copy.deepcopy(evidence)
+            case["zend"]["callback_summaries"][0]["unique_parameters"][0]["source"] = "GET"
+            cases["source"] = case
+            case = copy.deepcopy(evidence)
+            case["zend"]["callback_summaries"][0]["unique_parameters"][0]["path"] = ["other"]
+            cases["path"] = case
+            case = copy.deepcopy(evidence)
+            case["request"]["request_params"]["body_params"] = {}
+            cases["request_key"] = case
+            case = copy.deepcopy(evidence)
+            case["zend"]["events"] = [{
+                "source": "POST", "path": ["legacy_field"], "operation": "read",
+                "callback_context": {
+                    "attributed": True, "root_callback": "other_callback", "depth": 1,
+                },
+            }]
+            cases["invalid_raw_event_not_rescued"] = case
+
+            for name, case in cases.items():
+                with self.subTest(name=name):
+                    self.assertFalse(coordinator._trial_parameter_verified(parameter, case, parent))
+
     def test_replay_trial_rejects_untrusted_current_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])

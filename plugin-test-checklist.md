@@ -1,0 +1,9 @@
+# Plugin config checklist
+
+Agent cập nhật file này ngay trong task hoàn thành từng config, theo [AGENTS.md](AGENTS.md). Mỗi config có một dòng; giữ riêng kết quả kiểm chứng của agent và kết quả test do người dùng xác nhận.
+
+| Plugin | Endpoint / hook | Config path | Config xong | Agent kiểm chứng / evidence | Người dùng đã test | Verdict / phần còn thiếu | Cập nhật |
+| --- | --- | --- | :---: | --- | :---: | --- | --- |
+| Imsanity | `wp_ajax_imsanity_get_images` | `phuzz-main/code/fuzzer/output/online-linked/imsanity-20260923T110814Z/final-configs/fuzzer-config.wp_ajax_imsanity_get_images.271d3fbaad815b5e.json` | Có | Run `imsanity-20260923T110814Z`; final file hash matches v2; replay `stopped_on_callback`, `callback_reached`, matched request artifact; Pass 2 `1/1`. | Chưa | PARTIAL: bounded run ended `BUDGET_EXPIRED`; config/replay validated, no fuzzing PASS. | 2026-09-23 |
+| Imsanity | `wp_ajax_imsanity_remove_original` | `phuzz-main/code/fuzzer/output/online-linked/imsanity-20260923T110814Z/final-configs/fuzzer-config.wp_ajax_imsanity_remove_original.b010f2ded173fe65.json` | Có | Run `imsanity-20260923T110814Z`; final file hash matches v5; replay `stopped_on_callback`, `callback_reached`, matched request artifact; Pass 2 `1/1`; 48 duplicate proposals ignored. | Chưa | PARTIAL: bounded run ended `BUDGET_EXPIRED`; config/replay validated, no fuzzing PASS. | 2026-09-23 |
+| Imsanity | `wp_ajax_imsanity_resize_image` | `phuzz-main/code/fuzzer/output/online-linked/imsanity-20260923T110814Z/final-configs/fuzzer-config.wp_ajax_imsanity_resize_image.a76a53432f41aab6.json` | Có | Run `imsanity-20260923T110814Z`; final file hash matches v5; v5 replay `stopped_on_callback`, matched request artifact; Pass 2 `1/1`. | Chưa | PARTIAL: later v6 replay `SENDER_TIMEOUT`, callback false, Pass 2 `0/0`; candidate `NOT_VERIFIED/CHILD_REPLAY_FAILED`. | 2026-09-23 |

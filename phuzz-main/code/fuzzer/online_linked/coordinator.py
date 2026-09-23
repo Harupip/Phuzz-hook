@@ -253,6 +253,7 @@ class OnlineLinkedCoordinator:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._write_state()
         try:
+            config_generation_started_at = self.clock()
             selected = self._select_v0()
             if selected is None:
                 self.state["terminal_status"] = "NOT_VERIFIED"
@@ -261,7 +262,11 @@ class OnlineLinkedCoordinator:
                 return 2
             item, config, target_key = selected
             config_path = self._write_config("v0", config)
-            version = self._new_version("v0", config, config_path, None, None, item)
+            config_generation_seconds = round(max(0.0, self.clock() - config_generation_started_at), 3)
+            version = self._new_version(
+                "v0", config, config_path, None, None, item,
+                config_generation_seconds=config_generation_seconds,
+            )
             version["worker_run_id"] = f"{self.legacy_run_id}-v0"
             version["known_parameters"] = []
             self._reports["v0"] = copy.deepcopy(self._raw_report or {})
@@ -1316,6 +1321,7 @@ class OnlineLinkedCoordinator:
         }
         self.state["attempts"].append(attempt)
         self._write_state()
+        config_generation_started_at = self.clock()
         try:
             # Only the selected, correlated request may seed the published child.
             metadata = child_config.get("metadata")
@@ -1325,7 +1331,11 @@ class OnlineLinkedCoordinator:
             replay_config = copy.deepcopy(child_config)
             _replace_fuzzable_values_with_placeholder(child_config)
             child_path = self._write_config(next_version, child_config)
-            child = self._new_version(next_version, child_config, child_path, parent, discovery["event_id"], seed)
+            config_generation_seconds = round(max(0.0, self.clock() - config_generation_started_at), 3)
+            child = self._new_version(
+                next_version, child_config, child_path, parent, discovery["event_id"], seed,
+                config_generation_seconds=config_generation_seconds,
+            )
             child["known_parameters"] = proposed_parameters
             child["replay_input_trial"] = {
                 "attempt_id": trial_attempt["attempt_id"],
@@ -1798,6 +1808,8 @@ class OnlineLinkedCoordinator:
             return False
         if helper_depth < 0:
             return False
+        check_parameter = dict(parameter)
+        check_parameter.pop("access_forms", None)
         events = zend.get("events")
         matching_events: list[Mapping[str, Any]] = []
         if isinstance(events, list):
@@ -1850,8 +1862,7 @@ class OnlineLinkedCoordinator:
         summaries = zend.get("callback_summaries")
         if not isinstance(summaries, list):
             return False
-        operations: set[str] = set()
-        summary_source = ""
+        parameter_source = str(parameter.get("source") or "").upper()
         for summary in summaries:
             if not isinstance(summary, Mapping):
                 continue
@@ -1862,26 +1873,41 @@ class OnlineLinkedCoordinator:
             if not isinstance(values, list):
                 continue
             for value in values:
-                if not isinstance(value, Mapping) or str(value.get("name") or value.get("parameter") or "") != name:
+                if not isinstance(value, Mapping):
                     continue
-                summary_source = str(value.get("source") or "").upper()
+                value_name = str(value.get("name") or value.get("parameter") or "")
+                value_path = value.get("path")
+                if value_name and value_name != name:
+                    continue
+                if value_path is not None and value_path != path:
+                    continue
+                if not value_name and value_path != path:
+                    continue
+                row_source = str(value.get("source") or "").upper()
+                if row_source not in {parameter_source, "REQUEST"}:
+                    continue
                 forms = value.get("access_forms")
-                if isinstance(forms, list):
-                    operations.update(str(item).lower() for item in forms if str(item).strip())
-        if not operations.intersection({"empty", "isset", "read"}):
-            return False
-        if summary_source == "REQUEST":
-            check_parameter["source"] = "REQUEST"
-        check_parameter["access_forms"] = sorted(operations)
-        return runtime_parameter_is_accepted(
-            check_parameter,
-            request,
-            zend,
-            canonical_callback=expected_callback,
-            request_method=str(parent.get("resolved_method") or ""),
-            operations=operations,
-            runtime_cookie_probes=self.runtime_cookie_probes,
-        )
+                operations = {
+                    str(item).lower() for item in forms
+                    if str(item).strip()
+                } if isinstance(forms, list) else set()
+                if not operations.intersection({"empty", "isset", "read"}):
+                    continue
+                row_parameter = dict(check_parameter)
+                if row_source == "REQUEST":
+                    row_parameter["source"] = "REQUEST"
+                row_parameter["access_forms"] = sorted(operations)
+                if runtime_parameter_is_accepted(
+                    row_parameter,
+                    request,
+                    zend,
+                    canonical_callback=expected_callback,
+                    request_method=str(parent.get("resolved_method") or ""),
+                    operations=operations,
+                    runtime_cookie_probes=self.runtime_cookie_probes,
+                ):
+                    return True
+        return False
 
     @staticmethod
     def _apply_request_value(config: dict[str, Any], section_name: str, name: str, value: Any) -> bool:
@@ -3338,6 +3364,8 @@ class OnlineLinkedCoordinator:
         parent: Mapping[str, Any] | None,
         discovery_event: str | None,
         seed_item: Mapping[str, Any],
+        *,
+        config_generation_seconds: float | None = None,
     ) -> dict[str, Any]:
         metadata = config.get("metadata") if isinstance(config.get("metadata"), Mapping) else {}
         record = {
@@ -3362,6 +3390,8 @@ class OnlineLinkedCoordinator:
             "seed_variant_id": str(metadata.get("seed_variant_id") or (seed_item.get("seed") or {}).get("seed_variant_id") or ""),
             "seed_item": copy.deepcopy(dict(seed_item)),
         }
+        if config_generation_seconds is not None:
+            record["config_generation_seconds"] = max(0.0, float(config_generation_seconds))
         self.state["versions"].append(record)
         self._write_state()
         return record
