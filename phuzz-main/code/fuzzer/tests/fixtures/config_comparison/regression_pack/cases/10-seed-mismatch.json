@@ -1,0 +1,85 @@
+{
+  "target": "http://web/wp-admin/admin-ajax.php",
+  "methods": [
+    "POST"
+  ],
+  "print_timestamps": false,
+  "headers": {
+    "data": [
+      {
+        "name": "Authorization",
+        "value": "Bearer fixture-token"
+      }
+    ],
+    "fixed": [
+      "Authorization"
+    ],
+    "fuzz": [],
+    "weight": 1
+  },
+  "cookies": {
+    "data": [
+      {
+        "name": "session_id",
+        "value": "fixture-session"
+      }
+    ],
+    "fixed": [
+      "session_id"
+    ],
+    "fuzz": [],
+    "weight": 1
+  },
+  "query_params": {
+    "data": [
+      {
+        "name": "locale",
+        "value": "en_US"
+      },
+      {
+        "name": "page",
+        "value": "1"
+      }
+    ],
+    "fixed": [],
+    "fuzz": [],
+    "weight": 1
+  },
+  "body_params": {
+    "data": [
+      {
+        "name": "action",
+        "value": "hookphuzz_compare_fixture"
+      },
+      {
+        "name": "object_id",
+        "value": 7,
+        "seeds": [
+          7,
+          "7"
+        ]
+      },
+      {
+        "name": "payload",
+        "value": "alpha",
+        "seeds": [
+          "alpha",
+          "gamma"
+        ]
+      }
+    ],
+    "fixed": [
+      "action",
+      "object_id"
+    ],
+    "fuzz": [
+      "payload"
+    ],
+    "weight": 1
+  },
+  "metadata": {
+    "hook_name": "wp_ajax_hookphuzz_compare_fixture",
+    "auth_mode": "authenticated",
+    "run_id": "baseline-run"
+  }
+}

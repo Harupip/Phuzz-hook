@@ -1,0 +1,160 @@
+{
+  "title": "Config comparison regression pack",
+  "purpose": "Synthetic raw PHUZZ configs for direct expected-vs-actual comparisons.",
+  "provenance": "synthetic_fixture",
+  "expected_config": "baseline.json",
+  "comparison": "Compare baseline.json as --expected with each case file as --actual.",
+  "default_policy": "strict",
+  "cases": [
+    {
+      "file": "cases/01-exact-match.json",
+      "policy": "strict",
+      "expected_status": "MATCH",
+      "expected_difference_kinds": [],
+      "purpose": "Exact direct match."
+    },
+    {
+      "file": "cases/02-equivalent-declaration-order.json",
+      "policy": "strict",
+      "expected_status": "MATCH",
+      "expected_difference_kinds": [],
+      "purpose": "Reordered declarations and seed alternatives."
+    },
+    {
+      "file": "cases/03-semantic-transient-metadata.json",
+      "policy": "semantic",
+      "expected_status": "MATCH",
+      "expected_difference_kinds": [],
+      "purpose": "Only semantic-policy transient fields differ."
+    },
+    {
+      "file": "cases/04-target-mismatch.json",
+      "policy": "strict",
+      "expected_status": "MISMATCH",
+      "expected_difference_kinds": [
+        "TARGET_MISMATCH"
+      ],
+      "purpose": "Endpoint differs."
+    },
+    {
+      "file": "cases/05-method-mismatch.json",
+      "policy": "strict",
+      "expected_status": "MISMATCH",
+      "expected_difference_kinds": [
+        "METHOD_MISMATCH"
+      ],
+      "purpose": "HTTP method differs."
+    },
+    {
+      "file": "cases/06-source-mismatch.json",
+      "policy": "strict",
+      "expected_status": "MISMATCH",
+      "expected_difference_kinds": [
+        "SOURCE_MISMATCH"
+      ],
+      "purpose": "The locale parameter moves from query to body."
+    },
+    {
+      "file": "cases/07-missing-parameter.json",
+      "policy": "strict",
+      "expected_status": "MISMATCH",
+      "expected_difference_kinds": [
+        "MISSING_PARAMETER"
+      ],
+      "purpose": "A required body parameter is absent."
+    },
+    {
+      "file": "cases/08-unexpected-parameter.json",
+      "policy": "strict",
+      "expected_status": "MISMATCH",
+      "expected_difference_kinds": [
+        "UNEXPECTED_PARAMETER"
+      ],
+      "purpose": "An undeclared actual parameter is added."
+    },
+    {
+      "file": "cases/09-value-type-mismatch.json",
+      "policy": "strict",
+      "expected_status": "MISMATCH",
+      "expected_difference_kinds": [
+        "VALUE_MISMATCH"
+      ],
+      "purpose": "Integer and string values remain distinct."
+    },
+    {
+      "file": "cases/10-seed-mismatch.json",
+      "policy": "strict",
+      "expected_status": "MISMATCH",
+      "expected_difference_kinds": [
+        "SEED_MISMATCH"
+      ],
+      "purpose": "The allowed seed set differs."
+    },
+    {
+      "file": "cases/11-fixed-fuzz-classification-mismatch.json",
+      "policy": "strict",
+      "expected_status": "MISMATCH",
+      "expected_difference_kinds": [
+        "CLASSIFICATION_MISMATCH"
+      ],
+      "purpose": "A parameter moves from fuzz to fixed."
+    },
+    {
+      "file": "cases/12-authorization-mismatch.json",
+      "policy": "strict",
+      "expected_status": "MISMATCH",
+      "expected_difference_kinds": [
+        "VALUE_MISMATCH"
+      ],
+      "purpose": "Authorization header value differs."
+    },
+    {
+      "file": "cases/13-cookie-mismatch.json",
+      "policy": "strict",
+      "expected_status": "MISMATCH",
+      "expected_difference_kinds": [
+        "VALUE_MISMATCH"
+      ],
+      "purpose": "Cookie value differs."
+    },
+    {
+      "file": "cases/14-nontransient-metadata-mismatch.json",
+      "policy": "semantic",
+      "expected_status": "MISMATCH",
+      "expected_difference_kinds": [
+        "VALUE_MISMATCH"
+      ],
+      "purpose": "Semantic mode still compares unknown metadata."
+    },
+    {
+      "file": "cases/15-invalid-duplicate-parameter.json",
+      "policy": "strict",
+      "expected_status": "INVALID",
+      "expected_difference_kinds": [
+        "DUPLICATE_PARAMETER"
+      ],
+      "purpose": "A repeated parameter name is invalid."
+    },
+    {
+      "file": "cases/16-invalid-missing-target.json",
+      "policy": "strict",
+      "expected_status": "INVALID",
+      "expected_difference_kinds": [
+        "INVALID_CONFIG"
+      ],
+      "purpose": "The required target is missing."
+    },
+    {
+      "file": "cases/17-missing-cookie.json",
+      "policy": "strict",
+      "expected_status": "MISMATCH",
+      "expected_difference_kinds": [
+        "CLASSIFICATION_MISMATCH",
+        "MISSING_PARAMETER",
+        "VALUE_MISMATCH"
+      ],
+      "purpose": "The actual config omits cookies, including its cookie declarations and weight."
+    }
+  ],
+  "coverage_note": "NO_REFERENCE and AMBIGUOUS belong to bulk reference-index lookup, not direct single-config comparisons; this pack covers direct MATCH, MISMATCH, and INVALID outcomes."
+}

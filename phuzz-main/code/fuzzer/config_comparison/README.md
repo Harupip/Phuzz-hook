@@ -65,6 +65,23 @@ counts for all five statuses, results, reference errors, and input errors.
 Exit codes are 0 for all matches, 1 for mismatch/no-reference/ambiguity, and 2
 for invalid configs, invalid references, input errors, or invalid arguments.
 
+## One-command comparison using `phuzz.env`
+
+Set `CONFIG_COMPARE_EXPECTED` and `CONFIG_COMPARE_ACTUAL` in
+`phuzz-main/code/phuzz.env`. Paths may be absolute or relative to
+`phuzz-main/code`. `CONFIG_COMPARE_POLICY` accepts `strict` or `semantic` and
+defaults to `strict`.
+
+From `phuzz-main/code`, run:
+
+```powershell
+rtk proxy pwsh -NoProfile -File .\compare-configs.ps1
+```
+
+The script calls the offline comparator and returns its exit code: 0 for
+`MATCH`, 1 for `MISMATCH`, and 2 for `INVALID` or an input error. It does not
+start online-linked or Docker.
+
 ## Offline comparison of one online-linked final config
 
 `phuzz.env` controls the optional prompt at the end of a successful online-linked

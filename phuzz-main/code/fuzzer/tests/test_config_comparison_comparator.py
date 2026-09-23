@@ -78,6 +78,21 @@ class ConfigComparatorTests(unittest.TestCase):
         self.assertEqual(result.status, Status.MISMATCH)
         self.assertIn((DifferenceKind.MISSING_PARAMETER, "/body_params/product_id"), kinds_and_paths(result))
 
+    def test_missing_cookie_is_mismatch(self) -> None:
+        expected = comparison_config()
+        expected["cookies"] = {
+            "data": [{"name": "session_id", "value": "fixture-session"}],
+            "fixed": ["session_id"],
+            "fuzz": [],
+        }
+        actual = copy.deepcopy(expected)
+        del actual["cookies"]
+
+        result = compare_configs(expected, actual, ComparisonPolicy())
+
+        self.assertEqual(result.status, Status.MISMATCH)
+        self.assertIn((DifferenceKind.MISSING_PARAMETER, "/cookies/session_id"), kinds_and_paths(result))
+
     def test_selector_move_from_fuzz_to_fixed_is_classification_mismatch(self) -> None:
         expected = comparison_config()
         actual = copy.deepcopy(expected)
