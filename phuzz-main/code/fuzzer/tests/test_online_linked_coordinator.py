@@ -2108,7 +2108,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(values["b"], "fuzz")
             replay_config = json.loads(Path(child["replay_config_path"]).read_text())
             replay_values = {row["name"]: row["value"] for row in replay_config["body_params"]["data"]}
-            self.assertEqual(replay_values["a"], "fuzz")
+            self.assertEqual(replay_values["a"], "probe-a")
             self.assertEqual(replay_values["b"], "probe-b")
             seed_metadata = child_config["metadata"]["online_request_seed"]
             self.assertEqual(seed_metadata["evidence_request_ids"], [seed_metadata["request_id"]])
@@ -2118,12 +2118,113 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             )
             self.assertEqual(parent["known_parameters"], [])
 
+    def test_separate_probes_are_combined_only_after_one_verified_request(self):
+        for names in (("nonce", "notice_id", "repeat_notice_after"),
+                      ("repeat_notice_after", "notice_id", "nonce")):
+            with self.subTest(names=names), tempfile.TemporaryDirectory() as tmp:
+                coordinator, parent, evidence, convergence = self.make_probe_context(
+                    Path(tmp), [], names=names, accepted=names,
+                )
+                child = coordinator._run_pending_probe(
+                    parent=parent, evidence=evidence,
+                    raw_report=coordinator._reports["v0"], convergence=convergence,
+                    probe=convergence["pending_probes"][0], seed=parent["seed_item"], deadline=None,
+                )
+                self.assertIsNotNone(child)
+                self.assertEqual(
+                    [p["name"] for p in child["known_parameters"]],
+                    ["nonce", "notice_id", "repeat_notice_after"],
+                )
+                self.assertTrue(child["replay_result"]["passed"])
+                trial = coordinator.state["replay_input_trials"][0]
+                self.assertEqual(trial["trials"][0]["missing_parameters"], [])
+                config = json.loads(Path(child["config_path"]).read_text())
+                provenance = config["metadata"]["online_request_seed"]
+                self.assertEqual(provenance["evidence_request_ids"], [provenance["request_id"]])
+                self.assertTrue(all(row["request_id"] == provenance["request_id"]
+                                    for row in provenance["values"]))
+                self.assertEqual(coordinator.state["pending_runtime_candidates"], [])
+
+    def test_combined_trial_does_not_inherit_an_individual_probes_missing_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
+            old = {"name": "old", "path": ["old"], "source": "POST", "location": "form",
+                   "helper_depth": 0, "fuzzable": True, "observed_count": 1,
+                   "evidence_kind": "zend_runtime", "canonical_callback": "fixture_callback",
+                   "callback_id": "cb-fixture", "request_method": "POST"}
+            parent["known_parameters"] = [old]
+            original_converge = coordinator.converge_fn
+
+            def converge(**kwargs):
+                result = original_converge(**kwargs)
+                if "-probe-" in kwargs["legacy_run_id"]:
+                    result.update(status="REPLAY_FAILED", missing_parameters=[old],
+                                  observed_parameters=result["new_parameters"])
+                return result
+
+            coordinator.converge_fn = converge
+            child = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=None,
+            )
+            self.assertIsNotNone(child)
+            trial = coordinator.state["replay_input_trials"][0]
+            self.assertEqual({p["name"] for p in trial["expected_parameters"]}, {"old", "a", "b"})
+            self.assertEqual({p["name"] for p in child["known_parameters"]}, {"old", "a", "b"})
+            self.assertEqual(coordinator.state["pending_runtime_candidates"], [])
+
+    def test_combined_probe_proposal_does_not_publish_missing_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
+            original_sender = coordinator.probe_sender
+
+            def sender(container_name, **kwargs):
+                result = original_sender(container_name, **kwargs)
+                if "replay-input-trials" in kwargs["config_slug"]:
+                    # This callback cannot read a and b in the same request.
+                    result["zend"]["events"] = [e for e in result["zend"]["events"] if e["path"] != ["a"]]
+                    result["zend"]["callback_summaries"][0]["unique_parameters"] = [
+                        p for p in result["zend"]["callback_summaries"][0]["unique_parameters"]
+                        if p["name"] != "a"
+                    ]
+                return result
+
+            coordinator.probe_sender = sender
+            child = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=None,
+            )
+            self.assertIsNotNone(child)
+            self.assertEqual({p["name"] for p in child["known_parameters"]}, {"b"})
+            first_trial = coordinator.state["replay_input_trials"][0]
+            self.assertEqual({p["name"] for p in first_trial["expected_parameters"]}, {"a", "b"})
+            self.assertEqual(first_trial["status"], "failed")
+            self.assertEqual({p["name"] for p in coordinator.state["pending_runtime_candidates"]}, {"a"})
+
+    def limit_trial_reads(self, coordinator, names):
+        original = coordinator.probe_sender
+
+        def sender(container_name, **kwargs):
+            result = original(container_name, **kwargs)
+            if "replay-input-trials" in kwargs["config_slug"] and result.get("zend"):
+                result["zend"]["events"] = [e for e in result["zend"]["events"] if e["path"][0] in names]
+                result["zend"]["callback_summaries"][0]["unique_parameters"] = [
+                    p for p in result["zend"]["callback_summaries"][0]["unique_parameters"] if p["name"] in names
+                ]
+            return result
+
+        coordinator.probe_sender = sender
+        return original
+
     def test_noncooccurring_probe_candidates_are_not_promoted_as_one_union(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, parent, evidence, convergence = self.make_probe_context(
                 Path(tmp), [], names=("guard_value", "body_candidate"),
                 accepted=("guard_value", "body_candidate"),
             )
+            self.limit_trial_reads(coordinator, {"guard_value"})
 
             result = coordinator._run_pending_probe(
                 parent=parent, evidence=evidence,
@@ -2147,6 +2248,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             coordinator, parent, evidence, convergence = self.make_probe_context(
                 Path(tmp), [], names=("a", "b"), accepted=("a", "b"),
             )
+            original_sender = self.limit_trial_reads(coordinator, {"b"})
 
             child = coordinator._run_pending_probe(
                 parent=parent, evidence=evidence,
@@ -2159,6 +2261,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 {item["name"] for item in coordinator.state["pending_runtime_candidates"]}, {"a"},
             )
 
+            coordinator.probe_sender = original_sender
             fresh_evidence = copy.deepcopy(evidence)
             fresh_evidence["request_id"] = "child-v1-request"
             fresh_evidence["worker_run_id"] = "child-v1-run"
@@ -2208,6 +2311,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             coordinator, parent, evidence, convergence = self.make_probe_context(
                 Path(tmp), [], names=("a", "b"), accepted=("a", "b"),
             )
+            self.limit_trial_reads(coordinator, {"b"})
             child = coordinator._run_pending_probe(
                 parent=parent, evidence=evidence,
                 raw_report=coordinator._reports["v0"], convergence=convergence,
@@ -2479,7 +2583,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(
                 {item["name"] for item in result["known_parameters"]}, {"guard_value"},
             )
-            self.assertEqual(coordinator.state.get("pending_runtime_candidates"), [])
+            self.assertEqual({p["name"] for p in coordinator.state["pending_runtime_candidates"]}, {"body_candidate"})
             self.assertTrue(coordinator._active_container)
 
     def test_bounded_two_probes_keep_independent_evidence(self):
@@ -2560,12 +2664,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
                 self.assertIsNotNone(result)
                 child_names = {item["name"] for item in coordinator.state["versions"][1]["known_parameters"]}
-                self.assertEqual(child_names, {"a"} if deadline is None else {"existing"})
+                self.assertEqual(child_names, {"a", "existing"} if deadline is None else {"existing"})
                 if deadline is None:
-                    self.assertIn(
-                        "existing",
-                        {item["name"] for item in coordinator.state["pending_runtime_candidates"]},
-                    )
+                    self.assertEqual(coordinator.state["pending_runtime_candidates"], [])
                 self.assertEqual(parent["known_parameters"], [])
                 if deadline is None:
                     self.assertIn("probe:a", log)
@@ -2729,6 +2830,29 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertNotIn("worker_stop", log)
             self.assertNotEqual(coordinator.state.get("terminal_reason"), "BUDGET_EXPIRED")
             self.assertIn("CHILD_CONFIG_EXPORT_FAILED", json.dumps(coordinator.state["events"]))
+
+    def test_measured_sender_cost_reserves_time_for_trial_and_replay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
+            original_sender = coordinator.probe_sender
+
+            def sender(container_name, **kwargs):
+                result = original_sender(container_name, **kwargs)
+                coordinator.sleeper(1.0)
+                return result
+
+            coordinator.probe_sender = sender
+            child = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=5.0,
+            )
+            self.assertIsNotNone(child)
+            self.assertTrue(child["replay_result"]["passed"])
+            self.assertEqual([p["candidate"]["name"] for p in coordinator.state["probe_attempts"]], ["a"])
+            deferred = [e for e in coordinator.state["events"] if e.get("status") == "DEFERRED"]
+            self.assertEqual(deferred[0]["candidate"]["name"], "b")
+            self.assertLess(coordinator.clock(), 5.0)
 
     def test_fake_clock_reserves_child_budget_after_accepted_probe(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3191,8 +3315,12 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             )
 
             self.assertIsNotNone(result)
-            self.assertEqual(len(trial_inputs), 1)
-            self.assertEqual(worker_counts_at_trial, [0])
+            self.assertEqual(len(trial_inputs), 2)
+            self.assertEqual(worker_counts_at_trial, [0, 0])
+            attempt = coordinator.state["replay_input_trials"][0]
+            self.assertEqual(attempt["status"], "selected")
+            self.assertEqual([p["name"] for p in attempt["trials"][0]["missing_parameters"]], ["post_id"])
+            self.assertEqual(attempt["trials"][1]["missing_parameters"], [])
             self.assertEqual(trial_inputs[0]["post_type"], "probe")
             self.assertEqual(trial_inputs[0]["post_id"], "probe")
             self.assertEqual(len(coordinator.state["versions"]), 2)
@@ -4279,10 +4407,33 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     return replay_runner(*args, **kwargs)
 
                 coordinator.replay_runner = slow_replay
-                self.assertEqual(coordinator.run(), 1)
+                self.assertEqual(coordinator.run(), 0)
                 self.assertEqual(log.count("worker_start"), 1)
                 self.assertFalse(coordinator.state["versions"][1]["replay_result"]["passed"])
-                self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
+                self.assertEqual(coordinator.state["terminal_status"], "BOUNDED_ONLINE_COMPLETE")
+                child = coordinator.state["versions"][1]
+                self.assertEqual(child["terminal_reason"], "CANDIDATE_BUDGET_EXPIRED")
+                replay = child["replay_result"]
+                self.assertEqual(replay["runner"]["runs"][0]["callback_reached"], replay_passes)
+                self.assertTrue(replay["budget_expired"])
+
+    def test_deadline_spent_verifying_replay_does_not_admit_a_late_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            original_verify = coordinator.verify_pass2_fn
+
+            def verify(report, *args, **kwargs):
+                result = original_verify(report, *args, **kwargs)
+                if str(report.get("legacy_run_id", "")).endswith("-v1-replay"):
+                    coordinator.sleeper(3)
+                return result
+
+            coordinator.verify_pass2_fn = verify
+            coordinator.run()
+            child = coordinator.state["versions"][1]
+            self.assertFalse(child["replay_result"]["passed"])
+            self.assertEqual(child["terminal_reason"], "CANDIDATE_BUDGET_EXPIRED")
+            self.assertTrue(child["replay_result"]["runner"]["runs"][0]["callback_reached"])
 
     def test_replay_pass_starts_child_only_after_parent_stops(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -207,6 +207,41 @@ class OnlineLinkedExportTests(unittest.TestCase):
         self.assertEqual(export_online_linked_batch(self.batch([candidate])), 0)
         self.assertEqual(list((self.root / "final-configs").iterdir()), [])
 
+    def test_export_reports_fallback_and_observed_fields_missing_from_final(self):
+        older = self.version("v1")
+        newer = self.version("v2", gate=False, pass2=(0, 0))
+        newer["terminal_reason"] = "CANDIDATE_BUDGET_EXPIRED"
+        candidate, path = self.write_state(versions=[older, newer], terminal_reason="BUDGET_EXPIRED")
+        state = json.loads(path.read_text())
+        state["probe_attempts"] = [{"candidate": {
+            "name": "notice_id", "source": "POST", "location": "form",
+        }, "status": "accepted"}]
+        path.write_text(json.dumps(state))
+        export_online_linked_batch(self.batch([candidate]))
+        summary_path = self.root / "final-config-summary.json"
+        self.assertTrue(summary_path.is_file(), "Export must explain which verified version was selected")
+        row = json.loads(summary_path.read_text())["candidates"][0]
+        self.assertEqual(row["selected_version"], "v1")
+        self.assertEqual(row["latest_version"], "v2")
+        self.assertEqual(row["discovery_status"], "PARTIAL")
+        self.assertEqual(row["pending_parameters"], [{
+            "name": "notice_id", "source": "POST", "location": "form",
+        }])
+        self.assertEqual(row["skipped_versions"][0]["terminal_reason"], "CANDIDATE_BUDGET_EXPIRED")
+        self.assertEqual(next((self.root / "final-configs").iterdir()).read_bytes(),
+                         Path(older["config_path"]).read_bytes())
+
+    def test_export_reports_direct_read_proposals_that_failed_before_publication(self):
+        candidate, path = self.write_state(versions=[self.version("v1")])
+        state = json.loads(path.read_text())
+        field = {"name": "new_field", "source": "POST", "location": "form"}
+        state["events"] = [{"kind": "PARAMETER_DISCOVERY", "parameters": [field]}]
+        state["replay_input_trials"] = [{"status": "failed", "expected_parameters": [field]}]
+        path.write_text(json.dumps(state))
+        export_online_linked_batch(self.batch([candidate]))
+        row = json.loads((self.root / "final-config-summary.json").read_text())["candidates"][0]
+        self.assertEqual(row["pending_parameters"], [field])
+
     def test_unrelated_probe_parent_does_not_reject_real_version(self):
         version = self.version("v1", config_path=self.root / "probe" / "project" / "versions" / "v1" / "v1-config.json")
         candidate, _ = self.write_state(versions=[version])
