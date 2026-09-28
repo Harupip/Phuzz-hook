@@ -191,9 +191,9 @@ pwsh -NoProfile -File .\phuzz.ps1 -PluginSlug nmedia-user-file-uploader -OnlineT
 ```text
 fuzzer/output/online-seed-generation/<run-id>/suggested_seeds.json
 fuzzer/output/online-linked/<run-id>/batch-state.json
-fuzzer/output/online-linked/<storage-id>/state.json
-fuzzer/output/online-linked/<storage-id>/events.jsonl
-fuzzer/output/online-linked/<storage-id>/versions/vN/
+fuzzer/output/online-linked/<run-id>/campaigns/<storage-id>/state.json
+fuzzer/output/online-linked/<run-id>/campaigns/<storage-id>/events.jsonl
+fuzzer/output/online-linked/<run-id>/campaigns/<storage-id>/versions/vN/
 fuzzer/configs/online-linked/<plugin-slug>/<storage-id>/versions/vN/vN-config.json
 fuzzer/configs/online-linked/<plugin-slug>/<storage-id>/versions/vN/replay/vN-replay.json
 fuzzer/output/online-linked/<batch-run-id>/callback-registry.json
@@ -228,7 +228,7 @@ Khi convergence phát hiện tham số mới, coordinator dựng một context �
 
 ```text
 fuzzer/configs/online-linked/<plugin-slug>/<storage-id>/replay-input-trials/<attempt>/tN.json
-fuzzer/output/online-linked/<storage-id>/replay-input-trials/<attempt>/tN/{request,zend}/
+fuzzer/output/online-linked/<run-id>/campaigns/<storage-id>/replay-input-trials/<attempt>/tN/{request,zend}/
 ```
 
 Có tối đa 4 trial cho một attempt: context ban đầu và tối đa 3 điều chỉnh. Trial dùng cùng deadline của candidate, không tiêu hao `OnlineMaxVersions`, không ghi đè parent hay version đã công bố, và không khởi động worker child. Mỗi trial phải có request/Zend pair cùng request ID, run ID, plugin, callback, method, auth context và transport đã chứng minh; callback reached hoặc HTTP status thành công riêng lẻ không đủ. Pass 2 cũng phải đạt `accepted == total > 0` khi toàn bộ expected parameters đã được xác minh.

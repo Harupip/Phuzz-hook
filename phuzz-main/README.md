@@ -65,7 +65,7 @@ sleep 15s # give the DB some time to start up - might be shorter or longer depen
 sudo docker-compose up fuzzer-wordpress-show-all-comments-in-one-page-1 --build --force-recreate
 # Let the fuzzer run for a while and terminate it with ctrl+c
 # View the results with
-less fuzzer/output/fuzzer-1/vulnerable-candidates.json
+less fuzzer/output/workers/fuzzer-1/vulnerable-candidates.json
 ```
 
 The default compose file expects the matching WordPress plugin archive to exist in `code/web/applications/wordpress/_plugins/`.

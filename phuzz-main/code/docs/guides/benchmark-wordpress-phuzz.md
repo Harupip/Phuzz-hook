@@ -48,7 +48,7 @@ No lam cac viec sau cho tung run:
 1. Dat `PHUZZ_SCORING_MODE` trong `fuzzer/scoring.env`
 2. Tao Compose override tam thoi theo plugin
 3. `docker compose down --volumes --remove-orphans`
-4. Xoa `fuzzer/output/fuzzer-1`
+4. Xoa `fuzzer/output/workers/fuzzer-1`
 5. Start lai `db` va `web`
 6. Doi `http://localhost:8080/` tra `200`
 7. Verify plugin active, `WP_TARGET_PLUGIN`, `FUZZER_COVERAGE_PATH`
@@ -167,7 +167,7 @@ Dung de lay:
 Tu local:
 
 ```text
-fuzzer/output/fuzzer-1/
+fuzzer/output/workers/fuzzer-1/
 ```
 
 Dung de lay:

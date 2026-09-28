@@ -1099,6 +1099,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertEqual(run_online_linked(args), 0)
 
             self.assertEqual(len(calls), 2)
+            self.assertTrue(all(call["campaign_dir"] == root / "output/online-linked/run" for call in calls))
             batch_state = json.loads(
                 (root / "output" / "online-linked" / "run" / "batch-state.json").read_text(encoding="utf-8")
             )
@@ -1469,6 +1470,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         campaign_deadline: float | None = None,
         runtime_cookie_probes: bool = False,
         runtime_batch_reader=None,
+        campaign_dir: Path | None = None,
     ) -> OnlineLinkedCoordinator:
         item = seed_item()
         raw_report = {"plugin_slug": "fixture", "suggested_seeds": [item]}
@@ -1708,6 +1710,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             runtime_cookie_probes=runtime_cookie_probes,
             registry_path=registry,
             campaign_deadline=campaign_deadline,
+            campaign_dir=campaign_dir,
             build_config_fn=build_config,
             list_targets_fn=list_targets,
             list_artifacts=list_artifacts,
@@ -4502,6 +4505,17 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertTrue((run_dir / "state.json").is_file())
             self.assertTrue((run_dir / "events.jsonl").is_file())
             self.assertTrue((run_dir / "versions" / "v0").is_dir())
+
+    def test_candidate_evidence_is_grouped_under_owning_campaign(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            campaign_dir = root / "output/online-linked/fixture-20260928T120000Z"
+            coordinator = self.make_coordinator(root, [], campaign_dir=campaign_dir)
+            self.assertEqual(coordinator.run(), 0)
+            self.assertEqual(coordinator.run_dir.parent, campaign_dir / "campaigns")
+            self.assertTrue(coordinator.state_path.is_file())
+            self.assertTrue((coordinator.run_dir / "versions/v0").is_dir())
+            self.assertFalse((root / "output/online-linked" / coordinator.run_dir.name).exists())
 
     def test_long_run_id_preserves_evidence_and_resolvable_worker_configs(self):
         with tempfile.TemporaryDirectory() as tmp:

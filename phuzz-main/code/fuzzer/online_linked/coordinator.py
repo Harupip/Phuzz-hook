@@ -163,6 +163,7 @@ class OnlineLinkedCoordinator:
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         campaign_deadline: float | None = None,
+        campaign_dir: Path | None = None,
     ) -> None:
         if not 1 <= max_seconds <= 120:
             raise ValueError("max_seconds must be between 1 and 120")
@@ -199,9 +200,10 @@ class OnlineLinkedCoordinator:
         self.clock = clock
         self.sleeper = sleeper
         self.campaign_deadline = float(campaign_deadline) if campaign_deadline is not None else None
-        # Keep nested evidence/config paths below Windows MAX_PATH for long run IDs.
+        # Avoid repeating long candidate run IDs in nested evidence/config paths.
         storage_id = hashlib.sha256(self.legacy_run_id.encode("utf-8")).hexdigest()[:16]
-        self.run_dir = self.output_root / "online-linked" / storage_id
+        evidence_root = Path(campaign_dir) / "campaigns" if campaign_dir is not None else self.output_root / "online-linked"
+        self.run_dir = evidence_root / storage_id
         self.config_dir = self.config_root / "online-linked" / self.plugin_slug / storage_id
         if registry is not None:
             self.registry = dict(registry)
@@ -4014,6 +4016,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 service=args.service,
                 load_finding_artifact=load_finding_artifact,
                 campaign_deadline=campaign_deadline,
+                campaign_dir=batch_dir,
             )
             result = coordinator.run()
             skipped = skipped or result != 0 or coordinator.state.get("terminal_status") == "NOT_VERIFIED"
