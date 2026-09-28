@@ -116,6 +116,34 @@ class Clock:
 
 
 class OnlineLinkedCoordinatorTests(unittest.TestCase):
+    def test_request_artifact_names_stay_short_and_preserve_correlation(self):
+        from online_linked.coordinator import _request_id
+
+        run = "custom-fonts-20260928T140526Z-candidate-001-wp_ajax_astra-notice-dismiss-v0"
+        ids = set()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            # Match the failing Windows directory depth without requiring long-path support.
+            root = root / ("x" * max(1, 180 - len(str(root)) - 1))
+            coordinator = object.__new__(OnlineLinkedCoordinator)
+            for suffix in ("-probe-p1", "-probe-p2", "-replay", "-replay-input-a1-t1"):
+                run_id = run + suffix
+                request_id = _request_id(run_id)
+                self.assertEqual(request_id, _request_id(run_id))
+                self.assertNotIn(request_id, ids)
+                ids.add(request_id)
+                name = request_id + ".json"
+                self.assertLess(len(str(root / "request" / name)), 260)
+                request = {"request_id": request_id, "legacy_run_id": run_id}
+                zend = {"request_id": request_id, "run_id": run_id}
+                row = coordinator._sender_runner_row({}, {
+                    "status": "callback_reached", "request_name": name, "request": request,
+                    "zend_name": name, "zend": zend,
+                }, run_id)
+                coordinator._save_replay_artifacts(row, root / "request", root / "zend")
+                self.assertEqual(json.loads((root / "request" / name).read_text()), request)
+                self.assertEqual(json.loads((root / "zend" / name).read_text()), zend)
+
     def test_poll_deadline_is_bounded_without_losing_verified_version(self):
         for outcome in ("timeout", "late_output", "before_poll", "early_timeout", "docker_error"):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:

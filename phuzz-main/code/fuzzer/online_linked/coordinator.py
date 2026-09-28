@@ -67,6 +67,11 @@ ConfigBuilder = Callable[..., tuple[str, dict[str, Any]]]
 RuntimeBatchReader = Callable[..., dict[str, Any]]
 
 
+def _request_id(run_id: str) -> str:
+    # Request IDs become artifact filenames; keep full run identity in the payload.
+    return hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:32]
+
+
 def _parameter_key(parameter: Any) -> tuple[str, str, str]:
     if not isinstance(parameter, Mapping):
         return "", "", ""
@@ -2028,7 +2033,7 @@ class OnlineLinkedCoordinator:
             trial_run_id = self._bounded_trial_run_id(
                 parent["worker_run_id"], attempt["attempt_id"], trial_name,
             )
-            trial_request_id = f"{trial_run_id}-request"
+            trial_request_id = _request_id(trial_run_id)
             trial_config_path = trial_root / f"{trial_name}.json"
             trial_request_dir = mirror_root / trial_name / "request"
             trial_zend_dir = mirror_root / trial_name / "zend"
@@ -2719,7 +2724,7 @@ class OnlineLinkedCoordinator:
         try:
             sender_result = self._run_light_sender(
                 config_path=replay_path,
-                request_id=f"{probe_run_id}-request",
+                request_id=_request_id(probe_run_id),
                 run_id=probe_run_id,
                 hook_name=probe_row["hook_name"],
                 callback_id=probe_row["callback_id"],
@@ -3171,7 +3176,7 @@ class OnlineLinkedCoordinator:
         try:
             sender_result = self._run_light_sender(
                 config_path=replay_path,
-                request_id=f"{replay_run_id}-request",
+                request_id=_request_id(replay_run_id),
                 run_id=replay_run_id,
                 hook_name=row["hook_name"],
                 callback_id=row["callback_id"],
