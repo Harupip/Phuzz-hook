@@ -186,7 +186,7 @@ class MethodInferenceTests(unittest.TestCase):
             },
         }
         decisions = LiveHookSeedGenerator()._method_decisions(
-            "wp_ajax_runtime", metadata, [{"source": "REQUEST", "name": "id"}]
+            "wp_ajax_runtime", metadata, [{"source": "GET", "name": "id"}]
         )
         self.assertEqual(decisions[0]["method"], "PUT")
         self.assertEqual(decisions[0]["method_source"], "runtime_observed")

@@ -12,12 +12,12 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from seed_generation.config.config_exporter import export_seed_configs
     from seed_generation.convergence.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment, runtime_parameter_is_accepted
+    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, correlate_pass1_artifact, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment, runtime_parameter_is_accepted
     from instrumentation.zend.rest.runtime import canonical_rest_parameter_name
 else:
     from seed_generation.config.config_exporter import export_seed_configs
     from seed_generation.convergence.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment, runtime_parameter_is_accepted
+    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, correlate_pass1_artifact, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment, runtime_parameter_is_accepted
     from instrumentation.zend.rest.runtime import canonical_rest_parameter_name
 
 
@@ -398,6 +398,25 @@ def converge_iteration(
     )
     seed = raw_item.get("seed")
     is_probe_variant = isinstance(seed, Mapping) and seed.get("probe_variant") is True
+    method_fallback = bool(
+        not prior and not observed and not is_probe_variant
+        and candidate.get("entrypoint_type") == "ajax"
+        and candidate.get("method") == "GET"
+        and isinstance(seed, Mapping) and seed.get("method_source") == "bootstrap_probe"
+        and str(zend.get("request_method") or zend.get("method") or "").upper() == "GET"
+        and correlate_pass1_artifact(
+            candidate, uopz, legacy_run_id=legacy_run_id,
+            pass1_request_id=request_id, plugin_slug=plugin_slug,
+        ) is not None
+    )
+    if method_fallback:
+        pending_candidates = [{
+            "name": "", "source": "POST", "location": "form", "method_probe": True,
+            "request_method": "GET", "request_id": request_id, "run_id": legacy_run_id,
+            "plugin_slug": plugin_slug, "callback_id": candidate.get("callback_id"),
+            "canonical_callback": canonical_callback,
+        }]
+        status = "CONTINUE"
     merged = materialize_convergence_seeds(
         raw_for_iteration,
         plugin_slug=plugin_slug,
@@ -568,11 +587,12 @@ def _materialize_ajax_runtime_probes(
         source = str(candidate.get("source") or "").upper()
         name = str(candidate.get("name") or "")
         location = str(candidate.get("location") or "")
+        method_probe = candidate.get("method_probe") is True
         if (
             source not in {"GET", "POST", "COOKIE"}
             or (source == "COOKIE" and not runtime_cookie_probes)
             or location not in {"query", "form", "cookie"}
-            or not name
+            or (not name and not method_probe)
         ):
             continue
         identity = (source, name)
@@ -580,6 +600,19 @@ def _materialize_ajax_runtime_probes(
             continue
         seen.add(identity)
         seed = deepcopy(dict(raw_seed))
+        if source == "POST" and str(seed.get("method") or "").upper() == "GET":
+            if seed.get("method_source") != "bootstrap_probe":
+                continue
+            seed.update({
+                "method": "POST", "resolved_method": "POST", "candidate_methods": ["POST"],
+                "method_source": "bootstrap_probe", "method_confidence": "bootstrap_probe",
+                "method_evidence": {"reason": "bounded_post_discovery_probe",
+                                    "request_id": candidate.get("request_id")},
+            })
+            seed["method_transition"] = {"from": "GET", "to": "POST"}
+            seed.pop("observed_request_method", None)
+        if source == "POST":
+            seed.setdefault("headers", {})["Content-Type"] = "application/x-www-form-urlencoded"
         variant = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"zend_probe_{source.lower()}_{name}").strip("-.")
         seed["seed_variant_id"] = variant or f"zend_probe_{source.lower()}"
         bucket_name = (
@@ -590,9 +623,10 @@ def _materialize_ajax_runtime_probes(
         target = seed.setdefault(bucket_name, {})
         if not isinstance(target, dict):
             raise ValueError(f"AJAX {location} probe target must be an object")
-        target[name] = "HOOKPHUZZ_COOKIE_PROBE" if source == "COOKIE" else "probe"
+        if name:
+            target[name] = "HOOKPHUZZ_COOKIE_PROBE" if source == "COOKIE" else "probe"
         fixed = seed.get("fixed_params") if isinstance(seed.get("fixed_params"), list) else []
-        seed["fixed_params"] = list(dict.fromkeys([str(value) for value in fixed if str(value)] + [name]))
+        seed["fixed_params"] = list(dict.fromkeys([str(value) for value in fixed if str(value)] + ([name] if name else [])))
         seed["fuzzable_params"] = []
         seed["input_params"] = []
         seed["export_allowed"] = True
@@ -605,7 +639,9 @@ def _materialize_ajax_runtime_probes(
         item["generated_reason"] = "zend_runtime_parameter_probe"
         item["missing_requirements"] = ["correlated_runtime_read"]
         item["probe_request"] = {
-            "parameters": [name],
+            "parameters": [name] if name else [],
+            "method_probe": method_probe,
+            "probe_method": seed.get("resolved_method") or seed.get("method"),
             "source": source,
             "location": location,
             "content_type": "",
@@ -621,6 +657,8 @@ def _materialize_ajax_runtime_probes(
         }
         probes.append(item)
         probe_rows.append({
+            "method_probe": method_probe,
+            "probe_method": seed.get("resolved_method") or seed.get("method"),
             "name": name,
             "source": source,
             "location": location,
@@ -699,10 +737,17 @@ def verify_pass2_contract(
     for row in pass2_run_summary.get("runs", []):
         if not isinstance(row, Mapping) or row.get("callback_reached") is not True:
             continue
-        want = expected.get((str(row.get("hook_name") or ""), str(row.get("callback_id") or "")), {})
-        want_params = want.get("params") if isinstance(want, Mapping) else set()
-        canonical_callback = str(want.get("callback") or "") if isinstance(want, Mapping) else ""
-        if not want_params or not canonical_callback:
+        hook_name = str(row.get("hook_name") or "")
+        callback_id = str(row.get("callback_id") or "")
+        candidates = [
+            (key, value) for key, value in expected.items()
+            if key[:2] == (hook_name, callback_id)
+        ]
+        if not candidates and hook_name == callback_id:
+            candidates = [
+                (key, value) for key, value in expected.items() if key[1] == callback_id
+            ]
+        if not any(value.get("params") and value.get("callback") for _, value in candidates):
             continue
         total += 1
         artifact_name = str(row.get("matched_artifact") or "")
@@ -731,6 +776,29 @@ def verify_pass2_contract(
         zend_method = str(zend.get("request_method") or zend.get("method") or "").upper()
         row_method = str(row.get("resolved_method") or "").upper()
         if zend_method and row_method and zend_method != row_method:
+            continue
+        request_method = str(uopz.get("http_method") or uopz.get("method") or "").upper()
+        methods = {method for method in (row_method, zend_method, request_method) if method}
+        variants = {
+            str(artifact["seed_variant_id"] or "") for artifact in (row, zend, uopz)
+            if artifact.get("seed_variant_id") is not None
+        }
+        # Missing legacy identity fields are safe only when the remaining match is unique.
+        matches = [
+            value for key, value in candidates
+            if (not methods or methods == {key[2]})
+            and (not variants or variants == {key[3]})
+        ]
+        if len(matches) != 1:
+            continue
+        want = matches[0]
+        want_params = want.get("params")
+        canonical_callback = str(want.get("callback") or "")
+        if not want_params or not canonical_callback:
+            continue
+        expected_method = str(want.get("method") or "").upper()
+        if any(method and expected_method and method != expected_method
+               for method in (zend_method, row_method, request_method)):
             continue
         observed = _zend_observed_params(
             zend, uopz, canonical_callback, runtime_cookie_probes=runtime_cookie_probes,
@@ -777,8 +845,8 @@ def _expected_pass2_params(
     merged_seed_report: Mapping[str, Any],
     *,
     runtime_cookie_probes: bool = False,
-) -> dict[tuple[str, str], dict[str, Any]]:
-    expected: dict[tuple[str, str], dict[str, Any]] = {}
+) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+    expected: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for item in merged_seed_report.get("suggested_seeds", []):
         if not isinstance(item, Mapping):
             continue
@@ -796,12 +864,15 @@ def _expected_pass2_params(
         }
         value = {
             "callback": str(seed.get("zend_canonical_callback") or ""),
+            "method": str(seed.get("resolved_method") or seed.get("method") or "").upper(),
             "params": params,
             "rest_identity": _expected_rest_identity(item, seed),
         }
         callback_id = str(item.get("callback_id") or "")
-        expected[(str(item.get("hook_name") or ""), callback_id)] = value
-        expected.setdefault((callback_id, callback_id), value)
+        expected[(
+            str(item.get("hook_name") or ""), callback_id,
+            value["method"], str(seed.get("seed_variant_id") or ""),
+        )] = value
     return expected
 
 

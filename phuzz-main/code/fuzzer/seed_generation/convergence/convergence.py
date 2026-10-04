@@ -178,6 +178,10 @@ def _apply_patch(
     seed.pop("block_reason", None)
     if for_replay:
         return item
+    if patch["fuzzable_parameters"]:
+        seed.pop("probe_variant", None)
+        seed.pop("method_transition", None)
+        item.pop("probe_request", None)
     fuzzable_parameters = _effective_fuzzable_parameters(seed, patch["fuzzable_parameters"])
     seed["fuzzable_params"] = []
     seed["input_params"] = []
@@ -334,11 +338,21 @@ def materialize_convergence_seeds(
         if canonical_identity_id(candidate) != candidate_key:
             continue
         identity = canonical_identity(candidate)
+        if any(
+            parameter.get("request_method")
+            and str(parameter["request_method"]).upper() != identity["resolved_method"]
+            for parameter in runtime_parameters.values()
+        ):
+            raise ValueError("runtime_parameter_method_mismatch")
+        provenance = next(reversed(runtime_parameters.values()), {})
         materialized.append(
             _apply_patch(
                 raw_item,
                 {
                     "method": identity["resolved_method"],
+                    "run_id": str(provenance.get("run_id") or ""),
+                    "request_id": str(provenance.get("request_id") or ""),
+                    "request_method": identity["resolved_method"],
                     "canonical_callback": callback,
                     "fuzzable_parameters": parameters,
                 },

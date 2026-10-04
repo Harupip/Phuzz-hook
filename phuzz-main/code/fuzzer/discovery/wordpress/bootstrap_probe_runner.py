@@ -38,7 +38,7 @@ class BootstrapProbe:
 def default_probes() -> list[BootstrapProbe]:
     probe_specs = [
         ("frontend_home", "GET", "/"),
-        ("admin_ajax_probe", "POST", "/wp-admin/admin-ajax.php?action=hookphuzz_probe"),
+        ("admin_ajax_probe", "GET", "/wp-admin/admin-ajax.php?action=hookphuzz_probe"),
         ("admin_post_probe", "POST", "/wp-admin/admin-post.php?action=hookphuzz_probe"),
         ("rest_api_index", "GET", "/wp-json/"),
         ("rest_route_index", "GET", "/?rest_route=/"),

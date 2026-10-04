@@ -18,8 +18,9 @@ Flow co hai pass.
 
 Pass 1 tao replay-only config tu WordPress platform metadata:
 
-- AJAX callback dung `POST /wp-admin/admin-ajax.php`
-- body co fixed `action`
+- AJAX chua co bang chung method dung `GET /wp-admin/admin-ajax.php?action=...`, provenance `bootstrap_probe`
+- giu method runtime/REST da biet; `$_GET` vao query, `$_POST` vao form body
+- POST probe la request rieng, chi nhan parameter sau bang chung runtime tuong quan va replay/Pass 2
 - khong co synthetic fuzz field
 - khong goi `InputSignatureExtractor`
 - khong copy/read plugin source de quyet dinh parameter

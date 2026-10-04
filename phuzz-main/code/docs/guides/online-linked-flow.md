@@ -10,6 +10,16 @@ Kế hoạch bổ sung: [Online-linked completion](../../../../docs/superpowers/
 
 Các đường dẫn source bên dưới tính từ `phuzz-main/code`.
 
+### Method trong Zend runtime discovery
+
+**Zend runtime discovery mặc định probe GET khi chưa có bằng chứng method; chuyển sang POST khi có bằng chứng runtime phù hợp.**
+
+- AJAX chưa biết method dùng GET với `action` trong query; provenance là `bootstrap_probe`, chưa phải `runtime_observed`.
+- Method runtime tương quan hoặc REST route đã biết được giữ nguyên. `$_GET` xác định query, `$_POST` xác định form body; nguồn param không ghi đè method runtime.
+- Zend thấy key POST còn thiếu trong request thì tạo probe POST riêng. Nếu GET chưa thấy param, thử một probe POST không thêm key giả; các probe tiếp theo vẫn chịu giới hạn số lần và ngân sách hiện có.
+- Probe chỉ là replay-only. Key phải có trong request và được Zend ghi nhận ở đúng callback, request ID, run ID và method; config con còn phải qua replay/Pass 2 trước khi publish/fuzz.
+- Khi đổi method, chỉ nhận param được xác minh lại trên method mới. Không sửa artifact/config cũ hoặc dùng replay GET để chứng minh config POST.
+
 ## 2. Luồng đang được nối trong code
 
 ```mermaid

@@ -65,6 +65,149 @@ class StaticExtractor:
 
 
 class ZendDiscoveryTests(unittest.TestCase):
+    def test_ajax_get_query_parameters_survive_replay_and_pass2(self) -> None:
+        raw = self.raw_seed_item()
+        raw["seed"].update({
+            "method": "GET", "resolved_method": "GET", "method_source": "bootstrap_probe",
+            "body": {}, "query_params": {"action": "demo_fetch_items", "post_id": "1", "blog_id": "1"},
+            "fixed_params": ["action"], "fuzzable_params": [], "input_params": [],
+        })
+        request = self.pass1_artifact_for_raw(raw)
+        request["request_params"] = {"query_params": raw["seed"]["query_params"]}
+        zend = self.zend_artifact_for_raw(raw)
+        zend["request_method"] = "GET"
+        zend["callback_summaries"][0]["unique_parameters"] = [
+            {"source": "GET", "path": [name], "helper_depth": 0, "observed_count": 1, "access_forms": ["read"]}
+            for name in ("post_id", "blog_id")
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            request_dir, zend_dir = Path(tmp) / "request", Path(tmp) / "zend"
+            request_dir.mkdir()
+            zend_dir.mkdir()
+            name = request["request_id"] + ".json"
+            (request_dir / name).write_text(json.dumps(request), encoding="utf-8")
+            (zend_dir / name).write_text(json.dumps(zend), encoding="utf-8")
+            summary = {"legacy_run_id": "legacy-1", "runs": [{
+                "hook_name": raw["hook_name"], "callback_id": raw["callback_id"], "seed_variant_id": "",
+                "resolved_method": "GET", "callback_reached": True, "matched_artifact": name,
+            }]}
+            result = converge_iteration(
+                raw_report={"suggested_seeds": [raw]}, pass_run_summary=summary,
+                pass_artifacts_dir=request_dir, zend_events_dir=zend_dir,
+                registry={"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}},
+                plugin_slug="demo-plugin", legacy_run_id="legacy-1", known_state={"known_parameters": []},
+            )
+            self.assertEqual({row["name"] for row in result["new_parameters"]}, {"post_id", "blog_id"})
+            final = materialize_convergence_seeds(
+                {"suggested_seeds": [raw]}, plugin_slug="demo-plugin",
+                candidate_key=result["candidate_key"], known_parameters=result["known_parameters"],
+            )
+            self.assertEqual(final["suggested_seeds"][0]["seed"]["method"], "GET")
+            self.assertEqual(verify_pass2_contract(summary, final, zend_dir, pass2_artifacts_dir=request_dir), {"accepted": 1, "total": 1})
+            request["http_method"] = "POST"
+            (request_dir / name).write_text(json.dumps(request), encoding="utf-8")
+            self.assertEqual(verify_pass2_contract(summary, final, zend_dir, pass2_artifacts_dir=request_dir), {"accepted": 0, "total": 1})
+
+    def test_ajax_get_bootstrap_post_probe_requires_fresh_method_evidence(self) -> None:
+        raw = self.raw_seed_item()
+        raw["seed"].update({
+            "method": "GET", "resolved_method": "GET", "method_source": "bootstrap_probe",
+            "method_confidence": "bootstrap_probe", "body": {},
+            "query_params": {"action": "demo_fetch_items"}, "fixed_params": ["action"],
+        })
+        original = copy.deepcopy(raw)
+        pending = {"name": "term", "source": "POST", "location": "form", "request_method": "GET"}
+        merged, probes = _materialize_ajax_runtime_probes({"suggested_seeds": [raw]}, [pending])
+        post = merged["suggested_seeds"][0]
+        self.assertEqual(raw, original)
+        self.assertEqual(post["seed"]["method"], "POST")
+        self.assertEqual(post["seed"]["query_params"], {"action": "demo_fetch_items"})
+        self.assertEqual(post["seed"]["body"], {"term": "probe"})
+        self.assertEqual(post["seed"]["method_source"], "bootstrap_probe")
+        self.assertEqual(probes[0]["probe_method"], "POST")
+        get_candidate = candidate_from_seed_item(raw, plugin_slug="demo-plugin", legacy_run_id="legacy-1")
+        post_candidate = candidate_from_seed_item(post, plugin_slug="demo-plugin", legacy_run_id="legacy-1")
+        self.assertNotEqual(canonical_identity_id(get_candidate), canonical_identity_id(post_candidate))
+        old_request = self.pass1_artifact_for_raw(raw)
+        post_candidate["pass1_request_id"] = old_request["request_id"]
+        self.assertIsNone(correlate_pass1_artifact(
+            post_candidate, old_request, legacy_run_id="legacy-1",
+            pass1_request_id=old_request["request_id"], plugin_slug="demo-plugin",
+        ))
+        proven = {
+            "name": "term", "path": ["term"], "source": "POST", "location": "form",
+            "evidence_kind": "zend_runtime", "helper_depth": 0, "observed_count": 1,
+            "fuzzable": True, "canonical_callback": "Demo::fetch", "request_method": "POST",
+            "run_id": "post-run", "request_id": "post-request",
+        }
+        with self.assertRaisesRegex(ValueError, "runtime_parameter_method_mismatch"):
+            materialize_convergence_seeds(
+                {"suggested_seeds": [raw]}, plugin_slug="demo-plugin",
+                candidate_key=canonical_identity_id(get_candidate), known_parameters=[proven],
+            )
+        final = materialize_convergence_seeds(
+            merged, plugin_slug="demo-plugin", candidate_key=canonical_identity_id(post_candidate),
+            known_parameters=[proven],
+        )["suggested_seeds"][0]["seed"]
+        self.assertEqual(final["method_evidence"]["request_id"], "post-request")
+        self.assertEqual(final["method_evidence"]["run_id"], "post-run")
+        self.assertEqual(final["method_source"], "runtime_observed")
+
+    def test_ajax_proven_get_method_is_not_switched_by_post_parameter_source(self) -> None:
+        raw = self.raw_seed_item()
+        raw["seed"].update({"method": "GET", "resolved_method": "GET", "method_source": "runtime_observed"})
+        merged, probes = _materialize_ajax_runtime_probes(
+            {"suggested_seeds": [raw]}, [{"name": "body_key", "source": "POST", "location": "form"}],
+        )
+        self.assertEqual(probes, [])
+        self.assertEqual(merged["suggested_seeds"], [])
+
+    def test_ajax_empty_get_bootstrap_has_one_post_method_probe(self) -> None:
+        raw = self.raw_seed_item()
+        raw["seed"].update({
+            "method": "GET", "resolved_method": "GET", "method_source": "bootstrap_probe",
+            "method_confidence": "bootstrap_probe", "body": {},
+            "query_params": {"action": "demo_fetch_items"}, "fixed_params": ["action"],
+        })
+        registry = {"schema_version": 1, "callback_map": {raw["callback_id"]: "Demo::fetch"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            request_dir, zend_dir = Path(tmp) / "request", Path(tmp) / "zend"
+            request_dir.mkdir()
+            zend_dir.mkdir()
+            def replay(item, method, parameters):
+                request = self.pass1_artifact_for_raw(item)
+                request["http_method"] = method
+                request["request_params"] = {
+                    "query_params": item["seed"]["query_params"], "body_params": item["seed"]["body"],
+                }
+                zend = self.zend_artifact_for_raw(item)
+                zend["request_method"] = method
+                zend["callback_summaries"][0]["unique_parameters"] = parameters
+                name = f"{request['request_id']}.json"
+                (request_dir / name).write_text(json.dumps(request), encoding="utf-8")
+                (zend_dir / name).write_text(json.dumps(zend), encoding="utf-8")
+                return converge_iteration(
+                    raw_report={"suggested_seeds": [item]},
+                    pass_run_summary={"runs": [{
+                        "hook_name": item["hook_name"], "callback_id": item["callback_id"],
+                        "seed_variant_id": item["seed"].get("seed_variant_id", ""),
+                        "callback_reached": True, "matched_artifact": name,
+                    }]}, pass_artifacts_dir=request_dir, zend_events_dir=zend_dir,
+                    registry=registry, plugin_slug="demo-plugin", legacy_run_id="legacy-1",
+                    known_state={"known_parameters": []},
+                )
+            first = replay(raw, "GET", [])
+            self.assertEqual(first["status"], "CONTINUE")
+            self.assertEqual(len(first["pending_probes"]), 1)
+            self.assertTrue(first["pending_probes"][0]["method_probe"])
+            post = first["merged_suggested_seeds"]["suggested_seeds"][0]
+            self.assertEqual(post["seed"]["method"], "POST")
+            second = replay(post, "POST", [])
+            self.assertEqual(second["pending_probes"], [])
+            known = copy.deepcopy(raw)
+            known["seed"]["method_source"] = "runtime_observed"
+            self.assertEqual(replay(known, "GET", [])["pending_probes"], [])
+
     def test_fresh_docker_fixture_records_direct_nested_and_local_reads(self) -> None:
         docker = shutil.which("docker")
         if docker is None:

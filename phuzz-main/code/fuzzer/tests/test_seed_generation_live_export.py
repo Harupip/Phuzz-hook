@@ -149,6 +149,21 @@ def build_rest_probe_payload(source_root: Path, *, schema_name: str = "id", sche
 
 
 class SeedGeneratorTests(unittest.TestCase):
+    def test_zend_runtime_generator_preserves_proven_ajax_and_rest_methods(self) -> None:
+        metadata = {"callback_id": "cb", "hook_name": "wp_ajax_fixture", "callback_repr": "fixture_callback"}
+        for method in ("POST", "PUT"):
+            observation = {**metadata, "request_id": "req-1", "http_method": method, "target_plugin": "fixture"}
+            decision = ZendRuntimeSeedGenerator()._method_decisions(
+                metadata["hook_name"], {**metadata, "_executed_callback": observation}, [],
+            )[0]
+            self.assertEqual(decision["method"], method)
+            self.assertEqual(decision["method_source"], "runtime_observed")
+        decision = ZendRuntimeSeedGenerator()._method_decisions(
+            "rest-fixture", {"entrypoint_type": "rest_route", "methods": ["PATCH"]}, [],
+        )[0]
+        self.assertEqual(decision["method"], "PATCH")
+        self.assertEqual(decision["method_source"], "route_declared")
+
     def test_zend_runtime_generator_uses_exact_admin_post_runtime_probe_evidence(self) -> None:
         payload = build_live_coverage_payload()
         payload["data"]["registered_callbacks"].update({
@@ -229,15 +244,17 @@ class SeedGeneratorTests(unittest.TestCase):
         self.assertNotIn("InputSignatureExtractor", runtime_source)
         self.assertNotIn("SourcePathResolver", runtime_source)
 
-    def test_zend_runtime_generator_skips_source_extraction_and_builds_post_action_probe(self) -> None:
+    def test_zend_runtime_generator_skips_source_extraction_and_builds_get_action_probe(self) -> None:
         _, seed_report = ZendRuntimeSeedGenerator().build_reports(build_live_coverage_payload())
 
         item = next(
             row for row in seed_report["suggested_seeds"]
             if row["hook_name"] == "wp_ajax_nopriv_sac_post_type_call"
         )
-        self.assertEqual(item["seed"]["method"], "POST")
-        self.assertEqual(item["seed"]["body"], {"action": "sac_post_type_call"})
+        self.assertEqual(item["seed"]["method"], "GET")
+        self.assertEqual(item["seed"]["query_params"], {"action": "sac_post_type_call"})
+        self.assertEqual(item["seed"]["body"], {})
+        self.assertEqual(item["seed"]["method_source"], "bootstrap_probe")
         self.assertEqual(item["seed"]["fuzzable_params"], [])
         self.assertEqual(item["seed"]["input_params"], [])
 

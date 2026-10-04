@@ -67,13 +67,21 @@ class ZendRuntimeSeedGenerator(SeedGeneratorBase):
         metadata: dict[str, Any],
         input_params: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        decisions = super()._method_decisions(hook_name, metadata, input_params)
         if hook_name.startswith(("wp_ajax_nopriv_", "wp_ajax_")):
+            if any(item.get("method_status") == "resolved" for item in decisions):
+                return decisions
             return [{
-                "method": "POST",
-                "resolved_method": "POST",
+                "method": "GET",
+                "resolved_method": "GET",
                 "method_status": "resolved",
-                "method_confidence": "runtime_probe",
-                "candidate_methods": ["POST"],
+                "method_source": "bootstrap_probe",
+                "method_confidence": "bootstrap_probe",
+                "candidate_methods": ["GET"],
+                "method_evidence": {"reason": "ajax_bootstrap_without_method_evidence"},
+                "seed_variant_id": "get",
+                "export_allowed": True,
+                "replay_allowed": True,
             }]
         runtime_observation = metadata.get("_executed_callback")
         if self._correlated_admin_post_probe(metadata, runtime_observation):

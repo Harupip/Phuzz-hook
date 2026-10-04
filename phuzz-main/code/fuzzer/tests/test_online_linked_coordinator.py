@@ -30,7 +30,8 @@ from online_linked.coordinator import (
 )
 from hook_energy.seed_generation.generated_config_runner import STOP_ON_VULN_EXIT_CODE
 from online_linked.probe_sender import ParentInspectionTimeout
-from seed_generation.config.config_exporter import SeedConfigSkip, export_seed_configs
+from seed_generation.config.config_exporter import SeedConfigSkip, export_seed_configs, build_config_for_seed_item
+from hook_energy.seed_generation.zend_runtime.bridge_cli import converge_iteration, verify_pass2_contract, _materialize_ajax_runtime_probes
 from seed_generation.convergence.convergence import materialize_convergence_seeds
 from zend_discovery.engine import candidate_from_seed_item, canonical_identity_id
 
@@ -116,6 +117,92 @@ class Clock:
 
 
 class OnlineLinkedCoordinatorTests(unittest.TestCase):
+    def test_get_bootstrap_post_probe_replays_and_pass2_before_new_worker(self):
+        for method_only in (False, True):
+            with self.subTest(method_only=method_only), tempfile.TemporaryDirectory() as tmp:
+                coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [], names=("body_key",))
+                raw = copy.deepcopy(parent["seed_item"])
+                raw["seed"].update({
+                    "method": "GET", "resolved_method": "GET", "method_source": "bootstrap_probe",
+                    "method_confidence": "bootstrap_probe", "seed_variant_id": "get", "body": {},
+                    "query_params": {"action": "fixture"}, "fixed_params": ["action"],
+                    "fuzzable_params": [], "input_params": [],
+                })
+                parent.update(resolved_method="GET", seed_variant_id="get", seed_item=raw, entrypoint_type="ajax")
+                Path(parent["config_path"]).write_text(json.dumps(build_config_for_seed_item(raw)[1]), encoding="utf-8")
+                original = Path(parent["config_path"]).read_bytes()
+                report = {"suggested_seeds": [raw]}
+                coordinator._reports["v0"] = report
+                pending = {
+                    "name": "" if method_only else "body_key", "source": "POST", "location": "form",
+                    "method_probe": method_only, "request_method": "GET", "request_id": "req-v0",
+                }
+                merged, probes = _materialize_ajax_runtime_probes(report, [pending])
+                coordinator.converge_fn = converge_iteration
+                coordinator.materialize_fn = materialize_convergence_seeds
+                coordinator.export_configs_fn = export_seed_configs
+                coordinator.verify_pass2_fn = verify_pass2_contract
+                methods = []
+                def sender(container_name, **kwargs):
+                    config = json.loads((coordinator.config_root / (kwargs["config_slug"] + ".json")).read_text())
+                    method = config["methods"][0]
+                    methods.append((method, kwargs["expected"]["method"]))
+                    query = {row["name"]: row["value"] for row in config["query_params"]["data"]}
+                    body = {row["name"]: row["value"] for row in config.get("body_params", {}).get("data", [])}
+                    self.assertEqual(query["action"], "fixture")
+                    self.assertNotIn("action", body)
+                    request_id, run_id = kwargs["request_id"], kwargs["run_id"]
+                    candidate_item = copy.deepcopy(raw)
+                    candidate_item["seed"]["method"] = candidate_item["seed"]["resolved_method"] = method
+                    candidate = candidate_from_seed_item(candidate_item, plugin_slug="fixture")
+                    request = {
+                        "request_id": request_id, "run_id": run_id, "legacy_run_id": run_id,
+                        "target_plugin": "fixture", "http_method": method,
+                        "hook_name": parent["hook_name"], "callback_id": parent["callback_id"],
+                        "auth_context": "guest", "auth_variant": "unauthenticated",
+                        "canonical_identity_id": canonical_identity_id(candidate),
+                        "request_params": {"query_params": query, "body_params": body},
+                        "hook_coverage": {"executed_callbacks": {parent["callback_id"]: {"callback_id": parent["callback_id"]}}},
+                    }
+                    zend = {
+                        "schema_version": 3, "request_id": request_id, "run_id": run_id, "request_method": method,
+                        "target_loading": {"load_status": "loaded", "file_target_count": 1},
+                        "callback_summaries": [{"callback": "fixture_callback", "unique_parameters": [{
+                            "source": "POST", "path": ["body_key"], "helper_depth": 0,
+                            "observed_count": 1, "access_forms": ["read"],
+                        }]}],
+                        "events": [{"source": "POST", "path": ["body_key"], "operation": "read",
+                                    "callback_context": {"attributed": True, "root_callback": "fixture_callback", "depth": 0}}],
+                    }
+                    if not method_only:
+                        zend["callback_summaries"][0]["unique_parameters"].append({
+                            "source": "POST", "path": ["not_sent"], "helper_depth": 0,
+                            "observed_count": 1, "access_forms": ["read"],
+                        })
+                        zend["events"].append({
+                            "source": "POST", "path": ["not_sent"], "operation": "read",
+                            "callback_context": {"attributed": True, "root_callback": "fixture_callback", "depth": 0},
+                        })
+                    return {"status": "callback_reached", "callback_reached": True, "validation_status": "callback_reached",
+                            "request_name": request_id + ".json", "request": request,
+                            "zend_name": request_id + ".json", "zend": zend, "timing": {}}
+                coordinator.probe_sender = sender
+                child = coordinator._run_pending_probe(
+                    parent=parent, evidence={"request_id": "req-v0", "request": {"request_params": {"query_params": {"action": "fixture"}}}},
+                    raw_report=report, convergence={"pending_probes": probes, "merged_suggested_seeds": merged},
+                    probe=probes[0], seed=raw, deadline=None,
+                )
+                self.assertIsNotNone(child, coordinator.state)
+                self.assertEqual(child["resolved_method"], "POST")
+                self.assertEqual(child["replay_result"]["pass2_verification"], {"accepted": 1, "total": 1})
+                self.assertEqual(Path(parent["config_path"]).read_bytes(), original)
+                final = json.loads(Path(child["config_path"]).read_text())
+                self.assertEqual(final["methods"], ["POST"])
+                self.assertIn("body_key", final["body_params"]["fuzz"])
+                self.assertNotIn("not_sent", {row["name"] for row in final["body_params"]["data"]})
+                self.assertNotIn("probe_variant", final["metadata"])
+                self.assertTrue(all(actual == expected == "POST" for actual, expected in methods))
+
     def test_poll_deadline_is_bounded_without_losing_verified_version(self):
         for outcome in ("timeout", "late_output", "before_poll", "early_timeout", "docker_error"):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:

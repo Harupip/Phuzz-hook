@@ -53,7 +53,7 @@ from seed_generation.config.config_exporter import (
 from seed_generation.convergence.convergence import materialize_convergence_seeds
 from discovery.entrypoints.entrypoints import seed_template_for_callback
 from discovery.entrypoints.method_resolution import resolve_http_methods
-from zend_discovery.engine import prepare_callback_registry, runtime_parameter_is_accepted
+from zend_discovery.engine import candidate_from_seed_item, canonical_identity_id, prepare_callback_registry, runtime_parameter_is_accepted
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
@@ -1157,6 +1157,12 @@ class OnlineLinkedCoordinator:
             if isinstance(parameter, Mapping) else parameter
             for parameter in new_parameters
         ]
+        admission_parent = parent
+        transition_report = result.get("method_transition_report")
+        if isinstance(transition_report, Mapping):
+            raw_report = transition_report
+            transition_seed = raw_report["suggested_seeds"][0]["seed"]
+            admission_parent = {**parent, "resolved_method": transition_seed["resolved_method"]}
         evidence_by_parameter = result.get("parameter_evidence")
         for parameter in new_parameters:
             parameter_evidence = evidence
@@ -1169,9 +1175,9 @@ class OnlineLinkedCoordinator:
             except (TypeError, ValueError):
                 helper_depth = 0
             admitted = (
-                self._probe_admission_complete(parameter, parameter_evidence, parent)
+                self._probe_admission_complete(parameter, parameter_evidence, admission_parent)
                 if helper_depth != 0
-                else self._admission_complete(parameter, parameter_evidence, parent)
+                else self._admission_complete(parameter, parameter_evidence, admission_parent)
             )
             if not admitted:
                 self._record_event({
@@ -1348,7 +1354,8 @@ class OnlineLinkedCoordinator:
             child_path = self._write_config(next_version, child_config)
             config_generation_seconds = round(max(0.0, self.clock() - config_generation_started_at), 3)
             child = self._new_version(
-                next_version, child_config, child_path, parent, discovery["event_id"], seed,
+                next_version, child_config, child_path, parent, discovery["event_id"],
+                materialized["suggested_seeds"][0] if isinstance(transition_report, Mapping) else seed,
                 config_generation_seconds=config_generation_seconds,
             )
             child["known_parameters"] = proposed_parameters
@@ -2004,6 +2011,11 @@ class OnlineLinkedCoordinator:
         attempt: dict[str, Any],
         deadline: float | None,
     ) -> dict[str, Any] | None:
+        # Trial correlation follows the new config; the parent remains immutable.
+        parent = {**parent, "resolved_method": child_config.get("metadata", {}).get("resolved_method")
+                  or parent.get("resolved_method"),
+                  "seed_variant_id": child_config.get("metadata", {}).get("seed_variant_id")
+                  or parent.get("seed_variant_id")}
         transports = self._parameter_transport_rows(child_config, expected_parameters)
         attempt["parameter_transports"] = [dict(row) for row in transports]
         queue: list[dict[str, Any]] = [{"config": copy.deepcopy(dict(child_config)), "hint": None}]
@@ -2522,6 +2534,13 @@ class OnlineLinkedCoordinator:
             }
             final_result["base_evidence"] = chosen_evidence
             final_result["candidate_key"] = str(convergence.get("candidate_key") or self._target_key)
+            if isinstance(group["result"].get("method_transition_report"), Mapping):
+                final_result["method_transition_report"] = group["result"]["method_transition_report"]
+                final_result["candidate_key"] = group["result"]["candidate_key"]
+                final_result["known_parameters"] = [
+                    dict(parameter) for parameter in group["result"].get("observed_parameters", [])
+                    if isinstance(parameter, Mapping) and parameter.get("fuzzable") is True
+                ]
             final_result["_pending_group_dispatch"] = True
             if convergence.get("_coherent_only") is True:
                 final_result["status"] = "CONTINUE"
@@ -2672,6 +2691,10 @@ class OnlineLinkedCoordinator:
             "first_probe_delay_seconds": attempt.get("first_probe_delay_seconds"),
         })
         probe_seed = probe_item.get("seed") if isinstance(probe_item.get("seed"), Mapping) else {}
+        probe_parent = parent
+        method_transition = probe_seed.get("method_transition") == {"from": "GET", "to": "POST"}
+        if method_transition:
+            probe_parent = {**parent, "resolved_method": "POST"}
         probe_row = {
             "config_slug": replay_path.relative_to(self.config_root).with_suffix("").as_posix(),
             "hook_name": str(probe_item.get("hook_name") or parent["hook_name"]),
@@ -2799,7 +2822,7 @@ class OnlineLinkedCoordinator:
                 }]},
                 pass_artifacts_dir=request_dir, zend_events_dir=zend_dir, registry=self.registry,
                 plugin_slug=self.plugin_slug, legacy_run_id=probe_run_id,
-                known_state={"known_parameters": parent.get("known_parameters", [])}, candidate_key=None,
+                known_state={"known_parameters": [] if method_transition else parent.get("known_parameters", [])}, candidate_key=None,
                 runtime_cookie_probes=self.runtime_cookie_probes,
             )
         except (OSError, RuntimeError, ValueError) as exc:
@@ -2817,13 +2840,13 @@ class OnlineLinkedCoordinator:
         matching = [
             parameter for parameter in all_probe_parameters
             if isinstance(parameter, Mapping)
-            and _parameter_key(parameter) == target_key
+            and (probe.get("method_probe") is True or _parameter_key(parameter) == target_key)
             and parameter.get("fuzzable") is True
         ]
         pending_matching = [
             parameter for parameter in all_probe_parameters
             if isinstance(parameter, Mapping)
-            and _parameter_key(parameter) == target_key
+            and (probe.get("method_probe") is True or _parameter_key(parameter) == target_key)
             and parameter.get("fuzzable") is not True
         ]
         unexpected = [
@@ -2843,11 +2866,15 @@ class OnlineLinkedCoordinator:
                 extra={"unexpected_parameters": unexpected},
             )
         parameter = self._inherit_callback_identity(matching[0], parent)
-        if not self._probe_admission_complete(parameter, probe_evidence, parent):
+        if not self._probe_admission_complete(parameter, probe_evidence, probe_parent):
             return self._finish_probe_failure(
                 parent, evidence, attempt, "PROBE_PROVENANCE_INCOMPLETE", deadline,
                 extra={"unexpected_parameters": unexpected},
             )
+        if method_transition:
+            probe_result = dict(probe_result)
+            # Materialize the request just replayed, never its prospective probes.
+            probe_result["method_transition_report"] = {"suggested_seeds": [copy.deepcopy(dict(probe_item))]}
         if unexpected:
             attempt["unexpected_parameters"] = unexpected
         attempt.update(status="accepted", probe_request_id=probe_evidence["request_id"])
@@ -3284,6 +3311,10 @@ class OnlineLinkedCoordinator:
                 return False
             if self._start_worker(child, deadline=deadline):
                 self._active_version = str(child["version"])
+                if child.get("resolved_method") != parent.get("resolved_method"):
+                    candidate = candidate_from_seed_item(merged_report["suggested_seeds"][0], plugin_slug=self.plugin_slug)
+                    variant = str(merged_report["suggested_seeds"][0]["seed"].get("seed_variant_id") or "")
+                    self._target_key = canonical_identity_id(candidate) + (f"::{variant}" if variant else "")
                 replay_result["timing"]["handoff"] = round(self.clock() - handoff_started_at, 3)
                 record_replay_event("PASS", "PASS2_VERIFIED")
                 self._write_state()

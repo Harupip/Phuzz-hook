@@ -69,14 +69,17 @@ def resolve_http_methods(
         ]
 
     exact_methods = [method for method in ("GET", "POST") if method in sources]
-    if exact_methods and observed_method and observed_method not in exact_methods:
-        return [_blocked_decision(
-            status="conflict",
-            candidates=exact_methods,
+    if observed:
+        # Superglobal sources describe parameter placement, not HTTP methods.
+        return [_resolved_decision(
+            observed_method,
+            candidates=[observed_method],
+            confidence="runtime_observed",
             route_methods=[],
             observed_method=observed_method,
-            reason="runtime_observation_conflicts_with_source_exact",
-            evidence={"parameter_sources": sources, "source_exact_methods": exact_methods, "observed_request_method": observed_method},
+            evidence={"parameter_sources": sources, "request_id": observed["request_id"],
+                      "callback_id": observed["callback_id"], "hook_name": observed["hook_name"],
+                      "target_plugin": observed["target_plugin"]},
         )]
 
     source_methods = list(exact_methods)
@@ -95,25 +98,6 @@ def resolve_http_methods(
                 route_methods=[],
             )
             for method in source_methods
-        ]
-
-    if observed:
-        evidence = {
-            "parameter_sources": sources,
-            "request_id": observed["request_id"],
-            "callback_id": observed["callback_id"],
-            "hook_name": observed["hook_name"],
-            "target_plugin": observed["target_plugin"],
-        }
-        return [
-            _resolved_decision(
-                observed["method"],
-                candidates=[observed["method"]],
-                confidence="runtime_observed",
-                evidence=evidence,
-                observed_method=observed["method"],
-                route_methods=[],
-            )
         ]
 
     return [
