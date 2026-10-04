@@ -11,6 +11,7 @@ from typing import Any
 
 import requests
 
+from filesystem_paths import filesystem_path
 from hook_energy.seed_generation.generated_config_runner import (
     REQUESTS_DIR,
     ZEND_ARTIFACTS_DIR,
@@ -296,7 +297,7 @@ def send_and_wait(
     started_at = clock()
     deadline = started_at + timeout_seconds
     try:
-        config = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
+        config = json.loads(filesystem_path(Path(config_path)).read_text(encoding="utf-8-sig"))
         prepared = prepare_request_from_config(config, request_id=request_id, run_id=run_id)
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         finished_at = clock()

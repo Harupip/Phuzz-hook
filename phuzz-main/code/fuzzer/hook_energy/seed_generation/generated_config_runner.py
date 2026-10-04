@@ -14,6 +14,7 @@ FUZZER_DIR = Path(__file__).resolve().parents[2]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
+from filesystem_paths import filesystem_path
 from seed_generation.verification.seed_validator import evaluate_artifact_payloads
 
 
@@ -43,7 +44,7 @@ UNAUTHENTICATED_ENTRYPOINT_TYPES = {"ajax_unauthenticated", "admin_post_unauthen
 
 
 def load_generated_configs(path: Path) -> list[dict[str, Any]]:
-    payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    payload = json.loads(filesystem_path(Path(path)).read_text(encoding="utf-8-sig"))
     if not isinstance(payload, Mapping) or not isinstance(payload.get("generated"), list):
         raise ValueError("generated_config_summary.json must contain a generated array")
 
@@ -175,7 +176,7 @@ def read_correlated_artifact_pair(
     request_path = Path(request_dir) / f"{request_id}.json"
     zend_path = Path(zend_dir) / f"{request_id}.json"
     try:
-        request_payload = json.loads(request_path.read_text(encoding="utf-8-sig"))
+        request_payload = json.loads(filesystem_path(request_path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(request_payload, Mapping):
@@ -219,7 +220,7 @@ def read_correlated_artifact_pair(
         return None
 
     try:
-        zend_payload = json.loads(zend_path.read_text(encoding="utf-8-sig"))
+        zend_payload = json.loads(filesystem_path(zend_path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(zend_payload, Mapping):
@@ -480,10 +481,10 @@ def format_recursive_summary(report: Mapping[str, Any]) -> dict[str, Any]:
 
 def write_report(report: Mapping[str, Any], output_file: Path) -> None:
     output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    filesystem_path(output_path.parent).mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(f"{output_path.name}.tmp")
-    temporary_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    temporary_path.replace(output_path)
+    filesystem_path(temporary_path).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    filesystem_path(temporary_path).replace(filesystem_path(output_path))
 
 
 def build_argument_parser() -> argparse.ArgumentParser:

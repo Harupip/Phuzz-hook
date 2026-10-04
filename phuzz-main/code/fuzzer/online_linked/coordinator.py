@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from filesystem_paths import check_directory_io, filesystem_path
 from hook_energy.seed_generation.generated_config_runner import (
     STOP_ON_VULN_EXIT_CODE,
     list_request_artifacts,
@@ -108,6 +109,10 @@ def _replace_fuzzable_values_with_placeholder(config: dict[str, Any]) -> None:
                 continue
             if _config_name_is_fuzzable(section, name):
                 row["value"] = "fuzz"
+
+
+def _request_id(run_id: str) -> str:
+    return "r-" + hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:24]
 
 
 class OnlineLinkedError(ValueError):
@@ -205,7 +210,7 @@ class OnlineLinkedCoordinator:
         if registry is not None:
             self.registry = dict(registry)
         elif registry_path is not None:
-            self.registry = json.loads(Path(registry_path).read_text(encoding="utf-8-sig"))
+            self.registry = json.loads(filesystem_path(Path(registry_path)).read_text(encoding="utf-8-sig"))
         else:
             raise ValueError("online-linked requires a callback registry")
         self.registry_path = Path(registry_path) if registry_path is not None else None
@@ -250,7 +255,17 @@ class OnlineLinkedCoordinator:
         self._failure = False
 
     def run(self) -> int:
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            check_directory_io(self.run_dir)
+            check_directory_io(self.config_dir)
+        except OSError as exc:
+            self.state.update(terminal_status="NOT_VERIFIED", terminal_reason=str(exc))
+            print(str(exc), file=sys.stderr)
+            try:
+                self._write_state()
+            except OSError:
+                pass
+            return 2
         self._write_state()
         try:
             config_generation_started_at = self.clock()
@@ -574,19 +589,19 @@ class OnlineLinkedCoordinator:
         if Path(request_name).name != request_name or Path(request_name).suffix != ".json":
             return None
         request_path = request_dir / request_name
-        if not request_path.is_file():
+        if not filesystem_path(request_path).is_file():
             return None
         zend_name = str(result_row.get("zend_artifact") or "")
         if Path(zend_name).name != zend_name or Path(zend_name).stem != Path(request_name).stem:
-            zend_paths = [path for path in zend_dir.glob("*.json") if path.stem == Path(request_name).stem]
+            zend_paths = [path for path in filesystem_path(zend_dir).glob("*.json") if path.stem == Path(request_name).stem]
             if len(zend_paths) != 1:
                 return None
             zend_name = zend_paths[0].name
         zend_path = zend_dir / zend_name
-        if not zend_path.is_file():
+        if not filesystem_path(zend_path).is_file():
             return None
-        request = json.loads(request_path.read_text(encoding="utf-8-sig"))
-        zend = json.loads(zend_path.read_text(encoding="utf-8-sig"))
+        request = json.loads(filesystem_path(request_path).read_text(encoding="utf-8-sig"))
+        zend = json.loads(filesystem_path(zend_path).read_text(encoding="utf-8-sig"))
         evidence = self._correlate_runtime_pair(
             version,
             {
@@ -1231,8 +1246,8 @@ class OnlineLinkedCoordinator:
         generated_dir = self.config_dir / "replay-input-trials" / attempt_id / "exported"
         generated_summary_path = self.run_dir / "replay-input-trials" / attempt_id / "generated_config_summary.json"
         try:
-            generated_dir.mkdir(parents=True, exist_ok=True)
-            generated_summary_path.parent.mkdir(parents=True, exist_ok=True)
+            filesystem_path(generated_dir).mkdir(parents=True, exist_ok=True)
+            filesystem_path(generated_summary_path.parent).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return self._finish_replay_input_attempt(
                 parent, trial_attempt, discovery, "CHILD_CONFIG_PREPARE_FAILED", deadline,
@@ -1249,7 +1264,7 @@ class OnlineLinkedCoordinator:
                 output_config_dir=generated_dir,
                 summary_path=generated_summary_path,
                 target_base="http://web",
-                rest_route_fallback=True,
+                rest_route_fallback=True, compact_names=True,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             trial_attempt["export_error"] = str(exc)
@@ -1260,12 +1275,12 @@ class OnlineLinkedCoordinator:
                 parent, trial_attempt, discovery, child_failure_reason, deadline, terminal=False,
             )
         generated_path = Path(str(rows[0].get("config_path") or ""))
-        if not generated_path.is_file():
+        if not filesystem_path(generated_path).is_file():
             return self._finish_replay_input_attempt(
                 parent, trial_attempt, discovery, "CHILD_CONFIG_MISSING", deadline, terminal=False,
             )
         try:
-            child_config = json.loads(generated_path.read_text(encoding="utf-8-sig"))
+            child_config = json.loads(filesystem_path(generated_path).read_text(encoding="utf-8-sig"))
             base_evidence = result.get("base_evidence") if isinstance(result.get("base_evidence"), Mapping) else evidence
             self._restore_request_values(child_config, base_evidence, parent)
             if isinstance(evidence_by_parameter, Mapping):
@@ -1587,7 +1602,7 @@ class OnlineLinkedCoordinator:
                 # payloads contain per-trial fuzz mutations and are not
                 # semantic progress by themselves.
                 published_path = version["config_path"]
-                published = json.loads(Path(str(published_path)).read_text(encoding="utf-8-sig"))
+                published = json.loads(filesystem_path(Path(str(published_path))).read_text(encoding="utf-8-sig"))
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
                 continue
             if self._config_request_key(published) == candidate_key:
@@ -2008,7 +2023,7 @@ class OnlineLinkedCoordinator:
             trial_run_id = self._bounded_trial_run_id(
                 parent["worker_run_id"], attempt["attempt_id"], trial_name,
             )
-            trial_request_id = f"{trial_run_id}-request"
+            trial_request_id = _request_id(trial_run_id)
             trial_config_path = trial_root / f"{trial_name}.json"
             trial_request_dir = mirror_root / trial_name / "request"
             trial_zend_dir = mirror_root / trial_name / "zend"
@@ -2594,8 +2609,8 @@ class OnlineLinkedCoordinator:
         attempts.append(attempt)
         self._write_state()
         try:
-            generated_dir.mkdir(parents=True, exist_ok=True)
-            generated_summary_path.parent.mkdir(parents=True, exist_ok=True)
+            filesystem_path(generated_dir).mkdir(parents=True, exist_ok=True)
+            filesystem_path(generated_summary_path.parent).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONFIG_PREPARE_FAILED", deadline, detail=str(exc))
         try:
@@ -2605,7 +2620,7 @@ class OnlineLinkedCoordinator:
                 summary_path=generated_summary_path,
                 target_base="http://web",
                 replay_only=True,
-                rest_route_fallback=True,
+                rest_route_fallback=True, compact_names=True,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONFIG_EXPORT_FAILED", deadline, detail=str(exc))
@@ -2613,10 +2628,10 @@ class OnlineLinkedCoordinator:
         if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONFIG_EXPORT_FAILED", deadline)
         generated_path = Path(str(rows[0].get("config_path") or ""))
-        if not generated_path.is_file():
+        if not filesystem_path(generated_path).is_file():
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONFIG_MISSING", deadline)
         try:
-            probe_config = json.loads(generated_path.read_text(encoding="utf-8-sig"))
+            probe_config = json.loads(filesystem_path(generated_path).read_text(encoding="utf-8-sig"))
             self._restore_request_values(probe_config, evidence, parent)
             probe_metadata = probe_config.setdefault("metadata", {})
             if not isinstance(probe_metadata, dict):
@@ -2671,7 +2686,7 @@ class OnlineLinkedCoordinator:
         try:
             sender_result = self._run_light_sender(
                 config_path=replay_path,
-                request_id=f"{probe_run_id}-request",
+                request_id=_request_id(probe_run_id),
                 run_id=probe_run_id,
                 hook_name=probe_row["hook_name"],
                 callback_id=probe_row["callback_id"],
@@ -2745,11 +2760,11 @@ class OnlineLinkedCoordinator:
             self._save_replay_artifacts(replay_row, request_dir, zend_dir)
             artifact_name = str(replay_row.get("matched_artifact") or "")
             request_path = request_dir / artifact_name
-            zend_paths = [path for path in zend_dir.glob("*.json") if path.stem == request_path.stem]
-            if Path(artifact_name).name != artifact_name or not request_path.is_file() or len(zend_paths) != 1:
+            zend_paths = [path for path in filesystem_path(zend_dir).glob("*.json") if path.stem == request_path.stem]
+            if Path(artifact_name).name != artifact_name or not filesystem_path(request_path).is_file() or len(zend_paths) != 1:
                 raise OnlineLinkedError("PROBE_ARTIFACT_CORRELATION_FAILED")
-            probe_request = json.loads(request_path.read_text(encoding="utf-8-sig"))
-            probe_zend = json.loads(zend_paths[0].read_text(encoding="utf-8-sig"))
+            probe_request = json.loads(filesystem_path(request_path).read_text(encoding="utf-8-sig"))
+            probe_zend = json.loads(filesystem_path(zend_paths[0]).read_text(encoding="utf-8-sig"))
             if (
                 not isinstance(probe_request, Mapping)
                 or not isinstance(probe_zend, Mapping)
@@ -2950,7 +2965,7 @@ class OnlineLinkedCoordinator:
             params = {}
         if not isinstance(params, Mapping):
             raise OnlineLinkedError("UNSUPPORTED_REQUEST_PARAMS: expected an object")
-        parent_config = json.loads(Path(str(parent["config_path"])).read_text(encoding="utf-8-sig"))
+        parent_config = json.loads(filesystem_path(Path(str(parent["config_path"]))).read_text(encoding="utf-8-sig"))
         headers = config.get("headers", {}).get("data", [])
         is_json = any(
             str(row.get("name", "")).lower() == "content-type"
@@ -3123,7 +3138,7 @@ class OnlineLinkedCoordinator:
         try:
             sender_result = self._run_light_sender(
                 config_path=replay_path,
-                request_id=f"{replay_run_id}-request",
+                request_id=_request_id(replay_run_id),
                 run_id=replay_run_id,
                 hook_name=row["hook_name"],
                 callback_id=row["callback_id"],
@@ -3310,7 +3325,7 @@ class OnlineLinkedCoordinator:
         return False
 
     def _select_v0(self) -> tuple[Mapping[str, Any], dict[str, Any], str] | None:
-        payload = json.loads(self.suggested_seeds.read_text(encoding="utf-8-sig"))
+        payload = json.loads(filesystem_path(self.suggested_seeds).read_text(encoding="utf-8-sig"))
         if not isinstance(payload, Mapping) or not isinstance(payload.get("suggested_seeds"), list):
             raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
         self._raw_report = copy.deepcopy(dict(payload))
@@ -3335,7 +3350,7 @@ class OnlineLinkedCoordinator:
                 selected = (item, config)
                 break
         if selected is None:
-            if self.bootstrap_config is None or not self.bootstrap_config.is_file():
+            if self.bootstrap_config is None or not filesystem_path(self.bootstrap_config).is_file():
                 return None
             selected = select_v0(self.suggested_seeds, self.bootstrap_config)
             if selected is None:
@@ -3655,8 +3670,8 @@ class OnlineLinkedCoordinator:
         if any(existing.get("event_id") == item["event_id"] for existing in self.state["events"]):
             return item
         self.state["events"].append(item)
-        self.events_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.events_path.open("a", encoding="utf-8", newline="\n") as handle:
+        filesystem_path(self.events_path.parent).mkdir(parents=True, exist_ok=True)
+        with filesystem_path(self.events_path).open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
         self._write_state()
         return item
@@ -3668,7 +3683,7 @@ class OnlineLinkedCoordinator:
         return next((item for item in self.state["versions"] if item.get("version") == name), None)
 
     def config_hash(self, path: Path) -> str:
-        return config_hash(json.loads(Path(path).read_text(encoding="utf-8")))
+        return config_hash(json.loads(filesystem_path(Path(path)).read_text(encoding="utf-8")))
 
     def _admission_complete(self, parameter: Any, evidence: Mapping[str, Any], parent: Mapping[str, Any]) -> bool:
         if not isinstance(parameter, Mapping):
@@ -3880,21 +3895,23 @@ def _sync_callback_registry_to_web(registry_path: Path) -> None:
 
 def run_online_linked(args: argparse.Namespace) -> int:
     suggested_path = Path(args.suggested_seeds)
-    payload = json.loads(suggested_path.read_text(encoding="utf-8-sig"))
+    payload = json.loads(filesystem_path(suggested_path).read_text(encoding="utf-8-sig"))
     items = payload.get("suggested_seeds") if isinstance(payload, Mapping) else None
     if not isinstance(items, list):
         raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
 
     batch_dir = Path(args.output_root) / "online-linked" / args.legacy_run_id
+    check_directory_io(batch_dir)
+    check_directory_io(Path(args.config_root) / "online-linked")
     candidate_input_dir = batch_dir / "candidates"
-    candidate_input_dir.mkdir(parents=True, exist_ok=True)
+    filesystem_path(candidate_input_dir).mkdir(parents=True, exist_ok=True)
     max_candidates = int(getattr(args, "max_candidates", max(1, len(items) + 16)))
     campaign_seconds = int(getattr(args, "campaign_seconds", max(60, args.max_seconds * max_candidates)))
     if max_candidates < 1 or campaign_seconds < 1:
         raise ValueError("online-linked candidate and campaign budgets must be positive")
     registry_source = Path(args.callback_registry)
     batch_registry = batch_dir / "callback-registry.json"
-    batch_registry.write_text(registry_source.read_text(encoding="utf-8-sig"), encoding="utf-8")
+    filesystem_path(batch_registry).write_text(filesystem_path(registry_source).read_text(encoding="utf-8-sig"), encoding="utf-8")
     batch_state: dict[str, Any] = {
         "schema_version": 1,
         "mode": "online-linked-batch",
@@ -3947,7 +3964,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
         if isinstance(raw_item.get("lineage"), Mapping):
             candidate_record["lineage"] = dict(raw_item["lineage"])
         try:
-            candidate_input.write_text(
+            filesystem_path(candidate_input).write_text(
                 json.dumps({**payload, "suggested_seeds": [dict(raw_item)]}, indent=2) + "\n",
                 encoding="utf-8",
             )

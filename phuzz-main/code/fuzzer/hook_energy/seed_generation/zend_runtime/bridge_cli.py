@@ -21,13 +21,16 @@ else:
     from instrumentation.zend.rest.runtime import canonical_rest_parameter_name
 
 
+from filesystem_paths import filesystem_path
+
+
 def _read_json(path: Path) -> Any:
-    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    return json.loads(filesystem_path(Path(path)).read_text(encoding="utf-8-sig"))
 
 
 def _write_json(path: Path, value: Any) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    filesystem_path(Path(path).parent).mkdir(parents=True, exist_ok=True)
+    filesystem_path(Path(path)).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _seed_key(item: Mapping[str, Any]) -> tuple[str, str, str]:
@@ -109,7 +112,7 @@ def build_enrichment_inputs(
         if raw_item is None or not artifact_name:
             continue
         artifact_path = pass1_artifacts_dir / artifact_name
-        if not artifact_path.is_file():
+        if not filesystem_path(artifact_path).is_file():
             continue
         artifact = _read_json(artifact_path)
         if not isinstance(artifact, dict):
@@ -259,7 +262,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             legacy_run_id=args.legacy_run_id,
         )
         zend_artifacts = [
-            item for path in sorted(Path(args.zend_events_dir).glob("*.json"))
+            item for path in sorted(filesystem_path(Path(args.zend_events_dir)).glob("*.json"))
             if isinstance((item := _read_json(path)), dict)
         ]
         summary = run_enrichment(
@@ -341,7 +344,7 @@ def converge_iteration(
     if str(uopz.get("request_id") or "") != request_id or uopz.get("compat_request_id_matches") is False:
         raise RuntimeError("REPLAY_FAILED: request-ID headers are incompatible")
     zend_path = zend_events_dir / artifact_name
-    if not zend_path.is_file():
+    if not filesystem_path(zend_path).is_file():
         raise RuntimeError("REPLAY_FAILED: matched Zend artifact is missing")
     zend = _read_json(zend_path)
     if not isinstance(zend, Mapping) or str(zend.get("request_id") or "") != request_id:
@@ -707,11 +710,11 @@ def verify_pass2_contract(
             continue
         zend_path = zend_events_dir / artifact_name
         uopz_path = pass2_artifacts_dir / artifact_name if pass2_artifacts_dir is not None else None
-        if not zend_path.is_file():
+        if not filesystem_path(zend_path).is_file():
             continue
         try:
             zend = _read_json(zend_path)
-            uopz = _read_json(uopz_path) if uopz_path is not None and uopz_path.is_file() else {}
+            uopz = _read_json(uopz_path) if uopz_path is not None and filesystem_path(uopz_path).is_file() else {}
         except (OSError, json.JSONDecodeError):
             continue
         if not isinstance(zend, Mapping):

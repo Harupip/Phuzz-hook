@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from filesystem_paths import filesystem_path
+
 from hook_energy.seed_generation.generated_config_runner import ZEND_ARTIFACTS_DIR
 from seed_generation.config.config_exporter import SeedConfigSkip, build_config_for_seed_item
 
@@ -101,6 +103,7 @@ def _load_zend_artifact(name: str) -> Any:
 
 
 def _write_exclusive_json(path: Path, payload: Any) -> None:
+    path = filesystem_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8", newline="\n") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
@@ -108,6 +111,7 @@ def _write_exclusive_json(path: Path, payload: Any) -> None:
 
 
 def _write_json(path: Path, payload: Any) -> None:
+    path = filesystem_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.tmp")
     temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -132,7 +136,7 @@ def select_v0(
     *,
     build_config_fn: Callable[..., Any] = build_config_for_seed_item,
 ) -> tuple[Mapping[str, Any], dict[str, Any]] | None:
-    payload = json.loads(suggested_seeds.read_text(encoding="utf-8-sig"))
+    payload = json.loads(filesystem_path(suggested_seeds).read_text(encoding="utf-8-sig"))
     suggestions = payload.get("suggested_seeds") if isinstance(payload, Mapping) else None
     if not isinstance(suggestions, list):
         raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
@@ -149,8 +153,8 @@ def select_v0(
         valid, _ = validate_v0_config(config)
         if valid:
             return item, config
-    if bootstrap_config and bootstrap_config.exists():
-        bootstrap = json.loads(bootstrap_config.read_text(encoding="utf-8-sig"))
+    if bootstrap_config and filesystem_path(bootstrap_config).exists():
+        bootstrap = json.loads(filesystem_path(bootstrap_config).read_text(encoding="utf-8-sig"))
         if isinstance(bootstrap, Mapping):
             for item in suggestions:
                 if not isinstance(item, Mapping) or not _seed_matches_target(item, bootstrap):

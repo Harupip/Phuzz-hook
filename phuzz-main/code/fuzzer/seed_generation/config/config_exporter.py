@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from filesystem_paths import filesystem_path
+
 
 class SeedConfigSkip(Exception):
     def __init__(self, reason: str) -> None:
@@ -149,9 +151,10 @@ def export_seed_configs(
     # TEMP MERGE-BACKPORT (2026-08-19): keeps exporter API aligned with its CLI
     # callers; compare against the merged implementation before changing.
     rest_route_fallback: bool = False,
+    compact_names: bool = False,
 ) -> dict[str, list[dict[str, str]]]:
     output_dir = Path(output_config_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    filesystem_path(output_dir).mkdir(parents=True, exist_ok=True)
 
     summary: dict[str, list[dict[str, str]]] = {"generated": [], "skipped": []}
     suggestions = seed_report.get("suggested_seeds", [])
@@ -178,9 +181,10 @@ def export_seed_configs(
         if replay_only or _is_probe_variant(item):
             _force_replay_only(config)
 
-        file_slug = _bounded_file_slug(file_slug)
+        file_slug = ("c-" + hashlib.sha256(file_slug.encode("utf-8")).hexdigest()[:24]
+                     if compact_names else _bounded_file_slug(file_slug))
         config_path = output_dir / f"{file_slug}.json"
-        config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        filesystem_path(config_path).write_text(json.dumps(config, indent=2), encoding="utf-8")
         generated_row = {
             "config_slug": _build_config_slug(output_dir, file_slug),
             "config_path": str(config_path),
@@ -194,8 +198,8 @@ def export_seed_configs(
         summary["generated"].append(generated_row)
 
     if summary_path is not None:
-        Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(summary_path).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        filesystem_path(Path(summary_path).parent).mkdir(parents=True, exist_ok=True)
+        filesystem_path(summary_path).write_text(json.dumps(summary, indent=2), encoding="utf-8")
         if write_param_summary:
             param_summary_path = Path(summary_path).with_name("generated_param_summary.json")
             param_summary = build_generated_param_summary(
@@ -203,7 +207,7 @@ def export_seed_configs(
                 summary,
                 output_config_dir=output_dir,
             )
-            param_summary_path.write_text(json.dumps(param_summary, indent=2), encoding="utf-8")
+            filesystem_path(param_summary_path).write_text(json.dumps(param_summary, indent=2), encoding="utf-8")
 
     return summary
 
@@ -569,7 +573,7 @@ def _probe_request_metadata(seed_item: Mapping[str, Any]) -> dict[str, Any] | No
 
 def _read_json_object(path: Path) -> Mapping[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        payload = json.loads(filesystem_path(path).read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, Mapping) else {}

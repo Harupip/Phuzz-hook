@@ -6,13 +6,15 @@ import re
 import sys
 from pathlib import Path
 
+from filesystem_paths import filesystem_path
+
 from hook_energy.seed_generation.online_common import config_hash
 
 
 def export_online_linked_batch(batch_state_path: Path, destination: Path | None = None) -> int:
-    batch = json.loads(batch_state_path.read_text(encoding="utf-8-sig"))
+    batch = json.loads(filesystem_path(batch_state_path).read_text(encoding="utf-8-sig"))
     destination = destination or batch_state_path.parent / "final-configs"
-    destination.mkdir(parents=True, exist_ok=False)
+    filesystem_path(destination).mkdir(parents=True, exist_ok=False)
     count = 0
     seen = set()
     for candidate in batch["candidates"]:
@@ -24,7 +26,7 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
             state_path = Path(candidate["state_path"])
             if not state_path.is_absolute():
                 state_path = batch_state_path.parent / state_path
-            state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+            state = json.loads(filesystem_path(state_path).read_text(encoding="utf-8-sig"))
             if (not candidate.get("run_id") or state["legacy_run_id"] != candidate["run_id"]
                     or state["plugin_slug"] != batch["plugin_slug"]):
                 raise ValueError("RUN_MISMATCH")
@@ -44,7 +46,7 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
             hook = re.sub(r"[^A-Za-z0-9_-]+", "-", candidate.get("hook_name", "hook"))[:40]
             suffix = hashlib.sha256(identity.encode()).hexdigest()[:16]
             # Exclusive creation preserves existing output; bytes retain all metadata/auth.
-            with (destination / f"fuzzer-config.{hook}.{suffix}.json").open("xb") as output:
+            with filesystem_path(destination / f"fuzzer-config.{hook}.{suffix}.json").open("xb") as output:
                 output.write(content)
             count += 1
             break
@@ -76,7 +78,7 @@ def _verified_base(version: dict) -> tuple[bytes, dict]:
     relative_parts = parts[roots[-1] + 2:] if roots else parts[-2:]
     if any(part.lower() in {"probe", "replay"} for part in relative_parts):
         raise ValueError("PROBE_OR_REPLAY")
-    content = path.read_bytes()
+    content = filesystem_path(path).read_bytes()
     config = json.loads(content.decode("utf-8-sig"))
     if config_hash(config) != version.get("config_hash"):
         raise ValueError("CONFIG_HASH_MISMATCH")
