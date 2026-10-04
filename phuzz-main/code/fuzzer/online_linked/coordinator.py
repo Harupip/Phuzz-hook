@@ -68,6 +68,11 @@ ConfigBuilder = Callable[..., tuple[str, dict[str, Any]]]
 RuntimeBatchReader = Callable[..., dict[str, Any]]
 
 
+def _request_id(run_id: str) -> str:
+    # Request IDs become artifact filenames; keep full run identity in the payload.
+    return hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:32]
+
+
 def _parameter_key(parameter: Any) -> tuple[str, str, str]:
     if not isinstance(parameter, Mapping):
         return "", "", ""
@@ -168,6 +173,7 @@ class OnlineLinkedCoordinator:
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         campaign_deadline: float | None = None,
+        campaign_dir: Path | None = None,
     ) -> None:
         if not 1 <= max_seconds <= 120:
             raise ValueError("max_seconds must be between 1 and 120")
@@ -180,6 +186,7 @@ class OnlineLinkedCoordinator:
         self.plugin_slug = plugin_slug
         self.legacy_run_id = legacy_run_id
         self.max_seconds = max_seconds
+        self._sender_seconds = 0.0
         self.max_versions = max_versions
         self.runtime_cookie_probes = bool(runtime_cookie_probes)
         self.service = service
@@ -203,9 +210,10 @@ class OnlineLinkedCoordinator:
         self.clock = clock
         self.sleeper = sleeper
         self.campaign_deadline = float(campaign_deadline) if campaign_deadline is not None else None
-        # Keep nested evidence/config paths below Windows MAX_PATH for long run IDs.
+        # Avoid repeating long candidate run IDs in nested evidence/config paths.
         storage_id = hashlib.sha256(self.legacy_run_id.encode("utf-8")).hexdigest()[:16]
-        self.run_dir = self.output_root / "online-linked" / storage_id
+        evidence_root = Path(campaign_dir) / "campaigns" if campaign_dir is not None else self.output_root / "online-linked"
+        self.run_dir = evidence_root / storage_id
         self.config_dir = self.config_root / "online-linked" / self.plugin_slug / storage_id
         if registry is not None:
             self.registry = dict(registry)
@@ -427,6 +435,7 @@ class OnlineLinkedCoordinator:
         if timeout <= 0:
             return {"status": "timeout", "error": "SENDER_BUDGET_EXPIRED"}
         config_slug = config_path.relative_to(self.config_root).with_suffix("").as_posix()
+        started = self.clock()
         result = self.probe_sender(
             self._active_container,
             config_slug=config_slug,
@@ -446,6 +455,10 @@ class OnlineLinkedCoordinator:
             clock=self.clock,
             sleeper=self.sleeper,
         )
+        if (isinstance(result, Mapping)
+                and (result.get("status") == "callback_reached" or result.get("callback_reached") is True)
+                and (deadline is None or self.clock() < deadline)):
+            self._sender_seconds = max(self._sender_seconds, self.clock() - started)
         return dict(result) if isinstance(result, Mapping) else {"status": "sender_invalid"}
 
     @staticmethod
@@ -1207,6 +1220,18 @@ class OnlineLinkedCoordinator:
             if isinstance(parameter, Mapping) else parameter
             for parameter in (result.get("known_parameters") or [])
         ]
+        # Reserve two sends (trial + replay) and one sender-sized overhead
+        # allowance for verification/handoff. This never extends the deadline.
+        if deadline is not None and deadline - self.clock() < 3 * self._sender_seconds:
+            self._retain_pending_runtime_candidates([
+                {"parameters": [parameter], "evidence": (
+                    evidence_by_parameter.get(_parameter_key(parameter), evidence)
+                    if isinstance(evidence_by_parameter, Mapping) else evidence
+                )} for parameter in new_parameters
+            ], parent)
+            self._record_event({**discovery, "event_id": "", "status": "DEFERRED",
+                                "reason": "INSUFFICIENT_VERIFICATION_BUDGET"})
+            return None
         materialize_candidate_key = str(result.get("candidate_key") or self._target_key).split("::", 1)[0]
         try:
             materialized = self.materialize_fn(
@@ -2411,7 +2436,7 @@ class OnlineLinkedCoordinator:
                 "evidence": copy.deepcopy(dict(candidate_evidence)),
             })
 
-        for candidate in initial_candidates:
+        for candidate in sorted(initial_candidates, key=_parameter_key):
             enqueue(candidate, convergence, evidence)
         probe_deadline = None
         if deadline is not None:
@@ -2440,17 +2465,21 @@ class OnlineLinkedCoordinator:
         index = 0
         while index < len(queue):
             queue_item = queue[index]
-            index += 1
             candidate = queue_item["candidate"]
             candidate_convergence = queue_item["convergence"]
             candidate_evidence = queue_item["evidence"]
-            if probe_deadline is not None and self.clock() >= probe_deadline:
-                deferred = [dict(item["candidate"]) for item in queue[index:]]
-                break
+            if probe_deadline is not None:
+                effective_deadline = probe_deadline
+                if accepted_records:
+                    effective_deadline = min(probe_deadline, deadline - 3 * self._sender_seconds)
+                if self.clock() + self._sender_seconds >= effective_deadline:
+                    deferred = [dict(item["candidate"]) for item in queue[index:]]
+                    break
+            index += 1
             outcome = self._run_pending_probe_once(
                 parent=parent, evidence=candidate_evidence, raw_report=raw_report,
                 convergence=candidate_convergence, probe=candidate,
-                seed=seed, deadline=probe_deadline,
+                seed=seed, deadline=effective_deadline if probe_deadline is not None else None,
             )
             if not isinstance(outcome, Mapping) or outcome.get("status") != "accepted":
                 if isinstance(outcome, Mapping) and outcome.get("status") == "pending":
@@ -2505,31 +2534,50 @@ class OnlineLinkedCoordinator:
             })
             group["parameters"].append(record["parameter"])
             group["result"] = record["result"]
-        # The latest correlated request is the proposal for the next version.
-        # Earlier candidates remain evidence-backed work, not an input union.
-        chosen_key = next(reversed(groups))
-        ordered_groups = [groups[chosen_key]] + [
-            group for key, group in reversed(list(groups.items())) if key != chosen_key
-        ]
-        self._retain_pending_runtime_candidates(ordered_groups[1:], parent)
+        ordered_groups = sorted(
+            groups.values(),
+            key=lambda group: sorted(_parameter_key(p) for p in group["parameters"]),
+            reverse=True,
+        )
+        self._retain_pending_runtime_candidates(ordered_groups, parent)
+
+        # Separate reads justify trying a combined request, never publishing a
+        # union directly. Admission checks each original evidence pair, then the
+        # existing coherent trial and Pass 2 must verify ALL proposed fields.
+        proposals = list(ordered_groups)
+        if len(ordered_groups) > 1:
+            proposals.insert(0, {
+                "parameters": sorted(
+                    (record["parameter"] for record in accepted_records), key=_parameter_key,
+                ),
+                "evidence": ordered_groups[0]["evidence"],
+                "result": ordered_groups[0]["result"],
+                "parameter_evidence": {
+                    _parameter_key(record["parameter"]): record["evidence"]
+                    for record in accepted_records
+                },
+                "combined": True,
+            })
 
         existing = parent.get("known_parameters", [])
         existing = [dict(item) for item in existing if isinstance(item, Mapping)] if isinstance(existing, list) else []
-        if convergence.get("_coherent_only") is True:
-            existing = []
-        for group in ordered_groups:
+        for group in proposals:
             # Consume only the proposal currently entering admission. If its
             # replay-input trial fails, the remaining groups keep the parent
             # recoverable and are tried as separate coherent proposals.
-            self._discard_pending_runtime_candidates([group])
+            if not group.get("combined"):
+                self._discard_pending_runtime_candidates([group])
             chosen_parameters = [dict(item) for item in group["parameters"]]
             chosen_evidence = group["evidence"]
             final_result = dict(group["result"])
             final_result["new_parameters"] = chosen_parameters
-            final_result["known_parameters"] = existing + chosen_parameters
+            inherited = [] if convergence.get("_coherent_only") is True and not group.get("combined") else existing
+            final_result["known_parameters"] = list({
+                _parameter_key(p): p for p in sorted(inherited + chosen_parameters, key=_parameter_key)
+            }.values())
             final_result.pop("pending_probes", None)
             final_result["deferred_probes"] = deferred
-            final_result["parameter_evidence"] = {
+            final_result["parameter_evidence"] = group.get("parameter_evidence") or {
                 _parameter_key(parameter): chosen_evidence for parameter in chosen_parameters
             }
             final_result["base_evidence"] = chosen_evidence
@@ -2542,7 +2590,9 @@ class OnlineLinkedCoordinator:
                     if isinstance(parameter, Mapping) and parameter.get("fuzzable") is True
                 ]
             final_result["_pending_group_dispatch"] = True
-            if convergence.get("_coherent_only") is True:
+            if group.get("combined") or convergence.get("_coherent_only") is True:
+                # A probe's missing reads describe that individual request,
+                # not the combined proposal which has yet to be sent.
                 final_result["status"] = "CONTINUE"
                 final_result["missing_parameters"] = []
             child = self._handle_convergence_result(
@@ -2550,6 +2600,9 @@ class OnlineLinkedCoordinator:
                 result=final_result, seed=seed, deadline=deadline,
             )
             if child is not None:
+                if group.get("combined") and (child.get("replay_result") or {}).get("passed") is True:
+                    self._discard_pending_runtime_candidates(ordered_groups)
+                    self._write_state()
                 return child
             if self.state.get("terminal_status") or not self._active_container:
                 break
@@ -3204,16 +3257,9 @@ class OnlineLinkedCoordinator:
             return False
         parent_timeout = None if deadline is None else deadline - self.clock()
         deadline_expired = parent_timeout is not None and parent_timeout <= 0
-        if deadline_expired:
-            sender_result = dict(sender_result)
-            sender_result.update(
-                status="timeout",
-                callback_reached=False,
-                validation_status="registered_not_executed",
-                validation_reason="SENDER_TIMEOUT",
-                error="SENDER_TIMEOUT",
-            )
-        else:
+        # Budget exhaustion is not evidence that the HTTP callback failed.
+        # Keep any received request/Zend artifacts, but do not admit a late gate.
+        if not deadline_expired:
             try:
                 parent_exit_code = self._observe_parent_exit(timeout=parent_timeout)
             except (ParentInspectionTimeout, ParentInspectionError) as exc:
@@ -3258,8 +3304,10 @@ class OnlineLinkedCoordinator:
             )
         except (OSError, RuntimeError, ValueError) as exc:
             verification = {"accepted": 0, "total": 0, "error": str(exc)}
+        deadline_expired = deadline is not None and self.clock() >= deadline
         replay_passed = bool(
             isinstance(replay_row, Mapping)
+            and not deadline_expired
             and not artifact_error
             and replay_row.get("validation_status") == "callback_reached"
             and replay_row.get("process_status") not in {"failed", "runner_error", "window_elapsed"}
@@ -3268,6 +3316,7 @@ class OnlineLinkedCoordinator:
         )
         replay_result = {
             "passed": replay_passed,
+            "budget_expired": deadline_expired,
             "config_path": str(replay_path),
             "config_hash": self.config_hash(replay_path),
             "runner": replay_report,
@@ -3333,6 +3382,13 @@ class OnlineLinkedCoordinator:
         else:
             child["status"] = "replay_failed"
             child["worker_status"] = "not_started_replay_failed"
+            if deadline_expired:
+                child["terminal_reason"] = "CANDIDATE_BUDGET_EXPIRED"
+                self.state["terminal_status"] = "BOUNDED_ONLINE_COMPLETE"
+                self.state["terminal_reason"] = "BUDGET_EXPIRED"
+                record_replay_event("DEFERRED", "CANDIDATE_BUDGET_EXPIRED")
+                self._write_state()
+                return False
             if artifact_error:
                 child["terminal_reason"] = "REPLAY_ARTIFACT_SAVE_FAILED"
             elif replay_report.get("error") or replay_row.get("process_status") in {"failed", "runner_error"}:
@@ -4013,6 +4069,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 service=args.service,
                 load_finding_artifact=load_finding_artifact,
                 campaign_deadline=campaign_deadline,
+                campaign_dir=batch_dir,
             )
             result = coordinator.run()
             skipped = skipped or result != 0 or coordinator.state.get("terminal_status") == "NOT_VERIFIED"

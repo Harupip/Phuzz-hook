@@ -180,10 +180,10 @@ class Fuzzer:
             "/shared-tmpfs/", "pathtraversal-error-reports")
         self.xxe_errors_folder = os.path.join(
             "/shared-tmpfs/", "xxe-error-reports")
-        self.output_dir = os.path.join("./output", f"fuzzer-{fuzzer_id}")
+        self.output_dir = os.path.join("./output", "workers", f"fuzzer-{fuzzer_id}")
         if os.path.exists(self.output_dir):
             shutil.rmtree(self.output_dir)
-        os.mkdir(self.output_dir)
+        os.makedirs(self.output_dir, exist_ok=True)
 
         ### 
         # BEGIN Define Fuzzing modules

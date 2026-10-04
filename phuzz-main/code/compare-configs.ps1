@@ -46,7 +46,7 @@ $compareExitCode = 2
 
 Push-Location $fuzzerRoot
 try {
-    & rtk proxy python -m config_comparison.cli `
+    & python -m config_comparison.cli `
         --expected $expectedPath `
         --actual $actualPath `
         --policy $policy `
