@@ -192,13 +192,58 @@ class OnlineLinkedExportTests(unittest.TestCase):
         for rejected in (False, True):
             with self.subTest(rejected=rejected):
                 new_config = self.config()
-                new_config["metadata"]["new_parameter"] = "v10-only"
+                new_config["metadata"]["online_request_seed"]["request_id"] = "v10-only"
                 versions = [self.version("v2"), self.version("v10", config=new_config, gate=not rejected)]
                 candidate, _ = self.write_state(versions=versions)
                 destination = self.root / str(rejected)
                 self.assertEqual(export_online_linked_batch(self.batch([candidate]), destination), 1)
                 selected = versions[0 if rejected else 1]
                 self.assertEqual(next(destination.iterdir()).read_bytes(), Path(selected["config_path"]).read_bytes())
+
+    def test_keeps_verified_branches_without_duplicate_or_failed_versions(self):
+        versions = []
+        for name, mode, field, passed in (("v1", "search", "keyword", True),
+                                          ("v2", "delete", "item_id", True),
+                                          ("v3", "search", "keyword", True),
+                                          ("v4", "update", "title", False)):
+            config = self.config()
+            config["body_params"] = {
+                "data": [{"name": "mode", "value": mode}, {"name": field, "value": "fuzz"}],
+                "fixed": ["mode"], "fuzz": [field], "weight": 1,
+            }
+            config["metadata"]["online_request_seed"]["request_id"] = name
+            version = self.version(name, config=config, gate=passed)
+            version["known_parameters"] = [{"name": field, "source": "POST", "location": "form"}]
+            versions.append(version)
+        candidate, _ = self.write_state(versions=versions)
+        self.assertEqual(export_online_linked_batch(self.batch([candidate])), 2)
+        row = json.loads((self.root / "final-config-summary.json").read_text())["candidates"][0]
+        self.assertEqual(row["selected_version"], "v3")
+        self.assertEqual([item["version"] for item in row["exported_configs"]], ["v3", "v2"])
+        self.assertEqual(row["exported_configs"][0]["equivalent_versions"], ["v1"])
+        for item, version in zip(row["exported_configs"], (versions[2], versions[1])):
+            self.assertEqual(Path(item["config_path"]).read_bytes(), Path(version["config_path"]).read_bytes())
+        self.assertEqual({p["name"] for p in row["verified_parameters"]}, {"keyword", "item_id"})
+        self.assertEqual([p["name"] for p in row["pending_parameters"]], ["title"])
+        self.assertEqual(row["discovery_status"], "PARTIAL")
+
+    def test_same_field_keeps_different_fixed_context_and_transport(self):
+        versions = []
+        for name, mode, method in (("v1", "search", "POST"), ("v2", "delete", "POST"),
+                                    ("v3", "search", "GET")):
+            config = self.config()
+            config["methods"] = [method]
+            config["body_params"]["data"][0] = {"name": "action", "value": mode}
+            if method == "GET":
+                config["query_params"], config["body_params"] = config["body_params"], config["query_params"]
+            versions.append(self.version(name, config=config))
+        candidate, _ = self.write_state(versions=versions)
+        batch = self.batch([candidate])
+        self.assertEqual(export_online_linked_batch(batch), 3)
+        destination = self.root / "second-export"
+        self.assertEqual(export_online_linked_batch(batch, destination), 3)
+        self.assertEqual({p.name for p in destination.iterdir()},
+                         {p.name for p in (self.root / "final-configs").iterdir()})
 
     def test_rejected_versions_leave_empty_folder(self):
         versions = [self.version("v0", pass2=(0, 0)), self.version("v1", pass2=(1, 2)),

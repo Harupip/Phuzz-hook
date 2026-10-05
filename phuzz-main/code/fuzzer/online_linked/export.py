@@ -1,4 +1,4 @@
-"""Copy each candidate's latest verified config into one folder."""
+"""Copy each candidate's distinct verified configs into one folder."""
 
 import hashlib
 import json
@@ -24,7 +24,8 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
             continue
         seen.add(identity)
         summary = {"identity": identity, "hook_name": candidate.get("hook_name"),
-                   "selected_version": None, "skipped_versions": [], "discovery_status": "NOT_ASSESSED"}
+                   "selected_version": None, "exported_configs": [], "skipped_versions": [],
+                   "discovery_status": "NOT_ASSESSED"}
         summaries.append(summary)
         try:
             state_path = Path(candidate["state_path"])
@@ -39,6 +40,7 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
                 key=lambda v: int(v["version"][1:]), reverse=True,
             )
             summary.update(
+                state_path=str(state_path),
                 latest_version=versions[0]["version"] if versions else None,
                 terminal_status=state.get("terminal_status"), terminal_reason=state.get("terminal_reason"),
             )
@@ -46,6 +48,8 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
             summary.update(discovery_status="PARTIAL", reason=str(exc))
             print(f"Config skipped {identity}: {exc}", file=sys.stderr)
             continue
+        exported = {}
+        verified_versions = []
         for version in versions:
             try:
                 content = _verified_config(version)
@@ -56,24 +60,41 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
                 })
                 print(f"Config skipped {identity}/{version['version']}: {exc}", file=sys.stderr)
                 continue
+            # Per-request evidence changes across equivalent replays; retain it
+            # in the copied bytes, but do not create another identical request.
+            semantic = json.loads(content.decode("utf-8-sig"))
+            if isinstance(semantic.get("metadata"), dict):
+                semantic["metadata"].pop("online_request_seed", None)
+            request_key = config_hash(semantic)
+            verified_versions.append(version["version"])
+            if request_key in exported:
+                exported[request_key]["equivalent_versions"].append(version["version"])
+                continue
             hook = re.sub(r"[^A-Za-z0-9_-]+", "-", candidate.get("hook_name", "hook"))[:40]
             suffix = hashlib.sha256(identity.encode()).hexdigest()[:16]
+            version_suffix = f".{version['version']}" if exported else ""
+            config_path = destination / f"fuzzer-config.{hook}.{suffix}{version_suffix}.json"
             # Exclusive creation preserves existing output; bytes retain all metadata/auth.
-            with filesystem_path(destination / f"fuzzer-config.{hook}.{suffix}.json").open("xb") as output:
+            with filesystem_path(config_path).open("xb") as output:
                 output.write(content)
             count += 1
-            summary.update(selected_version=version["version"],
-                           config_path=str(destination / f"fuzzer-config.{hook}.{suffix}.json"))
-            break
-        summary.update(_discovery_summary(state, summary["selected_version"]))
+            row = {"version": version["version"], "config_path": str(config_path),
+                   "source_config_path": version["config_path"], "config_hash": version["config_hash"],
+                   "equivalent_versions": []}
+            exported[request_key] = row
+            summary["exported_configs"].append(row)
+            if summary["selected_version"] is None:
+                summary.update(selected_version=version["version"], config_path=str(config_path))
+        summary.update(_discovery_summary(state, verified_versions))
     summary_name = "final-config-summary.json" if destination.name == "final-configs" else f"{destination.name}-summary.json"
     summary_path = destination.parent / summary_name
     summary_path.write_text(json.dumps({"schema_version": 1, "candidates": summaries}, indent=2) + "\n", encoding="utf-8")
-    print(f"Final configs: {destination} ({count} files, {len(seen) - count} skipped)")
+    skipped = sum(row["selected_version"] is None for row in summaries)
+    print(f"Final configs: {destination} ({count} files, {skipped} skipped)")
     return count
 
 
-def _discovery_summary(state: dict, selected_version: str | None) -> dict:
+def _discovery_summary(state: dict, selected_versions: list[str]) -> dict:
     """Describe observed work, without claiming all possible inputs were found."""
     observed = {}
     verified = {}
@@ -87,7 +108,7 @@ def _discovery_summary(state: dict, selected_version: str | None) -> dict:
 
     for version in state.get("versions", []):
         add(version.get("known_parameters"), observed)
-        if version.get("version") == selected_version:
+        if version.get("version") in selected_versions:
             add(version.get("known_parameters"), verified)
         convergence = (version.get("readiness") or {}).get("convergence") or {}
         add(convergence.get("observed_parameters"), observed)
@@ -103,7 +124,7 @@ def _discovery_summary(state: dict, selected_version: str | None) -> dict:
             add(event.get("parameters"), observed)
     pending = [observed[key] for key in sorted(observed) if key not in verified]
     reason = str(state.get("terminal_reason") or "")
-    partial = bool(pending or selected_version is None or state.get("terminal_status") == "NOT_VERIFIED"
+    partial = bool(pending or not selected_versions or state.get("terminal_status") == "NOT_VERIFIED"
                    or "BUDGET" in reason or "LIMIT" in reason)
     return {"discovery_status": "PARTIAL" if partial else "NOT_ASSESSED",
             "verified_parameters": [verified[key] for key in sorted(verified)],
