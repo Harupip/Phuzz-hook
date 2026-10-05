@@ -4852,6 +4852,98 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "config hash changed"):
                 rejected._load_checkpoint()
 
+    def test_partial_campaign_resume_uses_real_exporter_with_existing_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator = self.make_coordinator(root, [])
+            registry = root / "registry.json"
+            registry.write_text(json.dumps(coordinator.registry), encoding="utf-8")
+            args = SimpleNamespace(suggested_seeds=str(coordinator.suggested_seeds), bootstrap_config="",
+                config_root=str(root / "configs"), output_root=str(root / "output"), plugin_slug="fixture",
+                legacy_run_id="campaign", max_seconds=10, max_versions=3, max_candidates=2,
+                campaign_seconds=100, callback_registry=str(registry), service="fuzzer-wordpress-plugin")
+            class FakeCoordinator:
+                def __init__(self, **kwargs):
+                    self.state_path = root / "candidate-state.json"
+                    self.state = {"legacy_run_id": kwargs["legacy_run_id"], "plugin_slug": "fixture",
+                        "terminal_status": "BOUNDED_ONLINE_COMPLETE" if kwargs["resume"] else "PARTIAL",
+                        "terminal_reason": None if kwargs["resume"] else "PENDING_RUNTIME_VERIFICATION",
+                        "versions": [], "candidate_queue": []}
+                def run(self):
+                    self.state_path.write_text(json.dumps(self.state), encoding="utf-8")
+                    return 0
+            batch_path = root / "output/online-linked/campaign/batch-state.json"
+            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator):
+                self.assertEqual(run_online_linked(args), 0)
+                saved = json.loads(batch_path.read_text())
+                self.assertEqual(saved["campaign_status"], "PARTIAL")
+                self.assertTrue((batch_path.parent / "final-configs").is_dir())
+                args.resume = True
+                with patch("online_linked.coordinator.time.time", return_value=saved["budget"]["saved_at"]):
+                    self.assertEqual(run_online_linked(args), 0)
+            self.assertEqual(json.loads(batch_path.read_text())["campaign_status"], "complete")
+
+    def test_campaign_resume_after_runtime_registry_merge_retains_integrity(self):
+        for interrupt_before_publish in (False, True):
+            with self.subTest(interrupt_before_publish=interrupt_before_publish), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                coordinator, parent, _, _ = self.make_probe_context(root, [])
+                registry = root / "registry.json"
+                registry.write_text(json.dumps(coordinator.registry), encoding="utf-8")
+                args = SimpleNamespace(suggested_seeds=str(coordinator.suggested_seeds), bootstrap_config="",
+                    config_root=str(root / "configs"), output_root=str(root / "output"), plugin_slug="fixture",
+                    legacy_run_id="campaign", max_seconds=10, max_versions=3, max_candidates=2,
+                    campaign_seconds=100, callback_registry=str(registry), service="fuzzer-wordpress-plugin")
+                calls = []
+                class FakeCoordinator:
+                    def __init__(self, **kwargs):
+                        self.kwargs = kwargs
+                        calls.append(kwargs)
+                        self.state_path = root / "candidate-state.json"
+                        self.state = {"legacy_run_id": kwargs["legacy_run_id"], "plugin_slug": "fixture",
+                                      "terminal_status": "BOUNDED_ONLINE_COMPLETE", "versions": [], "candidate_queue": []}
+                    def run(self):
+                        if self.kwargs.get("resume"):
+                            return 0
+                        self.state_path.write_text(json.dumps(self.state), encoding="utf-8")
+                        coordinator.registry_path = self.kwargs["registry_path"]
+                        coordinator.progress_callback = self.kwargs["progress_callback"]
+                        coordinator.registry_checkpoint_callback = self.kwargs.get("registry_checkpoint_callback")
+                        original_merge = coordinator._merge_runtime_registry
+                        def merge(callback):
+                            original_merge(callback)
+                            raise KeyboardInterrupt
+                        coordinator._merge_runtime_registry = merge
+                        coordinator._discover_runtime_candidates({"request_id": "runtime-child", "request": {
+                            "hook_coverage": {"registered_callbacks": {"cb-child": {
+                                "callback_id": "cb-child", "callback_repr": "child_callback",
+                                "hook_name": "wp_ajax_nopriv_child", "method": "POST",
+                                "registered_inside_callback": True, "parent_callback_id": parent["callback_id"],
+                            }}}}})
+                        return 0
+                from online_linked.coordinator import _write_json
+                def write_json(path, content):
+                    if interrupt_before_publish and path.name == "callback-registry.json":
+                        raise KeyboardInterrupt
+                    return _write_json(path, content)
+                with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                        patch("online_linked.coordinator._write_json", write_json):
+                    with self.assertRaises(KeyboardInterrupt):
+                        run_online_linked(args)
+                batch_path = root / "output/online-linked/campaign/batch-state.json"
+                saved = json.loads(batch_path.read_text())
+                self.assertTrue(saved["pending_candidates"])
+                args.resume = True
+                with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                        patch("online_linked.coordinator.time.time", return_value=saved["budget"]["saved_at"]):
+                    self.assertEqual(run_online_linked(args), 0)
+                published = root / "output/online-linked/campaign/callback-registry.json"
+                self.assertEqual(json.loads(published.read_text())["callback_map"]["cb-child"], "child_callback")
+                self.assertTrue(calls[-1]["resume"])
+                published.write_text(published.read_text() + " ", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "registry snapshot changed"):
+                    run_online_linked(args)
+
     def test_resume_pending_probe_rechecks_gate_then_sends_fresh_request(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = []
@@ -4888,6 +4980,113 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(len(coordinator.state["probe_attempts"]), 1)
             self.assertFalse(coordinator.state["pending_probe_queue"])
             self.assertLessEqual(coordinator.clock(), coordinator._hard_deadline)
+
+    def test_resume_deferred_probe_from_ancestor_revalidates_saved_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), log, names=("a", "b", "c"), accepted=("a", "b", "c"))
+            coordinator.max_seconds = coordinator.state["max_seconds"] = 10
+            coordinator.hard_seconds = coordinator.state["hard_seconds"] = 30
+            coordinator._candidate_deadline()
+            old_sender = coordinator.probe_sender
+            def slow_sender(*args, **kwargs):
+                result = old_sender(*args, **kwargs)
+                coordinator.sleeper(1)
+                return result
+            coordinator.probe_sender = slow_sender
+            child = coordinator._run_pending_probe(parent=parent, evidence=evidence,
+                raw_report=coordinator._reports["v0"], convergence=convergence,
+                probe=convergence["pending_probes"][0], seed=parent["seed_item"], deadline=5)
+            self.assertIsNotNone(child)
+            self.assertEqual(coordinator._active_version, "v1")
+            self.assertEqual([(row["parent_version"], row["candidate"]["name"])
+                              for row in coordinator.state["pending_probe_queue"]], [("v0", "b"), ("v0", "c")])
+            coordinator.state.update(terminal_status="PARTIAL", terminal_reason="PENDING_RUNTIME_VERIFICATION")
+            coordinator._write_state()
+            saved_at = coordinator.state["budget"]["saved_at"]
+            coordinator.resume = True
+            coordinator.clock.now = 1000
+            coordinator.probe_sender = old_sender
+            old_replay = coordinator.replay_runner
+            def replay(rows, **kwargs):
+                run_id = kwargs["legacy_run_id"]
+                if "-resume-1" in run_id and "-probe-" not in run_id:
+                    return {"legacy_run_id": run_id, "runs": [{**rows[0],
+                        "callback_reached": True, "validation_status": "callback_reached", "process_status": "replaying",
+                        "matched_artifact": "fresh-gate.json", "zend_artifact": "fresh-gate.json",
+                        "request_payload": {"request_id": "fresh-gate", "legacy_run_id": run_id,
+                            "target_plugin": "fixture", "http_method": "POST",
+                            "request_params": {"body_params": {"action": "fixture", "seed": "base"}}},
+                        "zend_payload": {"request_id": "fresh-gate", "run_id": run_id}}]}
+                return old_replay(rows, **kwargs)
+            coordinator.replay_runner = replay
+            old_gate = coordinator._gate_v0
+            def gate(version, config, **kwargs):
+                log.append("fresh_gate:" + version["version"])
+                return old_gate(version, config, **kwargs)
+            coordinator._gate_v0 = gate
+            with patch("online_linked.coordinator.time.time", return_value=saved_at):
+                coordinator.run()
+            self.assertLess(log.index("fresh_gate:v1"), log.index("fresh_gate:v0"))
+            self.assertLess(log.index("fresh_gate:v0"), log.index("probe:b"))
+            self.assertFalse(coordinator.state["pending_probe_queue"])
+            resumed_attempts = coordinator.state["probe_attempts"][1:]
+            self.assertEqual([row["candidate"]["name"] for row in resumed_attempts], ["b", "c"])
+            self.assertEqual({row["parent_version"] for row in resumed_attempts}, {"v0"})
+            self.assertEqual(len({row["probe_run_id"] for row in resumed_attempts}), 2)
+            self.assertTrue(all("resume-1-activation-" in row["probe_run_id"] for row in resumed_attempts))
+            self.assertTrue(all(row["status"] == "accepted" for row in resumed_attempts))
+            self.assertEqual([row["version"] for row in coordinator.state["versions"]], ["v0", "v1", "v2", "v3"])
+            for version, parameter in zip(coordinator.state["versions"][2:], ("b", "c")):
+                self.assertTrue(version["replay_result"]["passed"])
+                self.assertIn(parameter, {row["name"] for row in version["known_parameters"]})
+
+    def test_resume_ancestor_gate_restores_method_and_seed_variant_filter(self):
+        from hook_energy.seed_generation.zend_runtime.bridge_cli import _filter_iteration_inputs
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), [], names=("a",))
+            coordinator._candidate_deadline()
+            coordinator._run_pending_probe(parent=parent, evidence=evidence,
+                raw_report=coordinator._reports["v0"], convergence=convergence,
+                probe=convergence["pending_probes"][0], seed=parent["seed_item"], deadline=0)
+            parent["seed_item"]["seed"].update(method="GET", resolved_method="GET", seed_variant_id="get-parent")
+            parent.update(resolved_method="GET", seed_variant_id="get-parent")
+            coordinator._reports["v0"]["suggested_seeds"] = [copy.deepcopy(parent["seed_item"])]
+            child_item = copy.deepcopy(parent["seed_item"])
+            child_item["seed"].update(method="POST", resolved_method="POST", seed_variant_id="post-child")
+            child_config = config_for(child_item)
+            child_path = coordinator._write_config("v1", child_config)
+            child = coordinator._new_version("v1", child_config, child_path, parent, None, child_item)
+            child.update(worker_run_id="run-v1", known_parameters=[])
+            coordinator._reports["v1"] = {"plugin_slug": "fixture", "suggested_seeds": [child_item]}
+            coordinator._active_version = "v1"
+            coordinator._target_key = canonical_identity_id(candidate_from_seed_item(child_item, plugin_slug="fixture")) + "::post-child"
+            coordinator.state.update(terminal_status="PARTIAL", terminal_reason="PENDING_RUNTIME_VERIFICATION")
+            coordinator._write_state()
+            saved_at = coordinator.state["budget"]["saved_at"]
+            coordinator.resume = True
+            gated = []
+            def gate(version, config, **kwargs):
+                raw = coordinator._reports[version["version"]]
+                row = {"hook_name": version["hook_name"], "callback_id": version["callback_id"],
+                       "resolved_method": version["resolved_method"], "seed_variant_id": version["seed_variant_id"]}
+                filtered, summary = _filter_iteration_inputs(raw, {"runs": [row]}, plugin_slug="fixture",
+                    legacy_run_id=version["worker_run_id"], candidate_key=coordinator._target_key)
+                self.assertEqual(len(filtered["suggested_seeds"]), 1)
+                self.assertEqual(summary["runs"], [row])
+                gated.append((version["version"], filtered["suggested_seeds"][0]["seed"]["method"]))
+                return True
+            def pending(**kwargs):
+                self.assertEqual(kwargs["parent"]["version"], "v0")
+                coordinator.state["pending_probe_queue"] = []
+                coordinator.state.update(terminal_status="BOUNDED_ONLINE_COMPLETE", terminal_reason="BUDGET_EXPIRED")
+            with patch.object(coordinator, "_gate_v0", side_effect=gate), \
+                    patch.object(coordinator, "_consume_gate_evidence"), \
+                    patch.object(coordinator, "_run_pending_probe", side_effect=pending), \
+                    patch("online_linked.coordinator.time.time", return_value=saved_at):
+                self.assertEqual(coordinator.run(), 0)
+            self.assertEqual(gated, [("v1", "POST"), ("v0", "GET")])
 
     def test_no_worker_versions_run_concurrently(self):
         with tempfile.TemporaryDirectory() as tmp:

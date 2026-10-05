@@ -14,7 +14,7 @@ from hook_energy.seed_generation.online_common import config_hash
 def export_online_linked_batch(batch_state_path: Path, destination: Path | None = None) -> int:
     batch = json.loads(filesystem_path(batch_state_path).read_text(encoding="utf-8-sig"))
     destination = destination or batch_state_path.parent / "final-configs"
-    filesystem_path(destination).mkdir(parents=True, exist_ok=False)
+    filesystem_path(destination).mkdir(parents=True, exist_ok=True)
     count = 0
     seen = set()
     summaries = []
@@ -74,9 +74,16 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
             suffix = hashlib.sha256(identity.encode()).hexdigest()[:16]
             version_suffix = f".{version['version']}" if exported else ""
             config_path = destination / f"fuzzer-config.{hook}.{suffix}{version_suffix}.json"
-            # Exclusive creation preserves existing output; bytes retain all metadata/auth.
-            with filesystem_path(config_path).open("xb") as output:
-                output.write(content)
+            config_path = next((path for path in filesystem_path(destination).glob(f"fuzzer-config.{hook}.{suffix}*.json")
+                                if path.read_bytes() == content), config_path)
+            if filesystem_path(config_path).exists() and filesystem_path(config_path).read_bytes() != content:
+                config_path = config_path.with_name(f"{config_path.stem}.{hashlib.sha256(content).hexdigest()}.json")
+            # Reuse exact bytes on resume; never overwrite a prior export.
+            if not filesystem_path(config_path).exists():
+                with filesystem_path(config_path).open("xb") as output:
+                    output.write(content)
+            elif filesystem_path(config_path).read_bytes() != content:
+                raise ValueError(f"EXPORTED_CONFIG_CHANGED: {config_path}")
             count += 1
             row = {"version": version["version"], "config_path": str(config_path),
                    "source_config_path": version["config_path"], "config_hash": version["config_hash"],

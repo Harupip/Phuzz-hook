@@ -6,6 +6,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -190,6 +191,7 @@ class OnlineLinkedCoordinator:
         hard_seconds: int | None = None,
         hard_versions: int | None = None,
         progress_callback: Callable[[str, str], float | None] | None = None,
+        registry_checkpoint_callback: Callable[[Mapping[str, Any]], None] | None = None,
         resume: bool = False,
     ) -> None:
         if type(max_seconds) is not int or type(max_versions) is not int:
@@ -210,6 +212,7 @@ class OnlineLinkedCoordinator:
         self.hard_seconds = hard_seconds
         self.hard_versions = hard_versions
         self.progress_callback = progress_callback
+        self.registry_checkpoint_callback = registry_checkpoint_callback
         self._deadline: float | None = None
         self._hard_deadline: float | None = None
         self._progress_keys: set[tuple[str, str]] = set()
@@ -353,9 +356,28 @@ class OnlineLinkedCoordinator:
             self._consume_gate_evidence(version, deadline=deadline)
             if resumed and self._active_container and self.state["terminal_status"] is None:
                 for pending in list(self.state.get("pending_probe_queue", [])):
-                    parent = self._version(self._active_version)
-                    if parent is None or pending.get("parent_version") != parent["version"]:
+                    parent = self._version(pending["parent_version"])
+                    if parent is None:
                         continue
+                    if parent["version"] != self._active_version:
+                        self._stop_active_worker("RESUME_PENDING_PARENT")
+                        if self._active_container:
+                            break
+                        self._active_version = parent["version"]
+                        candidate = candidate_from_seed_item(parent["seed_item"], plugin_slug=self.plugin_slug)
+                        variant = str(parent["seed_item"]["seed"].get("seed_variant_id") or "")
+                        self._target_key = canonical_identity_id(candidate) + (f"::{variant}" if variant else "")
+                        parent["previous_worker_run_id"] = parent.get("worker_run_id")
+                        parent.setdefault("readiness_history", []).append(copy.deepcopy(parent.get("readiness")))
+                        activation = len(parent["readiness_history"])
+                        parent["worker_run_id"] = f"{self.legacy_run_id}-{parent['version']}-resume-{self.state['resume_count']}-activation-{activation}"
+                        parent_path = Path(parent.get("replay_config_path") or parent["config_path"])
+                        parent_config = json.loads(filesystem_path(parent_path).read_text(encoding="utf-8-sig"))
+                        if not self._gate_v0(parent, parent_config, deadline=self._deadline):
+                            break
+                        if not self._start_worker(parent, deadline=self._deadline):
+                            self.state.update(terminal_status="NOT_VERIFIED", terminal_reason="RESUME_PARENT_WORKER_START_FAILED")
+                            break
                     convergence = dict(pending["convergence"])
                     # Saved requests are proposals, never accepted evidence.
                     convergence.update(new_parameters=[], known_parameters=parent.get("known_parameters", []),
@@ -600,6 +622,8 @@ class OnlineLinkedCoordinator:
         replay = copy.deepcopy(dict(config))
         self.force_replay_only_fn(replay)
         gate_name = "v0" if not self.resume else f"resume-{self.state['resume_count']}-{version['version']}"
+        if self.resume:
+            gate_name += f"-activation-{len(version.get('readiness_history', []))}"
         path = self._write_config(gate_name, replay, replay=True)
         version["replay_config_path"] = str(path)
         version["replay_config_hash"] = config_hash(replay)
@@ -636,7 +660,7 @@ class OnlineLinkedCoordinator:
                 raise OnlineLinkedError(reason)
             if result_row.get("process_status") in {"failed", "runner_error"}:
                 raise OnlineLinkedError("V0_REPLAY_PROCESS_FAILED")
-            probe_dir = "probe" if not self.resume else f"resume-{self.state['resume_count']}-probe"
+            probe_dir = "probe" if not self.resume else gate_name + "-probe"
             request_dir = self.run_dir / "versions" / str(version["version"]) / probe_dir / "request"
             zend_dir = request_dir.parent / "zend"
             self._save_replay_artifacts(
@@ -1101,7 +1125,10 @@ class OnlineLinkedCoordinator:
             "callback_type": "static_method" if "::" in canonical else "function",
         })
         if self.registry_path is not None:
-            _write_json(self.registry_path, self.registry)
+            if self.registry_checkpoint_callback is not None:
+                self.registry_checkpoint_callback(self.registry)
+            else:
+                _write_json(self.registry_path, self.registry)
 
     def advance_online_version(self, evidence: Mapping[str, Any], *, deadline: float | None = None) -> dict[str, Any] | None:
         """Run existing convergence/export logic and prepare one child version."""
@@ -4286,7 +4313,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
         batch_state.update(campaign_status="running", terminal_reason=None)
         skipped = any(row.get("terminal_status") == "NOT_VERIFIED" for row in saved["candidates"])
 
-    def checkpoint() -> None:
+    def checkpoint(registry: Mapping[str, Any] | None = None) -> None:
         now = time.monotonic()
         records = {row["index"]: row for row in batch_state["candidates"]}
         batch_state["pending_candidates"] = [
@@ -4295,18 +4322,35 @@ def run_online_linked(args: argparse.Namespace) -> int:
              "terminal_reason": records.get(index, {}).get("terminal_reason")}
             for index, item, source in queue + ([active_entry] if active_entry else []) + blocked_pending
         ]
+        registry_bytes = batch_registry.read_bytes()
+        if registry is not None:
+            batch_state["registry_previous_hash"] = hashlib.sha256(registry_bytes).hexdigest()
+            # Match the existing atomic JSON writer, including Windows newlines.
+            registry_text = json.dumps(registry, indent=2, ensure_ascii=False) + "\n"
+            registry_bytes = registry_text.replace("\n", os.linesep).encode("utf-8")
+            batch_state["registry_snapshot"] = registry_bytes.decode("utf-8")
+        else:
+            batch_state.pop("registry_previous_hash", None)
+            batch_state.pop("registry_snapshot", None)
         batch_state.update(effective_max_candidates=max_candidates, queued_ids=sorted(queued_ids),
                            campaign_deadline=campaign_deadline, hard_campaign_deadline=hard_campaign_deadline,
-                           registry_snapshot_hash=hashlib.sha256(batch_registry.read_bytes()).hexdigest())
+                           registry_snapshot_hash=hashlib.sha256(registry_bytes).hexdigest())
         batch_state["budget"] = {
             "remaining_seconds": max(0.0, campaign_deadline - now),
             "hard_remaining_seconds": max(0.0, hard_campaign_deadline - now),
             "progress_keys": sorted(progress_keys), "saved_at": time.time(),
         }
         _write_json(batch_state_path, batch_state)
+        if registry is not None:
+            # Commit the recoverable snapshot before publishing the mutable file.
+            _write_json(batch_registry, registry)
 
     if resume and hashlib.sha256(batch_registry.read_bytes()).hexdigest() != batch_state["registry_snapshot_hash"]:
-        raise ValueError("resume campaign registry snapshot changed")
+        snapshot = batch_state.get("registry_snapshot", "").encode("utf-8")
+        if (hashlib.sha256(batch_registry.read_bytes()).hexdigest() != batch_state.get("registry_previous_hash")
+                or hashlib.sha256(snapshot).hexdigest() != batch_state["registry_snapshot_hash"]):
+            raise ValueError("resume campaign registry snapshot changed")
+        _write_json(batch_registry, json.loads(snapshot))
     if resume and bool(getattr(args, "sync_registry", False)) and queue:
         _sync_callback_registry_to_web(batch_registry)
 
@@ -4393,6 +4437,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 resume=bool(previous and previous.get("state_path") and Path(previous["state_path"]).is_file()),
                 progress_callback=lambda kind, key, identity=candidate_record["identity"]:
                     credit_progress(kind, key if kind == "runtime_callback" else identity + ":" + key),
+                registry_checkpoint_callback=checkpoint,
             )
             candidate_record["state_path"] = str(coordinator.state_path)
             checkpoint()

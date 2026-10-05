@@ -309,6 +309,25 @@ class OnlineLinkedExportTests(unittest.TestCase):
         batch = self.batch([first, second])
         self.assertEqual(export_online_linked_batch(batch), 2)
         before = {p.name: p.read_bytes() for p in (self.root / "final-configs").iterdir()}
-        with self.assertRaises(FileExistsError):
-            export_online_linked_batch(batch)
+        self.assertEqual(export_online_linked_batch(batch), 2)
         self.assertEqual(before, {p.name: p.read_bytes() for p in (self.root / "final-configs").iterdir()})
+
+    def test_resume_keeps_prior_bytes_and_exports_new_verified_version(self):
+        older = self.version("v0")
+        candidate, _ = self.write_state(versions=[older])
+        batch = self.batch([candidate])
+        self.assertEqual(export_online_linked_batch(batch), 1)
+        before = {p: p.read_bytes() for p in (self.root / "final-configs").iterdir()}
+        config = self.config()
+        config["body_params"]["data"].append({"name": "new", "value": "fuzz"})
+        newer = self.version("v1", config=config)
+        self.write_state(versions=[older, newer])
+        self.assertEqual(export_online_linked_batch(batch), 2)
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        row = json.loads((self.root / "final-config-summary.json").read_text())["candidates"][0]
+        self.assertEqual(row["selected_version"], "v1")
+        self.assertEqual(Path(row["config_path"]).read_bytes(), Path(newer["config_path"]).read_bytes())
+        files = {p: p.read_bytes() for p in (self.root / "final-configs").iterdir()}
+        self.assertEqual(len(files), 2)
+        self.assertEqual(export_online_linked_batch(batch), 2)
+        self.assertEqual(files, {p: p.read_bytes() for p in (self.root / "final-configs").iterdir()})
