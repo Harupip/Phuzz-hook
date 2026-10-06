@@ -108,7 +108,7 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
                 summary.update(selected_version=version["version"], config_path=str(config_path))
         summary.update(_discovery_summary(state, verified_versions))
     _archive_superseded_exports(previous, summaries, destination)
-    summary_path.write_text(json.dumps({"schema_version": 1, "candidates": summaries}, indent=2) + "\n", encoding="utf-8")
+    filesystem_path(summary_path).write_text(json.dumps({"schema_version": 1, "candidates": summaries}, indent=2) + "\n", encoding="utf-8")
     skipped = sum(row["selected_version"] is None for row in summaries)
     print(f"Final configs: {destination} ({count} files, {skipped} skipped)")
     return count

@@ -71,12 +71,12 @@ Hiện có 183 plugin ZIP. Mốc artifact hiện tại gồm 111 plugin có ít 
 | 46 | 400000-contact-form-7-honeypot.zip | [ ] | [ ] | 0 | |
 | 47 | 400000-easy-table-of-contents.2.0.47.1.zip | [ ] | [ ] | 4 | |
 | 48 | 400000-font-awesome.4.3.2.zip | [ ] | [ ] | 0 | |
-| 49 | 400000-force-regenerate-thumbnails.2.1.2.zip | [ ] | [ ] | 1 | |
+| 49 | 400000-force-regenerate-thumbnails.2.1.2.zip | [x] | [x] | 1 | 2026-09-23 fresh online-linked run; phuzz.env SHA256 E8F59E2DFEB8D2269342545B390FF6AA2FA0BCA5A2F73E9A1980F308F33E3421. Existing experiment configs=1; fresh final configs=1: phuzz-main/code/fuzzer/output/online-linked/force-regenerate-thumbnails-20260923T213136Z/final-configs/fuzzer-config.wp_ajax_regeneratethumbnail.3abc4950c291a739.json. Workers executed=5 (v0-v4); callback wp_ajax_regeneratethumbnail reached. Callback HTTP=200; Pass 2 accepted=1/1; vulnerability=NOT_VERIFIED. Other 5/6 candidates first failed at V0_PREREQUISITE_GATE_FAILED; target terminal reason BUDGET_EXPIRED. Inventory gap: stored config method GET, fresh observed method POST for same action. Evidence: experiment/02-0day-vulns/run-logs/2026-09-23/force-regenerate-thumbnails.log; phuzz-main/code/fuzzer/output/online-linked/force-regenerate-thumbnails-20260923T213136Z/batch-state.json; correlated request/Zend at phuzz-main/code/fuzzer/output/online-linked/3f1fe107c9a186b5/versions/v0/probe/p1/request/force-regenerate-thumbnails-20260923T213136Z-candidate-001-wp_ajax_regeneratethumbnail-v0-probe-p1-request.json and sibling zend/ |
 | 50 | 400000-forminator.1.23.3.zip | [ ] | [ ] | 18 | |
 | 51 | 400000-gtranslate.3.0.3.zip | [ ] | [ ] | 0 | |
 | 52 | 400000-header-footer.3.2.5.zip | [ ] | [ ] | 0 | |
-| 53 | 400000-header-footer-code-manager.1.1.32.zip | [ ] | [ ] | 0 | |
-| 54 | 400000-intuitive-custom-post-order.3.1.4.1.zip | [ ] | [ ] | 3 | |
+| 53 | 400000-header-footer-code-manager.1.1.32.zip | [x] | [x] | 0 | 2026-09-23 fresh run. Runtime generated configs=0; experiment config count remains 0. Bootstrap fuzzer container started; linked candidate workers=0. Runtime callbacks registered=0, callback not reached. WordPress readiness and REST bootstrap HTTP 200 only. First failed boundary: callback discovery/registry preparation; snapshot has 0 registered callbacks and bridge exits with `AttributeError: 'list' object has no attribute 'items'`. Vulnerability status NOT_VERIFIED. Evidence: `experiment/02-0day-vulns/run-logs/2026-09-23/header-footer-code-manager.log`; `phuzz-main/code/fuzzer/output/online-seed-generation/header-footer-code-manager-20260923T194600Z/runtime_coverage_snapshot.json` |
+| 54 | 400000-intuitive-custom-post-order.3.1.4.1.zip | [x] | [x] | 3 | 2026-09-23 fresh online-linked run; phuzz.env SHA256 E8F59E2DFEB8D2269342545B390FF6AA2FA0BCA5A2F73E9A1980F308F33E3421. Existing experiment configs=3; fresh final configs=2: phuzz-main/code/fuzzer/output/online-linked/intuitive-custom-post-order-20260923T213523Z/final-configs/fuzzer-config.wp_ajax_update-menu-order.12c9cf6bf0d9d7f3.json and fuzzer-config.wp_ajax_update-menu-order-tags.ff36168f942c0b5a.json. Workers executed=3 per target (v0-v2); both callbacks reached; each callback probe HTTP=200; Pass 2 accepted=1/1 each; vulnerability=NOT_VERIFIED. Other 10/12 candidates first failed at V0_PREREQUISITE_GATE_FAILED; both targets ended BUDGET_EXPIRED. Inventory gap: stored update-menu-order-sites config was absent from the current 12-candidate bootstrap list, so fresh generation was not verified for it. Evidence: experiment/02-0day-vulns/run-logs/2026-09-23/intuitive-custom-post-order.log; phuzz-main/code/fuzzer/output/online-linked/intuitive-custom-post-order-20260923T213523Z/batch-state.json; request/Zend pairs under phuzz-main/code/fuzzer/output/online-linked/0d72eefdf63e8fc9/versions/v0/probe/p1/ and 788a16a81a09fdd9/versions/v0/probe/p1/ |
 | 55 | 400000-megamenu.3.2.2.zip | [ ] | [ ] | 13 | |
 | 56 | 400000-pixelyoursite.9.3.6.zip | [ ] | [ ] | 4 | |
 | 57 | 400000-woo-checkout-field-editor-pro.zip | [ ] | [ ] | 2 | |
@@ -89,7 +89,7 @@ Hiện có 183 plugin ZIP. Mốc artifact hiện tại gồm 111 plugin có ít 
 | 64 | 500000-official-facebook-pixel.3.0.10.zip | [ ] | [ ] | 3 | |
 | 65 | 500000-really-simple-captcha.zip | [ ] | [ ] | 0 | |
 | 66 | 500000-siteguard.1.7.5.zip | [ ] | [ ] | 0 | |
-| 67 | 500000-taxonomy-terms-order.1.7.5.zip | [ ] | [ ] | 1 | |
+| 67 | 500000-taxonomy-terms-order.1.7.5.zip | [x] | [x] | 1 | 2026-09-23 fresh online-linked run; phuzz.env SHA256 E8F59E2DFEB8D2269342545B390FF6AA2FA0BCA5A2F73E9A1980F308F33E3421. Existing experiment configs=1; fresh final configs=1: phuzz-main/code/fuzzer/output/online-linked/taxonomy-terms-order-20260923T213846Z/final-configs/fuzzer-config.wp_ajax_update-taxonomy-order.88fe86b33a3401f4.json. Workers executed=3 (v0-v2); callback wp_ajax_update-taxonomy-order reached; callback HTTP=200; Pass 2 accepted=1/1; vulnerability=NOT_VERIFIED. Other 6/7 candidates first failed at V0_PREREQUISITE_GATE_FAILED; target terminal reason BUDGET_EXPIRED. Stored and fresh configs both use POST/action update-taxonomy-order. Evidence: experiment/02-0day-vulns/run-logs/2026-09-23/taxonomy-terms-order.log; phuzz-main/code/fuzzer/output/online-linked/taxonomy-terms-order-20260923T213846Z/batch-state.json; correlated request/Zend at phuzz-main/code/fuzzer/output/online-linked/a2152008f5e725a9/versions/v0/probe/p1/request/taxonomy-terms-order-20260923T213846Z-candidate-001-wp_ajax_update-taxonomy-order-v0-probe-p1-request.json and sibling zend/ |
 | 68 | 500000-ultimate-addons-for-gutenberg.2.5.1.zip | [ ] | [ ] | 23 | |
 | 69 | 600000-complianz-gdpr.6.4.3.zip | [ ] | [ ] | 23 | |
 | 70 | 600000-creame-whatsapp-me.4.5.20.zip | [ ] | [ ] | 0 | |
@@ -99,7 +99,7 @@ Hiện có 183 plugin ZIP. Mốc artifact hiện tại gồm 111 plugin có ít 
 | 74 | 600000-ga-google-analytics.20230306.zip | [ ] | [ ] | 0 | |
 | 75 | 600000-google-listings-and-ads.2.4.4.zip | [ ] | [ ] | 1 | |
 | 76 | 600000-kirki.zip | [ ] | [ ] | 3 | |
-| 77 | 600000-limit-login-attempts.1.7.2.zip | [ ] | [ ] | 0 | |
+| 77 | 600000-limit-login-attempts.1.7.2.zip | [x] | [x] | 0 | 2026-09-23 fresh run using exact phuzz.env SHA256 E8F59E2DFEB8D2269342545B390FF6AA2FA0BCA5A2F73E9A1980F308F33E3421. Experiment config inventory=0; final configs=0. Bootstrap worker ran and stopped; registered=11, uncovered=10, bootstrap_candidates=0, no linked replay worker. Callback NOT_VERIFIED; HTTP 200 only for readiness/REST bootstrap, no callback request. Vulnerability NOT_VERIFIED. First failed boundary V0_PREREQUISITE_GATE_FAILED (10/10). Evidence: experiment/02-0day-vulns/run-logs/2026-09-23/limit-login-attempts.log; phuzz-main/code/fuzzer/output/online-linked/limit-login-attempts-20260923T211351Z/batch-state.json; phuzz-main/code/fuzzer/output/online-seed-generation/limit-login-attempts-20260923T211351Z/zend-bridge/limit-login-attempts-20260923T211351Z/hookphuzz-callback-registry.json |
 | 78 | 600000-mailpoet.4.14.0.zip | [ ] | [ ] | 0 | |
 | 79 | 600000-mainwp-child.4.4.1.zip | [ ] | [ ] | 3 | |
 | 80 | 600000-nextgen-gallery.3.35.zip | [ ] | [ ] | 4 | |
@@ -113,7 +113,7 @@ Hiện có 183 plugin ZIP. Mốc artifact hiện tại gồm 111 plugin có ít 
 | 88 | 700000-backwpup.4.0.0.zip | [ ] | [ ] | 3 | |
 | 89 | 700000-broken-link-checker.2.0.0.zip | [ ] | [ ] | 6 | |
 | 90 | 700000-creative-mail-by-constant-contact.1.6.7.zip | [ ] | [ ] | 2 | |
-| 91 | 700000-disable-gutenberg.2.9.zip | [ ] | [ ] | 0 | |
+| 91 | 700000-disable-gutenberg.2.9.zip | [x] | [x] | 0 | 2026-09-23 fresh run using exact phuzz.env SHA256 E8F59E2DFEB8D2269342545B390FF6AA2FA0BCA5A2F73E9A1980F308F33E3421. Experiment config inventory=0; final configs=0. Bootstrap worker ran and stopped; registered=23, uncovered=22, bootstrap_candidates=0, no linked replay worker. Callback NOT_VERIFIED; HTTP 200 only for readiness/REST bootstrap, no callback request. Vulnerability NOT_VERIFIED. First failed boundary V0_PREREQUISITE_GATE_FAILED (22/22). Evidence: experiment/02-0day-vulns/run-logs/2026-09-23/disable-gutenberg.log; phuzz-main/code/fuzzer/output/online-linked/disable-gutenberg-20260923T211526Z/batch-state.json; phuzz-main/code/fuzzer/output/online-seed-generation/disable-gutenberg-20260923T211526Z/zend-bridge/disable-gutenberg-20260923T211526Z/hookphuzz-callback-registry.json |
 | 92 | 700000-flamingo.2.3.zip | [ ] | [ ] | 0 | |
 | 93 | 700000-google-analytics-dashboard-for-wp.7.15.2.zip | [ ] | [ ] | 44 | |
 | 94 | 700000-imagify.2.1.1.zip | [ ] | [ ] | 4 | |
@@ -128,7 +128,7 @@ Hiện có 183 plugin ZIP. Mốc artifact hiện tại gồm 111 plugin có ít 
 | 103 | 800000-antispam-bee.2.11.3.zip | [ ] | [ ] | 0 | |
 | 104 | 800000-code-snippets.3.3.0.zip | [ ] | [ ] | 1 | |
 | 105 | 800000-facebook-for-woocommerce.3.0.22.zip | [ ] | [ ] | 7 | |
-| 106 | 800000-hello-dolly.1.7.2.zip | [ ] | [ ] | 0 | |
+| 106 | 800000-hello-dolly.1.7.2.zip | [x] | [x] | 0 | 2026-09-23 fresh run. Generated configs=0. Two manual-only suggestions, direct HTTP seeds=0; both end `NOT_VERIFIED/V0_PREREQUISITE_GATE_FAILED`; bootstrap fuzzer container started, linked workers=0, callbacks not reached (2 registered, 2 uncovered). WordPress readiness and REST bootstrap HTTP 200; callback HTTP status N/A. Vulnerability status NOT_VERIFIED. Evidence: `experiment/02-0day-vulns/run-logs/2026-09-23/hello-dolly.log`; `phuzz-main/code/fuzzer/output/online-linked/hello-dolly-20260923T193525Z/batch-state.json`; `phuzz-main/code/fuzzer/output/online-linked/hello-dolly-20260923T193525Z/candidates/001-admin_head.json`, `phuzz-main/code/fuzzer/output/online-linked/hello-dolly-20260923T193525Z/candidates/002-admin_notices.json` |
 | 107 | 800000-maintenance.4.07.zip | [ ] | [ ] | 2 | |
 | 108 | 800000-safe-svg.2.1.1.zip | [ ] | [ ] | 0 | |
 | 109 | 800000-sg-security.1.4.5.zip | [ ] | [ ] | 2 | |
@@ -163,11 +163,11 @@ Hiện có 183 plugin ZIP. Mốc artifact hiện tại gồm 111 plugin có ít 
 | 138 | 1000000-insert-headers-and-footers.2.0.11.zip | [ ] | [ ] | 7 | |
 | 139 | 1000000-instagram-feed.6.1.4.zip | [ ] | [ ] | 17 | |
 | 140 | 1000000-loco-translate.2.6.4.zip | [ ] | [ ] | 0 | |
-| 141 | 1000000-loginizer.zip | [ ] | [ ] | 0 | |
+| 141 | 1000000-loginizer.zip | [x] | [x] | 0 | 2026-09-23 fresh run using exact phuzz.env SHA256 E8F59E2DFEB8D2269342545B390FF6AA2FA0BCA5A2F73E9A1980F308F33E3421. Experiment config inventory=0; one final config generated at phuzz-main/code/fuzzer/output/online-linked/loginizer-20260923T210424Z/final-configs/fuzzer-config.wp_ajax_loginizer_export.6e34d322515cbc5f.json. Bootstrap plus five v0 replay workers executed; candidate wp_ajax_loginizer_export ran v1, Pass 2 accepted=1/1. Callback IDs reached=4/5 direct AJAX candidates; dismiss_newsletter callback remains NOT_VERIFIED due request artifact mismatch. HTTP=200 for all five direct POSTs; REST bootstrap=200. Vulnerability NOT_VERIFIED. Batch complete_with_skips: 13 candidates, 5 BOUNDED_ONLINE_COMPLETE, 8 NOT_VERIFIED; first failed boundaries: GATE_NOT_VERIFIED for four config skips, V0_PREREQUISITE_GATE_FAILED for eight candidates. Evidence: experiment/02-0day-vulns/run-logs/2026-09-23/loginizer.log; phuzz-main/code/fuzzer/output/online-linked/loginizer-20260923T210424Z/batch-state.json; phuzz-main/code/fuzzer/output/online-linked/6579100901148910/state.json; correlated request/Zend evidence under phuzz-main/code/fuzzer/output/online-linked/{8ee0954af1bdd776,ab40af1ecf590147,6579100901148910,33f9157380baa468}/versions/v0/probe/{request,zend}/ |
 | 142 | 1000000-one-click-demo-import.3.1.2.zip | [ ] | [ ] | 3 | |
 | 143 | 1000000-optinmonster.2.13.2.zip | [ ] | [ ] | 0 | |
 | 144 | 1000000-redux-framework.4.4.1.zip | [ ] | [ ] | 5 | |
-| 145 | 1000000-regenerate-thumbnails.3.1.5.zip | [ ] | [ ] | 0 | |
+| 145 | 1000000-regenerate-thumbnails.3.1.5.zip | [x] | [x] | 0 | 2026-09-23 fresh run. Experiment config count remains 0; one runtime v0 config generated, final configs=0. One v0 replay worker ran and stopped at `BUDGET_EXPIRED`; no fuzz child. REST callback reached in request/Zend pair `1790167380-18684df9-c096-4289-b3c2-7f9ebcc286ff`, GET REST `/regenerate-thumbnails/v1/featuredimages` HTTP 200. First failed boundary: v0 verification gate `GATE_NOT_VERIFIED`; 16 other candidates `NOT_VERIFIED`. Vulnerability status NOT_VERIFIED. Evidence: `experiment/02-0day-vulns/run-logs/2026-09-23/regenerate-thumbnails.log`; `phuzz-main/code/fuzzer/output/online-linked/regenerate-thumbnails-20260923T194154Z/batch-state.json`; `phuzz-main/code/fuzzer/output/online-linked/0c75a6bb74ad1376/versions/v0/observation/request/1790167380-18684df9-c096-4289-b3c2-7f9ebcc286ff.json`; matching `zend/1790167380-18684df9-c096-4289-b3c2-7f9ebcc286ff.json` |
 | 146 | 1000000-seo-by-rank-math.1.0.114.zip | [ ] | [ ] | 2 | |
 | 147 | 1000000-sg-cachepress.7.3.1.zip | [ ] | [ ] | 1 | |
 | 148 | 1000000-svg-support.2.5.5.zip | [ ] | [ ] | 0 | |
