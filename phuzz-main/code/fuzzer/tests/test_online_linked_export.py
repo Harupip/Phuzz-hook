@@ -245,12 +245,72 @@ class OnlineLinkedExportTests(unittest.TestCase):
         self.assertEqual({p.name for p in destination.iterdir()},
                          {p.name for p in (self.root / "final-configs").iterdir()})
 
+    def test_cumulative_parameters_export_only_verified_replacement(self):
+        for rejected, changed_context, missing_proof in (
+            (False, False, False), (True, False, False),
+            (False, True, False), (False, False, True),
+        ):
+            with self.subTest(rejected=rejected, changed_context=changed_context, missing_proof=missing_proof):
+                versions = []
+                for name, fields in (("v1", ["a"]), ("v2", ["a", "b"])):
+                    config = self.config()
+                    config["body_params"] = {
+                        "data": [{"name": "mode", "value": "search"}] +
+                                [{"name": field, "value": "fuzz"} for field in fields],
+                        "fixed": ["mode"], "fuzz": fields, "weight": 1,
+                    }
+                    config["metadata"]["method_evidence"] = {
+                        "request_id": name, "run_id": name, "request_method": "POST",
+                    }
+                    if name == "v2" and changed_context:
+                        config["body_params"]["data"][0]["value"] = "delete"
+                    version = self.version(name, config=config, gate=not (name == "v2" and rejected))
+                    version["known_parameters"] = [
+                        {"name": field, "source": "POST", "location": "form"}
+                        for field in fields if not (name == "v2" and missing_proof and field == "a")
+                    ]
+                    versions.append(version)
+                candidate, _ = self.write_state(versions=versions)
+                destination = self.root / f"case-{rejected}-{changed_context}-{missing_proof}"
+                expected = 1 if rejected or not (changed_context or missing_proof) else 2
+                self.assertEqual(export_online_linked_batch(self.batch([candidate]), destination), expected)
+                summary = json.loads(destination.with_name(destination.name + "-summary.json").read_text())
+                row = summary["candidates"][0]
+                if expected == 1 and not rejected:
+                    self.assertEqual(row["exported_configs"][0]["superseded_versions"], ["v1"])
+                    self.assertEqual(len(list(destination.glob("*.json"))), 1)
+
     def test_rejected_versions_leave_empty_folder(self):
         versions = [self.version("v0", pass2=(0, 0)), self.version("v1", pass2=(1, 2)),
                     self.version("v2", probe=True), self.version("v3", config_type="replay_only")]
         candidate, _ = self.write_state(versions=versions)
         self.assertEqual(export_online_linked_batch(self.batch([candidate])), 0)
         self.assertEqual(list((self.root / "final-configs").iterdir()), [])
+
+    def test_parameter_superset_does_not_hide_request_context_changes(self):
+        for change in ("method", "auth", "policy", "fixed_type", "bucket"):
+            with self.subTest(change=change):
+                old = self.config()
+                old["body_params"] = {"data": [{"name": "mode", "value": False}, {"name": "a", "value": "fuzz"}],
+                                      "fixed": ["mode"], "fuzz": ["a"], "weight": 1}
+                new = copy.deepcopy(old)
+                new["body_params"]["data"].append({"name": "b", "value": "fuzz"})
+                new["body_params"]["fuzz"].append("b")
+                if change == "method":
+                    new["methods"] = ["GET"]
+                elif change == "auth":
+                    new["metadata"]["auth_context"] = "admin"
+                elif change == "policy":
+                    new["body_params"]["fixed"].append("a")
+                elif change == "fixed_type":
+                    new["body_params"]["data"][0]["value"] = 0
+                else:
+                    new["body_params"], new["query_params"] = new["query_params"], new["body_params"]
+                versions = [self.version("v1", config=old), self.version("v2", config=new)]
+                for version, fields in zip(versions, (["a"], ["a", "b"])):
+                    version["known_parameters"] = [{"name": field, "source": "POST", "location": "form"} for field in fields]
+                candidate, _ = self.write_state(versions=versions)
+                self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / change), 2)
 
     def test_export_reports_fallback_and_observed_fields_missing_from_final(self):
         older = self.version("v1")
@@ -314,20 +374,25 @@ class OnlineLinkedExportTests(unittest.TestCase):
 
     def test_resume_keeps_prior_bytes_and_exports_new_verified_version(self):
         older = self.version("v0")
+        older["known_parameters"] = [{"name": "settings[nested]", "source": "POST", "location": "form"}]
         candidate, _ = self.write_state(versions=[older])
         batch = self.batch([candidate])
         self.assertEqual(export_online_linked_batch(batch), 1)
         before = {p: p.read_bytes() for p in (self.root / "final-configs").iterdir()}
         config = self.config()
         config["body_params"]["data"].append({"name": "new", "value": "fuzz"})
+        config["body_params"]["fuzz"].append("new")
         newer = self.version("v1", config=config)
+        newer["known_parameters"] = older["known_parameters"] + [{"name": "new", "source": "POST", "location": "form"}]
         self.write_state(versions=[older, newer])
-        self.assertEqual(export_online_linked_batch(batch), 2)
-        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        self.assertEqual(export_online_linked_batch(batch), 1)
+        for path, content in before.items():
+            self.assertEqual((path.parent / "superseded" / path.name).read_bytes(), content)
+        self.assertEqual(Path(older["config_path"]).read_bytes(), next(iter(before.values())))
         row = json.loads((self.root / "final-config-summary.json").read_text())["candidates"][0]
         self.assertEqual(row["selected_version"], "v1")
         self.assertEqual(Path(row["config_path"]).read_bytes(), Path(newer["config_path"]).read_bytes())
-        files = {p: p.read_bytes() for p in (self.root / "final-configs").iterdir()}
-        self.assertEqual(len(files), 2)
-        self.assertEqual(export_online_linked_batch(batch), 2)
-        self.assertEqual(files, {p: p.read_bytes() for p in (self.root / "final-configs").iterdir()})
+        files = {p: p.read_bytes() for p in (self.root / "final-configs").glob("*.json")}
+        self.assertEqual(len(files), 1)
+        self.assertEqual(export_online_linked_batch(batch), 1)
+        self.assertEqual(files, {p: p.read_bytes() for p in (self.root / "final-configs").glob("*.json")})

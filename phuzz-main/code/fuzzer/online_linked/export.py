@@ -14,6 +14,9 @@ from hook_energy.seed_generation.online_common import config_hash
 def export_online_linked_batch(batch_state_path: Path, destination: Path | None = None) -> int:
     batch = json.loads(filesystem_path(batch_state_path).read_text(encoding="utf-8-sig"))
     destination = destination or batch_state_path.parent / "final-configs"
+    summary_name = "final-config-summary.json" if destination.name == "final-configs" else f"{destination.name}-summary.json"
+    summary_path = destination.parent / summary_name
+    previous = json.loads(filesystem_path(summary_path).read_text(encoding="utf-8-sig")) if filesystem_path(summary_path).exists() else {}
     filesystem_path(destination).mkdir(parents=True, exist_ok=True)
     count = 0
     seen = set()
@@ -49,6 +52,7 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
             print(f"Config skipped {identity}: {exc}", file=sys.stderr)
             continue
         exported = {}
+        representatives = []
         verified_versions = []
         for version in versions:
             try:
@@ -65,10 +69,19 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
             semantic = json.loads(content.decode("utf-8-sig"))
             if isinstance(semantic.get("metadata"), dict):
                 semantic["metadata"].pop("online_request_seed", None)
+                method_evidence = semantic["metadata"].get("method_evidence")
+                if isinstance(method_evidence, dict):
+                    for key in ("request_id", "run_id"):
+                        method_evidence.pop(key, None)
             request_key = config_hash(semantic)
             verified_versions.append(version["version"])
             if request_key in exported:
                 exported[request_key]["equivalent_versions"].append(version["version"])
+                continue
+            replacement = next((row for config, newer, row in representatives
+                                if _covers_version(config, newer, semantic, version)), None)
+            if replacement is not None:
+                replacement["superseded_versions"].append(version["version"])
                 continue
             hook = re.sub(r"[^A-Za-z0-9_-]+", "-", candidate.get("hook_name", "hook"))[:40]
             suffix = hashlib.sha256(identity.encode()).hexdigest()[:16]
@@ -87,18 +100,86 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
             count += 1
             row = {"version": version["version"], "config_path": str(config_path),
                    "source_config_path": version["config_path"], "config_hash": version["config_hash"],
-                   "equivalent_versions": []}
+                   "equivalent_versions": [], "superseded_versions": []}
             exported[request_key] = row
+            representatives.append((semantic, version, row))
             summary["exported_configs"].append(row)
             if summary["selected_version"] is None:
                 summary.update(selected_version=version["version"], config_path=str(config_path))
         summary.update(_discovery_summary(state, verified_versions))
-    summary_name = "final-config-summary.json" if destination.name == "final-configs" else f"{destination.name}-summary.json"
-    summary_path = destination.parent / summary_name
+    _archive_superseded_exports(previous, summaries, destination)
     summary_path.write_text(json.dumps({"schema_version": 1, "candidates": summaries}, indent=2) + "\n", encoding="utf-8")
     skipped = sum(row["selected_version"] is None for row in summaries)
     print(f"Final configs: {destination} ({count} files, {skipped} skipped)")
     return count
+
+
+def _covers_version(new_config: dict, newer: dict, old_config: dict, older: dict) -> bool:
+    """Only collapse verified input growth with unchanged existing request fields."""
+    def parameters(version):
+        return {(row["name"], str(row.get("source") or "").upper(), str(row.get("location") or "").lower())
+                for row in version.get("known_parameters", []) if isinstance(row, dict) and row.get("name")}
+
+    old_parameters = parameters(older)
+    if not old_parameters or not old_parameters <= parameters(newer):
+        return False
+    buckets = {"query_params", "body_params", "json_params"}
+    if config_hash({k: v for k, v in old_config.items() if k not in buckets}) != config_hash({
+        k: v for k, v in new_config.items() if k not in buckets
+    }):
+        return False
+    for bucket in buckets:
+        old, new = old_config.get(bucket), new_config.get(bucket)
+        if config_hash(old) == config_hash(new):
+            continue
+        if not isinstance(old, dict) or not isinstance(new, dict):
+            return False
+        if config_hash({k: v for k, v in old.items() if k not in {"data", "fuzz", "fixed"}}) != config_hash({
+            k: v for k, v in new.items() if k not in {"data", "fuzz", "fixed"}
+        }):
+            return False
+        # Generated form/query configs use named rows; other shapes stay separate.
+        old_rows, new_rows = old.get("data"), new.get("data")
+        if not isinstance(old_rows, list) or not isinstance(new_rows, list):
+            return False
+        for row in old_rows:
+            if (not isinstance(row, dict) or not isinstance(row.get("name"), str)
+                    or not any(config_hash(row) == config_hash(item) for item in new_rows)):
+                return False
+            for policy in ("fixed", "fuzz"):
+                if [pattern for pattern in old.get(policy, []) if re.match(pattern, row["name"])] != [
+                    pattern for pattern in new.get(policy, []) if re.match(pattern, row["name"])
+                ]:
+                    return False
+    return True
+
+
+def _archive_superseded_exports(previous: dict, summaries: list[dict], destination: Path) -> None:
+    """Keep prior bytes, but remove replaced exports from the active flat folder."""
+    active = {filesystem_path(row["config_path"]).resolve()
+              for summary in summaries for row in summary["exported_configs"]}
+    replaced = {(summary["identity"], version) for summary in summaries
+                for row in summary["exported_configs"]
+                for version in row["superseded_versions"] + row["equivalent_versions"]}
+    for summary in previous.get("candidates", []):
+        for row in summary.get("exported_configs", []):
+            if (summary["identity"], row["version"]) not in replaced:
+                continue
+            path = filesystem_path(row["config_path"])
+            if path.resolve() in active or path.resolve().parent != filesystem_path(destination).resolve() or not path.is_file():
+                continue
+            content = path.read_bytes()
+            if config_hash(json.loads(content.decode("utf-8-sig"))) != row.get("config_hash"):
+                raise ValueError(f"EXPORTED_CONFIG_CHANGED: {path}")
+            archive = filesystem_path(destination) / "superseded"
+            archive.mkdir(exist_ok=True)
+            target = archive / path.name
+            if target.exists():
+                if target.read_bytes() != content:
+                    raise ValueError(f"EXPORTED_CONFIG_CHANGED: {target}")
+                path.unlink()
+            else:
+                path.rename(target)
 
 
 def _discovery_summary(state: dict, selected_versions: list[str]) -> dict:
