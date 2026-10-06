@@ -118,8 +118,8 @@ class Clock:
 
 class OnlineLinkedCoordinatorTests(unittest.TestCase):
     def test_get_bootstrap_post_probe_replays_and_pass2_before_new_worker(self):
-        for method_only in (False, True):
-            with self.subTest(method_only=method_only), tempfile.TemporaryDirectory() as tmp:
+        for method_only, post_action in ((False, False), (True, False), (True, True)):
+            with self.subTest(method_only=method_only, post_action=post_action), tempfile.TemporaryDirectory() as tmp:
                 coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [], names=("body_key",))
                 raw = copy.deepcopy(parent["seed_item"])
                 raw["seed"].update({
@@ -137,7 +137,10 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     "name": "" if method_only else "body_key", "source": "POST", "location": "form",
                     "method_probe": method_only, "request_method": "GET", "request_id": "req-v0",
                 }
-                merged, probes = _materialize_ajax_runtime_probes(report, [pending])
+                probe_report = copy.deepcopy(report)
+                if post_action:
+                    probe_report["suggested_seeds"][0]["seed"]["body"]["action"] = "fixture"
+                merged, probes = _materialize_ajax_runtime_probes(probe_report, [pending])
                 coordinator.converge_fn = converge_iteration
                 coordinator.materialize_fn = materialize_convergence_seeds
                 coordinator.export_configs_fn = export_seed_configs
@@ -150,7 +153,10 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     query = {row["name"]: row["value"] for row in config["query_params"]["data"]}
                     body = {row["name"]: row["value"] for row in config.get("body_params", {}).get("data", [])}
                     self.assertEqual(query["action"], "fixture")
-                    self.assertNotIn("action", body)
+                    if post_action:
+                        self.assertEqual(body["action"], "fixture")
+                    else:
+                        self.assertNotIn("action", body)
                     request_id, run_id = kwargs["request_id"], kwargs["run_id"]
                     candidate_item = copy.deepcopy(raw)
                     candidate_item["seed"]["method"] = candidate_item["seed"]["resolved_method"] = method
@@ -199,6 +205,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 final = json.loads(Path(child["config_path"]).read_text())
                 self.assertEqual(final["methods"], ["POST"])
                 self.assertIn("body_key", final["body_params"]["fuzz"])
+                if post_action:
+                    self.assertIn("action", final["body_params"]["fixed"])
+                    self.assertNotIn("action", final["body_params"]["fuzz"])
                 self.assertNotIn("not_sent", {row["name"] for row in final["body_params"]["data"]})
                 self.assertNotIn("probe_variant", final["metadata"])
                 self.assertTrue(all(actual == expected == "POST" for actual, expected in methods))
@@ -3815,6 +3824,42 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(parameter, original_parameter)
             self.assertEqual(parent["known_parameters"], original_parent_parameters)
             self.assertEqual(result["zend"]["events"][0]["callback_context"]["depth"], 2)
+
+    def test_trial_parameter_verified_preserves_request_named_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
+            parameter = {
+                "name": "request", "path": ["request"], "source": "POST", "location": "form",
+                "helper_depth": 0, "observed_count": 1, "evidence_kind": "zend_runtime",
+                "plugin_slug": "fixture", "request_id": "trial-request", "run_id": "run-v0",
+                "callback_id": "cb-fixture", "canonical_callback": "fixture_callback",
+                "request_method": "POST",
+            }
+            evidence = {
+                "request_id": "trial-request", "worker_run_id": "run-v0",
+                "request": {
+                    "http_method": "POST", "request_params": {"body_params": {"request": "probe"}},
+                },
+                "zend": {
+                    "events": [{
+                        "source": "POST", "path": ["request"], "operation": "read",
+                        "callback_context": {
+                            "attributed": True, "root_callback": "fixture_callback", "depth": 0,
+                        },
+                    }],
+                },
+            }
+            self.assertTrue(coordinator._trial_parameter_verified(parameter, evidence, parent))
+            evidence["request"]["request_params"]["body_params"] = {}
+            self.assertFalse(coordinator._trial_parameter_verified(parameter, evidence, parent))
+
+    def test_event_parameter_name_strips_source_only_when_key_follows(self):
+        for source in ("GET", "POST", "REQUEST", "JSON"):
+            with self.subTest(source=source):
+                self.assertEqual(OnlineLinkedCoordinator._event_parameter_name({"path": [source.lower()]}), source.lower())
+                self.assertEqual(OnlineLinkedCoordinator._event_parameter_name({"path": [source]}), source)
+                self.assertEqual(OnlineLinkedCoordinator._event_parameter_name({"path": [source, "request"]}), "request")
+        self.assertEqual(OnlineLinkedCoordinator._event_parameter_name({"path": ["POST", "item", "id"]}), "item[id]")
 
     def test_trial_parameter_verified_accepts_legacy_summary_only_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:

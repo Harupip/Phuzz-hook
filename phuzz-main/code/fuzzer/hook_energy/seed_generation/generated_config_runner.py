@@ -151,6 +151,13 @@ def _load_artifact_with_retry(load_artifact: ArtifactLoader, name: str) -> Any:
     raise RuntimeError(f"Could not read artifact: {name}") from last_error
 
 
+def _artifact_matches_run(payload: Any, run_id: str) -> bool:
+    return not run_id or (
+        isinstance(payload, Mapping)
+        and str(payload.get("legacy_run_id") or payload.get("run_id") or "").strip() == run_id
+    )
+
+
 def read_correlated_artifact_pair(
     request_dir: Path,
     zend_dir: Path,
@@ -334,6 +341,7 @@ def run_generated_configs(
                     command,
                     container_name=container_name,
                     config=config,
+                    legacy_run_id=legacy_run_id,
                     artifacts_before=artifacts_before,
                     timeout_seconds=timeout_seconds,
                     process_factory=process_factory,
@@ -376,6 +384,9 @@ def run_generated_configs(
         try:
             new_artifacts = sorted(list_artifacts() - artifacts_before)
             artifact_payloads = [(name, _load_artifact_with_retry(load_artifact, name)) for name in new_artifacts]
+            artifact_payloads = [(name, payload) for name, payload in artifact_payloads
+                                 if _artifact_matches_run(payload, legacy_run_id)]
+            new_artifacts = [name for name, _ in artifact_payloads]
         except Exception as exc:
             runs.append(_runner_error_row(config, container_name, started_at, str(exc)))
             continue
@@ -569,6 +580,7 @@ def _run_until_callback(
     *,
     container_name: str,
     config: Mapping[str, str],
+    legacy_run_id: str,
     artifacts_before: set[str],
     timeout_seconds: int,
     process_factory: ProcessFactory,
@@ -587,6 +599,8 @@ def _run_until_callback(
             new_artifacts = sorted(list_artifacts() - artifacts_before)
             for name in new_artifacts:
                 payload = _load_artifact_with_retry(load_artifact, name)
+                if not _artifact_matches_run(payload, legacy_run_id):
+                    continue
                 stop_reason = _stop_reason_for_request_artifact(
                     candidate,
                     name,

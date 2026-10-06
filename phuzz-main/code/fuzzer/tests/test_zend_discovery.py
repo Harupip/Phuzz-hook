@@ -174,7 +174,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             request_dir, zend_dir = Path(tmp) / "request", Path(tmp) / "zend"
             request_dir.mkdir()
             zend_dir.mkdir()
-            def replay(item, method, parameters):
+            def replay(item, method, parameters, events=None):
                 request = self.pass1_artifact_for_raw(item)
                 request["http_method"] = method
                 request["request_params"] = {
@@ -183,6 +183,8 @@ class ZendDiscoveryTests(unittest.TestCase):
                 zend = self.zend_artifact_for_raw(item)
                 zend["request_method"] = method
                 zend["callback_summaries"][0]["unique_parameters"] = parameters
+                if events is not None:
+                    zend["events"] = events
                 name = f"{request['request_id']}.json"
                 (request_dir / name).write_text(json.dumps(request), encoding="utf-8")
                 (zend_dir / name).write_text(json.dumps(zend), encoding="utf-8")
@@ -202,8 +204,34 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertTrue(first["pending_probes"][0]["method_probe"])
             post = first["merged_suggested_seeds"]["suggested_seeds"][0]
             self.assertEqual(post["seed"]["method"], "POST")
+            self.assertEqual(post["seed"]["body"], {})
             second = replay(post, "POST", [])
             self.assertEqual(second["pending_probes"], [])
+            # A fixed route selector can still guard access to the next POST input.
+            for source, callback, attributed, needs_action in (
+                ("POST", "Demo::fetch", True, True),
+                ("GET", "Demo::fetch", True, False),
+                ("POST", "Other::fetch", True, False),
+                ("POST", "Demo::fetch", False, False),
+            ):
+                with self.subTest(source=source, callback=callback, attributed=attributed):
+                    guard = {"source": source, "path": ["action"], "helper_depth": 0,
+                             "observed_count": 1, "access_forms": ["isset"]}
+                    events = [{"source": source, "path": ["action"], "operation": "isset",
+                               "callback_context": {"attributed": attributed, "root_callback": callback, "depth": 0}}]
+                    result = replay(raw, "GET", [guard], events)
+                    action_probe = result["merged_suggested_seeds"]["suggested_seeds"][0]
+                    self.assertEqual(action_probe["seed"]["body"],
+                                     {"action": "demo_fetch_items"} if needs_action else {})
+                    self.assertEqual(raw["seed"]["body"], {})
+                    if needs_action:
+                        next_guard = {"source": "POST", "path": ["cn_param"], "helper_depth": 0,
+                                      "observed_count": 1, "access_forms": ["isset"]}
+                        result = replay(action_probe, "POST", [guard, next_guard])
+                        self.assertEqual([row["name"] for row in result["pending_probes"]], ["cn_param"])
+                        next_seed = result["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]
+                        self.assertEqual(next_seed["body"], {"action": "demo_fetch_items", "cn_param": "probe"})
+                        self.assertNotIn("action", [row["name"] for row in result["observed_parameters"]])
             known = copy.deepcopy(raw)
             known["seed"]["method_source"] = "runtime_observed"
             self.assertEqual(replay(known, "GET", [])["pending_probes"], [])

@@ -430,6 +430,18 @@ def converge_iteration(
         merged, pending_probes = _materialize_ajax_runtime_probes(
             raw_for_iteration, pending_candidates, runtime_cookie_probes=runtime_cookie_probes,
         )
+        query = seed.get("query_params") if isinstance(seed, Mapping) else None
+        if isinstance(query, Mapping) and "action" in query and "action" in candidate.get("fixed_bootstrap", {}):
+            # Fixed selectors remain fixed, but a POST guard needs their value in the body.
+            selector_reads = normalize_runtime_evidence(
+                {**candidate, "fixed_bootstrap": {}}, uopz, zend, registry,
+                runtime_cookie_probes=runtime_cookie_probes,
+            )
+            if any(parameter.get("name") == "action" and parameter.get("source") == "POST"
+                   and parameter.get("helper_depth") == 0 for parameter in selector_reads):
+                for probe_item in merged["suggested_seeds"]:
+                    if probe_item["seed"].get("method") == "POST":
+                        probe_item["seed"].setdefault("body", {}).setdefault("action", query["action"])
     runtime_candidate_reasons = dict(rejected_reasons)
     for parameter in observed:
         reason = parameter.get("candidate_reason")

@@ -1979,7 +1979,7 @@ class OnlineLinkedCoordinator:
         if not isinstance(path, (list, tuple)):
             return ""
         parts = list(path)
-        if parts and str(parts[0]).upper() in {"GET", "POST", "REQUEST", "JSON"}:
+        if len(parts) > 1 and str(parts[0]).upper() in {"GET", "POST", "REQUEST", "JSON"}:
             parts = parts[1:]
         if not parts or not all(isinstance(part, str) and part for part in parts):
             return ""

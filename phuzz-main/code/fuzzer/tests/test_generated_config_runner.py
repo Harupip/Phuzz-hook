@@ -81,6 +81,56 @@ class FakeArtifacts:
 
 
 class GeneratedConfigRunnerTests(unittest.TestCase):
+    def test_callback_poll_ignores_foreign_run_before_current_request(self):
+        for identity in ({"legacy_run_id": "old-run"}, {"run_id": "old-run"}, {}):
+            for reached in (False, True):
+                with self.subTest(identity=identity, foreign_callback_reached=reached):
+                    coverage = {
+                        "registered_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                        "executed_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                    }
+                    foreign = {**identity, "response": {"status_code": 200},
+                               "hook_coverage": {**coverage, "executed_callbacks": coverage["executed_callbacks"] if reached else {}}}
+                    current = {"run_id": "current-run", "response": {"status_code": 200},
+                               "hook_coverage": coverage}
+                    artifacts = FakeArtifacts(
+                        [set(), {"a-old.json"}, {"a-old.json", "b-current.json"}, {"a-old.json", "b-current.json"}],
+                        {"a-old.json": foreign, "b-current.json": current},
+                    )
+                    report = run_generated_configs(
+                        [generated_config()], timeout_seconds=1, legacy_run_id="current-run",
+                        stop_on_callback=True, process_factory=lambda *args, **kwargs: FakeProcess(),
+                        list_artifacts=artifacts.list, load_artifact=artifacts.load,
+                        list_zend_artifacts=lambda: {"a-old.json", "b-current.json"},
+                        poll_interval_seconds=0, run_command=FakeRunner([]),
+                    )
+                    row = report["runs"][0]
+                    self.assertEqual(row["process_status"], "stopped_on_callback")
+                    self.assertTrue(row["callback_reached"])
+                    self.assertEqual(row["matched_artifact"], "b-current.json")
+                    self.assertEqual(row["request_artifacts"], ["b-current.json"])
+                    self.assertEqual(row["requests_created"], 1)
+
+    def test_final_validation_ignores_foreign_run_with_same_callback(self):
+        coverage = {"registered_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                    "executed_callbacks": {"cb-one": {"callback_id": "cb-one"}}}
+        foreign = {"legacy_run_id": "old-run", "hook_coverage": coverage}
+        current = {"legacy_run_id": "current-run", "hook_coverage": {**coverage, "executed_callbacks": {}}}
+        artifacts = FakeArtifacts(
+            [set(), {"a-old.json", "b-current.json"}],
+            {"a-old.json": foreign, "b-current.json": current},
+        )
+        report = run_generated_configs(
+            [generated_config()], timeout_seconds=1, legacy_run_id="current-run",
+            run_command=FakeRunner([completed(0)]), list_artifacts=artifacts.list, load_artifact=artifacts.load,
+        )
+        row = report["runs"][0]
+        self.assertFalse(row["callback_reached"])
+        self.assertEqual(row["validation_status"], "registered_not_executed")
+        self.assertIsNone(row["matched_artifact"])
+        self.assertEqual(row["request_artifacts"], ["b-current.json"])
+        self.assertEqual(row["requests_created"], 1)
+
     def test_optional_fuzzer_node_id_is_forwarded_to_worker(self):
         runner = FakeRunner([completed(0)])
         artifacts = FakeArtifacts([set(), set()], {})
