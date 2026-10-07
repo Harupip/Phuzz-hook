@@ -420,6 +420,86 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     self.assertFalse(state["pending_candidates"])
 
 
+    def test_initial_candidate_queue_uses_available_slots_without_time_credit(self):
+        cases = (
+            # name, unique inputs, duplicate input, discoveries, expire after,
+            # processed, effective slots, pending, stop reason
+            ("all_90", 90, False, False, None, 90, 90, 0, None),
+            ("dedupe", 90, True, False, None, 90, 90, 0, None),
+            ("new_and_duplicate_callbacks", 90, False, True, None, 92, 92, 0, None),
+            ("hard_cap", 130, False, False, None, 128, 128, 2, "HARD_CANDIDATE_COUNT_CAP"),
+            ("time_cap", 90, False, False, 40, 40, 90, 50, "CAMPAIGN_BUDGET_EXPIRED"),
+            ("below_initial", 3, False, False, None, 3, 32, 0, None),
+        )
+        for name, count, duplicates, discoveries, expire_after, processed, slots, pending, reason in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                items = [{**seed_item(), "callback_id": f"cb-{i}",
+                          "hook_name": f"wp_ajax_fixture_{i}"} for i in range(count)]
+                children = [{**seed_item(), "callback_id": f"new-{i}",
+                             "hook_name": f"wp_ajax_new_{i}",
+                             "lineage": {"parent_callback_id": "cb-89", "parent_request_id": "req-89"}}
+                            for i in range(2)] if discoveries else []
+                suggested = root / "suggested.json"
+                # Non-object rows and duplicates must not reserve candidate slots.
+                suggested.write_text(json.dumps({"suggested_seeds": [None, "invalid"] + items
+                                                 + (items if duplicates else [])}))
+                registry = root / "registry.json"
+                registry.write_text("{}")
+                now = [0.0]
+                seen = []
+                growth = []
+
+                class FakeCoordinator:
+                    def __init__(self, **kwargs):
+                        self.kwargs = kwargs
+                        item = json.loads(Path(kwargs["suggested_seeds"]).read_text())["suggested_seeds"][0]
+                        seen.append(item["callback_id"])
+                        self.state_path = root / "candidate-state.json"
+                        self.state = {"terminal_status": "BOUNDED_ONLINE_COMPLETE", "versions": [],
+                                      "candidate_queue": children + children + [items[0]]
+                                      if discoveries and len(seen) == count else []}
+
+                    def run(self):
+                        if discoveries and len(seen) == count:
+                            callback = self.kwargs["progress_callback"]
+                            callback("runtime_callback", _batch_candidate_identity(items[0], "fixture"))
+                            for child in children + children:
+                                callback("runtime_callback", _batch_candidate_identity(child, "fixture"))
+                                state = json.loads((root / "output/online-linked/run/batch-state.json").read_text())
+                                growth.append(state["effective_max_candidates"])
+                        if len(seen) == expire_after:
+                            now[0] = 10.0
+                        return 0
+
+                args = SimpleNamespace(suggested_seeds=str(suggested), bootstrap_config="",
+                    config_root=str(root / "configs"), output_root=str(root / "output"),
+                    plugin_slug="fixture", legacy_run_id="run", max_seconds=2, max_versions=2,
+                    max_candidates=32, hard_max_candidates=128, campaign_seconds=10,
+                    hard_campaign_seconds=20, callback_registry=str(registry), service="fixture")
+                with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                        patch("online_linked.coordinator.time.monotonic", side_effect=lambda: now[0]), \
+                        patch("online_linked.coordinator.export_online_linked_batch", return_value=0), \
+                        patch("sys.stdout", new=io.StringIO()):
+                    self.assertEqual(run_online_linked(args), 0)
+                state = json.loads((root / "output/online-linked/run/batch-state.json").read_text())
+                expected_ids = [item["callback_id"] for item in items + children]
+                self.assertEqual(seen, expected_ids[:processed])
+                self.assertEqual([row["callback_id"] for row in state["candidates"]], seen)
+                self.assertEqual([row["item"]["callback_id"] for row in state["pending_candidates"]],
+                                 expected_ids[processed:])
+                self.assertEqual(len(state["pending_candidates"]), pending)
+                self.assertEqual(state["effective_max_candidates"], slots)
+                self.assertEqual(state["max_candidates"], 32)
+                self.assertEqual(args.max_candidates, 32)
+                self.assertEqual(state["resume_context"]["budgets"][4], 32)
+                self.assertEqual(state["campaign_status"], "PARTIAL" if reason else "complete")
+                self.assertEqual(state.get("terminal_reason"), reason)
+                self.assertEqual(len(state["budget"]["progress_keys"]), 2 if discoveries else 0)
+                self.assertEqual(state["campaign_deadline"], 14.0 if discoveries else 10.0)
+                if discoveries:
+                    self.assertEqual(growth, [91, 92, 92, 92])
+
     def test_request_artifact_names_stay_short_and_preserve_correlation(self):
         from online_linked.coordinator import _request_id
 

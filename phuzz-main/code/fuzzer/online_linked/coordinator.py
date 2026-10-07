@@ -4298,6 +4298,8 @@ def run_online_linked(args: argparse.Namespace) -> int:
             continue
         queued_ids.add(identity)
         queue.append((index, dict(raw_item), "initial"))
+    # Known input needs slots, not progress credit or extra campaign time.
+    max_candidates = min(hard_max_candidates, max(initial_candidates, len(queue)))
     started_at = time.monotonic()
     campaign_deadline = started_at + campaign_seconds
     hard_campaign_deadline = campaign_deadline + hard_campaign_seconds - campaign_seconds
