@@ -100,6 +100,8 @@ def run_in_container(
         "--method", str(expected.get("method") or ""),
         "--auth-context", str(expected.get("auth_context") or "authenticated"),
     ]
+    if expected.get("allow_error_responses") is True:
+        command.append("--allow-error-responses")
     started_at = clock()
     process = process_factory(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     stdout_chunks: list[str | bytes] = []
@@ -429,6 +431,7 @@ def main(argv=None) -> int:
     parser.add_argument("--callback-id", required=True)
     parser.add_argument("--method", required=True)
     parser.add_argument("--auth-context", required=True)
+    parser.add_argument("--allow-error-responses", action="store_true")
     args = parser.parse_args(argv)
     try:
         result = send_and_wait(
@@ -442,6 +445,7 @@ def main(argv=None) -> int:
                 "callback_id": args.callback_id,
                 "method": args.method,
                 "auth_context": args.auth_context,
+                "allow_error_responses": args.allow_error_responses,
             },
         )
     except Exception as exc:

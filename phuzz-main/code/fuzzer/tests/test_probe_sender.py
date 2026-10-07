@@ -29,6 +29,121 @@ from seed_generation.config.config_exporter import export_seed_configs
 
 
 class ProbeSenderTests(unittest.TestCase):
+    def test_discovery_error_evidence_keeps_next_guard_and_strict_replay_default(self):
+        for status_code, discovery, want in ((400, True, "callback_reached"),
+                                             (403, True, "callback_reached"),
+                                             (400, False, "timeout"), (302, True, "timeout")):
+            with self.subTest(status_code=status_code, discovery=discovery), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_path = root / "config.json"
+                config_path.write_text(json.dumps({
+                    "target": "http://web/admin-ajax.php", "methods": ["POST"],
+                    "body_params": {"data": [{"name": "a", "value": "probe-a"}]},
+                }))
+                request_dir, zend_dir = root / "requests", root / "zend"
+                request_dir.mkdir()
+                zend_dir.mkdir()
+
+                class Session:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        return False
+
+                    def send(self, prepared, timeout, allow_redirects):
+                        (request_dir / "guard.json").write_text(json.dumps({
+                            "request_id": "guard", "run_id": "guard-run", "target_plugin": "fixture",
+                            "http_method": "POST", "auth_context": "authenticated",
+                            "response": {"status_code": status_code},
+                            "request_params": {"body_params": {"a": "probe-a"}},
+                            "hook_coverage": {"executed_callbacks": {
+                                "cb-fixture": {"hook_name": "wp_ajax_fixture"},
+                            }},
+                        }))
+                        (zend_dir / "guard.json").write_text(json.dumps({
+                            "request_id": "guard", "run_id": "guard-run",
+                            "events": [{"source": "POST", "path": ["b"], "operation": "isset"}],
+                        }))
+                        return type("Response", (), {"status_code": status_code})()
+
+                result = probe_sender.send_and_wait(
+                    config_path, request_id="guard", run_id="guard-run", timeout_seconds=0.05,
+                    expected={"plugin_slug": "fixture", "hook_name": "wp_ajax_fixture",
+                              "callback_id": "cb-fixture", "method": "POST", "auth_context": "authenticated",
+                              "allow_error_responses": discovery},
+                    session_factory=Session, request_dir=request_dir, zend_dir=zend_dir,
+                )
+                self.assertEqual(result["status"], want)
+                self.assertEqual(result["response_status"], status_code)
+                if discovery and status_code in (400, 403):
+                    self.assertEqual(result["zend"]["events"][0]["path"], ["b"])
+                    self.assertNotIn("passed", result)
+
+    def test_container_sender_enables_error_evidence_only_when_requested(self):
+        for discovery in (False, True):
+            with self.subTest(discovery=discovery):
+                commands = []
+
+                class Process:
+                    stdout = io.StringIO('{"status":"callback_reached"}')
+                    stderr = io.StringIO()
+
+                    def poll(self):
+                        return 0
+
+                def factory(command, **kwargs):
+                    commands.append(command)
+                    return Process()
+
+                probe_sender.run_in_container(
+                    "parent", config_slug="probe", request_id="request", run_id="run", timeout_seconds=5,
+                    expected={"allow_error_responses": discovery}, process_factory=factory,
+                )
+                self.assertEqual("--allow-error-responses" in commands[0], discovery)
+
+    def test_error_discovery_requires_executed_callback_and_exact_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            request_dir, zend_dir = root / "requests", root / "zend"
+            request_dir.mkdir()
+            zend_dir.mkdir()
+            request = {
+                "request_id": "guard", "run_id": "run", "target_plugin": "fixture",
+                "http_method": "POST", "auth_context": "authenticated",
+                "response": {"status_code": 403},
+                "hook_coverage": {"executed_callbacks": {
+                    "cb-fixture": {"hook_name": "wp_ajax_fixture"},
+                }},
+            }
+            zend = {"request_id": "guard", "run_id": "run", "events": []}
+            expected = {"plugin_slug": "fixture", "hook_name": "wp_ajax_fixture",
+                        "callback_id": "cb-fixture", "method": "POST",
+                        "auth_context": "authenticated", "allow_error_responses": True}
+
+            def read_pair(request_payload, zend_payload):
+                (request_dir / "guard.json").write_text(json.dumps(request_payload))
+                (zend_dir / "guard.json").write_text(json.dumps(zend_payload))
+                return generated_config_runner.read_correlated_artifact_pair(
+                    request_dir, zend_dir, request_id="guard", run_id="run", expected=expected,
+                )
+
+            self.assertIsNotNone(read_pair(request, zend))
+            for field, value in (("request_id", "other"), ("run_id", "other"),
+                                 ("target_plugin", "other"), ("http_method", "GET"),
+                                 ("auth_context", "guest"),
+                                 ("hook_coverage", {"registered_callbacks": {
+                                     "cb-fixture": {"hook_name": "wp_ajax_fixture"},
+                                 }}),
+                                 ("hook_coverage", {"executed_callbacks": {
+                                     "other": {"hook_name": "other_hook"},
+                                 }})):
+                with self.subTest(field=field, value=value):
+                    self.assertIsNone(read_pair({**request, field: value}, zend))
+            for field in ("request_id", "run_id"):
+                with self.subTest(zend_field=field):
+                    self.assertIsNone(read_pair(request, {**zend, field: "other"}))
+
     def test_container_sender_uses_exec_and_explicit_ids(self):
         calls = []
 

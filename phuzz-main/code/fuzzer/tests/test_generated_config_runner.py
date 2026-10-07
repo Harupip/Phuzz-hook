@@ -21,6 +21,7 @@ from hook_energy.seed_generation.generated_config_runner import (
     load_request_artifact,
     main,
     run_generated_configs,
+    _stop_reason_for_request_artifact,
 )
 
 
@@ -81,6 +82,63 @@ class FakeArtifacts:
 
 
 class GeneratedConfigRunnerTests(unittest.TestCase):
+    def test_error_response_without_target_callback_keeps_waiting(self):
+        for status_code in (200, 400, 403):
+            with self.subTest(status_code=status_code):
+                payload = {
+                    "response": {"status_code": status_code},
+                    "hook_coverage": {"registered_callbacks": {"cb-one": {"callback_id": "cb-one"}}},
+                }
+                self.assertEqual(_stop_reason_for_request_artifact(
+                    generated_config(), "request-one.json", payload, lambda: {"request-one.json"},
+                ), "request_completed" if status_code == 200 else None)
+
+    def test_error_response_stops_reached_callback_only_with_matching_zend(self):
+        for status_code in (400, 403):
+            for zend_names in ({"request-one.json"}, {"other-request.json"}):
+                with self.subTest(status_code=status_code, zend_names=zend_names):
+                    process = FakeProcess()
+                    process.returncode = 0
+                    payload = {
+                        "legacy_run_id": "current-run",
+                        "response": {"status_code": status_code},
+                        "hook_coverage": {
+                            "registered_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                            "executed_callbacks": {"cb-one": {"callback_id": "cb-one"}},
+                        },
+                    }
+                    snapshots = [set(), {"request-one.json"}]
+
+                    def list_requests():
+                        return snapshots.pop(0) if snapshots else {"request-one.json"}
+
+                    report = run_generated_configs(
+                        [generated_config()], timeout_seconds=1, legacy_run_id="current-run",
+                        stop_on_callback=True, process_factory=lambda *args, **kwargs: process,
+                        list_artifacts=list_requests, load_artifact=lambda name: payload,
+                        list_zend_artifacts=lambda: zend_names,
+                        poll_interval_seconds=0, run_command=FakeRunner([]),
+                    )
+                    row = report["runs"][0]
+                    self.assertEqual(
+                        row["process_status"],
+                        "stopped_on_callback" if "request-one.json" in zend_names else "exited",
+                    )
+                    self.assertTrue(row["callback_reached"])
+                    self.assertEqual(row["matched_artifact"], "request-one.json")
+
+    def test_callback_stop_waits_for_final_response_status(self):
+        for response in (None, {}, {"status_code": None}, {"status_code": "invalid"},
+                         {"status_code": 0}, {"status_code": 100}, {"status_code": 600}):
+            with self.subTest(response=response):
+                payload = {
+                    "response": response,
+                    "hook_coverage": {"executed_callbacks": {"cb-one": {"callback_id": "cb-one"}}},
+                }
+                self.assertIsNone(_stop_reason_for_request_artifact(
+                    generated_config(), "request-one.json", payload, lambda: {"request-one.json"},
+                ))
+
     def test_callback_poll_ignores_foreign_run_before_current_request(self):
         for identity in ({"legacy_run_id": "old-run"}, {"run_id": "old-run"}, {}):
             for reached in (False, True):

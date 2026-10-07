@@ -196,8 +196,14 @@ def read_correlated_artifact_pair(
     if not isinstance(response, Mapping):
         return None
     try:
-        if int(response.get("status_code")) != 200:
-            return None
+        status_code = int(response.get("status_code"))
+        if status_code != 200:
+            if expected.get("allow_error_responses") is not True or not 400 <= status_code <= 599:
+                return None
+            if not (expected.get("hook_name") or expected.get("callback_id")):
+                return None
+            if not _callback_artifact_is_ready(expected, request_payload):
+                return None
     except (TypeError, ValueError):
         return None
     if expected.get("plugin_slug") and str(request_payload.get("target_plugin") or "") != str(expected["plugin_slug"]):
@@ -638,7 +644,7 @@ def _stop_reason_for_request_artifact(
     if not _request_artifact_is_ready(payload):
         return None
     if not _callback_artifact_is_ready(candidate, payload):
-        return "request_completed"
+        return "request_completed" if int(payload["response"]["status_code"]) == 200 else None
     return "callback_reached" if _zend_artifact_matches_request(name, list_zend_artifacts) else None
 
 
@@ -679,7 +685,7 @@ def _request_artifact_is_ready(payload: Any) -> bool:
     if not isinstance(response, Mapping):
         return False
     try:
-        return int(response.get("status_code")) == 200
+        return 200 <= int(response.get("status_code")) <= 599
     except (TypeError, ValueError):
         return False
 

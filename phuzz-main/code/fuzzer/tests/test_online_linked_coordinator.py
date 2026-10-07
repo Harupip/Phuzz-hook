@@ -164,6 +164,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     request = {
                         "request_id": request_id, "run_id": run_id, "legacy_run_id": run_id,
                         "target_plugin": "fixture", "http_method": method,
+                        "response": {"status_code": 400 if not method_only and "not_sent" not in body else 200},
                         "hook_name": parent["hook_name"], "callback_id": parent["callback_id"],
                         "auth_context": "guest", "auth_variant": "unauthenticated",
                         "canonical_identity_id": canonical_identity_id(candidate),
@@ -189,6 +190,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                             "source": "POST", "path": ["not_sent"], "operation": "read",
                             "callback_context": {"attributed": True, "root_callback": "fixture_callback", "depth": 0},
                         })
+                    if request["response"]["status_code"] != 200 and not kwargs["expected"]["allow_error_responses"]:
+                        return {"status": "timeout", "error": "STRICT_REPLAY_REQUIRES_NEXT_PARAMETER"}
                     return {"status": "callback_reached", "callback_reached": True, "validation_status": "callback_reached",
                             "request_name": request_id + ".json", "request": request,
                             "zend_name": request_id + ".json", "zend": zend, "timing": {}}
@@ -208,7 +211,12 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 if post_action:
                     self.assertIn("action", final["body_params"]["fixed"])
                     self.assertNotIn("action", final["body_params"]["fuzz"])
-                self.assertNotIn("not_sent", {row["name"] for row in final["body_params"]["data"]})
+                if not method_only:
+                    # The first 400 exposes this key; only a later correlated
+                    # probe and strict replay may promote it alongside body_key.
+                    self.assertIn("not_sent", final["body_params"]["fuzz"])
+                else:
+                    self.assertNotIn("not_sent", {row["name"] for row in final["body_params"]["data"]})
                 self.assertNotIn("probe_variant", final["metadata"])
                 self.assertTrue(all(actual == expected == "POST" for actual, expected in methods))
 
@@ -2468,6 +2476,54 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 {"a": seed_metadata["request_id"], "b": seed_metadata["request_id"]},
             )
             self.assertEqual(parent["known_parameters"], [])
+
+    def test_error_probe_discovers_next_guard_before_strict_child_replay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), [], names=("a",), accepted=("a", "b"),
+            )
+            original_sender = coordinator.probe_sender
+            original_converge = coordinator.converge_fn
+            policies = []
+
+            def sender(container, **kwargs):
+                result = original_sender(container, **kwargs)
+                is_probe = "-probe-" in kwargs["run_id"]
+                policies.append((is_probe, kwargs["expected"].get("allow_error_responses", False)))
+                config = json.loads((coordinator.config_root / (kwargs["config_slug"] + ".json")).read_text())
+                body = {row["name"]: row["value"] for row in config["body_params"]["data"]}
+                result["request"]["request_params"]["body_params"] = body
+                if is_probe and "b" not in body:
+                    result["request"]["response"]["status_code"] = 400
+                elif not is_probe and "b" not in body:
+                    return {"status": "timeout", "error": "STRICT_REPLAY_REQUIRES_B"}
+                return result
+
+            def converge(**kwargs):
+                result = original_converge(**kwargs)
+                item = kwargs["raw_report"]["suggested_seeds"][0]
+                if item["seed"].get("seed_variant_id") == "zend_probe_post_a":
+                    next_guard = {**convergence["pending_probes"][0], "name": "b",
+                                  "request_id": "probe-a", "run_id": kwargs["legacy_run_id"]}
+                    merged, pending = _materialize_ajax_runtime_probes(
+                        {"suggested_seeds": [item]}, [next_guard],
+                    )
+                    result.update(merged_suggested_seeds=merged, pending_probes=pending)
+                return result
+
+            coordinator.probe_sender = sender
+            coordinator.converge_fn = converge
+            child = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=120.0,
+            )
+            self.assertEqual([p["candidate"]["name"] for p in coordinator.state["probe_attempts"]], ["a", "b"])
+            self.assertIsNotNone(child)
+            self.assertEqual({p["name"] for p in child["known_parameters"]}, {"a", "b"})
+            self.assertTrue(child["replay_result"]["passed"])
+            self.assertTrue(policies)
+            self.assertTrue(all(discovery == is_probe for is_probe, discovery in policies))
 
     def test_separate_probes_are_combined_only_after_one_verified_request(self):
         for names in (("nonce", "notice_id", "repeat_notice_after"),

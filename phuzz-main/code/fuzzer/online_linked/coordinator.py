@@ -515,6 +515,7 @@ class OnlineLinkedCoordinator:
         auth_context: str,
         deadline: float | None,
         seed_variant_id: str = "",
+        allow_error_responses: bool = False,
     ) -> dict[str, Any]:
         if not self._active_container:
             return {"status": "parent_container_missing", "error": "PARENT_CONTAINER_MISSING"}
@@ -538,6 +539,7 @@ class OnlineLinkedCoordinator:
                 "method": method,
                 "auth_context": auth_context,
                 "seed_variant_id": seed_variant_id,
+                "allow_error_responses": allow_error_responses,
             },
             process_factory=self.process_factory,
             parent_exit_code=self._worker_exit_code,
@@ -2676,6 +2678,11 @@ class OnlineLinkedCoordinator:
                 "evidence": probe_evidence,
                 "result": outcome.get("result") if isinstance(outcome.get("result"), Mapping) else {},
             })
+            probe_result = outcome.get("result")
+            next_probes = probe_result.get("pending_probes") if isinstance(probe_result, Mapping) else None
+            if isinstance(next_probes, list):
+                for next_probe in next_probes:
+                    enqueue(next_probe, probe_result, probe_evidence)
         for candidate in deferred:
             self._record_event({
                 "kind": "PARAMETER_PROBE",
@@ -2931,6 +2938,7 @@ class OnlineLinkedCoordinator:
                 method=probe_row["resolved_method"],
                 auth_context=str(parent.get("auth_context") or "authenticated"),
                 seed_variant_id=probe_row["seed_variant_id"],
+                allow_error_responses=True,
                 deadline=deadline,
             )
         except Exception as exc:

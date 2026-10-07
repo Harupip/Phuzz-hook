@@ -592,6 +592,9 @@ def _materialize_ajax_runtime_probes(
     raw_seed = raw_item.get("seed")
     if not isinstance(raw_seed, Mapping):
         raise ValueError("AJAX runtime probe candidate is invalid")
+    prior_probe = raw_item.get("probe_request")
+    prior_parameters = prior_probe.get("parameters") if isinstance(prior_probe, Mapping) else []
+    prior_parameters = prior_parameters if isinstance(prior_parameters, list) else []
     probes: list[dict[str, Any]] = []
     probe_rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -651,7 +654,9 @@ def _materialize_ajax_runtime_probes(
         item["generated_reason"] = "zend_runtime_parameter_probe"
         item["missing_requirements"] = ["correlated_runtime_read"]
         item["probe_request"] = {
-            "parameters": [name] if name else [],
+            "parameters": list(dict.fromkeys(
+                [str(value) for value in prior_parameters if str(value)] + ([name] if name else [])
+            )),
             "method_probe": method_probe,
             "probe_method": seed.get("resolved_method") or seed.get("method"),
             "source": source,
