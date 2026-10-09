@@ -4,6 +4,7 @@ param(
     [string]$PluginSlug = "show-all-comments-in-one-page",
     [switch]$ForcePlugins,
     [switch]$NoFollowLogs,
+    [switch]$NoComparePrompt,
     [switch]$UseZendDiscovery,
     [ValidatePattern('^[a-zA-Z0-9_./-]+$')]
     [string]$BootstrapConfigSlug = "",
@@ -33,6 +34,7 @@ if (-not (Test-Path -LiteralPath $settingsReaderPath -PathType Leaf)) {
 }
 . $settingsReaderPath
 $runtimeSettings = Resolve-PhuzzRuntimeSettings -Path (Join-Path $scriptRoot "phuzz.env") -BoundParameters $PSBoundParameters
+$pluginZipDir = $runtimeSettings["PluginZipDirectory"]
 $OnlineTimeoutSeconds = $runtimeSettings["OnlineTimeoutSeconds"]
 $OnlineMaxVersions = $runtimeSettings["OnlineMaxVersions"]
 $OnlineMaxCandidates = $runtimeSettings["OnlineMaxCandidates"]
@@ -111,6 +113,16 @@ function New-PluginOverrideFile {
             "      - shared-tmpfs:/shared"
         )
     }
+    # Keep the preferred archives separate so Docker cannot create fallback ZIP placeholders.
+    if ($pluginZipDir -and (Test-Path -LiteralPath $pluginZipDir -PathType Container)) {
+        $source = ConvertTo-Json -InputObject ($pluginZipDir.Replace('\', '/').Replace('$', '$$')) -Compress
+        $content += @(
+            "      - type: bind"
+            "        source: $source"
+            "        target: /plugin-zips"
+            "        read_only: true"
+        )
+    }
     $content += @(
         "  ${fuzzerService}:"
         "    environment:"
@@ -127,7 +139,7 @@ function New-PluginOverrideFile {
             "      - shared-tmpfs:/shared"
         )
     }
-    Set-Content -LiteralPath $path -Value $content -Encoding ASCII
+    [System.IO.File]::WriteAllLines($path, [string[]]$content, [System.Text.UTF8Encoding]::new($false))
     return $path
 }
 
@@ -691,7 +703,8 @@ try {
     Write-Host "Checking Docker availability"
     Invoke-Compose -ComposeArgs $composeArgs -AdditionalArgs @("version")
 
-    if ($PluginSlug -eq "show-all-comments-in-one-page") {
+    $requiredPlugin = Resolve-PhuzzPluginZip -ScriptRoot $scriptRoot -PluginZipDirectory $pluginZipDir -PluginSlug $PluginSlug
+    if ($PluginSlug -eq "show-all-comments-in-one-page" -and ($ForcePlugins -or -not (Test-Path -LiteralPath $requiredPlugin -PathType Leaf))) {
         Write-Host "Ensuring default plugin ZIP exists"
         if ($ForcePlugins) {
             & $pluginScript -Force
@@ -706,11 +719,11 @@ try {
     }
 
     $requiredConfig = Join-Path $scriptRoot ("fuzzer\configs\{0}.json" -f $BootstrapConfigSlug.Replace("/", [System.IO.Path]::DirectorySeparatorChar))
-    $requiredPlugin = Join-Path $scriptRoot "web\applications\wordpress\_plugins\$PluginSlug.zip"
     $requiredWpCli = Join-Path $scriptRoot "web\applications\wordpress\wp-cli.phar"
 
     Assert-PathExists -Path $requiredConfig -Hint "Choose an existing bootstrap config slug."
-    Assert-PathExists -Path $requiredPlugin -Hint "Choose a plugin ZIP that exists in web\applications\wordpress\_plugins, or add $PluginSlug.zip there."
+    Assert-PathExists -Path $requiredPlugin -Hint "Add $PluginSlug.zip to PLUGIN_ZIP_DIR or web\applications\wordpress\_plugins."
+    Write-Host "Plugin ZIP: $requiredPlugin"
     Assert-PathExists -Path $requiredWpCli -Hint "The WordPress bootstrap artifact is missing from this checkout."
 
     Write-Host "Starting db and web containers"
@@ -768,7 +781,7 @@ try {
         -OnlineMaxVersions $OnlineMaxVersions `
         -OnlineMaxCandidates $OnlineMaxCandidates `
         -OnlineCampaignTimeoutSeconds $OnlineCampaignTimeoutSeconds `
-        -OnlineComparePrompt ([bool]$runtimeSettings["OnlineComparePrompt"]) `
+        -OnlineComparePrompt ([bool]$runtimeSettings["OnlineComparePrompt"] -and -not $NoComparePrompt) `
         -OverridePath $overridePath `
         -ComposeArgs $composeArgs
 } finally {

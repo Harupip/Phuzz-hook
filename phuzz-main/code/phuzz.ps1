@@ -4,6 +4,7 @@ param(
     [string]$Mode = "online-linked",
     [ValidatePattern('^[a-zA-Z0-9_.-]+$')]
     [string]$PluginSlug,
+    [switch]$AllPlugins,
     [switch]$ForcePlugins,
     [switch]$NoFollowLogs,
     [ValidateRange(1, 86400)]
@@ -40,11 +41,14 @@ Usage:
   .\phuzz.ps1 -PluginSlug gamipress
   .\phuzz.ps1 -Mode online-linked -PluginSlug hookphuzz-online-discovery-fixture -OnlineTimeoutSeconds 60 -OnlineMaxVersions 3
   .\phuzz.ps1 -PluginSlug gamipress -DryRun
+  .\phuzz.ps1 -AllPlugins -DryRun
+  .\phuzz.ps1 -AllPlugins
 
 Online-linked is the only workflow. Zend runtime discovery is always enabled.
 
 Options:
   -PluginSlug <slug>               Local plugin ZIP slug; no matching manual config required.
+  -AllPlugins                      Run each ZIP in PLUGIN_ZIP_DIR sequentially; continue after errors.
   -ForcePlugins                    Re-download the default plugin ZIP.
   -WebTimeoutSeconds <seconds>     WordPress readiness wait. Default: 240.
   -SeedWaitSeconds <seconds>       Live coverage snapshot wait. Default: 45.
@@ -61,15 +65,14 @@ Options:
 }
 
 function Get-LocalPluginSlugs {
-    if (-not (Test-Path -LiteralPath $pluginDir)) {
-        return @()
-    }
-
     return @(
-        Get-ChildItem -LiteralPath $pluginDir -Filter "*.zip" |
-            ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) } |
-            Sort-Object -Unique
-    )
+        foreach ($directory in @($pluginZipDir, $pluginDir)) {
+            if ($directory -and (Test-Path -LiteralPath $directory -PathType Container)) {
+                Get-ChildItem -LiteralPath $directory -Filter "*.zip" -File |
+                    ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) }
+            }
+        }
+    ) | Sort-Object -Unique
 }
 
 function Read-PluginSlug {
@@ -133,16 +136,21 @@ if (-not (Test-Path -LiteralPath $settingsReaderPath -PathType Leaf)) {
 }
 . $settingsReaderPath
 $runtimeSettings = Resolve-PhuzzRuntimeSettings -Path (Join-Path $scriptRoot "phuzz.env") -BoundParameters $PSBoundParameters
+$pluginZipDir = $runtimeSettings["PluginZipDirectory"]
 $OnlineTimeoutSeconds = $runtimeSettings["OnlineTimeoutSeconds"]
 $OnlineMaxVersions = $runtimeSettings["OnlineMaxVersions"]
 $OnlineMaxCandidates = $runtimeSettings["OnlineMaxCandidates"]
 $OnlineCampaignTimeoutSeconds = $runtimeSettings["OnlineCampaignTimeoutSeconds"]
 $StopOnVulnCount = $runtimeSettings["StopOnVulnCount"]
 
+if ($AllPlugins -and $PSBoundParameters.ContainsKey("PluginSlug")) {
+    throw "Use either -AllPlugins or -PluginSlug, not both."
+}
+
 $UseZendDiscovery = $true
 $interactive = -not ($PSBoundParameters.ContainsKey("Mode") -or $PSBoundParameters.ContainsKey("PluginSlug") -or $DryRun)
 
-if (-not $PSBoundParameters.ContainsKey("PluginSlug")) {
+if (-not $AllPlugins -and -not $PSBoundParameters.ContainsKey("PluginSlug")) {
     if ($interactive) {
         $PluginSlug = Read-PluginSlug
     } else {
@@ -172,6 +180,47 @@ $runnerParams["OnlineTimeoutSeconds"] = $OnlineTimeoutSeconds
 $runnerParams["OnlineMaxVersions"] = $OnlineMaxVersions
 $runnerParams["OnlineMaxCandidates"] = $OnlineMaxCandidates
 $runnerParams["OnlineCampaignTimeoutSeconds"] = $OnlineCampaignTimeoutSeconds
+
+if ($AllPlugins) {
+    $batchDirectory = if ($pluginZipDir) { $pluginZipDir } else { $pluginDir }
+    if (-not (Test-Path -LiteralPath $batchDirectory -PathType Container)) {
+        throw "Plugin ZIP folder does not exist: $batchDirectory"
+    }
+    $archives = @(Get-ChildItem -LiteralPath $batchDirectory -Filter "*.zip" -File | Sort-Object Name)
+    if ($archives.Count -eq 0) {
+        throw "No plugin ZIP found in: $batchDirectory"
+    }
+
+    $runnerParams["NoComparePrompt"] = $true
+    $failed = 0
+    $completed = 0
+    Write-Host "Plugin batch folder: $batchDirectory"
+    for ($index = 0; $index -lt $archives.Count; $index++) {
+        $runnerParams["PluginSlug"] = [System.IO.Path]::GetFileNameWithoutExtension($archives[$index].Name)
+        Write-Host ("[{0}/{1}] {2}" -f ($index + 1), $archives.Count, $archives[$index].Name)
+        Write-Host ("  " + (Format-Command -CommandPath $runnerPath -Parameters $runnerParams))
+        if ($DryRun) {
+            continue
+        }
+        try {
+            $global:LASTEXITCODE = 0
+            & $runnerPath @runnerParams
+            if ($LASTEXITCODE -ne 0) {
+                throw "Runner returned exit code $LASTEXITCODE"
+            }
+            $completed++
+            Write-Host "Run completed: $($runnerParams['PluginSlug'])"
+        } catch {
+            $failed++
+            Write-Host "Run failed: $($runnerParams['PluginSlug']): $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    if (-not $DryRun) {
+        Write-Host "Batch finished: $completed completed, $failed failed. Completed runs are not a fuzzing PASS."
+    }
+    if ($failed -gt 0) { exit 1 }
+    exit 0
+}
 
 Write-Host "Delegating to WordPress PHUZZ runner:"
 Write-Host ("  " + (Format-Command -CommandPath $runnerPath -Parameters $runnerParams))
