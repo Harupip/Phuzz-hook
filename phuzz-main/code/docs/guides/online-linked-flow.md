@@ -1,6 +1,6 @@
 # Luồng online của HookPhuzz
 
-Cập nhật: 2026-09-22. Tài liệu mô tả `-Mode online-linked` theo mã hiện tại, bao gồm batching probe, provenance/evidence, COOKIE runtime opt-in, direct-argument Zend instrumentation, coherent replay, trạng thái lỗi và kiểm tra ngân sách. Đã có fresh fixture/Docker gates cho các thay đổi này; chưa có lần chạy Docker toàn tuyến với real plugin xác minh tất cả 10 bước.
+Cập nhật: **2026-10-09**, đối chiếu working tree, gồm WIP batch/ZIP directory. Tài liệu mô tả runtime discovery, coherent replay, budget thích ứng, checkpoint/resume, export nhiều context và config comparison. Các phần kiểm chứng có ngày bên dưới là snapshot lịch sử; lần cập nhật doc này không chạy campaign Docker hay xác nhận real-plugin fuzzing PASS. Xem [kiến trúc/source map](../reference/architecture.md) và [review record](../reports/2026-10-09-documentation-review.md).
 
 Kế hoạch bổ sung: [Online-linked completion](../../../../docs/superpowers/plans/2026-09-06-online-linked-completion.md). Những phần ghi “còn thiếu” bên dưới là công việc tương lai, không phải tính năng đã hoạt động.
 
@@ -28,19 +28,18 @@ flowchart TD
     B --> C[Snapshot seed và callback registry]
     C --> D[Chọn candidate tiếp theo]
     D --> E[Tạo v0 và kiểm tra cấu trúc]
-    E --> F{Có tham số fuzz?}
-    F -->|Có| G[Chạy PHUZZ v0]
-    F -->|Chưa có| H[Chạy v0 replay-only]
+    E --> F{Replay và provenance gate đạt?}
+    F -->|fuzzing_ready + Pass 2| G[Chạy PHUZZ v0]
+    F -->|replay_only hợp lệ| H[Chạy v0 replay-only]
     G --> I[Ghép request và Zend evidence]
     H --> I
     I --> J{Tham số Zend mới hợp lệ?}
-    J -->|Có| K[Tạo config con bất biến]
-    K --> L[Dừng parent thành công]
-    L --> M[Replay con và Pass 2]
-    M -->|Đạt và còn ngân sách| G2[Chạy worker con]
+    J -->|Có| K[Coherent trial rồi tạo config con bất biến]
+    K --> M[Replay con trong parent và Pass 2]
+    M -->|Đạt| L[Dừng parent thành công]
+    L -->|Còn ngân sách| G2[Chạy worker con]
     G2 --> I
-    M -->|Lỗi, còn ngân sách| R[Thử khởi động lại parent]
-    R --> I
+    M -->|Lỗi| R[Ghi CHILD_REPLAY_FAILED và cleanup]
     J -->|Không| N[Tiếp tục quan sát trong ngân sách]
     N --> I
     I -->|Runtime registration A→B| X[Classify B + identity dedupe]
@@ -152,6 +151,8 @@ Fresh Docker gate sau rebuild extension ghi đủ `data`, `helper`, `direct`, `n
 
 ## 4. Cách chạy và ngân sách
 
+Hướng dẫn ZIP, batch `-AllPlugins` và prerequisite: [run-wordpress-plugins.md](run-wordpress-plugins.md). Một batch ZIP chạy nhiều campaign riêng, tuần tự; `OnlineCampaignTimeoutSeconds` áp dụng từng plugin, không áp dụng tổng batch ZIP.
+
 Từ 2026-09-21, `online-linked` là workflow duy nhất và là mặc định. Các mode
 `default`, `seed-config`, `generated`, `zend`, `online` đã bị bỏ. Không còn menu
 chọn mode; gọi không tham số vẫn chọn plugin tương tác. Khi có `-PluginSlug`
@@ -183,24 +184,54 @@ pwsh -NoProfile -File .\phuzz.ps1 -PluginSlug nmedia-user-file-uploader -OnlineT
 
 - Các giá trị thay đổi thường xuyên nằm trong [`phuzz.env`](../../phuzz.env). Comment trong file dùng tiếng Anh ngắn; sửa file này trước khi chạy.
 - CLI flag vẫn được hỗ trợ và override `phuzz.env`; nếu thiếu key, wrapper dùng default trong loader.
-- `OnlineTimeoutSeconds`: 1–120 giây, mặc định 120, **cho từng candidate**; không phải timeout toàn batch hay Docker build/bootstrap.
-- `OnlineMaxVersions`: 1–20, mặc định 2, tính cả `v0` và phiên bản đã tạo nhưng replay thất bại.
-- `OnlineMaxCandidates`: 1–128, mặc định 32, giới hạn candidate cả initial và runtime expansion.
-- `OnlineCampaignTimeoutSeconds`: 1–86400, mặc định 3600, wall-clock budget toàn batch; khác timeout từng candidate.
-- Default trong loader khác giá trị hiện có trong file. Snapshot checkout ngày 2026-09-22: `ONLINE_TIMEOUT_SECONDS=90`, `ONLINE_MAX_VERSIONS=4`, `ONLINE_MAX_CANDIDATES=32`, `ONLINE_CAMPAIGN_TIMEOUT_SECONDS=3600`, `HOOKPHUZZ_STOP_ON_VULN=0`. Luôn đọc effective settings trong batch-state; CLI > phuzz.env > loader default.
-- Version tính theo v0 cộng số child attempt; tăng version không tăng 120 giây trần mỗi candidate. Không có `0=unlimited` cho bốn budget. Tăng campaign budget không tăng budget từng candidate.
+- Bốn flag `Online*` là **ngân sách ban đầu**, không còn là hard cap. Loader defaults lần lượt: candidate `120s`, versions `2`, candidates `32`, campaign `3600s`.
+- Snapshot `phuzz.env` ngày 2026-10-09: candidate `30s`, versions `9`, candidates `32`, campaign `3600s`, `HOOKPHUZZ_STOP_ON_VULN=0`. Dùng `-DryRun` để xem giá trị đã resolve; CLI > file > loader defaults.
+- Initial ranges: seconds `1–120`, versions `1–20`, candidates `1–128`, campaign `1–86400`. Không có `0=unlimited` cho bốn budget. Version tính cả v0 và child attempt đã tạo dù replay thất bại.
+- Initial queue được dedupe theo identity. Effective candidate capacity = `min(hard_max_candidates, max(initial_max_candidates, initial_queue_size))`; 60 candidate đã biết với initial 32/hard 128 có đủ 60 slots, không nhận thêm time/progress credit chỉ vì đã có trong seed.
+- Progress được xác minh và dedupe có thể tăng thời gian/version/candidate slots, tối đa hard cap. Duplicate callback/retry không mua thêm budget. AJAX (kể cả nopriv) được ưu tiên bằng stable sort trước mỗi lần lấy queue item.
 - `StopOnVulnCount` / `HOOKPHUZZ_STOP_ON_VULN`: `0` không dừng theo số finding; các budget và gate khác vẫn hiệu lực.
-- Không bắt đầu xử lý evidence để mở rộng khi deadline đã hết. Sau khi dừng parent, nếu còn dưới 1 giây thì không bắt đầu replay mới.
-- Sau replay, hết ngân sách thì không khởi động worker con hoặc khởi động lại parent.
+- Không admit evidence/trial/gate đến sau deadline. Replay child diễn ra khi parent còn chạy; chỉ sau replay/Pass 2 đạt mới dừng parent và start child nếu còn ngân sách.
 - Các lệnh Docker đang thực thi và cleanup vẫn có timeout riêng; thời gian thực tổng cộng có thể vượt ngân sách fuzz. Không coi `60` là giới hạn wall-clock cứng cho toàn lệnh.
 - Coordinator dừng candidate khi nhận exit code `1337 % 256 = 57`. Batch hiện tiếp tục candidate khác; cần kiểm chứng marker vulnerability giữa các candidate trước khi coi từng kết quả là phát hiện độc lập.
 - Runtime child cập nhật registry theo batch; wrapper dùng `--sync-registry` để nạp lại file vào web container trước replay candidate kế tiếp. Refresh lỗi chặn child.
+
+### Initial budget và hard cap
+
+| Initial flag / env | Loader default | Hard cap mặc định của Python coordinator | Flag Python để đổi hard cap |
+| --- | ---: | --- | --- |
+| `-OnlineTimeoutSeconds` / `ONLINE_TIMEOUT_SECONDS` | 120s | `4 × initial seconds` | `--hard-candidate-seconds` |
+| `-OnlineMaxVersions` / `ONLINE_MAX_VERSIONS` | 2 | `max(20, 4 × initial versions)` | `--hard-max-versions` |
+| `-OnlineMaxCandidates` / `ONLINE_MAX_CANDIDATES` | 32 | `max(128, initial candidates)` | `--hard-max-candidates` |
+| `-OnlineCampaignTimeoutSeconds` / `ONLINE_CAMPAIGN_TIMEOUT_SECONDS` | 3600s | `max(86400, initial campaign seconds)` | `--hard-campaign-seconds` |
+
+Với env snapshot trên, hard candidate time là 120s và hard versions là 36. Với loader defaults, chúng là 480s và 20. PowerShell wrapper chưa expose hard-cap flags hay `--resume`; muốn điều chỉnh phải gọi Python coordinator với context Docker phù hợp. Hard cap phải là số nguyên dương và không nhỏ hơn initial budget. Đọc `budget`, `budget_progress`, `effective_max_candidates`, `pending_candidates` và `stop_reasons`; không chỉ nhìn giá trị initial.
+
+### Checkpoint và resume
+
+`batch-state.json` lưu queue, registry snapshot/hash, progress keys và remaining budget; state từng candidate lưu config/replay hashes, pending work, lineage và reports. `--resume` dùng lại cùng run ID/output root, bỏ candidate đã hoàn tất và xác minh lại gate bằng request/worker identity mới trước pending probes. Config đã công bố vẫn bất biến.
+
+Resume kiểm tra seed, bootstrap, registry, plugin/service/config root, COOKIE policy và budget context. Không đổi budget hoặc sửa config cũ để ép resume. Thời gian offline bị trừ khỏi budget còn lại; resume không cấp một campaign mới. Hết hard budget thì resume không tạo thêm thời gian.
+
+Từ `phuzz-main/code/fuzzer`, mẫu lệnh cho **run đã có**, thay mọi placeholder bằng input/context ban đầu:
+
+```powershell
+# COMPOSE_FILE phải gồm base compose và override của đúng plugin/Zend setup.
+python -m online_linked --suggested-seeds <original-seeds.json> --bootstrap-config <original-bootstrap.json> --config-root <original-config-root> --output-root <original-output-root> --plugin-slug <slug> --legacy-run-id <original-run-id> --callback-registry <original-registry.json> --max-seconds <initial-seconds> --max-versions <initial-versions> --max-candidates <initial-candidates> --campaign-seconds <initial-campaign-seconds> --sync-registry --resume
+```
+
+Truyền lại custom hard caps, COOKIE opt-in và service nếu run gốc có. Runner xóa override tạm khi kết thúc; cần khôi phục cùng Compose context trước resume, không chỉ thêm `--resume` vào `phuzz.ps1`. Đây là contract code, không xác nhận mọi checkpoint cũ đều tương thích hoặc có thể phục hồi.
+
+### Discovery từ error response
+
+Pending probe có thể giữ Zend reads sau HTTP 400–599 nếu request/Zend/callback/method/auth được tương quan đầy đủ (`allow_error_responses=True` trên đường probe). Điều này giúp nhận input được đọc trước khi plugin trả lỗi. V0/final child replay không bật nới gate này; final config vẫn cần replay/readiness hợp lệ, Pass 2 đầy đủ, config hash đúng và `fuzzing_ready`. HTTP lỗi hay callback reached riêng lẻ chưa đủ export.
 
 ## 5. Artifact và cách đọc kết quả
 
 ```text
 fuzzer/output/online-seed-generation/<run-id>/suggested_seeds.json
 fuzzer/output/online-linked/<run-id>/batch-state.json
+fuzzer/output/online-linked/<run-id>/final-config-summary.json
+fuzzer/output/online-linked/<run-id>/final-configs/*.json
 fuzzer/output/online-linked/<run-id>/campaigns/<storage-id>/state.json
 fuzzer/output/online-linked/<run-id>/campaigns/<storage-id>/events.jsonl
 fuzzer/output/online-linked/<run-id>/campaigns/<storage-id>/versions/vN/
@@ -228,9 +259,13 @@ fuzzer/output/online-linked/<batch-run-id>/callback-registry.json
 | `ACTION_EXPANSION_SETUP_REQUIRED` | Registration có thật nhưng thiếu direct-HTTP mapping, method/route evidence hoặc prerequisite replay; không tạo request suy đoán. |
 | `CALLBACK_REGISTRY_REFRESH_FAILED` | Registry child không nạp lại được vào web container; child candidate bị chặn. |
 | `CANDIDATE_BUDGET_EXPIRED` / `CAMPAIGN_BUDGET_EXPIRED` | Batch dừng mở rộng theo cap candidate hoặc wall-clock campaign; timeout từng candidate vẫn độc lập. |
+| `PARTIAL` | Còn pending work hoặc chạm budget/cap. Có thể vẫn có config đã replay/Pass 2 đạt; không phải discovery đầy đủ. |
+| `HARD_CANDIDATE_COUNT_CAP` / `HARD_CAMPAIGN_TIME_CAP` / `HARD_CANDIDATE_TIME_CAP` / `HARD_VERSION_CAP` | Chạm hard cap; giữ pending/checkpoint. Tăng initial flag không tự sửa prerequisite hay replay failure. |
+| `FILESYSTEM_PATH_UNSUPPORTED` | IO preflight không tạo/ghi/replace/đọc/xóa được file thử; xem operation, path length và path. |
+| `EXPORT_FAILED` | Lỗi ghi/đọc/archive config cuối; giữ batch-state/source và trả exit 2. Thư mục export có thể mới hoàn tất một phần. |
 | `VULN_FOUND` | Worker báo điều kiện dừng vulnerability; đối chiếu run, request và artifact để xác nhận phát hiện tương ứng. |
 
-Lỗi hoặc timeout riêng của candidate được ghi `NOT_VERIFIED` và không hủy hàng đợi còn lại. Giới hạn `OnlineMaxCandidates` và `OnlineCampaignTimeoutSeconds` vẫn áp dụng; lỗi đầu vào chung hoặc không ghi được batch state vẫn làm CLI thất bại.
+Lỗi xác minh candidate ghi `NOT_VERIFIED`; budget/cap có thể ghi `PARTIAL` hoặc bounded với reason riêng. Batch tiếp tục candidate khác khi còn ngân sách. Exit 0 còn bao gồm `PARTIAL`/`complete_with_skips`; lỗi input chung hoặc export trả lỗi. Đọc từng state trước khi kết luận.
 
 ### 5.1. Coherent replay-input trial
 
@@ -324,26 +359,28 @@ Cuối batch, config được gom vào thư mục phẳng:
 fuzzer/output/online-linked/<batch-run-id>/final-configs/fuzzer-config.<hook>.<identity-hash>.json
 ```
 
-Mỗi candidate lấy phiên bản mới nhất qua replay và Pass 2 (`accepted == total > 0`),
-chỉ nhận `fuzzing_ready`. Nếu phiên bản mới bị loại thì xét phiên bản cũ hơn.
-File copy nguyên byte, giữ metadata/auth và tham số. Không tạo manifest.
-Terminal in đường dẫn, số file và lý do bỏ qua; không có config vẫn là kết quả hợp lệ.
-Lỗi ghi xuất trả lỗi, giữ batch-state và file nguồn. Không ghi đè thư mục đã tồn tại.
-Nếu ghi lỗi giữa chừng, thư mục có thể chứa một phần config; xem lỗi terminal.
-Đây là tổng hợp artifact đã lưu, không chạy lại replay hoặc fuzzing.
+Exporter xét **mọi version hợp lệ** theo thứ tự số giảm dần (`v10` trước `v2`). Mỗi version cần `fuzzing_ready`, gate `passed=true`, Pass 2 `accepted == total > 0`, identity và config hash đúng; probe/replay-only bị loại. Version mới lỗi không làm mất bản cũ hợp lệ.
+
+Context khác fixed value, method, auth, transport hoặc field không tương thích được giữ riêng. Hai config tương đương chỉ xuất một file; provenance request/run tạm không tạo duplicate. Bản tăng tham số `{a}` → `{a,b}` chỉ thay thế bản cũ khi known-parameter set và mọi field/selector cũ được giữ tương thích; không merge hai nhánh thành một request.
+
+File đầu giữ tên không có version suffix; bản bổ sung dùng `.vN.json`, collision khác bytes dùng hash suffix. `final-config-summary.json` ghi `exported_configs`, `equivalent_versions`, `superseded_versions`, `skipped_versions`, `state_path` và observed/verified/pending parameters. `selected_version`/`config_path` chỉ giữ đại diện mới nhất để tương thích, không phải danh sách đầy đủ.
+
+Export copy nguyên byte. Export lại/resume tái dùng file cùng bytes, không ghi đè bytes cũ; export trước đã bị bản mới bao phủ được chuyển vào `final-configs/superseded/`. Chọn file flat `final-configs/*.json` theo summary hiện tại; archive không thuộc tập active. Lỗi IO trả `EXPORT_FAILED`, giữ state/source nhưng folder có thể chứa kết quả một phần.
+
+Đây là tổng hợp evidence đã lưu, không chạy lại replay/fuzzing. Không có config vẫn là kết quả hợp lệ; summary `PARTIAL` hay `NOT_ASSESSED` không tuyên bố khám phá đủ mọi nhánh. Chi tiết [export contract](../../fuzzer/online_linked/README.md).
 
 ## 7. Source map và kiểm chứng
 
 | Thành phần | Source |
 | --- | --- |
-| Chọn mode | [phuzz.ps1](../../phuzz.ps1) |
+| CLI, chọn plugin/batch và load env | [phuzz.ps1](../../phuzz.ps1), [read-phuzz-env.ps1](../../scripts/wordpress/read-phuzz-env.ps1) |
 | Docker, bootstrap, export seed/registry | [run-wordpress-phuzz.ps1](../../scripts/wordpress/run-wordpress-phuzz.ps1) |
 | Launcher riêng của linked | [invoke-online-linked.ps1](../../scripts/wordpress/invoke-online-linked.ps1) |
 | Vòng phiên bản, handoff, deadline, state | [coordinator.py](../../fuzzer/online_linked/coordinator.py) |
 | Batch request/Zend evidence reader | [evidence.py](../../fuzzer/online_linked/evidence.py) |
 | Probe, replay-input, final export | [probe_sender.py](../../fuzzer/online_linked/probe_sender.py), [replay_inputs.py](../../fuzzer/online_linked/replay_inputs.py), [export.py](../../fuzzer/online_linked/export.py) |
 | Chọn v0, kiểm tra config, hash và artifact helpers dùng chung | [online_common.py](../../fuzzer/hook_energy/seed_generation/online_common.py) |
-| Shared online helpers | [online_common.py](../../fuzzer/hook_energy/seed_generation/online_common.py) |
+| Windows long-path IO và preflight | [filesystem_paths.py](../../fuzzer/filesystem_paths.py) |
 | Convergence và Pass 2 | [bridge_cli.py](../../fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py) |
 | Materialization và exporter | [convergence.py](../../fuzzer/seed_generation/convergence/convergence.py), [config_exporter.py](../../fuzzer/seed_generation/config/config_exporter.py) |
 | Root fetch provenance và raw events | [hookphuzz_opcode.c](../../fuzzer/zend_discovery/extension/hookphuzz_opcode.c), [direct-argument fixture](../../fuzzer/tests/fixtures/hookphuzz-direct-argument-fixture.php) |

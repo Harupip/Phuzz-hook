@@ -2,6 +2,12 @@
 
 This note documents TASK 5: recording parent/child hook registration metadata in the UOPZ hook registry.
 
+Reviewed 2026-10-09: this is the instrumentation contract. Current coordinator
+also validates correlated registration/HTTP mapping/parent lineage and queues
+replayable child candidates. Internal/ambiguous/setup-required hooks stay blocked.
+Offline recursive tooling below has a separate role. See [current flow](online-linked-flow.md)
+and [architecture](../reference/architecture.md).
+
 ## Scope
 
 Implemented scope:

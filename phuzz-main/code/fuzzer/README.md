@@ -1,5 +1,7 @@
 > Current WordPress entrypoint: `../phuzz.ps1 -PluginSlug <local-slug>`. Online-linked is the only supported workflow. The components below describe shared PHUZZ infrastructure; generic parallel-fuzzer support does not mean online-linked runs multiple active workers for one candidate. See [current flow](../docs/guides/online-linked-flow.md) for replay, export and verification limits.
 
+Reviewed 2026-10-09. [Architecture/source map](../docs/reference/architecture.md) covers current module ownership; [export contract](online_linked/README.md) covers all final configs, cumulative supersession and resume.
+
 Fuzzer Component
 ====================
 
@@ -25,15 +27,17 @@ A `Mutator` is a class implementing a set of `ParamMutators` that will take a ca
 
 ## Scoring
 
-Here, scoring formulas to rate candidates can be implemented. For now, PHUZZ only supports basic scoring formulas.
+`core/scoring.py` selects mode 1 (PHUZZ) or mode 2 (PHUZZ+hook), default 2. Hook feedback comes from `hook_guidance/`; priority adds a rarity bonus and energy blends PHUZZ energy with hook feedback using the largest scale observed by the worker's tracker. Settings live in `scoring.env`. See the [scoring reference](../docs/reference/scoring-modes-mini.md).
 
 ## Runtime Hook Seed Generation
 
-Runtime hook seed generation lives under `hook_energy/seed_generation/`. It exports `hook_gap_report.json`, `suggested_seeds.json`, and `suggested_seeds.md` from a UOPZ `total_coverage.json` snapshot.
+Canonical seed generation lives under `seed_generation/`: skeleton, config, convergence, verification, pipeline, source-assisted and parameter modules. `discovery/` owns entrypoint/method/WordPress classification. `hook_energy/seed_generation/` contains shared replay/online helpers and the Zend bridge. The runtime CLI is `cli/export_zend_seeds.py`, exporting `hook_gap_report.json`, `suggested_seeds.json` and `.md` from UOPZ `total_coverage.json`.
 
 The default/non-Zend exporter maps direct WordPress HTTP hooks such as `wp_ajax_*`, `wp_ajax_nopriv_*`, `admin_post_*`, and `admin_post_nopriv_*` to replayable PHUZZ seed templates. That legacy path may scan callback source for request-controlled inputs and inject discovered params as `FUZZ`, while keeping `action` fixed; do not copy that behavior into the runtime-only `-UseZendDiscovery` or CmpLog path.
 
 These are discovery artifacts, not automatic inserts into PHUZZ's live `Candidate` queue. `cli/seed_to_config.py` converts unauth-capable and authenticated suggestions into `configs/generated-config/<plugin>/*.json`. Authenticated configs rely on the existing WordPress UOPZ overrides for login, capability, and nonce checks; the converter does not run login automation. See `../docs/guides/hook-aware-seed-generation.md` for commands, output shape, and validation boundary.
+
+The supported runner uses runtime-only candidates and `online_linked/coordinator.py` to queue, probe, replay and start immutable config versions. It also admits correlated HTTP callback registrations with lineage. Source-assisted export and recursive offline artifacts remain separate tools; their existence does not enable retired CLI modes.
 
 `hook_energy/evaluation_report.py` builds an offline JSON and Markdown summary from existing generated-config, validation, and fuzzing artifacts. It does not rerun discovery or fuzzing; it writes `output/evaluation/hookphuzz_evaluation_summary.json` and `.md` for review.
 
@@ -41,7 +45,7 @@ The UOPZ hook registry also records multi-stage registration metadata when one c
 
 ### Runtime CmpLog feedback
 
-The opt-in Zend path adds request-linked PHP comparison operands as
+The Zend path (enabled by the online-linked runner) adds request-linked PHP comparison operands as
 parameter-specific deterministic mutations. Zend writes optional
 `comparison_events` into the existing request artifact; Python normalizes them
 before `Fuzzer.ff_mutate()`, and the mutator receives only normalized hints.
@@ -53,3 +57,9 @@ opcode evidence, limits, and fail-closed rules.
 ## VulnCheck
 
 The `VulnChecker` classes implement a call to a set of different `VulnChecks` that are used to identify client-side and server-side vulnerabilities in the target application, e.g. by checking the instrumentation's output for a specific candidate.
+
+## Worker output and findings
+
+`fuzzer.py` writes `output/workers/fuzzer-N/` and resets the same node's folder at startup. `core/finding_artifact.py` writes finding records with run ID, coverage/request ID, mutation source, payload, method/target and parameters. `HOOKPHUZZ_STOP_ON_VULN` stops after a configured finding count; 0 keeps fuzzing within the coordinator budget. `PHUZZ_TRACE_REQUESTS=1` adds outgoing request trace lines.
+
+Campaign evidence belongs to `output/online-linked/<run-id>/campaigns/<storage-id>/`, linked through batch `state_path`. Worker started, comparison event, stop signal and finding record are distinct evidence; confirm/reproduce the finding before reporting a vulnerability.

@@ -1,13 +1,62 @@
 # Chạy WordPress trên nhánh online-linked
 
-Cập nhật 2026-09-22. Từ `phuzz-main/code`, đặt ZIP plugin trong `web/applications/wordpress/_plugins/`, rồi chạy:
+Cập nhật **2026-10-09**, theo working tree gồm WIP batch/ZIP folder. Workflow WordPress duy nhất: `online-linked`, Zend và CMPLOG được runner bật. Không cần manual config cùng slug plugin.
+
+## Chuẩn bị
+
+Từ `phuzz-main/code`, cần PowerShell 7 (`pwsh`), Python có dependencies trong `fuzzer/requirements.txt`, Docker Desktop/Compose, `web/applications/wordpress/wp-cli.phar`, bootstrap config `fuzzer/configs/wordpress/bootstrap-generated.json` và ZIP `<slug>.zip`.
+
+`PLUGIN_ZIP_DIR` trong [phuzz.env](../../phuzz.env) nhận path tuyệt đối hoặc tương đối với `phuzz-main/code`. Chọn ZIP theo thứ tự:
+
+1. `PLUGIN_ZIP_DIR/<slug>.zip` nếu tồn tại.
+2. `web/applications/wordpress/_plugins/<slug>.zip`.
+
+Thư mục ưu tiên được mount read-only vào `/plugin-zips`; install recipe áp dụng fallback tương tự cho dependency ZIP. Dependency tự cài hiện có: WooCommerce cho `udraw`, Contact Form 7 cho `country-state-city-auto-dropdown`. Plugin khác có thể cần dependency/data riêng trước khi callback đăng ký. ZIP được staging không chứng minh plugin đã active hay endpoint đã chạy.
+
+Tên ZIP bỏ `.zip` chính là slug runner; không tự bỏ prefix priority hay version. Ví dụ `300000-imsanity.2.8.2.zip` không tương đương `imsanity.zip`. Chọn archive đúng slug và đúng version cần tái hiện. `-ForcePlugins` chỉ áp dụng download script plugin mặc định `show-all-comments-in-one-page`.
+
+## Một plugin
 
 ```powershell
 pwsh -NoProfile -File ./phuzz.ps1 -PluginSlug imsanity -DryRun
-pwsh -NoProfile -File ./phuzz.ps1 -PluginSlug imsanity -OnlineTimeoutSeconds 120 -OnlineMaxVersions 20 -OnlineMaxCandidates 32 -OnlineCampaignTimeoutSeconds 3600
+pwsh -NoProfile -NonInteractive -File ./phuzz.ps1 -PluginSlug imsanity
+# Override ngân sách ban đầu, không sửa phuzz.env
+pwsh -NoProfile -NonInteractive -File ./phuzz.ps1 -PluginSlug imsanity -OnlineTimeoutSeconds 60 -OnlineMaxVersions 3 -OnlineMaxCandidates 32 -OnlineCampaignTimeoutSeconds 3600
 ```
 
-CLI override không sửa phuzz.env. Các budget trên là hữu hạn; dùng process timeout lớn hơn campaign để dành thời gian bootstrap/cleanup. Không tăng budget để bỏ qua replay/provenance failure. Xem [flow và budget](online-linked-flow.md), rồi đọc `batch-state.json` và `final-configs` của đúng run. File count không phải fuzzing PASS.
+Không tham số: wrapper có menu local plugin từ cả thư mục ưu tiên và `_plugins`, dedupe theo slug. Có `-PluginSlug` hoặc `-DryRun`: không hỏi chọn plugin; `-DryRun` không có slug dùng plugin mặc định. Dry-run chưa kiểm tra archive/config/Docker readiness.
+
+## Batch ZIP tuần tự
+
+```powershell
+pwsh -NoProfile -File ./phuzz.ps1 -AllPlugins -DryRun
+pwsh -NoProfile -NonInteractive -File ./phuzz.ps1 -AllPlugins
+```
+
+Batch lấy **file ZIP trực tiếp** trong `PLUGIN_ZIP_DIR`; nếu setting trống thì lấy `_plugins`. Không gộp cả hai folder, không recurse, không nhận directory tên `.zip`. Sắp theo filename, chạy từng plugin, tiếp tục sau runner exception/nonzero exit; cuối batch trả 1 nếu có run lỗi, 0 nếu không. Không kết hợp `-AllPlugins` với `-PluginSlug`. Folder thiếu/rỗng báo lỗi trước run.
+
+Mỗi plugin có run ID, campaign budget và artifacts riêng. Batch tắt comparison prompt bằng `-NoComparePrompt`; không có resume batch ZIP trong wrapper. Runner completed/exit 0 có thể vẫn chứa candidate `PARTIAL` hoặc `NOT_VERIFIED`.
+
+## Settings và chạy không tương tác
+
+Ưu tiên CLI > `phuzz.env` > loader defaults. Snapshot file ngày 2026-10-09: `ONLINE_TIMEOUT_SECONDS=30`, `ONLINE_MAX_VERSIONS=9`, `ONLINE_MAX_CANDIDATES=32`, `ONLINE_CAMPAIGN_TIMEOUT_SECONDS=3600`; defaults loader khác file. Các giá trị này là **initial budget**, có thể tăng khi có progress đã xác minh tới hard cap. Xem [budget/resume](online-linked-flow.md#initial-budget-và-hard-cap).
+
+`ONLINE_COMPARE_PROMPT=1` hỏi so sánh khi single-plugin run kết thúc, terminal tương tác và có final export. Chạy `-NonInteractive` hoặc đặt setting `0` để batch tooling không đợi trả lời. `-NoFollowLogs` giữ tương thích, không vô hiệu prompt này. `-StopOnVulnCount 0` chỉ tắt dừng theo số finding.
+
+Bootstrap/build/cleanup có thời gian riêng, ngoài campaign budget; hard campaign cap mặc định có thể lên 86400s. Khi chạy bằng automation, đặt outer process timeout theo hard cap cộng phần bootstrap/cleanup và tổng số plugin. Không coi initial `3600` là wall-clock trần toàn lệnh. Không tăng budget để bỏ qua replay/provenance failure.
+
+## Đọc kết quả và debug
+
+Mở `fuzzer/output/online-linked/<run-id>/batch-state.json`, lấy `state_path` của candidate. Đọc `readiness`/`replay_result`, Pass 2, worker status và terminal reason riêng; rồi xem `final-config-summary.json` → `exported_configs`. Final files active nằm ở `final-configs/*.json`, bản được thay thế ở `final-configs/superseded/`.
+
+`fuzzer/output/workers/fuzzer-N` là output worker, không thay candidate state; fuzzer xóa output của cùng node ID khi khởi động lại. Snapshot/evidence campaign mới là nơi đối chiếu provenance. PowerShell runner reset artifact runtime trong shared volume trước campaign; Bash wrapper còn xóa `fuzzer/output`, nên dùng PowerShell để giữ host run history.
+
+```powershell
+docker compose logs --tail=100 web
+docker compose ps
+```
+
+Không gọi lại wrapper để resume cùng run: nó tạo run ID mới. Python coordinator có `--resume` với input/Compose/budget context cũ; xem [checkpoint/resume](online-linked-flow.md#checkpoint-và-resume). HTTP 200, file count hoặc exit 0 chưa chứng minh fuzzing PASS.
 
 ## Hướng dẫn matrix lịch sử
 

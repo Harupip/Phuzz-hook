@@ -75,7 +75,7 @@ defaults to `strict`.
 From `phuzz-main/code`, run:
 
 ```powershell
-rtk proxy pwsh -NoProfile -File .\compare-configs.ps1
+pwsh -NoProfile -File .\compare-configs.ps1
 ```
 
 The script calls the offline comparator and returns its exit code: 0 for
@@ -83,6 +83,11 @@ The script calls the offline comparator and returns its exit code: 0 for
 start online-linked or Docker.
 
 ## Offline comparison of one online-linked final config
+
+Reviewed 2026-10-09: `-AllPlugins` suppresses the prompt automatically. A candidate
+can export several configs. Use `final-config-summary.json.exported_configs`
+to choose the actual final JSON, rather than only `selected_version` or a file
+archived under `final-configs/superseded/`. See [export contract](../online_linked/README.md).
 
 `phuzz.env` controls the optional prompt at the end of a successful online-linked
 run: `ONLINE_COMPARE_PROMPT=1` enables it, `0` disables it (missing key defaults
@@ -98,7 +103,7 @@ directory and choose exactly one final JSON plus exactly one experiment
 reference JSON. From `phuzz-main/code`, run:
 
 ```text
-rtk proxy python -m fuzzer.config_comparison.online_linked --compare-final-config "PATH_TO_SELECTED_FINAL_CONFIG" --compare-with "PATH_TO_EXPERIMENT_REFERENCE"
+python -m fuzzer.config_comparison.online_linked --compare-final-config "PATH_TO_SELECTED_FINAL_CONFIG" --compare-with "PATH_TO_EXPERIMENT_REFERENCE"
 ```
 
 The command does not rerun discovery, prompt for a path, start Docker, or
