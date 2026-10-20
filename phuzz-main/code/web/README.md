@@ -1,7 +1,19 @@
 Web component
 ==================
 
-This component contains the web server, the server-side instrumentation and web applications that should be fuzzed.
+This component contains the web server, server-side instrumentation and target applications.
+
+Reviewed 2026-10-09. The [online-linked runner](../docs/guides/run-wordpress-plugins.md)
+supplies a Compose override for `Dockerfile.zend`: PHP 8.2.10 plus local
+`fuzzer/zend_discovery/extension/` source, built with repository-root context.
+Base Compose uses `Dockerfile` and does not itself enable Zend.
+
+UOPZ registration/execution and request evidence live under
+`instrumentation/hook_coverage/`. Zend loads the registry from
+`/shared/hookphuzz-callback-registry.json` and writes
+`/shared/opcode-events/<request_id>.json`. Hook request artifacts use
+`/shared-tmpfs/hook-coverage/requests/`. The runner mounts the shared volume at
+both roots and resets runtime artifacts before a campaign.
 
 By default, the container is built using the PHP version 8, but a PHP 7 version also exists. If you need PHP 7, change `dockerfile: Dockerfile` to `dockerfile: Dockerfile.php7` in the docker-compose.yml.
 
@@ -17,6 +29,18 @@ The checked-in repo currently ships with:
 
 The earlier benchmark applications used in the research paper were removed from this trimmed workspace to keep the WordPress-only flow lighter.
 
+WordPress `init.sh` prefers `<slug>.zip` in optional read-only `/plugin-zips`,
+then falls back to the application's `_plugins`. Dependencies use the same
+fallback: WooCommerce for `udraw`, Contact Form 7 for
+`country-state-city-auto-dropdown`. CMB2's working-tree setup installs the
+`_fixtures/cmb2-oembed.php` mu-plugin. Setup for other plugin prerequisites is
+not automatic.
+
+Application `_overrides` contain lab auth/capability/nonce hooks. Callback
+reachability under overrides does not prove original plugin auth behavior.
+LearnPress has dedicated nonce-proof setup in the runner. Missing dependencies
+or data can prevent registration; inspect artifacts before extending timeouts.
+
 ## Configs
 
 This folder contains the Apache webserver's configuration file (`mpm_prefork.conf`) and PHP configuration file (`php.ini`). The latter configures the required PHP extensions for function hooking and coverage collection.
@@ -29,6 +53,10 @@ Also, Opcache is used to increase the PHP performance. If you use PHUZZ to debug
 
 This folder contains the PHP files that will be copied into the docker container to perform the target instrumentation. 
 
-`__fuzzer_startcov.php` is loaded by `auto_prepend_file` in the PHP configuration, and `__fuzzer_stopcov.php` executed by `auto_append_file`. The former initializes the coverage collection and loads the function hook definitions which are in separate files in `overrides.d/`.
+`__fuzzer__startcov.php` is loaded by `auto_prepend_file` in the PHP configuration, and `__fuzzer__stopcov.php` executed by `auto_append_file`. The former initializes the coverage collection and loads the function hook definitions which are in separate files in `overrides.d/`.
 
-The instrumentation is done for all 
+Instrumentation reports coverage, exceptions/errors and sink-specific signals
+through shared artifacts; fuzzer checkers consume them by request/coverage ID.
+See [architecture](../docs/reference/architecture.md) for admission and findings.
+Check image/source parity in a fresh runtime before claiming an extension change
+is active.

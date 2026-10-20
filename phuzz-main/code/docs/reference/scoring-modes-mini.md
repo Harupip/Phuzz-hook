@@ -1,5 +1,8 @@
 # PHUZZ Scoring Modes Mini Doc
 
+Cập nhật theo code **2026-10-09**. Test count cuối tài liệu là lịch sử;
+kiểm chứng hiện tại trong [review record](../reports/2026-10-09-documentation-review.md).
+
 ## Da lam duoc gi
 
 - `DefaultScoringFormula` trong `core/scoring.py` bay gio la bo chon mode scoring.
@@ -67,9 +70,11 @@
   - `base = max(1, int(base_energy))`
   - `hook = clamp(hook_energy, 0.0, 1.0)`
   - `W = clamp(weight, 0.0, 1.0)`
-  - `H = max(min_hook_scale, base)`
+  - `H = max(min_hook_scale, base, largest_base_energy_seen_by_tracker)`
   - `final_energy = ceil((base * W) + (hook * (1 - W) * H))`
 - Final energy van duoc floor ve it nhat `1` de scheduler co integer budget hop le
+- `HookEnergyTracker.remember_max_energy_scale()` giữ scale lớn nhất đã thấy
+  trong worker; candidate base nhỏ vẫn dùng scale đã nhớ.
 - `candidate` se duoc cap nhat them:
   - `base_score`
   - `base_priority`
@@ -117,13 +122,17 @@ PHUZZ_SCORING_MODE=2
   - phan trong so giu lai cho PHUZZ base energy trong weighted blend
 - `FUZZER_HOOK_MIN_ENERGY_SCALE`
   - mac dinh: `4`
-  - khi `base_energy` nho, phan hook side van scale toi thieu theo moc nay
+  - floor cho scale; tracker còn giữ base energy lớn nhất đã thấy trong worker
 - `FUZZER_HOOK_ENERGY_WEIGHT`
   - deprecated fallback alias
   - chi duoc doc khi `FUZZER_HOOK_ENERGY_BASE_WEIGHT` khong duoc set
 - `PHUZZ_SCORE_DEBUG`
   - mac dinh: `0`
   - `1` de in log chi tiet khi `calculate_score()` dem path/line
+
+- `PHUZZ_TRACE_REQUESTS`
+  - code mặc định `0`, `scoring.env` hiện đặt `1`
+  - log method, URL, mutated param, status, body length; không đổi scoring
 
 ## Ghi chu quan trong
 

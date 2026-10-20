@@ -14,6 +14,17 @@ while [[ RET -ne 0 ]]; do
     RET=$?
 done
 
+resolve_plugin_zip() {
+    if [[ -f "/plugin-zips/$1.zip" ]]; then
+        printf '%s' "/plugin-zips/$1.zip"
+    else
+        printf '%s' "./_plugins/$1.zip"
+    fi
+}
+target_plugin_zip=$(resolve_plugin_zip "${WP_TARGET_PLUGIN}")
+woocommerce_zip=$(resolve_plugin_zip woocommerce)
+contact_form_zip=$(resolve_plugin_zip contact-form-7)
+
 cat > ./install.sh <<EOF
 export FUZZER_SETUP=1;
 # wget https://github.com/wp-cli/wp-cli/releases/download/v2.7.1/wp-cli-2.7.1.phar
@@ -28,12 +39,12 @@ export HOME=/tmp
 # Download plugins via:  wget https://downloads.wordpress.org/plugin/<plugins-slug>.<version>.zip 
 
 if [[ ${WP_TARGET_PLUGIN} == 'udraw' ]]; then
-./wp-cli.phar plugin install ./_plugins/woocommerce.zip --activate
+./wp-cli.phar plugin install "${woocommerce_zip}" --activate
 fi
 if [[ ${WP_TARGET_PLUGIN} == 'country-state-city-auto-dropdown' ]]; then
-./wp-cli.phar plugin install ./_plugins/contact-form-7.zip --activate
+./wp-cli.phar plugin install "${contact_form_zip}" --activate
 fi
-./wp-cli.phar plugin install ./_plugins/${WP_TARGET_PLUGIN}.zip --activate
+./wp-cli.phar plugin install "${target_plugin_zip}" --activate
 
 # SQLi (5/5)
 #./wp-cli.phar plugin install ./_plugins/kivicare-clinic-management-system.2.3.8.zip --activate # --version=2.3.8 # SQLi https://wpscan.com//vulnerability/53f493e9-273b-4349-8a59-f2207e8f8f30

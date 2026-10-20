@@ -1,6 +1,8 @@
 PHUZZ
 =====================================
 
+> HookPhuzz working-tree documentation refreshed 2026-10-09: see the [workspace entrypoint](../README.md), [run guide](code/docs/guides/run-wordpress-plugins.md) and [architecture](code/docs/reference/architecture.md). The paper abstract/features below describe upstream PHUZZ; the current WordPress runner supports only online-linked.
+
 PHUZZ is a grey-box coverage-guided fuzzer for PHP web applications developed by Sebastian Neef, Lorenz Kleissner & Jean-Pierre Seifert and was published at AsiaCCS 2024 [0]. 
 
 ## Features
@@ -52,23 +54,14 @@ Please also check the subfolders as many have a README with additional informati
 
 ## Quick run
 
-```
-# Clone the repository
-git clone https://github.com/gehaxelt/phuzz.git
-cd phuzz/code/
-
-sudo docker-compose up -d db --build --force-recreate
-sleep 15s # give the DB some time to start up - might be shorter or longer depending on your hardware. When in doubt, check with docker-compose logs -f db.
-sudo docker-compose up -d web --build --force-recreate
-sleep 15s # give the DB some time to start up - might be shorter or longer depending on your hardware. When in doubt, check with docker-compose logs -f db.
-
-sudo docker-compose up fuzzer-wordpress-show-all-comments-in-one-page-1 --build --force-recreate
-# Let the fuzzer run for a while and terminate it with ctrl+c
-# View the results with
-less fuzzer/output/workers/fuzzer-1/vulnerable-candidates.json
+```powershell
+# From the HookPhuzz repository root
+Set-Location phuzz-main/code
+pwsh -NoProfile -File ./phuzz.ps1 -PluginSlug imsanity -DryRun
+pwsh -NoProfile -NonInteractive -File ./phuzz.ps1 -PluginSlug imsanity
 ```
 
-The default compose file expects the matching WordPress plugin archive to exist in `code/web/applications/wordpress/_plugins/`.
+Prepare `<slug>.zip` in `PLUGIN_ZIP_DIR` configured by `code/phuzz.env`, or `code/web/applications/wordpress/_plugins/`. The runner supplies the Zend Compose override, bootstrap and replay gates. Use `-AllPlugins` for sequential ZIP campaigns. Read `code/fuzzer/output/online-linked/<run-id>/batch-state.json` and `final-config-summary.json`; exit 0 or exported configs alone are not a fuzzing PASS.
 
 ## Contributions & Future Work
 

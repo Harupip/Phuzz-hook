@@ -1,5 +1,10 @@
 # PHUZZ Hook Coverage Integration Plan
 
+> Historical integration plan. Paths/status below reflect the original snapshot.
+> Current implementation, including completed online-linked functionality, is in
+> [architecture](phuzz-main/code/docs/reference/architecture.md) and
+> [flow](phuzz-main/code/docs/guides/online-linked-flow.md), reviewed 2026-10-09.
+
 ## Goal
 
 - Ghep `Fuzz_WP` vao `phuzz-main` theo huong them adapter, han che sua source cu.

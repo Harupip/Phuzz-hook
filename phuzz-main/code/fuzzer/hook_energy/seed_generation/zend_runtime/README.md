@@ -1,11 +1,16 @@
 # Zend runtime seed generation
 
-This folder is the runtime-only Zend/UOPZ boundary.
+This folder contains the Zend bridge shared by online-linked.
 
-- `candidate_generator.py` creates bootstrap candidates from runtime coverage and registration metadata.
-- `export_cli.py` exports those candidates without copying or scanning plugin source.
+Reviewed 2026-10-09. The [current architecture](../../../../docs/reference/architecture.md)
+and [online-linked guide](../../../../docs/guides/online-linked-flow.md) take
+precedence over historical generated-mode instructions. Paths below are relative
+to the `fuzzer` root, except `bridge_cli.py` in this folder.
+
+- `seed_generation/skeleton/candidate_generator.py` creates bootstrap candidates from runtime coverage and registration metadata.
+- `cli/export_zend_seeds.py` exports those candidates without copying or scanning plugin source.
 - `bridge_cli.py` correlates Pass 1/Pass 2 UOPZ artifacts with Zend evidence and runs convergence helpers.
-- `artifact_retention.py` prunes only current-run Zend intermediates after terminal success.
+- `artifacts/retention/generated_runs.py` owns the generated-run retention API.
 
 Runtime contract:
 
@@ -14,7 +19,19 @@ Runtime contract:
 - Ambiguous, JSON-only, unsupported, or uncorrelated `REQUEST` evidence is
   rejected. Pass 2 uses the same resolver as Pass 1.
 
+Current admission can use helper-attributed reads and correlated `isset`/`empty`
+presence when exact request/callback/source/transport evidence supports them.
+A guard without the request key remains pending; raw guards are not renamed reads.
+COOKIE discovery is opt-in via Python `--runtime-cookie-probes`; PowerShell does
+not enable it. REST provenance retains query/form/JSON/path distinctions.
+Pending probe discovery can consume correlated HTTP 400–599 reads, without
+relaxing final readiness/replay/Pass 2 gates.
+
 Retention contract:
+
+The following is the **generated-run API** contract, not automatic online-linked
+pruning. The current PowerShell runner has no `-KeepDebugArtifacts` flag and
+keeps host online-linked campaign history.
 
 - Success statuses: `PASS`, `SUCCESS`, `CONVERGED`, and
   `PASS_PARTIAL_AUTH_EXPECTED` prune registry, Pass 1, target, iteration, log,
@@ -22,14 +39,16 @@ Retention contract:
 - Success keeps `zend_convergence_summary.json`, `final/`, the final replay
   summary, and usable generated configs/summaries.
 - Failure or timeout preserves the full current run tree.
-- `-KeepDebugArtifacts` preserves all success-run intermediates.
-- The public run-directory name is `<plugin-slug>-<UTC timestamp>`; the
-  existing `legacy_run_id` field/argument remains only for compatibility.
+- API `keep_debug_artifacts=True` preserves success-run intermediates.
+- Run directory names use `<plugin-slug>-<timestamp>Z`; the wrapper currently
+  uses host-local `Get-Date`, so the suffix alone does not prove UTC.
+  `legacy_run_id` remains a compatibility identifier.
 
 ## Runtime CmpLog contract
 
-CmpLog is an opt-in, runtime-only enrichment of the existing Zend artifact. It
-is enabled by the generated Zend runner with `HOOKPHUZZ_CMPLOG=1` and does not
+CmpLog is runtime-only enrichment of the existing Zend artifact. It is enabled
+by the online-linked runner with `HOOKPHUZZ_CMPLOG=1`; standalone fuzzer use
+defaults to disabled without that setting. It does not
 change the normal candidate, convergence, or replay contracts.
 
 The vertical slice is:
@@ -104,8 +123,9 @@ they may appear in an experiment only after the runtime has discovered them.
 Focused verification:
 
 ```powershell
-rtk python -m unittest fuzzer.tests.test_cmplog fuzzer.tests.test_cmplog_extension
-rtk php -l fuzzer/tests/fixtures/hookphuzz-cmplog-fixture.php
+# From phuzz-main/code, with a writable temporary directory
+python -B -c "import subprocess,sys; r=subprocess.run([sys.executable,'-B','-m','unittest','fuzzer.tests.test_cmplog','fuzzer.tests.test_cmplog_extension'],timeout=180); sys.exit(r.returncode)"
+php -l fuzzer/tests/fixtures/hookphuzz-cmplog-fixture.php
 ```
 
 The fixture covers strict/normal/reversed comparisons, string switch dispatch,
@@ -113,4 +133,4 @@ constant and unprovenance negative controls, deduplication, and two-parameter
 non-crossing. The PHP extension must also be built and exercised in the local
 Docker runtime before claiming an end-to-end proof.
 
-Do not add `InputSignatureExtractor` or `SourcePathResolver` imports here. Static source extraction lives in the parent seed-generation path (`static_generator.py` and `export_cli.py`) and is not part of `-UseZendDiscovery`.
+Do not add `InputSignatureExtractor` or `SourcePathResolver` imports here. Static source extraction lives in `seed_generation/source_assisted/` and `cli/export_seeds.py`, outside runtime-only discovery.

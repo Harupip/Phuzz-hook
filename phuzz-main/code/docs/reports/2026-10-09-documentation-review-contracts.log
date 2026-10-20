@@ -1,0 +1,180 @@
+.........................................................................................................................................Config skipped plugin|cb-fixture|ajax_unauthenticated|wp_ajax_nopriv_fixture|/wp-admin/admin-ajax.php|POST|post/v2: GATE_NOT_VERIFIED
+..Config skipped plugin|cb-fixture|ajax_unauthenticated|wp_ajax_nopriv_fixture|/wp-admin/admin-ajax.php|POST|post/v2: GATE_NOT_VERIFIED
+..Config skipped plugin|cb-fixture|ajax_unauthenticated|wp_ajax_nopriv_fixture|/wp-admin/admin-ajax.php|POST|post/v4: GATE_NOT_VERIFIED
+.Config skipped plugin|cb-fixture|ajax_unauthenticated|wp_ajax_nopriv_fixture|/wp-admin/admin-ajax.php|POST|post/v10: GATE_NOT_VERIFIED
+...Config skipped plugin|cb-fixture|ajax_unauthenticated|wp_ajax_nopriv_fixture|/wp-admin/admin-ajax.php|POST|post/v3: NOT_FUZZING_READY
+Config skipped plugin|cb-fixture|ajax_unauthenticated|wp_ajax_nopriv_fixture|/wp-admin/admin-ajax.php|POST|post/v2: NOT_FUZZING_READY
+Config skipped plugin|cb-fixture|ajax_unauthenticated|wp_ajax_nopriv_fixture|/wp-admin/admin-ajax.php|POST|post/v1: GATE_NOT_VERIFIED
+Config skipped plugin|cb-fixture|ajax_unauthenticated|wp_ajax_nopriv_fixture|/wp-admin/admin-ajax.php|POST|post/v0: GATE_NOT_VERIFIED
+..Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmph40j16mg\output\online-linked\run\batch-state.json
+Online-linked campaign status: complete
+Online-linked candidates: 2
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 1, "VULN_FOUND": 1}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmplx2a5ocv\output\online-linked\run\batch-state.json
+Online-linked campaign status: complete
+Online-linked candidates: 5
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 5}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp_kc68p9u\output\online-linked\run\batch-state.json
+Online-linked campaign status: complete_with_skips
+Online-linked candidates: 2
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 1, "NOT_VERIFIED": 1}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpjb47mhup\output\online-linked\run\batch-state.json
+Online-linked campaign status: complete_with_skips
+Online-linked candidates: 2
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 1, "NOT_VERIFIED": 1}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp9z9tiaht\output\online-linked\run\batch-state.json
+Online-linked campaign status: complete_with_skips
+Online-linked candidates: 2
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 1, "NOT_VERIFIED": 1}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmplilgsyla\output\online-linked\run\batch-state.json
+Online-linked campaign status: complete
+Online-linked candidates: 5
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 5}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp04fy5nue\output\online-linked\run\batch-state.json
+Online-linked campaign status: PARTIAL
+Online-linked candidates: 4
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 4}
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpy7zkcg68\output\online-linked\campaign\final-configs (0 files, 1 skipped)
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpy7zkcg68\output\online-linked\campaign\batch-state.json
+Online-linked campaign status: complete
+Online-linked candidates: 1
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 1}
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpg_y6t8cx\output\online-linked\campaign\final-configs (0 files, 1 skipped)
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpg_y6t8cx\output\online-linked\campaign\batch-state.json
+Online-linked campaign status: complete
+Online-linked candidates: 1
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 1}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp1iul2frf\output\online-linked\run\batch-state.json
+Online-linked campaign status: complete
+Online-linked candidates: 2
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 2}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp1iul2frf\output\online-linked\run\batch-state.json
+Online-linked campaign status: PARTIAL
+Online-linked candidates: 1
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 1}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp1iul2frf\output\online-linked\run\batch-state.json
+Online-linked campaign status: complete
+Online-linked candidates: 2
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 2}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpjs528dfb\output\online-linked\run\batch-state.json
+Online-linked campaign status: complete
+Online-linked candidates: 2
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 1, "VULN_FOUND": 1}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpdu9lsae6\output\online-linked\run\batch-state.json
+Online-linked campaign status: PARTIAL
+Online-linked candidates: 1
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 1}
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpjx4sg7_h\output\online-linked\campaign\final-configs (0 files, 1 skipped)
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpjx4sg7_h\output\online-linked\campaign\batch-state.json
+Online-linked campaign status: PARTIAL
+Online-linked candidates: 1
+Online-linked terminal statuses: {"PARTIAL": 1}
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpjx4sg7_h\output\online-linked\campaign\final-configs (0 files, 1 skipped)
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpjx4sg7_h\output\online-linked\campaign\batch-state.json
+Online-linked campaign status: complete
+Online-linked candidates: 1
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 1}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpl4or2tre\output\online-linked\run\batch-state.json
+Online-linked campaign status: PARTIAL
+Online-linked candidates: 1
+Online-linked terminal statuses: {"PARTIAL": 1}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp1spe0ucl\output\online-linked\run\batch-state.json
+Online-linked campaign status: PARTIAL
+Online-linked candidates: 32
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 32}
+Online-linked batch state: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpmtqkra9s\output\online-linked\run\batch-state.json
+Online-linked campaign status: complete
+Online-linked candidates: 33
+Online-linked terminal statuses: {"BOUNDED_ONLINE_COMPLETE": 33}
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp7v8zevqa\case-False-False-False (1 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp7v8zevqa\case-True-False-False (1 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp7v8zevqa\case-False-True-False (2 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp7v8zevqa\case-False-False-True (2 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpg51mb2n5\final-configs (1 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpiowwsn5p\final-configs (1 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp3kac5qt9\final-configs (1 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpob3azdys\final-configs (2 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpdkxtk6zb\False (1 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpdkxtk6zb\True (1 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpvsbajxca\final-configs (0 files, 2 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpomf5oqnz\method (2 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpomf5oqnz\auth (2 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpomf5oqnz\policy (2 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpomf5oqnz\fixed_type (2 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpomf5oqnz\bucket (2 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp3yac54x5\final-configs (0 files, 1 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpvz9o1n0f\final-configs (1 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpvz9o1n0f\final-configs (1 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpvz9o1n0f\final-configs (1 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpd53arp6w\final-configs (3 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpd53arp6w\second-export (3 files, 0 skipped)...........Config comparison input error: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp_kitz1y_\online-linked\run-1: invalid final config selection
+Config comparison input error: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp_kitz1y_\online-linked\run-1: invalid final config selection
+...s..Config comparison input error: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpep_m8upy\online-linked\run-1\batch-state.json: batch campaign_status is not a completed comparison state
+Config comparison input error: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpep_m8upy\online-linked\run-1\batch-state.json: batch state legacy_run_id does not match the run directory
+Config comparison input error: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpep_m8upy\online-linked\run-1\batch-state.json: [Errno 2] No such file or directory: 'C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\.dt\\tmpep_m8upy\\online-linked\\run-1\\batch-state.json'
+Config comparison input error: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpep_m8upy\outside.json: final config must be a direct child of final-configs
+..Config comparison input error: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp1u65il1o\online-linked\run-1\batch-state.json: batch state would overwrite an input
+Config comparison input error: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp1u65il1o\online-linked\run-1\config-comparison.json: report or batch state would overwrite an input
+......Config comparison report write failed at C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp7_m8zw2b\online-linked\run-1\config-comparison.json: replace blocked
+...................................................................s..................
+----------------------------------------------------------------------
+Ran 258 tests in 139.615s
+
+OK (skipped=2)
+
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp63e_nbq2\final-configs (2 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp63e_nbq2\final-configs (2 files, 0 skipped)
+Final configs: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp5p2rzytc\final-configs (1 files, 0 skipped)
+  1) chosen.json
+  2) other.json
+  1) chosen.json
+  2) other.json
+  1) chosen.json
+  2) other.json
+  1) chosen.json
+  2) other.json
+
+Config comparison cancelled.
+  1) chosen.json
+  2) other.json
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpknd6qgtr\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpknd6qgtr\online-linked\run-1\final-configs\chosen.json
+Config comparison counts: MATCH=1 MISMATCH=0 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=0
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpknd6qgtr\online-linked\run-1\config-comparison.json
+Config comparison prompt skipped: no interactive terminal.
+Config comparison skipped: no final configs exported.
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpy_dlggrz\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpy_dlggrz\online-linked\run-1\final-configs\missing.json
+Config comparison counts: MATCH=0 MISMATCH=0 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=0
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpy_dlggrz\online-linked\run-1\config-comparison.json
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpyb5om5by\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpyb5om5by\online-linked\run-1\final-configs\chosen.json
+Config comparison counts: MATCH=0 MISMATCH=0 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=0
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpyb5om5by\online-linked\run-1\config-comparison.json
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpx5xubge5\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpx5xubge5\online-linked\run-1\final-configs\chosen.json
+Config comparison counts: MATCH=0 MISMATCH=0 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=0
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpx5xubge5\online-linked\run-1\config-comparison.json
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp8pmdn634\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp8pmdn634\online-linked\run-1\final-configs\chosen.json
+Config comparison counts: MATCH=0 MISMATCH=0 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=0
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp8pmdn634\online-linked\run-1\config-comparison.json
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpopqt9_e_\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpopqt9_e_\online-linked\run-1\final-configs\chosen.json
+Config comparison counts: MATCH=0 MISMATCH=0 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=1
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpopqt9_e_\online-linked\run-1\config-comparison.json
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp0c3g2gsz\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp0c3g2gsz\online-linked\run-1\final-configs\chosen.json
+Config comparison counts: MATCH=0 MISMATCH=1 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=0
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmp0c3g2gsz\online-linked\run-1\config-comparison.json
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpk0c9y77x\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpk0c9y77x\online-linked\run-1\final-configs\chosen.json
+Config comparison counts: MATCH=0 MISMATCH=1 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=0
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpk0c9y77x\online-linked\run-1\config-comparison.json
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpylmfw8fl\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpylmfw8fl\online-linked\run-1\final-configs\chosen.json
+Config comparison counts: MATCH=0 MISMATCH=1 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=0
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpylmfw8fl\online-linked\run-1\config-comparison.json
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmps342e33b\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmps342e33b\online-linked\run-1\final-configs\chosen.json
+Config comparison counts: MATCH=1 MISMATCH=0 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=0
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmps342e33b\online-linked\run-1\config-comparison.json
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmps342e33b\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmps342e33b\online-linked\run-1\final-configs\other.json
+Config comparison counts: MATCH=0 MISMATCH=1 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=0
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmps342e33b\online-linked\run-1\config-comparison.json
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpjdg99iy3\run folder with spaces\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpjdg99iy3\run folder with spaces\online-linked\run-1\final-configs\chosen.json
+Config comparison counts: MATCH=1 MISMATCH=0 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=0
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmpjdg99iy3\run folder with spaces\online-linked\run-1\config-comparison.json
+Config comparison: expected=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmprnr7xyil\experiment reference with spaces.json actual=C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmprnr7xyil\online-linked\run-1\final-configs\chosen.json
+Config comparison counts: MATCH=1 MISMATCH=0 NO_REFERENCE=0 AMBIGUOUS=0 INVALID=0
+Config comparison report: C:\Users\nghia.cd_extremevn\Desktop\Phuzz-hook\.dt\tmprnr7xyil\online-linked\run-1\config-comparison.json

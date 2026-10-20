@@ -73,7 +73,15 @@ function Resolve-PhuzzRuntimeSettings {
     )
 
     $settings = Read-PhuzzEnv -Path $Path
+    $pluginZipDirectory = [string]$settings["PLUGIN_ZIP_DIR"]
+    if (-not [string]::IsNullOrWhiteSpace($pluginZipDirectory)) {
+        if (-not [System.IO.Path]::IsPathRooted($pluginZipDirectory)) {
+            $pluginZipDirectory = Join-Path (Split-Path -Parent $Path) $pluginZipDirectory
+        }
+        $pluginZipDirectory = [System.IO.Path]::GetFullPath($pluginZipDirectory)
+    }
     return [ordered]@{
+        PluginZipDirectory = $pluginZipDirectory
         OnlineComparePrompt = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineComparePrompt" -Key "ONLINE_COMPARE_PROMPT" -Default 0 -Minimum 0 -Maximum 1
         OnlineTimeoutSeconds = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineTimeoutSeconds" -Key "ONLINE_TIMEOUT_SECONDS" -Default 120 -Minimum 1 -Maximum 120
         OnlineMaxVersions = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineMaxVersions" -Key "ONLINE_MAX_VERSIONS" -Default 2 -Minimum 1 -Maximum 20
@@ -81,4 +89,20 @@ function Resolve-PhuzzRuntimeSettings {
         OnlineCampaignTimeoutSeconds = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineCampaignTimeoutSeconds" -Key "ONLINE_CAMPAIGN_TIMEOUT_SECONDS" -Default 3600 -Minimum 1 -Maximum 86400
         StopOnVulnCount = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "StopOnVulnCount" -Key "HOOKPHUZZ_STOP_ON_VULN" -Default 0 -Minimum 0 -Maximum 100000
     }
+}
+
+function Resolve-PhuzzPluginZip {
+    param(
+        [string]$ScriptRoot,
+        [string]$PluginZipDirectory,
+        [string]$PluginSlug
+    )
+
+    if ($PluginZipDirectory) {
+        $preferred = Join-Path $PluginZipDirectory "$PluginSlug.zip"
+        if (Test-Path -LiteralPath $preferred -PathType Leaf) {
+            return $preferred
+        }
+    }
+    return Join-Path $ScriptRoot "web\applications\wordpress\_plugins\$PluginSlug.zip"
 }

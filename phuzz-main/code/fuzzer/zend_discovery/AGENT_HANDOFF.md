@@ -1,5 +1,11 @@
 # Zend Discovery Agent Handoff
 
+> Historical handoff and dated evidence. Reviewed 2026-10-09: generated/zend
+> wrapper modes below are retired. Current module paths, helper/guard/COOKIE
+> admission, budgets, resume and export are in [architecture](../../docs/reference/architecture.md)
+> and [flow](../../docs/guides/online-linked-flow.md). Dated evidence is not
+> acceptance of today's working tree.
+
 ## 2026-08-25 LearnPress admin-post proof follow-up
 
 The real-plugin LearnPress proof is still **BLOCKED**, not PASS. Generic
