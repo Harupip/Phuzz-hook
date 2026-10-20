@@ -23,12 +23,16 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
     summaries = []
     for candidate in batch["candidates"]:
         identity = candidate["identity"]
-        if identity in seen:
+        context_key = candidate.get("context_key")
+        export_key = str(context_key) if context_key else identity
+        if export_key in seen:
             continue
-        seen.add(identity)
+        seen.add(export_key)
         summary = {"identity": identity, "hook_name": candidate.get("hook_name"),
                    "selected_version": None, "exported_configs": [], "skipped_versions": [],
                    "discovery_status": "NOT_ASSESSED"}
+        if context_key:
+            summary["context_key"] = str(context_key)
         summaries.append(summary)
         try:
             state_path = Path(candidate["state_path"])
@@ -84,7 +88,7 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
                 replacement["superseded_versions"].append(version["version"])
                 continue
             hook = re.sub(r"[^A-Za-z0-9_-]+", "-", candidate.get("hook_name", "hook"))[:40]
-            suffix = hashlib.sha256(identity.encode()).hexdigest()[:16]
+            suffix = hashlib.sha256(export_key.encode()).hexdigest()[:16]
             version_suffix = f".{version['version']}" if exported else ""
             config_path = destination / f"fuzzer-config.{hook}.{suffix}{version_suffix}.json"
             config_path = next((path for path in filesystem_path(destination).glob(f"fuzzer-config.{hook}.{suffix}*.json")
@@ -158,12 +162,13 @@ def _archive_superseded_exports(previous: dict, summaries: list[dict], destinati
     """Keep prior bytes, but remove replaced exports from the active flat folder."""
     active = {filesystem_path(row["config_path"]).resolve()
               for summary in summaries for row in summary["exported_configs"]}
-    replaced = {(summary["identity"], version) for summary in summaries
+    replaced = {(summary.get("context_key") or summary["identity"], version) for summary in summaries
                 for row in summary["exported_configs"]
                 for version in row["superseded_versions"] + row["equivalent_versions"]}
     for summary in previous.get("candidates", []):
+        export_key = summary.get("context_key") or summary["identity"]
         for row in summary.get("exported_configs", []):
-            if (summary["identity"], row["version"]) not in replaced:
+            if (export_key, row["version"]) not in replaced:
                 continue
             path = filesystem_path(row["config_path"])
             if path.resolve() in active or path.resolve().parent != filesystem_path(destination).resolve() or not path.is_file():

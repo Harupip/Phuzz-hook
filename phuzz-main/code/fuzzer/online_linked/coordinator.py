@@ -47,6 +47,8 @@ from hook_energy.seed_generation.zend_runtime.bridge_cli import (
 )
 from seed_generation.config.config_exporter import (
     SeedConfigSkip,
+    _fuzzable_params_for_section,
+    _string_set,
     _force_replay_only,
     build_config_for_seed_item,
     export_seed_configs,
@@ -67,6 +69,7 @@ ProbeSender = Callable[..., dict[str, Any]]
 Pass2Verifier = Callable[..., dict[str, int]]
 ConfigBuilder = Callable[..., tuple[str, dict[str, Any]]]
 RuntimeBatchReader = Callable[..., dict[str, Any]]
+_CANDIDATE_CONTEXT_KEY_VERSION = 1
 
 
 def _budget_pair(name: str, initial: int, hard: int | None, default: int,
@@ -257,6 +260,7 @@ class OnlineLinkedCoordinator:
             raise ValueError("callback registry must be an object")
         self.state: dict[str, Any] = {
             "schema_version": 1,
+            "context_key_version": _CANDIDATE_CONTEXT_KEY_VERSION,
             "mode": "online-linked",
             "plugin_slug": plugin_slug,
             "legacy_run_id": legacy_run_id,
@@ -276,6 +280,7 @@ class OnlineLinkedCoordinator:
             "pending_runtime_candidates": [],
             "candidate_queue": [],
             "queued_candidate_ids": [],
+            "queued_candidate_context_keys": [],
             "events": [],
             "workers": [],
             "terminal_status": None,
@@ -1061,13 +1066,15 @@ class OnlineLinkedCoordinator:
                 seed.update(decision)
                 seed["seed_variant_id"] = str(decision.get("seed_variant_id") or "")
                 entrypoint_type = str(seed.get("entrypoint_type") or callback.get("entrypoint_type") or "")
-                identity = _candidate_identity({
+                candidate = {
                     "callback_id": callback_id,
                     "hook_name": hook_name,
                     "entrypoint_type": entrypoint_type,
                     "seed": seed,
-                }, self.plugin_slug)
-                if identity in self.state["queued_candidate_ids"]:
+                }
+                identity = _candidate_identity(candidate, self.plugin_slug)
+                context_key = _candidate_context_key(candidate, self.plugin_slug)
+                if context_key in self.state["queued_candidate_context_keys"]:
                     continue
                 child = {
                     "hook_name": hook_name,
@@ -1075,6 +1082,7 @@ class OnlineLinkedCoordinator:
                     "callback_repr": str(callback.get("callback_repr") or callback_id),
                     "seed": seed,
                     "identity": identity,
+                    "context_key": context_key,
                     "lineage": {
                         "parent_version": parent["version"],
                         "parent_request_id": request_id,
@@ -1083,9 +1091,11 @@ class OnlineLinkedCoordinator:
                     },
                 }
                 self.state["candidate_queue"].append(child)
-                self.state["queued_candidate_ids"].append(identity)
+                if identity not in self.state["queued_candidate_ids"]:
+                    self.state["queued_candidate_ids"].append(identity)
+                self.state["queued_candidate_context_keys"].append(context_key)
                 discovered.append(child)
-                self._extend_progress_budget("runtime_callback", identity)
+                self._extend_progress_budget("runtime_callback", context_key)
                 deadline = self._deadline if deadline is not None else None
                 self._record_event({
                     "kind": "ACTION_DISCOVERY",
@@ -3626,6 +3636,13 @@ class OnlineLinkedCoordinator:
         ]
         if len(matches) != 1:
             return None
+        context_key = _candidate_context_key(item, self.plugin_slug)
+        self.state["candidate_context_key"] = context_key
+        if context_key not in self.state["queued_candidate_context_keys"]:
+            self.state["queued_candidate_context_keys"].append(context_key)
+        identity = _candidate_identity(item, self.plugin_slug)
+        if identity not in self.state["queued_candidate_ids"]:
+            self.state["queued_candidate_ids"].append(identity)
         return selected[0], selected[1], str(matches[0].get("candidate_key") or "")
 
     def _new_version(
@@ -3950,6 +3967,8 @@ class OnlineLinkedCoordinator:
                 "saved_at": time.time(),
             }
         self.state["checkpoint"] = {
+            "context_key_version": _CANDIDATE_CONTEXT_KEY_VERSION,
+            "candidate_context_key": self.state.get("candidate_context_key"),
             "reports": self._reports, "raw_report": self._raw_report,
             "targets": self._targets, "target_key": self._target_key,
             "active_version": self._active_version, "sender_seconds": self._sender_seconds,
@@ -3960,6 +3979,11 @@ class OnlineLinkedCoordinator:
     def _load_checkpoint(self) -> tuple[dict[str, Any], dict[str, Any]]:
         saved = json.loads(self.state_path.read_text(encoding="utf-8-sig"))
         checkpoint = saved.get("checkpoint", {})
+        if (saved.get("context_key_version") != _CANDIDATE_CONTEXT_KEY_VERSION
+                or checkpoint.get("context_key_version") != _CANDIDATE_CONTEXT_KEY_VERSION):
+            raise ValueError("resume candidate context-key version missing or unsupported")
+        if not isinstance(saved.get("queued_candidate_context_keys"), list):
+            raise ValueError("resume candidate context-key checkpoint is missing")
         if saved.get("terminal_status") not in {None, "PARTIAL"}:
             raise ValueError("resume requires a PARTIAL candidate")
         for field in ("plugin_slug", "legacy_run_id", "max_seconds", "hard_seconds", "hard_versions",
@@ -3977,6 +4001,10 @@ class OnlineLinkedCoordinator:
             if row.get("replay_config_hash") and self.config_hash(Path(row["replay_config_path"])) != row["replay_config_hash"]:
                 raise ValueError("resume replay config hash changed")
         version = next(row for row in saved["versions"] if row["version"] == checkpoint["active_version"])
+        candidate_context_key = saved.get("candidate_context_key")
+        if (not isinstance(candidate_context_key, str)
+                or checkpoint.get("candidate_context_key") != candidate_context_key):
+            raise ValueError("resume candidate request context changed")
         config_path = version.get("replay_config_path") or version["config_path"]
         config = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
         self.state = saved
@@ -4205,6 +4233,85 @@ def _batch_candidate_identity(item: Mapping[str, Any], plugin_slug: str) -> str:
     return _candidate_identity(item, plugin_slug)
 
 
+def _candidate_context_key(item: Mapping[str, Any], plugin_slug: str) -> str:
+    """Fingerprint a request context without provenance or fuzzable values."""
+    seed = item.get("seed") if isinstance(item.get("seed"), Mapping) else {}
+    fixed = _string_set(seed.get("fixed_params", []))
+    fuzzable = _string_set(seed.get("fuzzable_params", []))
+    roles = [{"name": name, "role": "fixed"} for name in sorted(fixed)]
+    roles.extend({"name": name, "role": "fuzzable"}
+                 for name in sorted(fuzzable - fixed))
+    scoped_normalized = {
+        bucket: {
+            name for name in _fuzzable_params_for_section(seed, fuzzable, config_key)
+            if name not in fixed and "nonce" not in name.lower()
+        }
+        for bucket, config_key in (
+            ("body", "body_params"), ("query_params", "query_params"),
+            ("headers", "headers"), ("cookies", "cookies"),
+        )
+    }
+    credential_normalized: dict[str, set[str]] = {}
+    input_roles = {}
+    input_params = seed.get("input_params", [])
+    for parameter in input_params if isinstance(input_params, list) else []:
+        if not isinstance(parameter, Mapping) or not parameter.get("name"):
+            continue
+        name = str(parameter["name"])
+        source = str(parameter.get("source") or "").upper()
+        location = str(parameter.get("location") or "").lower()
+        role = str(parameter.get("role") or "")
+        is_credential = any(token in role.lower() for token in ("nonce", "token"))
+        role_row = {
+            "name": name, "source": source, "location": location, "role": role,
+            "fuzzable": parameter.get("fuzzable") if type(parameter.get("fuzzable")) is bool else None,
+        }
+        input_roles[json.dumps(role_row, sort_keys=True, separators=(",", ":"))] = role_row
+        if not is_credential:
+            continue
+        bucket = (
+            "query_params" if source == "GET" or location == "query" else
+            "cookies" if source == "COOKIE" or location == "cookie" else
+            "headers" if source in {"HEADER", "HEADERS"} or location == "header" else
+            "json_params" if source in {"JSON", "JSON_BODY"} or location == "json" else
+            "body" if source == "POST" or location in {"form", "body"} else None
+        )
+        if bucket is not None:
+            credential_normalized.setdefault(bucket, set()).add(name)
+    roles.extend(input_roles[key] for key in sorted(input_roles))
+
+    def normalize(value: Any, bucket: str, *, top_level: bool = True) -> Any:
+        if isinstance(value, Mapping):
+            result = {}
+            for key, item in value.items():
+                name = str(key)
+                is_fuzzable = name in scoped_normalized.get(bucket, set())
+                is_credential = name in credential_normalized.get(bucket, set())
+                result[key] = ("<fuzzable>" if top_level and (is_fuzzable or is_credential)
+                               else normalize(item, bucket, top_level=False))
+            return result
+        if isinstance(value, list):
+            return [normalize(item, bucket, top_level=False) for item in value]
+        return value
+
+    descriptor = {
+        "identity": _candidate_identity(item, plugin_slug),
+        "path": seed.get("path"),
+        "method": str(seed.get("resolved_method") or seed.get("method") or "").upper(),
+        "content_type": seed.get("content_type"),
+        "auth_mode": seed.get("auth_mode", item.get("auth_mode")),
+        "request_buckets": {
+            bucket: normalize(seed.get(bucket, {}), bucket)
+            for bucket in ("query_params", "body", "json_params", "headers", "cookies")
+        },
+        "fixed_params": sorted(fixed),
+        "fuzzable_params": sorted(fuzzable),
+        "field_roles": roles,
+    }
+    encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _sync_callback_registry_to_web(registry_path: Path) -> None:
     """Reload callback targets in the running web container before child replay."""
     result = subprocess.run(
@@ -4273,6 +4380,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
         filesystem_path(batch_registry).write_text(filesystem_path(registry_source).read_text(encoding="utf-8-sig"), encoding="utf-8")
     batch_state: dict[str, Any] = {
         "schema_version": 1,
+        "context_key_version": _CANDIDATE_CONTEXT_KEY_VERSION,
         "mode": "online-linked-batch",
         "plugin_slug": args.plugin_slug,
         "legacy_run_id": args.legacy_run_id,
@@ -4290,13 +4398,16 @@ def run_online_linked(args: argparse.Namespace) -> int:
     skipped = False
     queue: list[tuple[int, Mapping[str, Any], str]] = []
     queued_ids: set[str] = set()
+    queued_context_keys: set[str] = set()
     for index, raw_item in enumerate(items, start=1):
         if not isinstance(raw_item, Mapping):
             continue
         identity = _batch_candidate_identity(raw_item, args.plugin_slug)
-        if identity in queued_ids:
+        context_key = _candidate_context_key(raw_item, args.plugin_slug)
+        if context_key in queued_context_keys:
             continue
         queued_ids.add(identity)
+        queued_context_keys.add(context_key)
         queue.append((index, dict(raw_item), "initial"))
     # Known input needs slots, not progress credit or extra campaign time.
     max_candidates = min(hard_max_candidates, max(initial_candidates, len(queue)))
@@ -4309,6 +4420,10 @@ def run_online_linked(args: argparse.Namespace) -> int:
     batch_state_path = batch_dir / "batch-state.json"
     if resume:
         saved = json.loads(batch_state_path.read_text(encoding="utf-8-sig"))
+        if saved.get("context_key_version") != _CANDIDATE_CONTEXT_KEY_VERSION:
+            raise ValueError("resume batch context-key version missing or unsupported")
+        if not isinstance(saved.get("queued_context_keys"), list):
+            raise ValueError("resume batch context-key queue is missing")
         if saved.get("resume_context") != context:
             raise ValueError("resume campaign context or budgets changed")
         budget = saved["budget"]
@@ -4320,6 +4435,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
         batch_state = saved
         queue = [(row["index"], row["item"], row["source"]) for row in saved["pending_candidates"]]
         queued_ids = set(saved["queued_ids"])
+        queued_context_keys = set(saved["queued_context_keys"])
         batch_state.update(campaign_status="running", terminal_reason=None)
         skipped = any(row.get("terminal_status") == "NOT_VERIFIED" for row in saved["candidates"])
 
@@ -4343,6 +4459,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
             batch_state.pop("registry_previous_hash", None)
             batch_state.pop("registry_snapshot", None)
         batch_state.update(effective_max_candidates=max_candidates, queued_ids=sorted(queued_ids),
+                           queued_context_keys=sorted(queued_context_keys),
                            campaign_deadline=campaign_deadline, hard_campaign_deadline=hard_campaign_deadline,
                            registry_snapshot_hash=hashlib.sha256(registry_bytes).hexdigest())
         batch_state["budget"] = {
@@ -4364,13 +4481,16 @@ def run_online_linked(args: argparse.Namespace) -> int:
     if resume and bool(getattr(args, "sync_registry", False)) and queue:
         _sync_callback_registry_to_web(batch_registry)
 
+    initial_context_keys = {_candidate_context_key(item, args.plugin_slug)
+                            for item in items if isinstance(item, Mapping)}
+
     def credit_progress(kind: str, key: str) -> float | None:
         nonlocal campaign_deadline, max_candidates
         identity = (kind, key)
         if identity in progress_keys:
             return None
         if time.monotonic() < campaign_deadline:
-            if kind == "runtime_callback" and key in initial_ids:
+            if kind == "runtime_callback" and key in initial_context_keys:
                 return None
             progress_keys.add(identity)
             campaign_deadline = min(hard_campaign_deadline,
@@ -4380,7 +4500,6 @@ def run_online_linked(args: argparse.Namespace) -> int:
             checkpoint()
         return campaign_deadline
 
-    initial_ids = {_batch_candidate_identity(item, args.plugin_slug) for item in items if isinstance(item, Mapping)}
     next_index = max([entry[0] for entry in queue] + [row["index"] for row in batch_state["candidates"]] + [0]) + 1
     while queue:
         queue.sort(key=lambda entry: not str(entry[1].get("hook_name") or "").startswith("wp_ajax_"))
@@ -4408,6 +4527,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
             "callback_id": str(raw_item.get("callback_id") or ""),
             "run_id": candidate_run_id,
             "identity": _batch_candidate_identity(raw_item, args.plugin_slug),
+            "context_key": _candidate_context_key(raw_item, args.plugin_slug),
             "source": source,
             "item": dict(raw_item),
             "input_path": str(candidate_input),
@@ -4466,23 +4586,27 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 if not isinstance(child, Mapping):
                     continue
                 child_identity = _batch_candidate_identity(child, args.plugin_slug)
-                if child_identity in queued_ids:
+                child_context_key = _candidate_context_key(child, args.plugin_slug)
+                if child_context_key in queued_context_keys:
                     continue
                 queued_ids.add(child_identity)
-                child_entry = (next_index, dict(child), "runtime_registration")
+                queued_context_keys.add(child_context_key)
+                child_item = {**dict(child), "context_key": child_context_key}
+                child_entry = (next_index, child_item, "runtime_registration")
                 next_index += 1
                 if time.monotonic() >= campaign_deadline:
                     batch_state["campaign_status"] = "CAMPAIGN_BUDGET_EXPIRED"
                     batch_state["expansion_events"].append({
                         "reason": "CAMPAIGN_BUDGET_EXPIRED",
                         "identity": child_identity,
+                        "context_key": child_context_key,
                         "lineage": dict(child.get("lineage") or {}),
                     })
                     queue.append(child_entry)
                     continue
                 # The coordinator already credited real discoveries. This also
                 # supports stored/fake queues without granting duplicate credit.
-                credit_progress("runtime_callback", child_identity)
+                credit_progress("runtime_callback", child_context_key)
                 if bool(getattr(args, "sync_registry", False)):
                     try:
                         _sync_callback_registry_to_web(batch_registry)
@@ -4490,6 +4614,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
                         batch_state["expansion_events"].append({
                             "reason": "CALLBACK_REGISTRY_REFRESH_FAILED",
                             "identity": child_identity,
+                            "context_key": child_context_key,
                             "detail": str(exc),
                             "lineage": dict(child.get("lineage") or {}),
                         })
@@ -4501,6 +4626,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
                         batch_state["expansion_events"].append({
                             "reason": "CAMPAIGN_BUDGET_EXPIRED",
                             "identity": child_identity,
+                            "context_key": child_context_key,
                             "lineage": dict(child.get("lineage") or {}),
                         })
                         queue.append(child_entry)

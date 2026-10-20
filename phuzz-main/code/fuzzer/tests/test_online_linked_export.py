@@ -245,6 +245,29 @@ class OnlineLinkedExportTests(unittest.TestCase):
         self.assertEqual({p.name for p in destination.iterdir()},
                          {p.name for p in (self.root / "final-configs").iterdir()})
 
+    def test_same_registration_identity_exports_each_context_without_filename_collision(self):
+        candidates = []
+        for index, (mode, context_key) in enumerate((("list", "context-list"), ("preview", "context-preview")), start=1):
+            config = self.config()
+            config["body_params"]["data"].append({"name": "mode", "value": mode})
+            config["body_params"]["fixed"].append("mode")
+            version = self.version("v0", config=config, config_path=self.root / "configs" / f"context-{index}.json")
+            candidate, _ = self.write_state(
+                versions=[version], run_id=f"campaign-candidate-{index}", filename=f"candidate-{index}.json"
+            )
+            candidate.update(index=index, context_key=context_key)
+            candidates.append(candidate)
+
+        batch_path = self.batch(candidates)
+        self.assertEqual(export_online_linked_batch(batch_path), 2)
+        summaries = json.loads((self.root / "final-config-summary.json").read_text())["candidates"]
+        self.assertEqual([row["identity"] for row in summaries], [candidates[0]["identity"], candidates[1]["identity"]])
+        self.assertEqual({row["context_key"] for row in summaries}, {"context-list", "context-preview"})
+        paths = [row["config_path"] for summary in summaries for row in summary["exported_configs"]]
+        self.assertEqual(len(set(paths)), 2)
+        self.assertEqual({json.loads(Path(path).read_text())["body_params"]["data"][-1]["value"] for path in paths},
+                         {"list", "preview"})
+
     def test_cumulative_parameters_export_only_verified_replacement(self):
         for rejected, changed_context, missing_proof in (
             (False, False, False), (True, False, False),

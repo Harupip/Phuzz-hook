@@ -178,7 +178,7 @@ class HookSeedImporter:
     def _is_replayable(self, callback: dict[str, Any]) -> bool:
         seed = callback.get("seed")
         return (
-            callback.get("status") == "uncovered"
+            callback.get("discovery_eligible", callback.get("status") == "uncovered") is True
             and callback.get("is_active") is True
             and callback.get("direct_http_supported") is True
             and callback.get("generation_status") == "supported_http_seed"
@@ -192,7 +192,7 @@ class HookSeedImporter:
 
     def _is_manual_only(self, callback: dict[str, Any]) -> bool:
         return (
-            callback.get("status") == "uncovered"
+            callback.get("discovery_eligible", callback.get("status") == "uncovered") is True
             and callback.get("is_active") is True
             and (
                 callback.get("direct_http_supported") is False
