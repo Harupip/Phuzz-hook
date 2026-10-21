@@ -1,4 +1,4 @@
-"""Copy each candidate's distinct verified configs into one folder."""
+"""Export verified configs and separate incomplete discovery drafts."""
 
 import hashlib
 import json
@@ -27,7 +27,7 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
             continue
         seen.add(identity)
         summary = {"identity": identity, "hook_name": candidate.get("hook_name"),
-                   "selected_version": None, "exported_configs": [], "skipped_versions": [],
+                   "selected_version": None, "exported_configs": [], "partial_configs": [], "skipped_versions": [],
                    "discovery_status": "NOT_ASSESSED"}
         summaries.append(summary)
         try:
@@ -107,11 +107,75 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
             if summary["selected_version"] is None:
                 summary.update(selected_version=version["version"], config_path=str(config_path))
         summary.update(_discovery_summary(state, verified_versions))
+        summary["partial_configs"] = _export_partial_config(state, versions, summary, destination)
     _archive_superseded_exports(previous, summaries, destination)
     filesystem_path(summary_path).write_text(json.dumps({"schema_version": 1, "candidates": summaries}, indent=2) + "\n", encoding="utf-8")
     skipped = sum(row["selected_version"] is None for row in summaries)
     print(f"Final configs: {destination} ({count} files, {skipped} skipped)")
+    partial_count = sum(len(row.get("partial_configs", [])) for row in summaries)
+    if partial_count:
+        print(f"Partial configs (unverified): {destination.parent / 'partial-configs'} ({partial_count} files)")
     return count
+
+
+def _export_partial_config(state: dict, versions: list[dict], summary: dict, destination: Path) -> list[dict]:
+    """Preserve observations at budget expiry without promoting them to verified inputs."""
+    reason = str(state.get("terminal_reason") or "")
+    parameters = summary["verified_parameters"] + summary["pending_parameters"]
+    if not versions or not parameters or not any(word in reason for word in ("BUDGET", "TIME_CAP", "LIMIT", "NO_NEW_PROGRESS")):
+        return []
+    version = versions[0]
+    config = json.loads(filesystem_path(version["config_path"]).read_text(encoding="utf-8-sig"))
+    if config_hash(config) != version.get("config_hash"):
+        raise ValueError(f"CONFIG_HASH_MISMATCH: {version['config_path']}")
+    placements = {("GET", "query"): "query_params", ("POST", "form"): "body_params",
+                  ("COOKIE", "cookie"): "cookies"}
+    unplaced = []
+    for parameter in parameters:
+        bucket = placements.get((parameter["source"], parameter["location"]))
+        if bucket is None:
+            unplaced.append(parameter)
+            continue
+        section = config.setdefault(bucket, {"data": [], "fixed": [], "fuzz": [], "weight": 1})
+        name = parameter["name"]
+        if not any(row.get("name") == name for row in section["data"]):
+            section["data"].append({"name": name, "value": "fuzz"})
+            section["fuzz"].append(re.escape(name))
+    metadata = config.setdefault("metadata", {})
+    if any(p["source"] == "POST" and p["location"] == "form" for p in parameters):
+        if config.get("methods") != ["POST"]:
+            config["methods"] = ["POST"]
+            metadata.update(resolved_method="POST", method_source="partial_export_inferred",
+                            method_confidence="unverified")
+    metadata.pop("online_request_seed", None)
+    metadata.pop("method_evidence", None)
+    config["config_type"] = "partial"
+    metadata["fuzzing_ready"] = False
+    metadata["partial_export"] = {
+        "status": "PARTIAL", "reason": reason,
+        "warning": "Discovery stopped before completion. Inputs may be missing or belong to incompatible branches. "
+                   "This combined config has not passed replay or Pass 2; it is not ready for fuzzing.",
+        "combined_request_verified": False,
+        "verified_parameters": summary["verified_parameters"],
+        "pending_parameters": summary["pending_parameters"],
+        "unplaced_parameters": unplaced,
+        "state_path": summary["state_path"],
+        "source_config_path": version["config_path"],
+    }
+    digest = config_hash(config)
+    hook = re.sub(r"[^A-Za-z0-9_-]+", "-", summary.get("hook_name") or "hook")[:40]
+    identity = hashlib.sha256(summary["identity"].encode()).hexdigest()[:16]
+    folder = destination.parent / "partial-configs"
+    filesystem_path(folder).mkdir(parents=True, exist_ok=True)
+    path = folder / f"fuzzer-config.{hook}.{identity}.{digest[:16]}.partial.json"
+    content = (json.dumps(config, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    if filesystem_path(path).exists():
+        if filesystem_path(path).read_bytes() != content:
+            raise ValueError(f"EXPORTED_CONFIG_CHANGED: {path}")
+    else:
+        with filesystem_path(path).open("xb") as output:
+            output.write(content)
+    return [{"config_path": str(path), "config_hash": digest, "status": "PARTIAL", "reason": reason}]
 
 
 def _covers_version(new_config: dict, newer: dict, old_config: dict, older: dict) -> bool:
@@ -203,6 +267,8 @@ def _discovery_summary(state: dict, selected_versions: list[str]) -> dict:
     for probe in state.get("probe_attempts", []):
         add([probe.get("candidate")], observed)
     add(state.get("pending_runtime_candidates"), observed)
+    for pending_probe in state.get("pending_probe_queue", []):
+        add([pending_probe.get("candidate")], observed)
     for attempt in state.get("replay_input_trials", []):
         add(attempt.get("expected_parameters"), observed)
     for event in state.get("events", []):

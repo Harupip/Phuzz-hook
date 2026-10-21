@@ -52,7 +52,7 @@ Options:
   -ForcePlugins                    Re-download the default plugin ZIP.
   -WebTimeoutSeconds <seconds>     WordPress readiness wait. Default: 240.
   -SeedWaitSeconds <seconds>       Live coverage snapshot wait. Default: 45.
-  -OnlineTimeoutSeconds <seconds>  Per-candidate budget. Default/max: 120.
+  -OnlineTimeoutSeconds <seconds>  Initial progress window. Loader default: 120; env/CLI overrides.
   -OnlineMaxVersions <count>       Versions including v0. Default: 2.
   -OnlineMaxCandidates <count>     Candidates per campaign. Default: 32.
   -OnlineCampaignTimeoutSeconds    Total campaign budget. Default: 3600.

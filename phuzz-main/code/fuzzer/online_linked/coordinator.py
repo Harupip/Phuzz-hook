@@ -196,8 +196,11 @@ class OnlineLinkedCoordinator:
     ) -> None:
         if type(max_seconds) is not int or type(max_versions) is not int:
             raise ValueError("initial candidate budgets must be positive integers")
-        max_seconds, hard_seconds = _budget_pair("candidate seconds", max_seconds, hard_seconds,
-                                                max_seconds * 4, 120)
+        if max_seconds < 1:
+            raise ValueError("candidate seconds must be a positive integer")
+        if hard_seconds is not None:
+            max_seconds, hard_seconds = _budget_pair("candidate seconds", max_seconds, hard_seconds,
+                                                    max_seconds, max_seconds)
         max_versions, hard_versions = _budget_pair("versions", max_versions, hard_versions,
                                                    max(20, max_versions * 4), 20)
         self.suggested_seeds = Path(suggested_seeds)
@@ -258,6 +261,7 @@ class OnlineLinkedCoordinator:
         self.state: dict[str, Any] = {
             "schema_version": 1,
             "mode": "online-linked",
+            "budget_policy": "progress_idle_v1",
             "plugin_slug": plugin_slug,
             "legacy_run_id": legacy_run_id,
             "max_seconds": max_seconds,
@@ -354,41 +358,7 @@ class OnlineLinkedCoordinator:
                 self._write_state()
                 return 1
             self._consume_gate_evidence(version, deadline=deadline)
-            if resumed and self._active_container and self.state["terminal_status"] is None:
-                for pending in list(self.state.get("pending_probe_queue", [])):
-                    parent = self._version(pending["parent_version"])
-                    if parent is None:
-                        continue
-                    if parent["version"] != self._active_version:
-                        self._stop_active_worker("RESUME_PENDING_PARENT")
-                        if self._active_container:
-                            break
-                        self._active_version = parent["version"]
-                        candidate = candidate_from_seed_item(parent["seed_item"], plugin_slug=self.plugin_slug)
-                        variant = str(parent["seed_item"]["seed"].get("seed_variant_id") or "")
-                        self._target_key = canonical_identity_id(candidate) + (f"::{variant}" if variant else "")
-                        parent["previous_worker_run_id"] = parent.get("worker_run_id")
-                        parent.setdefault("readiness_history", []).append(copy.deepcopy(parent.get("readiness")))
-                        activation = len(parent["readiness_history"])
-                        parent["worker_run_id"] = f"{self.legacy_run_id}-{parent['version']}-resume-{self.state['resume_count']}-activation-{activation}"
-                        parent_path = Path(parent.get("replay_config_path") or parent["config_path"])
-                        parent_config = json.loads(filesystem_path(parent_path).read_text(encoding="utf-8-sig"))
-                        if not self._gate_v0(parent, parent_config, deadline=self._deadline):
-                            break
-                        if not self._start_worker(parent, deadline=self._deadline):
-                            self.state.update(terminal_status="NOT_VERIFIED", terminal_reason="RESUME_PARENT_WORKER_START_FAILED")
-                            break
-                    convergence = dict(pending["convergence"])
-                    # Saved requests are proposals, never accepted evidence.
-                    convergence.update(new_parameters=[], known_parameters=parent.get("known_parameters", []),
-                                       pending_probes=[pending["candidate"]])
-                    self._run_pending_probe(
-                        parent=parent, evidence=pending["evidence"], raw_report=self._reports[parent["version"]],
-                        convergence=convergence, probe=pending["candidate"], seed=parent["seed_item"],
-                        deadline=self._deadline,
-                    )
-                    if self.state["terminal_status"] is not None:
-                        break
+            self._drain_pending_probes()
             if not self._active_container or self.state["terminal_status"] in {"VULN_FOUND", "NOT_VERIFIED"}:
                 self._stop_active_worker(self.state["terminal_reason"] or "GATE_PROCESSING_STOPPED")
                 self._mark_campaign_expired_if_needed()
@@ -398,6 +368,10 @@ class OnlineLinkedCoordinator:
             deadline = self._deadline or deadline
             while self.clock() < deadline:
                 if self.state["terminal_status"] in {"PARTIAL", "NOT_VERIFIED", "VULN_FOUND"}:
+                    break
+                self._drain_pending_probes()
+                deadline = self._candidate_deadline()
+                if self.state["terminal_status"] is not None or not self._active_container or self.clock() >= deadline:
                     break
                 worker_exit_code = self._observe_parent_exit(timeout=min(30.0, max(0.0, deadline - self.clock())))
                 if worker_exit_code is not None:
@@ -422,15 +396,15 @@ class OnlineLinkedCoordinator:
                 remaining = deadline - self.clock()
                 if remaining > 0:
                     self.sleeper(min(0.5, remaining))
-            self._stop_active_worker(self.state["terminal_reason"] or "BUDGET_EXPIRED")
+            self._stop_active_worker(self.state["terminal_reason"] or "NO_NEW_PROGRESS")
             self._mark_campaign_expired_if_needed()
             if self.state["terminal_status"] is None:
                 self.state["terminal_status"] = "BOUNDED_ONLINE_COMPLETE"
-                self.state["terminal_reason"] = "BUDGET_EXPIRED"
+                self.state["terminal_reason"] = "NO_NEW_PROGRESS"
             if self.state["terminal_status"] == "BOUNDED_ONLINE_COMPLETE" and self._hard_deadline is not None and self.clock() >= self._hard_deadline:
                 self.state.update(terminal_status="PARTIAL", terminal_reason="HARD_CANDIDATE_TIME_CAP")
             elif self.state["terminal_status"] == "BOUNDED_ONLINE_COMPLETE" and self.state.get("pending_runtime_candidates"):
-                self.state.update(terminal_status="PARTIAL", terminal_reason="PENDING_RUNTIME_VERIFICATION")
+                self.state["terminal_status"] = "PARTIAL"
             self._write_state()
             return 1 if self._failure else 0
         except Exception as exc:
@@ -440,6 +414,49 @@ class OnlineLinkedCoordinator:
             self._write_state()
             self._stop_active_worker("COORDINATOR_ERROR")
             return 1
+
+    def _drain_pending_probes(self) -> None:
+        for pending in list(self.state.get("pending_probe_queue", [])):
+            if self.clock() >= self._candidate_deadline() or self.state["terminal_status"] is not None or not self._active_container:
+                break
+            if pending not in self.state.get("pending_probe_queue", []):
+                continue
+            parent = self._version(pending["parent_version"])
+            if parent is None or parent.get("seed_item") is None or parent["version"] not in self._reports:
+                self._failure = True
+                self.state.update(terminal_status="NOT_VERIFIED", terminal_reason="PENDING_PARENT_CONTEXT_MISSING")
+                self._write_state()
+                break
+            if parent["version"] != self._active_version:
+                self._stop_active_worker("RESUME_PENDING_PARENT")
+                if self._active_container:
+                    break
+                self._active_version = parent["version"]
+                candidate = candidate_from_seed_item(parent["seed_item"], plugin_slug=self.plugin_slug)
+                variant = str(parent["seed_item"]["seed"].get("seed_variant_id") or "")
+                self._target_key = canonical_identity_id(candidate) + (f"::{variant}" if variant else "")
+                parent["previous_worker_run_id"] = parent.get("worker_run_id")
+                parent.setdefault("readiness_history", []).append(copy.deepcopy(parent.get("readiness")))
+                activation = len(parent["readiness_history"])
+                parent["worker_run_id"] = f"{self.legacy_run_id}-{parent['version']}-resume-{self.state.get('resume_count', 0)}-activation-{activation}"
+                parent_path = Path(parent.get("replay_config_path") or parent["config_path"])
+                parent_config = json.loads(filesystem_path(parent_path).read_text(encoding="utf-8-sig"))
+                if not self._gate_v0(parent, parent_config, deadline=self._deadline):
+                    break
+                if not self._start_worker(parent, deadline=self._deadline):
+                    self.state.update(terminal_status="NOT_VERIFIED", terminal_reason="RESUME_PARENT_WORKER_START_FAILED")
+                    break
+            convergence = dict(pending["convergence"])
+            # Saved requests are proposals, never accepted evidence.
+            convergence.update(new_parameters=[], known_parameters=parent.get("known_parameters", []),
+                               pending_probes=[pending["candidate"]])
+            self._run_pending_probe(
+                parent=parent, evidence=pending["evidence"], raw_report=self._reports[parent["version"]],
+                convergence=convergence, probe=pending["candidate"], seed=parent["seed_item"],
+                deadline=self._deadline,
+            )
+            if self.state["terminal_status"] is not None:
+                break
 
     def _handle_worker_exit(self, worker_exit_code: int) -> None:
         version = self._version(self._active_version)
@@ -580,7 +597,7 @@ class OnlineLinkedCoordinator:
         if self._deadline is None:
             now = self.clock()
             self._budget_started_at = now
-            self._hard_deadline = now + self.hard_seconds
+            self._hard_deadline = now + self.hard_seconds if self.hard_seconds is not None else None
             self._deadline = now + self.max_seconds
             if self.campaign_deadline is not None:
                 self._deadline = min(self._deadline, self.campaign_deadline)
@@ -590,23 +607,26 @@ class OnlineLinkedCoordinator:
         """Credit semantic progress once; retries cannot buy more time."""
         deadline = self._candidate_deadline()
         identity = (kind, key)
-        if identity in self._progress_keys or self.clock() >= deadline:
+        now = self.clock()
+        if kind == "pending_verification" or identity in self._progress_keys or now >= deadline:
+            return deadline
+        if self.campaign_deadline is not None and now >= self.campaign_deadline:
             return deadline
         if self.progress_callback is not None:
             campaign_deadline = self.progress_callback(kind, key)
             if campaign_deadline is None:
                 return deadline
             self.campaign_deadline = campaign_deadline
-        elif self.campaign_deadline is not None:
-            # Standalone callers cannot grant campaign time without its hard cap.
-            self.campaign_deadline = min(max(self.campaign_deadline, self._hard_deadline),
-                                         self.campaign_deadline + self.max_seconds)
         self._progress_keys.add(identity)
-        self._deadline = min(self._hard_deadline, deadline + self.max_seconds)
+        reserve = 3 * self._sender_seconds if kind == "verified_parameter" else 0.0
+        self._deadline = max(deadline, now + self.max_seconds + reserve) if kind == "verified_parameter" else deadline
+        if self._hard_deadline is not None:
+            self._deadline = min(self._hard_deadline, self._deadline)
         if self.campaign_deadline is not None:
             self._deadline = min(self._deadline, self.campaign_deadline)
         self.max_versions = min(self.hard_versions, self.max_versions + 1)
-        self.state["budget_progress"].append({"kind": kind, "key": key, "deadline": self._deadline})
+        self.state["budget_progress"].append({"kind": kind, "key": key, "at": now,
+            "previous_deadline": deadline, "deadline": self._deadline, "reserve_seconds": reserve})
         self.state.update(candidate_deadline=self._deadline, campaign_deadline=self.campaign_deadline,
                           max_versions=self.max_versions)
         return self._deadline
@@ -623,8 +643,9 @@ class OnlineLinkedCoordinator:
             return False
         replay = copy.deepcopy(dict(config))
         self.force_replay_only_fn(replay)
-        gate_name = "v0" if not self.resume else f"resume-{self.state['resume_count']}-{version['version']}"
-        if self.resume:
+        reactivation = self.resume or bool(version.get("readiness_history"))
+        gate_name = "v0" if not reactivation else f"resume-{self.state.get('resume_count', 0)}-{version['version']}"
+        if reactivation:
             gate_name += f"-activation-{len(version.get('readiness_history', []))}"
         path = self._write_config(gate_name, replay, replay=True)
         version["replay_config_path"] = str(path)
@@ -662,7 +683,7 @@ class OnlineLinkedCoordinator:
                 raise OnlineLinkedError(reason)
             if result_row.get("process_status") in {"failed", "runner_error"}:
                 raise OnlineLinkedError("V0_REPLAY_PROCESS_FAILED")
-            probe_dir = "probe" if not self.resume else gate_name + "-probe"
+            probe_dir = gate_name + "-probe" if reactivation else "probe"
             request_dir = self.run_dir / "versions" / str(version["version"]) / probe_dir / "request"
             zend_dir = request_dir.parent / "zend"
             self._save_replay_artifacts(
@@ -1255,16 +1276,6 @@ class OnlineLinkedCoordinator:
 
         pending_probes = result.get("pending_probes")
         if isinstance(pending_probes, list) and pending_probes:
-            for probe in pending_probes:
-                if isinstance(probe, Mapping) and self._admission_complete(
-                    {**dict(probe), "evidence_kind": "pending_runtime_proposal"}, evidence, parent
-                ):
-                    # A correlated proposal gets one bounded verification turn,
-                    # independently of request IDs, worker versions and retries.
-                    key = json.dumps([parent.get("callback_id"), _parameter_key(probe)])
-                    renewed = self._extend_progress_budget("pending_verification", key)
-                    if deadline is not None:
-                        deadline = max(deadline, renewed)
             return self._run_pending_probe(
                 parent=parent,
                 evidence=evidence,
@@ -1828,8 +1839,8 @@ class OnlineLinkedCoordinator:
         pending = self.state.get("pending_runtime_candidates")
         preserve_pending = (
             terminal
-            and isinstance(pending, list)
-            and bool(pending)
+            and (bool(pending) or (reason == "TRIAL_INPUT_SET_NOT_VERIFIED" and
+                                  bool(self.state.get("pending_probe_queue"))))
             and (deadline is None or self.clock() < deadline)
             and bool(self._active_container)
         )
@@ -1840,7 +1851,7 @@ class OnlineLinkedCoordinator:
         else:
             self.state["replay_input_last_reason"] = reason
             if preserve_pending:
-                attempt["pending_candidates_preserved"] = len(pending)
+                attempt["pending_candidates_preserved"] = len(pending or [])
             self._recover_parent_after_failure(parent, deadline)
         self._write_state()
         return None
@@ -2594,12 +2605,13 @@ class OnlineLinkedCoordinator:
             if not any(row.get("dedupe_key") == dedupe_key for row in saved_queue):
                 saved_queue.append({**copy.deepcopy(queue[-1]), "dedupe_key": dedupe_key,
                                     "parent_version": parent["version"]})
-                self._write_state()
 
         for candidate in sorted(initial_candidates, key=_parameter_key):
             enqueue(candidate, convergence, evidence)
+        self._write_state()
         probe_deadline = None
         if deadline is not None:
+            self._candidate_deadline()
             started = self.clock()
             probe_deadline = started + max(0.0, (deadline - started) / 2)
         accepted = [
@@ -2641,6 +2653,9 @@ class OnlineLinkedCoordinator:
                 convergence=candidate_convergence, probe=candidate,
                 seed=seed, deadline=effective_deadline if probe_deadline is not None else None,
             )
+            if deadline is not None and isinstance(outcome, Mapping) and outcome.get("status") == "accepted":
+                deadline = max(deadline, self._candidate_deadline())
+                probe_deadline = max(probe_deadline, deadline - 3 * self._sender_seconds)
             self.state["pending_probe_queue"] = [row for row in self.state.get("pending_probe_queue", [])
                 if not (row.get("parent_version") == parent["version"] and
                         row.get("candidate") == candidate and row.get("evidence") == candidate_evidence)]
@@ -2656,6 +2671,7 @@ class OnlineLinkedCoordinator:
                         )
                         for item in pending_candidates:
                             enqueue(item, pending_result, pending_evidence)
+                        self._write_state()
                 if self.state.get("terminal_status") or (
                     not self._active_container and
                     (deadline is not None and self.clock() >= deadline)
@@ -2683,6 +2699,11 @@ class OnlineLinkedCoordinator:
             if isinstance(next_probes, list):
                 for next_probe in next_probes:
                     enqueue(next_probe, probe_result, probe_evidence)
+            request = probe_evidence.get("request") or {}
+            status = (request.get("response") or {}).get("status_code")
+            if deadline is not None and (status is None or 200 <= status < 300):
+                deferred = [dict(item["candidate"]) for item in queue[index:]]
+                break
         for candidate in deferred:
             self._record_event({
                 "kind": "PARAMETER_PROBE",
@@ -2691,7 +2712,9 @@ class OnlineLinkedCoordinator:
                 "version": parent["version"],
                 "request_id": candidate.get("request_id") or evidence.get("request_id"),
                 "candidate": candidate,
-            })
+            }, checkpoint=False)
+        if deferred:
+            self._write_state()
         if not accepted_records:
             return None
 
@@ -3094,6 +3117,9 @@ class OnlineLinkedCoordinator:
                 parent, evidence, attempt, "PROBE_PROVENANCE_INCOMPLETE", deadline,
                 extra={"unexpected_parameters": unexpected},
             )
+        # Credit the verified read before checkpointing or queuing more guards.
+        key = json.dumps([parent.get("callback_id"), _parameter_key(parameter)])
+        self._extend_progress_budget("verified_parameter", key)
         if method_transition:
             probe_result = dict(probe_result)
             # Materialize the request just replayed, never its prospective probes.
@@ -3920,7 +3946,7 @@ class OnlineLinkedCoordinator:
             return
         _write_exclusive_json(path, value)
 
-    def _record_event(self, event: Mapping[str, Any]) -> dict[str, Any]:
+    def _record_event(self, event: Mapping[str, Any], *, checkpoint: bool = True) -> dict[str, Any]:
         item = dict(event)
         if not item.get("event_id"):
             encoded = json.dumps(item, sort_keys=True, default=str, separators=(",", ":"))
@@ -3931,7 +3957,8 @@ class OnlineLinkedCoordinator:
         filesystem_path(self.events_path.parent).mkdir(parents=True, exist_ok=True)
         with filesystem_path(self.events_path).open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-        self._write_state()
+        if checkpoint:
+            self._write_state()
         return item
 
     def _write_state(self) -> None:
@@ -3939,13 +3966,15 @@ class OnlineLinkedCoordinator:
             if self._hard_deadline is not None and self.clock() >= self._hard_deadline:
                 self.state.update(terminal_status="PARTIAL", terminal_reason="HARD_CANDIDATE_TIME_CAP")
             elif self.state.get("pending_runtime_candidates") or self.state.get("pending_probe_queue"):
-                self.state.update(terminal_status="PARTIAL", terminal_reason="PENDING_RUNTIME_VERIFICATION")
+                self.state["terminal_status"] = "PARTIAL"
+                if self.state.get("terminal_reason") != "NO_NEW_PROGRESS":
+                    self.state["terminal_reason"] = "PENDING_RUNTIME_VERIFICATION"
         if self._budget_started_at is not None:
             now = self.clock()
             self.state["budget"] = {
                 "elapsed_seconds": self._elapsed_seconds + max(0.0, now - self._budget_started_at),
                 "remaining_seconds": max(0.0, self._deadline - now),
-                "hard_remaining_seconds": max(0.0, self._hard_deadline - now),
+                "hard_remaining_seconds": max(0.0, self._hard_deadline - now) if self._hard_deadline is not None else None,
                 "progress_keys": sorted(self._progress_keys),
                 "saved_at": time.time(),
             }
@@ -3959,6 +3988,8 @@ class OnlineLinkedCoordinator:
 
     def _load_checkpoint(self) -> tuple[dict[str, Any], dict[str, Any]]:
         saved = json.loads(self.state_path.read_text(encoding="utf-8-sig"))
+        if saved.get("budget_policy") != "progress_idle_v1":
+            raise ValueError("resume budget policy incompatible; create a new run")
         checkpoint = saved.get("checkpoint", {})
         if saved.get("terminal_status") not in {None, "PARTIAL"}:
             raise ValueError("resume requires a PARTIAL candidate")
@@ -3996,10 +4027,14 @@ class OnlineLinkedCoordinator:
         offline_seconds = max(0.0, time.time() - budget["saved_at"])
         self._elapsed_seconds = budget["elapsed_seconds"] + offline_seconds
         self._budget_started_at = self.clock()
-        self._hard_deadline = self._budget_started_at + min(budget["hard_remaining_seconds"],
-                                                           max(0.0, self.hard_seconds - self._elapsed_seconds))
-        self._deadline = min(self._hard_deadline, self._budget_started_at +
-                             max(0.0, budget["remaining_seconds"] - offline_seconds))
+        self._hard_deadline = None
+        if self.hard_seconds is not None:
+            self._hard_deadline = self._budget_started_at + min(
+                max(0.0, budget["hard_remaining_seconds"] - offline_seconds),
+                max(0.0, self.hard_seconds - self._elapsed_seconds))
+        self._deadline = self._budget_started_at + max(0.0, budget["remaining_seconds"] - offline_seconds)
+        if self._hard_deadline is not None:
+            self._deadline = min(self._deadline, self._hard_deadline)
         if self.campaign_deadline is not None:
             self._deadline = min(self._deadline, self.campaign_deadline)
         self._progress_keys = {tuple(key) for key in budget["progress_keys"]}
@@ -4234,8 +4269,10 @@ def run_online_linked(args: argparse.Namespace) -> int:
         value = getattr(args, name, 1)
         if type(value) is not int or value < 1:
             raise ValueError(f"{name} must be a positive integer")
-    max_seconds, hard_seconds = _budget_pair("candidate seconds", args.max_seconds,
-        getattr(args, "hard_candidate_seconds", None), args.max_seconds * 4, 120)
+    max_seconds, hard_seconds = args.max_seconds, getattr(args, "hard_candidate_seconds", None)
+    if hard_seconds is not None:
+        max_seconds, hard_seconds = _budget_pair("candidate seconds", max_seconds,
+            hard_seconds, max_seconds, max_seconds)
     max_versions, hard_versions = _budget_pair("versions", args.max_versions,
         getattr(args, "hard_max_versions", None), max(20, args.max_versions * 4), 20)
     initial_candidates = getattr(args, "max_candidates", 32)
@@ -4258,6 +4295,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
     registry_source = Path(args.callback_registry)
     batch_registry = batch_dir / "callback-registry.json"
     context = {
+        "budget_policy": "progress_idle_v1",
         "plugin_slug": args.plugin_slug, "legacy_run_id": args.legacy_run_id, "service": args.service,
         "input_hash": hashlib.sha256(filesystem_path(suggested_path).read_bytes()).hexdigest(),
         "registry_hash": hashlib.sha256(filesystem_path(registry_source).read_bytes()).hexdigest(),
@@ -4309,6 +4347,8 @@ def run_online_linked(args: argparse.Namespace) -> int:
     batch_state_path = batch_dir / "batch-state.json"
     if resume:
         saved = json.loads(batch_state_path.read_text(encoding="utf-8-sig"))
+        if (saved.get("resume_context") or {}).get("budget_policy") != "progress_idle_v1":
+            raise ValueError("resume budget policy incompatible; create a new run")
         if saved.get("resume_context") != context:
             raise ValueError("resume campaign context or budgets changed")
         budget = saved["budget"]
@@ -4576,7 +4616,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--campaign-seconds", type=int, choices=range(1, 86401), default=3600, help="Initial campaign seconds (default 3600)")
     parser.add_argument("--hard-max-candidates", type=int, help="Absolute candidate cap (default max(128, initial))")
     parser.add_argument("--hard-campaign-seconds", type=int, help="Absolute campaign seconds (default max(86400, initial))")
-    parser.add_argument("--hard-candidate-seconds", type=int, help="Absolute candidate seconds (default 4 * initial)")
+    parser.add_argument("--hard-candidate-seconds", type=int, help="Absolute candidate seconds (default: no candidate hard cap)")
     parser.add_argument("--hard-max-versions", type=int, help="Absolute versions including v0 (default max(20, 4 * initial))")
     parser.add_argument("--resume", action="store_true", help="Reload this run's checkpoint; retain caps and credits, recheck gates")
     parser.add_argument("--sync-registry", action="store_true")

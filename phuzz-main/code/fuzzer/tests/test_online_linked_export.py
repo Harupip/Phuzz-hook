@@ -287,6 +287,77 @@ class OnlineLinkedExportTests(unittest.TestCase):
         self.assertEqual(export_online_linked_batch(self.batch([candidate])), 0)
         self.assertEqual(list((self.root / "final-configs").iterdir()), [])
 
+    def test_budget_expiry_preserves_observed_inputs_as_explicit_unverified_draft(self):
+        base = self.config()
+        base["methods"] = ["GET"]
+        base["query_params"] = base.pop("body_params")
+        version = self.version("v0", config=base, config_type="replay_only", pass2=(0, 0))
+        source_bytes = Path(version["config_path"]).read_bytes()
+        candidate, path = self.write_state(versions=[version], terminal_reason="HARD_CANDIDATE_TIME_CAP")
+        state = json.loads(path.read_text())
+        fields = [{"name": f"field_{i}", "source": "POST", "location": "form"} for i in range(40)]
+        fields += [{"name": "guard-only", "source": "GET", "location": "query"}]
+        state["probe_attempts"] = [{"candidate": field, "status": "pending"} for field in fields]
+        path.write_text(json.dumps(state))
+        batch = self.batch([candidate])
+        self.assertEqual(export_online_linked_batch(batch), 0, "Drafts must not count as verified exports")
+        row = json.loads((self.root / "final-config-summary.json").read_text())["candidates"][0]
+        self.assertIsNone(row["selected_version"])
+        self.assertEqual(row["exported_configs"], [])
+        self.assertEqual(len(row["partial_configs"]), 1)
+        draft = Path(row["partial_configs"][0]["config_path"])
+        self.assertEqual(draft.parent, self.root / "partial-configs")
+        self.assertTrue(draft.name.endswith(".partial.json"))
+        config = json.loads(draft.read_text())
+        self.assertEqual(config["config_type"], "partial")
+        self.assertFalse(config["metadata"]["fuzzing_ready"])
+        warning = config["metadata"]["partial_export"]
+        self.assertEqual(warning["status"], "PARTIAL")
+        self.assertEqual(warning["reason"], "HARD_CANDIDATE_TIME_CAP")
+        self.assertFalse(warning["combined_request_verified"])
+        self.assertEqual(warning["pending_parameters"], row["pending_parameters"])
+        self.assertEqual(config["methods"], ["POST"])
+        self.assertEqual(config["metadata"]["method_confidence"], "unverified")
+        self.assertTrue({f"field_{i}" for i in range(40)} <=
+                        {p["name"] for p in config["body_params"]["data"]})
+        self.assertIn("guard\\-only", config["query_params"]["fuzz"])
+        before = draft.read_bytes()
+        export_online_linked_batch(batch)
+        self.assertEqual(draft.read_bytes(), before)
+        self.assertEqual(len(list(draft.parent.glob("*.json"))), 1)
+        self.assertEqual(Path(version["config_path"]).read_bytes(), source_bytes)
+
+    def test_budget_draft_does_not_replace_verified_config_or_fake_transport(self):
+        version = self.version("v1")
+        candidate, path = self.write_state(versions=[version])
+        state = json.loads(path.read_text())
+        state["events"] = [{"kind": "PARAMETER_DISCOVERY", "parameters": [
+            {"name": "extra", "source": "GET", "location": "query"},
+            {"name": "unknown", "source": "REQUEST", "location": "request"},
+        ]}]
+        path.write_text(json.dumps(state))
+        self.assertEqual(export_online_linked_batch(self.batch([candidate])), 1)
+        row = json.loads((self.root / "final-config-summary.json").read_text())["candidates"][0]
+        self.assertEqual(Path(row["config_path"]).read_bytes(), Path(version["config_path"]).read_bytes())
+        draft = json.loads(Path(row["partial_configs"][0]["config_path"]).read_text())
+        self.assertEqual(draft["metadata"]["partial_export"]["unplaced_parameters"], [
+            {"name": "unknown", "source": "REQUEST", "location": "request"},
+        ])
+        self.assertNotIn("unknown", [p["name"] for p in draft["query_params"]["data"]])
+
+    def test_no_partial_draft_without_observed_parameters_or_budget_stop(self):
+        for reason, fields in (("BUDGET_EXPIRED", []), ("WORKER_START_FAILED", [
+            {"name": "extra", "source": "GET", "location": "query"},
+        ])):
+            with self.subTest(reason=reason):
+                version = self.version("v0", config_type="replay_only", pass2=(0, 0))
+                candidate, path = self.write_state(versions=[version], terminal_reason=reason)
+                state = json.loads(path.read_text())
+                state["events"] = [{"kind": "PARAMETER_DISCOVERY", "parameters": fields}]
+                path.write_text(json.dumps(state))
+                self.assertEqual(export_online_linked_batch(self.batch([candidate])), 0)
+                self.assertFalse((self.root / "partial-configs").exists())
+
     def test_parameter_superset_does_not_hide_request_context_changes(self):
         for change in ("method", "auth", "policy", "fixed_type", "bucket"):
             with self.subTest(change=change):

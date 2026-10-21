@@ -307,3 +307,5 @@ Chay tat ca plugin:
 ```powershell
 .\run-wordpress-plugin-matrix.ps1 -DownloadMissing
 ```
+
+Budget policy `progress_idle_v1`: candidate không có hard time cap tự sinh; chỉ `--hard-candidate-seconds` đặt rõ là trần tuyệt đối. Param được admit gia hạn `max(deadline, now + W + 3*S)` trong campaign cap. Pending không cấp giờ; callback chỉ cấp campaign work. Hết tiến triển ghi `NO_NEW_PROGRESS`, pending được giữ trong partial draft riêng; không phải fuzzing PASS. Resume giữ credit/thời gian, trừ offline time; checkpoint cũ cần run mới.

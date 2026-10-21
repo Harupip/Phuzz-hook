@@ -199,16 +199,22 @@ pwsh -NoProfile -File .\phuzz.ps1 -PluginSlug nmedia-user-file-uploader -OnlineT
 
 | Initial flag / env | Loader default | Hard cap mặc định của Python coordinator | Flag Python để đổi hard cap |
 | --- | ---: | --- | --- |
-| `-OnlineTimeoutSeconds` / `ONLINE_TIMEOUT_SECONDS` | 120s | `4 × initial seconds` | `--hard-candidate-seconds` |
+| `-OnlineTimeoutSeconds` / `ONLINE_TIMEOUT_SECONDS` | 120s | Không đặt (`null`) | `--hard-candidate-seconds` |
 | `-OnlineMaxVersions` / `ONLINE_MAX_VERSIONS` | 2 | `max(20, 4 × initial versions)` | `--hard-max-versions` |
 | `-OnlineMaxCandidates` / `ONLINE_MAX_CANDIDATES` | 32 | `max(128, initial candidates)` | `--hard-max-candidates` |
 | `-OnlineCampaignTimeoutSeconds` / `ONLINE_CAMPAIGN_TIMEOUT_SECONDS` | 3600s | `max(86400, initial campaign seconds)` | `--hard-campaign-seconds` |
 
-Với env snapshot trên, hard candidate time là 120s và hard versions là 36. Với loader defaults, chúng là 480s và 20. PowerShell wrapper chưa expose hard-cap flags hay `--resume`; muốn điều chỉnh phải gọi Python coordinator với context Docker phù hợp. Hard cap phải là số nguyên dương và không nhỏ hơn initial budget. Đọc `budget`, `budget_progress`, `effective_max_candidates`, `pending_candidates` và `stop_reasons`; không chỉ nhìn giá trị initial.
+Mặc định không tự sinh hard candidate time; hard versions với env snapshot là 36, loader default là 20. PowerShell wrapper chưa expose hard-cap flags hay `--resume`; muốn điều chỉnh phải gọi Python coordinator với context Docker phù hợp. Hard cap phải là số nguyên dương và không nhỏ hơn initial budget. Đọc `budget`, `budget_progress`, `effective_max_candidates`, `pending_candidates` và `stop_reasons`; không chỉ nhìn giá trị initial.
+
+Candidate khởi đầu với cửa sổ `W = max_seconds`. Param mới được admit gia hạn tới `max(deadline, now + W + 3 * sender_seconds)`, chặn bởi campaign và explicit `--hard-candidate-seconds`. Burst cùng thời điểm không cộng dồn cửa sổ; cùng callback và `(name, source, location)` chỉ nhận credit một lần. Pending name không cấp thời gian; callback mới chỉ cấp campaign work. Sau probe hợp lệ, ưu tiên trial/replay/Pass 2 rồi tiếp tục pending trong cùng run; HTTP lỗi có guard thì thử guard với allowance mới. Gate/correlation không đổi.
+
+Hết cửa sổ ghi `NO_NEW_PROGRESS`; còn pending thì `PARTIAL` và xuất draft `.partial.json` riêng, `fuzzing_ready=false`. Đây không phải tìm hết param hoặc fuzzing PASS. Count/version và campaign caps vẫn áp dụng.
 
 ### Checkpoint và resume
 
 `batch-state.json` lưu queue, registry snapshot/hash, progress keys và remaining budget; state từng candidate lưu config/replay hashes, pending work, lineage và reports. `--resume` dùng lại cùng run ID/output root, bỏ candidate đã hoàn tất và xác minh lại gate bằng request/worker identity mới trước pending probes. Config đã công bố vẫn bất biến.
+
+Checkpoint và batch context dùng `budget_policy=progress_idle_v1`; không đặt candidate cap thì `hard_remaining_seconds=null`. Checkpoint policy cũ bị từ chối; tạo run mới, không tự migrate.
 
 Resume kiểm tra seed, bootstrap, registry, plugin/service/config root, COOKIE policy và budget context. Không đổi budget hoặc sửa config cũ để ép resume. Thời gian offline bị trừ khỏi budget còn lại; resume không cấp một campaign mới. Hết hard budget thì resume không tạo thêm thời gian.
 

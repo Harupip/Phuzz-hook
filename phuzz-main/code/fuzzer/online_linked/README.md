@@ -14,6 +14,19 @@ Pass 2 (`accepted == total > 0`), config hash and `fuzzing_ready` checks. Probe
 and replay-only configs remain excluded. A failed latest version does not prevent
 older verified versions from being exported.
 
+When a candidate stops on a budget/time/limit with observed parameters, export
+also saves a draft in the sibling `partial-configs/` directory. Its filename ends
+in `.partial.json`, its `config_type` is `partial`, and `metadata.fuzzing_ready`
+is false. `metadata.partial_export` records the stop reason, verified and pending
+parameters, source state/config, and any parameters whose transport is unresolved.
+There is no parameter-count threshold. Drafts include guard-only observations;
+their combined inputs may belong to incompatible branches and have not passed
+replay/Pass 2 together. Form observations make the draft POST; this inference is
+not runtime method proof. Drafts are for inspection, not automatic fuzzing.
+The summary's separate `partial_configs` list identifies current drafts; older
+draft bytes remain preserved on re-export. They never enter `exported_configs`,
+`selected_version`, comparison's final-config menu, or the verified export count.
+
 ## Output and compatibility
 
 - The newest eligible config keeps the existing filename and the summary's
@@ -71,3 +84,5 @@ Use a writable temporary directory. On Windows, normalize the temporary path
 if short 8.3 names interfere with path-sensitive comparison tests. These tests
 cover offline export/replay-input/comparison behavior; they do not establish a
 fresh WordPress runtime or fuzzing PASS.
+
+Candidate time uses `progress_idle_v1`: initial window W; each newly admitted parameter renews to max(deadline, now + W + 3 * measured sender cost), bounded by campaign and any explicit `--hard-candidate-seconds`. No implicit candidate hard cap. Pending names buy no time; new callbacks only extend campaign work. Bounded probes hand off early, then service remaining probes in the same run, revalidating ancestor parents. Idle ends with `NO_NEW_PROGRESS`; pending work remains PARTIAL and exports unverified drafts. Resume retains credits/time, subtracts offline time, stores null hard remaining when uncapped, and rejects old-policy checkpoints. Replay/Pass 2 and version/count caps remain unchanged.

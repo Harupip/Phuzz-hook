@@ -117,6 +117,424 @@ class Clock:
 
 
 class OnlineLinkedCoordinatorTests(unittest.TestCase):
+    def test_verified_probe_renews_before_checkpoint_and_large_guard_queue_reaches_trial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c, parent, evidence, convergence = self.make_probe_context(Path(tmp), [], names=('a',))
+            c.max_seconds = 30
+            c._candidate_deadline()
+            c.clock.now = 15
+            sender = c.probe_sender
+            converge = c.converge_fn
+            write_state = c._write_state
+            checkpoints = []
+            admission_time = []
+            trial_inputs = []
+            handle = c._handle_convergence_result
+
+            def admit_near_deadline(*args, **kwargs):
+                result = sender(*args, **kwargs)
+                if kwargs['run_id'].endswith('-probe-p1'):
+                    c.clock.now = 22
+                return result
+
+            def discover_guards(**kwargs):
+                result = converge(**kwargs)
+                if '-probe-' in kwargs['legacy_run_id']:
+                    admission_time.append(c.clock())
+                    result['pending_probes'] = [
+                        {**convergence['pending_probes'][0], 'name': f'guard-{i:03d}'}
+                        for i in range(100)
+                    ]
+                return result
+
+            def slow_checkpoint():
+                if admission_time:
+                    checkpoints.append((c.clock(), len(c._progress_keys)))
+                    c.clock.sleep(0.1)
+                write_state()
+
+            def trial(**kwargs):
+                trial_inputs.append((c.clock(), kwargs['result']['new_parameters'], len(checkpoints)))
+                return handle(**kwargs)
+
+            c.probe_sender = admit_near_deadline
+            c.converge_fn = discover_guards
+            with patch.object(c, '_write_state', side_effect=slow_checkpoint), \
+                 patch.object(c, '_handle_convergence_result', side_effect=trial):
+                result = c._run_pending_probe(parent=parent, evidence=evidence,
+                    raw_report=c._reports['v0'], convergence=convergence,
+                    probe=convergence['pending_probes'][0], seed=parent['seed_item'], deadline=30)
+            self.assertIsNotNone(result)
+            self.assertTrue(checkpoints)
+            self.assertEqual(checkpoints[0][1], 1, 'verified input must earn time before its accepted checkpoint')
+            self.assertEqual(len(c.state['budget_progress']), 1)
+            self.assertEqual(c.state['budget_progress'][0]['at'], admission_time[0])
+            self.assertLess(trial_inputs[0][0], c._deadline)
+            self.assertEqual([p['name'] for p in trial_inputs[0][1]], ['a'])
+            self.assertEqual(len(c.state['pending_probe_queue']), 100)
+            self.assertLessEqual(trial_inputs[0][2], 5, 'checkpoint a queue batch, not each guard/event')
+            self.assertTrue(c.state['replay_input_trials'])
+            self.assertTrue(result['replay_result']['passed'])
+            saved = json.loads(c.state_path.read_text())
+            self.assertEqual(len(saved['pending_probe_queue']), 100)
+            events = [json.loads(line) for line in c.events_path.read_text().splitlines()]
+            self.assertEqual(sum(e.get('status') == 'DEFERRED' for e in events), 100)
+
+    def test_idle_completion_with_pending_probes_exports_partial_from_real_state(self):
+        from online_linked.export import export_online_linked_batch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            c = self.make_coordinator(root, [])
+            probe = {'name': 'b', 'source': 'POST', 'location': 'form'}
+
+            def stop_at_deadline(version, *, deadline):
+                c.state['pending_probe_queue'] = [{
+                    'parent_version': version['version'], 'candidate': probe,
+                    'convergence': {'pending_probes': [probe]},
+                    'evidence': {'request_id': 'pending-b'},
+                }]
+                c.clock.now = deadline
+
+            with patch.object(c, '_consume_gate_evidence', side_effect=stop_at_deadline):
+                self.assertEqual(c.run(), 0)
+            self.assertEqual(c.state['terminal_status'], 'PARTIAL')
+            self.assertEqual(c.state['terminal_reason'], 'NO_NEW_PROGRESS')
+            destination = root / 'export/final-configs'
+            batch = root / 'batch-state.json'
+            batch.write_text(json.dumps({'plugin_slug': 'fixture', 'candidates': [{
+                'identity': 'fixture', 'state_path': str(c.state_path), 'run_id': c.legacy_run_id,
+                'hook_name': c.state['versions'][0]['hook_name'],
+            }]}))
+            self.assertEqual(export_online_linked_batch(batch, destination), 1)
+            partials = list(destination.parent.glob('partial-configs/*.partial.json'))
+            self.assertEqual(len(partials), 1)
+            partial = json.loads(partials[0].read_text())
+            self.assertFalse(partial['metadata']['fuzzing_ready'])
+            self.assertEqual(partial['metadata']['partial_export']['pending_parameters'],
+                [{'name': 'b', 'source': 'POST', 'location': 'form'}])
+            before = partials[0].read_bytes()
+            export_online_linked_batch(batch, destination)
+            self.assertEqual(partials[0].read_bytes(), before)
+
+    def test_uncapped_resume_preserves_time_credit_and_rejects_old_policy(self):
+        for old_policy in (False, True):
+            with self.subTest(old_policy=old_policy), tempfile.TemporaryDirectory() as tmp:
+                c, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
+                c.max_seconds = c.state['max_seconds'] = 30
+                c._candidate_deadline()
+                c.clock.now = 20
+                c._extend_progress_budget('verified_parameter', 'a')
+                c.state.update(terminal_status='PARTIAL', terminal_reason='NO_NEW_PROGRESS')
+                c._write_state()
+                self.assertIsNone(c.state['budget']['hard_remaining_seconds'])
+                saved_at = c.state['budget']['saved_at']
+                if old_policy:
+                    saved = json.loads(c.state_path.read_text())
+                    saved.pop('budget_policy', None)
+                    c.state_path.write_text(json.dumps(saved))
+                restored = self.make_coordinator(Path(tmp), [], max_seconds=30)
+                restored.clock.now = 1000
+                with patch('online_linked.coordinator.time.time', return_value=saved_at + 5):
+                    if old_policy:
+                        with self.assertRaisesRegex(ValueError, 'policy.*new run'):
+                            restored._load_checkpoint()
+                        continue
+                    restored._load_checkpoint()
+                self.assertEqual(restored._candidate_deadline(), 1025)
+                self.assertIsNone(restored._hard_deadline)
+                self.assertEqual(restored._extend_progress_budget('verified_parameter', 'a'), 1025)
+
+    def test_explicit_candidate_cap_survives_resume_and_offline_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            c, _, _, _ = self.make_probe_context(root, [])
+            c.max_seconds = c.state['max_seconds'] = 30
+            c.hard_seconds = c.state['hard_seconds'] = 100
+            self.assertEqual(c._candidate_deadline(), 30)
+            c.clock.now = 20
+            self.assertEqual(c._extend_progress_budget('verified_parameter', 'a'), 50)
+            c.state.update(terminal_status='PARTIAL', terminal_reason='NO_NEW_PROGRESS')
+            c._write_state()
+            saved_at = c.state['budget']['saved_at']
+
+            restored = self.make_coordinator(root, [], max_seconds=30)
+            restored.hard_seconds = restored.state['hard_seconds'] = 100
+            restored.clock.now = 1000
+            with patch('online_linked.coordinator.time.time', return_value=saved_at + 5):
+                restored._load_checkpoint()
+            self.assertEqual(restored._candidate_deadline(), 1025)
+            self.assertEqual(restored._hard_deadline, 1075)
+            restored.clock.now = 1020
+            self.assertEqual(restored._extend_progress_budget('verified_parameter', 'b'), 1050)
+            restored.clock.now = 1040
+            self.assertEqual(restored._extend_progress_budget('verified_parameter', 'c'), 1070)
+            restored.clock.now = 1060
+            self.assertEqual(restored._extend_progress_budget('verified_parameter', 'd'), 1075)
+            restored.clock.now = 1075
+            self.assertEqual(restored._extend_progress_budget('verified_parameter', 'late'), 1075)
+
+    def test_failed_input_trial_keeps_untried_probe_recoverable_but_not_bad_artifacts(self):
+        for reason in ('TRIAL_INPUT_SET_NOT_VERIFIED', 'REPLAY_ARTIFACT_ERROR'):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as tmp:
+                c, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
+                c.state['pending_probe_queue'] = [dict(parent_version='v0', candidate=convergence['pending_probes'][1],
+                    convergence=convergence, evidence=evidence)]
+                c._finish_replay_input_attempt(parent, {}, {}, reason, 20, terminal=True)
+                self.assertEqual(c.state['terminal_status'], None if reason == 'TRIAL_INPUT_SET_NOT_VERIFIED' else 'NOT_VERIFIED')
+
+    def test_slow_error_probe_refreshes_guard_budget_before_strict_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c, parent, evidence, convergence = self.make_probe_context(Path(tmp), [], names=('a',))
+            c.max_seconds = 30
+            c._candidate_deadline()
+            calls = []
+            def probe_once(**kwargs):
+                calls.append((kwargs['probe']['name'], kwargs['deadline']))
+                name = kwargs['probe']['name']
+                c.clock.now = 14 if name == 'a' else 26
+                c._sender_seconds = 12
+                c._extend_progress_budget('verified_parameter', json.dumps([parent['callback_id'], [name, 'POST', 'form']]))
+                guard = {**convergence['pending_probes'][0], 'name': 'b'}
+                return dict(status='accepted', parameter={**kwargs['probe'], 'fuzzable': True},
+                    evidence={'request_id': name, 'request': {'response': {'status_code': 400 if name == 'a' else 200}}},
+                    result={'pending_probes': [guard] if name == 'a' else []})
+            with patch.object(c, '_run_pending_probe_once', side_effect=probe_once), \
+                 patch.object(c, '_handle_convergence_result', return_value=None):
+                c._run_pending_probe(parent=parent, evidence=evidence, raw_report=c._reports['v0'],
+                    convergence=convergence, probe=convergence['pending_probes'][0], seed=parent['seed_item'], deadline=30)
+            self.assertEqual([name for name, _ in calls], ['a', 'b'])
+            self.assertGreater(calls[1][1], 26)
+            self.assertGreaterEqual(c._deadline, 80)
+
+    def test_error_probe_refreshes_guard_allowance_at_explicit_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c, parent, evidence, convergence = self.make_probe_context(Path(tmp), [], names=('a',))
+            c.max_seconds = c.hard_seconds = 30
+            c._candidate_deadline()
+            calls = []
+
+            def probe_once(**kwargs):
+                name = kwargs['probe']['name']
+                calls.append(name)
+                c.clock.now = 14 if name == 'a' else 26
+                c._sender_seconds = 1
+                c._extend_progress_budget('verified_parameter', name)
+                return {'status': 'accepted', 'parameter': kwargs['probe'],
+                    'evidence': {'request_id': name, 'request': {'response': {'status_code': 400 if name == 'a' else 200}}},
+                    'result': {'pending_probes': [{**kwargs['probe'], 'name': 'b'}] if name == 'a' else []}}
+
+            with patch.object(c, '_run_pending_probe_once', side_effect=probe_once), \
+                 patch.object(c, '_handle_convergence_result', return_value=None):
+                c._run_pending_probe(parent=parent, evidence=evidence, raw_report=c._reports['v0'],
+                    convergence=convergence, probe=convergence['pending_probes'][0], seed=parent['seed_item'], deadline=30)
+            self.assertEqual(calls, ['a', 'b'])
+            self.assertEqual(c._deadline, 30)
+
+    def test_live_loop_services_probe_queue_after_publication_without_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            c, parent, evidence, convergence = self.make_probe_context(Path(tmp), log)
+            c.max_seconds = 30
+            # Begin from selection, so removing live drain from run() strands B.
+            Path(parent['config_path']).unlink()
+            (c.run_dir / 'versions/v0/v0-config.json').unlink()
+            c.state['versions'] = []
+            c.state['workers'] = []
+            c._active_container = ''
+            def initial_probe(version, **kwargs):
+                c._run_pending_probe(parent=version, evidence=evidence,
+                    raw_report=c._reports['v0'], convergence=convergence,
+                    probe=convergence['pending_probes'][0], seed=version['seed_item'], deadline=kwargs['deadline'])
+            replay = c.replay_runner
+            def reactivation(rows, **kwargs):
+                run_id = kwargs['legacy_run_id']
+                if '-activation-' in run_id and '-probe-' not in run_id:
+                    return {'legacy_run_id': run_id, 'runs': [{**rows[0],
+                        'callback_reached': True, 'validation_status': 'callback_reached', 'process_status': 'replaying',
+                        'matched_artifact': 'fresh-gate.json', 'zend_artifact': 'fresh-gate.json',
+                        'request_payload': {'request_id': 'fresh-gate', 'legacy_run_id': run_id,
+                            'target_plugin': 'fixture', 'http_method': 'POST',
+                            'request_params': {'body_params': {'action': 'fixture', 'seed': 'base'}}},
+                        'zend_payload': {'request_id': 'fresh-gate', 'run_id': run_id}}]}
+                return replay(rows, **kwargs)
+            c.replay_runner = reactivation
+            gate = c._gate_v0
+            def fresh_gate(version, config, **kwargs):
+                log.append('gate:' + version['version'])
+                if not version.get('readiness_history'):
+                    return True
+                return gate(version, config, **kwargs)
+            with patch.object(c, '_gate_v0', side_effect=fresh_gate), \
+                 patch.object(c, 'read_new_runtime_evidence', return_value=[]), \
+                 patch.object(c, '_consume_gate_evidence', side_effect=initial_probe):
+                self.assertEqual(c.run(), 0, c.state['terminal_reason'])
+            self.assertEqual([p['candidate']['name'] for p in c.state['probe_attempts']], ['a', 'b'])
+            self.assertLess(log.index('gate:v0'), log.index('probe:b'))
+            self.assertFalse(c.state['pending_probe_queue'])
+            self.assertTrue(c.state['versions'][-1]['replay_result']['passed'])
+
+    def test_live_loop_recovers_probe_after_failed_input_trial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            c, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), log, accepted=('a',),
+            )
+            Path(parent['config_path']).unlink()
+            (c.run_dir / 'versions/v0/v0-config.json').unlink()
+            c.state['versions'] = []
+            c.state['workers'] = []
+            c._active_container = ''
+            queue_after_failure = []
+            failure_contexts = []
+            run_probe = c._run_pending_probe
+
+            def record_probe(**kwargs):
+                result = run_probe(**kwargs)
+                if kwargs['probe']['name'] == 'a':
+                    queue_after_failure.extend(
+                        row['candidate']['name'] for row in c.state['pending_probe_queue']
+                    )
+                return result
+
+            c._run_pending_probe = record_probe
+            finish_trial = c._finish_replay_input_attempt
+
+            def finish_with_only_probe_queue(parent, attempt, discovery, reason, deadline, **kwargs):
+                if reason == 'TRIAL_INPUT_SET_NOT_VERIFIED':
+                    failure_contexts.append({
+                        'pending_runtime_candidates': copy.deepcopy(c.state['pending_runtime_candidates']),
+                        'pending_probe_queue': copy.deepcopy(c.state['pending_probe_queue']),
+                    })
+                    c.state['pending_runtime_candidates'] = []
+                return finish_trial(parent, attempt, discovery, reason, deadline, **kwargs)
+
+            c._finish_replay_input_attempt = finish_with_only_probe_queue
+            run_sender = c._run_light_sender
+
+            def failed_input_trial(**kwargs):
+                if 'replay-input-trials' not in str(kwargs['config_path']):
+                    return run_sender(**kwargs)
+                request_id, run_id = kwargs['request_id'], kwargs['run_id']
+                return {
+                    'status': 'callback_reached', 'callback_reached': True,
+                    'validation_status': 'callback_reached', 'request_name': f'{request_id}.json',
+                    'request': {
+                        'request_id': request_id, 'legacy_run_id': run_id, 'run_id': run_id,
+                        'target_plugin': 'fixture', 'hook_name': parent['hook_name'],
+                        'callback_id': parent['callback_id'], 'auth_context': kwargs['auth_context'],
+                        'http_method': 'POST',
+                        'request_params': {'body_params': {'action': 'fixture', 'a': 'probe-a'}},
+                        'response': {'status_code': 200},
+                    },
+                    'zend_name': f'{request_id}.json',
+                    'zend': {'request_id': request_id, 'run_id': run_id,
+                             'request_method': 'POST', 'events': []},
+                    'timing': {},
+                }
+
+            c._run_light_sender = failed_input_trial
+
+            def initial_probe(version, **kwargs):
+                c._run_pending_probe(
+                    parent=version, evidence=evidence, raw_report=c._reports['v0'],
+                    convergence=convergence, probe=convergence['pending_probes'][0],
+                    seed=version['seed_item'], deadline=kwargs['deadline'],
+                )
+
+            gate = c._gate_v0
+
+            def fresh_gate(version, config, **kwargs):
+                if not version.get('readiness_history'):
+                    return True
+                return gate(version, config, **kwargs)
+
+            with patch.object(c, '_gate_v0', side_effect=fresh_gate), \
+                 patch.object(c, 'read_new_runtime_evidence', return_value=[]), \
+                 patch.object(c, '_consume_gate_evidence', side_effect=initial_probe):
+                result = c.run()
+                self.assertEqual(result, 0, json.dumps(c.state['replay_input_trials']))
+
+            trial = c.state['replay_input_trials'][0]
+            self.assertEqual(trial['reason'], 'TRIAL_INPUT_SET_NOT_VERIFIED')
+            self.assertEqual(trial['status'], 'failed')
+            self.assertFalse(failure_contexts[0]['pending_runtime_candidates'])
+            self.assertEqual([row['candidate']['name'] for row in failure_contexts[0]['pending_probe_queue']], ['b'])
+            self.assertEqual(queue_after_failure, ['b'])
+            self.assertEqual([row['candidate']['name'] for row in c.state['probe_attempts']], ['a', 'b'])
+            self.assertIn('probe:b', log)
+            self.assertEqual([row['version'] for row in c.state['versions']], ['v0'])
+            self.assertEqual(c.state['versions'][0]['known_parameters'], [])
+
+    def test_pending_same_parent_needs_no_extra_gate_and_missing_parent_fails_closed(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmp:
+                c, parent, evidence, convergence = self.make_probe_context(Path(tmp), [], names=('a',))
+                c._candidate_deadline()
+                c.state['pending_probe_queue'] = [dict(parent_version='missing' if missing else 'v0',
+                    candidate=convergence['pending_probes'][0], evidence=evidence, convergence=convergence)]
+                with patch.object(c, '_gate_v0') as gate, patch.object(c, '_run_pending_probe') as probe:
+                    c._drain_pending_probes()
+                gate.assert_not_called()
+                self.assertEqual(probe.call_count, 0 if missing else 1)
+                if missing:
+                    self.assertEqual(c.state['terminal_status'], 'NOT_VERIFIED')
+                    self.assertTrue(c.state['pending_probe_queue'])
+
+    def test_drain_skips_probe_removed_after_snapshot_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c, _, evidence, convergence = self.make_probe_context(Path(tmp), [])
+            c._candidate_deadline()
+            rows = [dict(parent_version='v0', candidate=probe, convergence=convergence, evidence=evidence)
+                    for probe in convergence['pending_probes']]
+            c.state['pending_probe_queue'] = rows[:]
+            processed = []
+
+            def handoff(**kwargs):
+                name = kwargs['probe']['name']
+                processed.append(name)
+                if name == 'a':
+                    c.state['pending_probe_queue'].remove(rows[1])
+
+            with patch.object(c, '_run_pending_probe', side_effect=handoff):
+                c._drain_pending_probes()
+            self.assertEqual(processed, ['a'])
+
+    def test_verified_progress_uses_rolling_window_beyond_old_120_second_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [], max_seconds=30)
+            self.assertEqual(coordinator._candidate_deadline(), 30)
+            self.assertIsNone(coordinator.hard_seconds)
+            for now, expected in ((20, 50), (45, 75), (70, 100), (95, 125), (120, 150)):
+                coordinator.clock.now = now
+                self.assertEqual(coordinator._extend_progress_budget("verified_parameter", str(now)), expected)
+
+    def test_pending_names_and_same_time_burst_do_not_bank_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [], max_seconds=30)
+            coordinator._candidate_deadline()
+            coordinator.clock.now = 20
+            for index in range(100):
+                self.assertEqual(coordinator._extend_progress_budget("pending_verification", str(index)), 30)
+            for index in range(100):
+                self.assertEqual(coordinator._extend_progress_budget("verified_parameter", str(index)), 50)
+            coordinator.clock.now = 40
+            self.assertEqual(coordinator._extend_progress_budget("verified_parameter", "0"), 50)
+            coordinator.clock.now = 50
+            self.assertEqual(coordinator._extend_progress_budget("verified_parameter", "late"), 50)
+
+    def test_progress_reserve_respects_explicit_and_campaign_caps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [], max_seconds=30, campaign_deadline=115)
+            coordinator.hard_seconds = 120
+            coordinator._candidate_deadline()
+            coordinator._sender_seconds = 20
+            coordinator.clock.now = 20
+            self.assertEqual(coordinator._extend_progress_budget("verified_parameter", "a"), 110)
+            coordinator.clock.now = 50
+            self.assertEqual(coordinator._extend_progress_budget("verified_parameter", "b"), 115)
+            coordinator.clock.now = 115
+            self.assertEqual(coordinator._extend_progress_budget("verified_parameter", "c"), 115)
+
     def test_get_bootstrap_post_probe_replays_and_pass2_before_new_worker(self):
         for method_only, post_action in ((False, False), (True, False), (True, True)):
             with self.subTest(method_only=method_only, post_action=post_action), tempfile.TemporaryDirectory() as tmp:
@@ -239,11 +657,11 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             coordinator.clock.now = 1.9
             first = coordinator._extend_progress_budget("runtime_callback", "a")
             second = coordinator._extend_progress_budget("runtime_callback", "b")
-            self.assertGreater(second, first)
+            self.assertEqual(second, first)
             campaign = coordinator.campaign_deadline
             self.assertEqual(coordinator._extend_progress_budget("runtime_callback", "b"), second)
             self.assertEqual(coordinator.campaign_deadline, campaign)
-            self.assertLessEqual(second, coordinator._hard_deadline)
+            self.assertEqual(second, 2.0)
 
     def test_child_only_proposal_cannot_buy_parent_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -353,22 +771,22 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 with self.subTest(name=name, value=value), self.assertRaises(ValueError):
                     run_online_linked(args)
 
-    def test_progress_renews_both_deadlines_once_and_respects_hard_cap(self):
+    def test_progress_callback_can_renew_campaign_but_explicit_candidate_cap_still_wins(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator = self.make_coordinator(Path(tmp), [], campaign_deadline=2.0)
+            coordinator.hard_seconds = 8
+            coordinator.progress_callback = lambda kind, key: 20.0
             coordinator._candidate_deadline()
             coordinator.clock.now = 1.9
             deadline = coordinator._extend_progress_budget("verified_parameter", "body:new")
-            self.assertGreater(deadline, 2.0)
-            self.assertGreater(coordinator.campaign_deadline, 2.0)
-            campaign = coordinator.campaign_deadline
+            self.assertEqual(deadline, 3.9)
+            self.assertEqual(coordinator.campaign_deadline, 20)
             coordinator.clock.now = 2.1
             self.assertEqual(coordinator._extend_progress_budget("verified_parameter", "body:new"), deadline)
-            self.assertEqual(coordinator.campaign_deadline, campaign)
             for index in range(20):
                 coordinator.clock.now = min(coordinator._deadline - 0.1, 7.9)
                 coordinator._extend_progress_budget("verified_parameter", str(index))
-            self.assertEqual(coordinator._deadline, coordinator._hard_deadline)
+            self.assertEqual(coordinator._deadline, 8)
 
     def test_runtime_callback_33_runs_beyond_initial_budget_or_is_preserved_at_hard_cap(self):
         for hard_cap in (32, 33):
@@ -684,7 +1102,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             gate_request_id = "v0-probe"
             probe_items = []
             pending = []
-            for name in ("a", "b", "c"):
+            for name in ("a",):
                 variant = f"zend_probe_post_{name}"
                 item = copy.deepcopy(seed_item())
                 item["seed"]["seed_variant_id"] = variant
@@ -1670,6 +2088,13 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             sync.assert_called_once()
             args.hard_max_candidates = 129
             with self.assertRaisesRegex(ValueError, "context or budgets changed"):
+                run_online_linked(args)
+            args.hard_max_candidates = None
+            batch_path = root / "output/online-linked/run/batch-state.json"
+            old_policy = json.loads(batch_path.read_text(encoding="utf-8"))
+            old_policy["resume_context"].pop("budget_policy")
+            batch_path.write_text(json.dumps(old_policy), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "policy.*new run"):
                 run_online_linked(args)
 
     def test_online_linked_batch_does_not_sync_or_queue_after_campaign_deadline(self):
@@ -3073,7 +3498,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual({p["name"] for p in coordinator.state["pending_runtime_candidates"]}, {"body_candidate"})
             self.assertTrue(coordinator._active_container)
 
-    def test_bounded_two_probes_keep_independent_evidence(self):
+    def test_unbounded_two_probes_keep_independent_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = []
             coordinator, parent, evidence, convergence = self.make_probe_context(
@@ -3082,7 +3507,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 parent=parent, evidence=evidence,
                 raw_report=coordinator._reports["v0"], convergence=convergence,
                 probe=convergence["pending_probes"][0],
-                seed=parent["seed_item"], deadline=120.0)
+                seed=parent["seed_item"], deadline=None)
             self.assertIsNotNone(result)
             self.assertEqual([p["status"] for p in coordinator.state["probe_attempts"]],
                              ["accepted", "accepted"])
@@ -3366,7 +3791,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(
                 [item["status"] for item in coordinator.state["probe_attempts"]],
-                ["accepted", "failed"],
+                ["accepted"],
             )
             self.assertEqual([version["version"] for version in coordinator.state["versions"]], ["v0", "v1"])
             self.assertEqual(parent["known_parameters"], [])
@@ -3378,6 +3803,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 max(float(entry.rsplit(":", 1)[-1]) for entry in log if "-probe-" in entry),
                 1.5,
             )
+
+            self.assertEqual([row["candidate"]["name"] for row in coordinator.state["pending_probe_queue"]], ["b"])
 
     def test_optional_probe_overhead_cannot_starve_accepted_child(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3406,7 +3833,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(
                 [row["status"] for row in coordinator.state["probe_attempts"]],
-                ["accepted", "failed"],
+                ["accepted"],
             )
             self.assertEqual(
                 [row["version"] for row in coordinator.state["versions"]],
@@ -3421,6 +3848,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator._active_version, "v1")
             self.assertTrue(coordinator._active_container)
             self.assertEqual(parent["known_parameters"], [])
+
+            self.assertEqual([row["candidate"]["name"] for row in coordinator.state["pending_probe_queue"]], ["b"])
 
     def test_deadline_expiration_after_accepted_probe_does_not_start_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4933,7 +5362,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     return replay_runner(*args, **kwargs)
 
                 coordinator.replay_runner = slow_replay
-                self.assertEqual(coordinator.run(), 0)
+                self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
                 self.assertEqual(log.count("worker_start"), 1)
                 self.assertFalse(coordinator.state["versions"][1]["replay_result"]["passed"])
                 self.assertEqual(coordinator.state["terminal_status"], "PARTIAL")
@@ -5022,7 +5451,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             with patch("online_linked.coordinator.time.time", return_value=original["budget"]["saved_at"]):
                 restored._load_checkpoint()
             self.assertEqual(restored._deadline, 1000 + original["budget"]["remaining_seconds"])
-            self.assertEqual(restored._hard_deadline, 1000 + original["budget"]["hard_remaining_seconds"])
+            self.assertIsNone(restored._hard_deadline)
             self.assertEqual(restored.state["pending_runtime_candidates"], original["pending_runtime_candidates"])
             self.assertEqual(restored.state["pending_runtime_candidates"][0]["parameter"]["payload"], "probe")
             self.assertEqual(restored._extend_progress_budget("runtime_callback", "child"), restored._deadline)
@@ -5160,7 +5589,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertIn("resume-1-probe", coordinator.state["probe_attempts"][0]["probe_run_id"])
             self.assertEqual(len(coordinator.state["probe_attempts"]), 1)
             self.assertFalse(coordinator.state["pending_probe_queue"])
-            self.assertLessEqual(coordinator.clock(), coordinator._hard_deadline)
+            self.assertLessEqual(coordinator.clock(), coordinator._deadline)
 
     def test_resume_deferred_probe_from_ancestor_revalidates_saved_parent(self):
         with tempfile.TemporaryDirectory() as tmp:
