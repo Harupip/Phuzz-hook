@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
 
+from discovery.entrypoints.entrypoints import seed_template_for_callback
 from .common_generator import SeedGeneratorBase
 
 
@@ -19,20 +19,13 @@ class ZendRuntimeSeedGenerator(SeedGeneratorBase):
             },
         }
 
-    def build_reports(self, coverage_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        payload = deepcopy(coverage_payload)
-        data = payload.get("data")
-        if isinstance(data, dict):
-            registered = data.get("registered_callbacks")
-            executed = data.get("executed_callbacks")
-            if isinstance(registered, dict) and isinstance(executed, dict):
-                for callback_id, observation in executed.items():
-                    registration = registered.get(callback_id)
-                    if self._correlated_admin_post_probe(registration, observation):
-                        # Keep runtime transport evidence while admitting this explicit
-                        # action probe as a bootstrap candidate for Zend replay.
-                        observation["executed_count"] = 0
-        return super().build_reports(payload)
+    def _is_discovery_eligible(
+        self, hook_name: str, is_active: bool, coverage_status: str, callback_metadata: dict[str, Any],
+    ) -> bool:
+        return is_active and (
+            coverage_status == "uncovered"
+            or seed_template_for_callback(hook_name, callback_metadata) is not None
+        )
 
     @staticmethod
     def _correlated_admin_post_probe(registration: Any, observation: Any) -> bool:
@@ -67,6 +60,13 @@ class ZendRuntimeSeedGenerator(SeedGeneratorBase):
         metadata: dict[str, Any],
         input_params: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        if hook_name.startswith(("admin_post_nopriv_", "admin_post_")):
+            metadata = dict(metadata)
+            if self._correlated_admin_post_probe(metadata, metadata.get("_executed_callback")):
+                # Registration provenance is not the replay observation ID.
+                metadata.pop("request_id", None)
+            else:
+                metadata.pop("_executed_callback", None)
         decisions = super()._method_decisions(hook_name, metadata, input_params)
         if hook_name.startswith(("wp_ajax_nopriv_", "wp_ajax_")):
             if any(item.get("method_status") == "resolved" for item in decisions):
@@ -83,9 +83,4 @@ class ZendRuntimeSeedGenerator(SeedGeneratorBase):
                 "export_allowed": True,
                 "replay_allowed": True,
             }]
-        runtime_observation = metadata.get("_executed_callback")
-        if self._correlated_admin_post_probe(metadata, runtime_observation):
-            metadata = dict(metadata)
-            # Registration request provenance is not the replay observation ID.
-            metadata.pop("request_id", None)
-        return super()._method_decisions(hook_name, metadata, input_params)
+        return decisions

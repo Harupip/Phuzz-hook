@@ -82,6 +82,25 @@ function hookphuzz_online_discovery_secondary_ajax(): void
     ]);
 }
 
+function hookphuzz_online_discovery_mode_ajax(): void
+{
+    if (!isset($_POST['mode'])) {
+        return;
+    }
+
+    $mode = sanitize_text_field(wp_unslash($_POST['mode']));
+    $payload = isset($_POST['payload'])
+        ? sanitize_text_field(wp_unslash($_POST['payload']))
+        : '';
+
+    wp_send_json_success([
+        'case' => 'ajax_mode',
+        'mode' => $mode,
+        'payload' => $payload,
+        'payload_seen' => $payload !== '',
+    ]);
+}
+
 add_action('rest_api_init', static function (): void {
     register_rest_route('hookphuzz-online/v1', '/probe', [
         'methods' => 'GET',
@@ -114,3 +133,5 @@ add_action('wp_ajax_nopriv_hookphuzz_online_discovery', 'hookphuzz_online_discov
 add_action('wp_ajax_hookphuzz_online_discovery', 'hookphuzz_online_discovery_ajax');
 add_action('wp_ajax_nopriv_hookphuzz_online_discovery_secondary', 'hookphuzz_online_discovery_secondary_ajax');
 add_action('wp_ajax_hookphuzz_online_discovery_secondary', 'hookphuzz_online_discovery_secondary_ajax');
+add_action('wp_ajax_nopriv_hookphuzz_online_discovery_mode', 'hookphuzz_online_discovery_mode_ajax');
+add_action('wp_ajax_hookphuzz_online_discovery_mode', 'hookphuzz_online_discovery_mode_ajax');

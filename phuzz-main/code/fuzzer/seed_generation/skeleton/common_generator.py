@@ -18,7 +18,7 @@ class SeedGeneratorBase:
 
     def build_reports(self, coverage_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         callback_rows = self._build_callback_rows(coverage_payload)
-        suggested_rows = [item for item in callback_rows if item["status"] == "uncovered" and item["is_active"]]
+        suggested_rows = [item for item in callback_rows if item["discovery_eligible"]]
 
         gap_report = {
             "schema_version": "hook-gap-report-v1",
@@ -27,7 +27,8 @@ class SeedGeneratorBase:
             "summary": {
                 "registered_callbacks": len(callback_rows),
                 "uncovered_callbacks": len([item for item in callback_rows if item["status"] == "uncovered"]),
-                "active_uncovered_callbacks": len(suggested_rows),
+                "active_uncovered_callbacks": sum(item["status"] == "uncovered" and item["is_active"] for item in callback_rows),
+                "discovery_eligible_callbacks": len(suggested_rows),
                 "direct_http_seed_candidates": len([item for item in suggested_rows if item["direct_http_supported"]]),
             },
             "callbacks": callback_rows,
@@ -49,6 +50,8 @@ class SeedGeneratorBase:
                     "seed_priority": item["seed_priority"],
                     "target_family": item["target_family"],
                     "status": item["status"],
+                    "discovery_eligible": item["discovery_eligible"],
+                    "discovery_reason": item["discovery_reason"],
                     "is_active": item["is_active"],
                     "direct_http_supported": item["direct_http_supported"],
                     "priority": item["priority"],
@@ -194,6 +197,8 @@ class SeedGeneratorBase:
                 "register_count": 1,
                 "execute_count": execute_count,
                 "status": status,
+                "discovery_eligible": self._is_discovery_eligible(hook_name, is_active, status, registered_entry),
+                "discovery_reason": "covered_http_context" if status == "covered" and seeds else generation_status,
                 "seed_priority": seed_priority,
                 "priority_rank": priority_rank,
                 "target_family": target_family,
@@ -231,6 +236,11 @@ class SeedGeneratorBase:
 
     def _extract_input_params(self, registered_entry: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError("Seed generator must define its parameter evidence source")
+
+    def _is_discovery_eligible(
+        self, hook_name: str, is_active: bool, coverage_status: str, callback_metadata: dict[str, Any],
+    ) -> bool:
+        return is_active and coverage_status == "uncovered"
 
     def _resolve_callback_name(self, callback_id: str, payload: dict[str, Any]) -> str:
         for key in ("callback_repr", "stable_id", "runtime_id"):
@@ -283,7 +293,7 @@ class SeedGeneratorBase:
     ) -> tuple[list[dict[str, Any]], str]:
         if not is_active:
             return [], "inactive_callback"
-        if coverage_status != "uncovered":
+        if not self._is_discovery_eligible(hook_name, is_active, coverage_status, callback_metadata or {}):
             return [], "already_covered"
         is_rest_route = str((callback_metadata or {}).get("entrypoint_type", "")) == "rest_route"
         is_seeded_hook = hook_name.startswith(
@@ -516,7 +526,7 @@ class SeedGeneratorBase:
         ]
         suggestions = seed_report.get("suggested_seeds", [])
         if not suggestions:
-            lines.append("No uncovered active callbacks were found.")
+            lines.append("No active callbacks eligible for discovery were found.")
         else:
             for item in suggestions:
                 lines.append(f"## {item['hook_name']}")

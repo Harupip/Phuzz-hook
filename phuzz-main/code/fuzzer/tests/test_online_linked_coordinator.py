@@ -25,12 +25,14 @@ if str(FUZZER_DIR) not in __import__("sys").path:
 from online_linked.coordinator import (
     OnlineLinkedCoordinator,
     OnlineLinkedError,
+    _candidate_context_key,
     _batch_candidate_identity,
     run_online_linked,
 )
 from hook_energy.seed_generation.generated_config_runner import STOP_ON_VULN_EXIT_CODE
 from online_linked.probe_sender import ParentInspectionTimeout
 from seed_generation.config.config_exporter import SeedConfigSkip, export_seed_configs, build_config_for_seed_item
+from seed_generation.skeleton.candidate_generator import ZendRuntimeSeedGenerator
 from hook_energy.seed_generation.zend_runtime.bridge_cli import converge_iteration, verify_pass2_contract, _materialize_ajax_runtime_probes
 from seed_generation.convergence.convergence import materialize_convergence_seeds
 from zend_discovery.engine import candidate_from_seed_item, canonical_identity_id
@@ -713,7 +715,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                         if len(calls) == 1:
                             now[0] = 0.9
                             for child in children:
-                                self.kwargs["progress_callback"]("runtime_callback", _batch_candidate_identity(child, "fixture"))
+                                self.kwargs["progress_callback"]("runtime_callback", _candidate_context_key(child, "fixture"))
                         else:
                             now[0] = min(self.kwargs["campaign_deadline"], now[0] + 1.5)
                         return 0
@@ -813,7 +815,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                         if len(calls) == 32:
                             now[0] = 0.9
                             callback = self.kwargs["progress_callback"]
-                            deadline = callback("runtime_callback", _batch_candidate_identity(child, "fixture"))
+                            deadline = callback("runtime_callback", _candidate_context_key(child, "fixture"))
                             now[0] = 1.1
                             self.state["campaign_deadline"] = deadline
                         return 0
@@ -881,9 +883,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     def run(self):
                         if discoveries and len(seen) == count:
                             callback = self.kwargs["progress_callback"]
-                            callback("runtime_callback", _batch_candidate_identity(items[0], "fixture"))
+                            callback("runtime_callback", _candidate_context_key(items[0], "fixture"))
                             for child in children + children:
-                                callback("runtime_callback", _batch_candidate_identity(child, "fixture"))
+                                callback("runtime_callback", _candidate_context_key(child, "fixture"))
                                 state = json.loads((root / "output/online-linked/run/batch-state.json").read_text())
                                 growth.append(state["effective_max_candidates"])
                         if len(seen) == expire_after:
@@ -1330,7 +1332,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             replay_values = {row["name"]: row["value"] for row in replay["body_params"]["data"]}
             self.assertEqual(replay_values, values)
 
-    def test_same_hook_different_runtime_callback_is_queued_once(self):
+    def test_same_callback_is_queued_once_per_distinct_runtime_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator = self.make_coordinator(Path(tmp), [])
             item, config, target_key = coordinator._select_v0()
@@ -1387,8 +1389,11 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 },
             }}
             cycle = coordinator._discover_runtime_candidates(evidence)
-            self.assertEqual(cycle, [])
-            self.assertEqual(len(coordinator.state["candidate_queue"]), 1)
+            self.assertEqual(len(cycle), 1)
+            self.assertEqual(cycle[0]["callback_id"], "cb-fixture")
+            self.assertNotEqual(cycle[0]["context_key"], first[0]["context_key"])
+            self.assertEqual(coordinator._discover_runtime_candidates(evidence), [])
+            self.assertEqual(len(coordinator.state["candidate_queue"]), 2)
     def test_uopz_producer_contract_exports_json_status_and_cookie_names(self):
         hook_path = Path(__file__).resolve().parents[2] / "web" / "instrumentation" / "hook_coverage" / "uopz_hook_wp.php"
         source = hook_path.read_text(encoding="utf-8")
@@ -1519,6 +1524,327 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             },
         }
         self.assertEqual(_batch_candidate_identity(ajax_initial, "fixture"), _batch_candidate_identity(ajax_runtime, "fixture"))
+
+    def test_candidate_context_key_deduplicates_provenance_and_fuzzable_values(self):
+        item = {
+            "hook_name": "wp_ajax_nopriv_context",
+            "callback_id": "cb-context",
+            "request_id": "req-1",
+            "executed_count": 4,
+            "observed_at": "2026-10-20T00:00:00Z",
+            "seed": {
+                "entrypoint_type": "ajax_unauthenticated",
+                "path": "/wp-admin/admin-ajax.php",
+                "method": "POST",
+                "content_type": "application/x-www-form-urlencoded",
+                "auth_mode": "unauth-capable",
+                "query_params": {"page": 1},
+                "body": {"action": "context", "mode": "list", "payload": "first"},
+                "headers": {"X-Trace": "fixed", "X-Nonce": "nonce-1"},
+                "cookies": {"session": "fixed-cookie"},
+                "fixed_params": ["action", "mode", "page", "X-Trace", "session"],
+                "fuzzable_params": ["payload"],
+                "input_params": [
+                    {"name": "payload", "source": "POST", "role": "application_data", "fuzzable": True},
+                    {"name": "X-Nonce", "source": "HEADER", "role": "security_nonce", "fuzzable": False},
+                ],
+            },
+        }
+        reordered = copy.deepcopy(item)
+        reordered["request_id"] = "req-2"
+        reordered["executed_count"] = 99
+        reordered["observed_at"] = "later"
+        reordered["seed"]["body"]["payload"] = "second"
+        reordered["seed"]["headers"]["X-Nonce"] = "nonce-2"
+        reordered["seed"]["body"] = dict(reversed(list(reordered["seed"]["body"].items())))
+        reordered["seed"]["headers"] = dict(reversed(list(reordered["seed"]["headers"].items())))
+
+        self.assertEqual(_candidate_context_key(item, "fixture"), _candidate_context_key(reordered, "fixture"))
+
+    def test_candidate_context_key_keeps_auth_transport_and_fixed_selectors_distinct(self):
+        item = {
+            "hook_name": "wp_ajax_nopriv_context",
+            "callback_id": "cb-context",
+            "seed": {
+                "entrypoint_type": "ajax_unauthenticated",
+                "path": "/wp-admin/admin-ajax.php",
+                "method": "POST",
+                "content_type": "application/x-www-form-urlencoded",
+                "auth_mode": "unauth-capable",
+                "body": {"action": "context", "mode": "list", "payload": "first"},
+                "fixed_params": ["action", "mode"],
+                "fuzzable_params": ["payload"],
+            },
+        }
+        base = _candidate_context_key(item, "fixture")
+        for section, key, value in (
+            ("body", "mode", "preview"),
+            ("auth_mode", None, "authenticated"),
+            ("method", None, "GET"),
+            ("content_type", None, "application/json"),
+        ):
+            changed = copy.deepcopy(item)
+            if key is None:
+                changed["seed"][section] = value
+            else:
+                changed["seed"][section][key] = value
+            self.assertNotEqual(base, _candidate_context_key(changed, "fixture"), section)
+
+    def test_candidate_context_key_keeps_unclassified_nonce_values_fixed(self):
+        item = {
+            "hook_name": "wp_ajax_nopriv_context",
+            "callback_id": "cb-context",
+            "seed": {"path": "/wp-admin/admin-ajax.php", "method": "POST",
+                     "headers": {"X-Nonce": "nonce-1"}},
+        }
+        changed = copy.deepcopy(item)
+        changed["seed"]["headers"]["X-Nonce"] = "nonce-2"
+        self.assertNotEqual(_candidate_context_key(item, "fixture"), _candidate_context_key(changed, "fixture"))
+
+    def test_candidate_context_key_matches_exporter_section_fuzz_rules(self):
+        item = {
+            "hook_name": "wp_ajax_nopriv_context",
+            "callback_id": "cb-context",
+            "seed": {
+                "path": "/wp-admin/admin-ajax.php", "method": "POST",
+                "auth_mode": "unauth-capable",
+                "body": {"action": "demo", "payload": "fuzz"},
+                "query_params": {"payload": "list"},
+                "headers": {"payload": "header-fixed"},
+                "cookies": {"payload": "cookie-fixed"},
+                "fixed_params": ["action"], "fuzzable_params": ["payload"],
+                "input_params": [{
+                    "name": "payload", "source": "POST", "location": "form", "fuzzable": True,
+                }],
+            },
+        }
+        _, config = build_config_for_seed_item(item)
+        self.assertEqual(config["body_params"]["fuzz"], ["payload"])
+        self.assertIn("payload", config["query_params"]["fixed"])
+        self.assertEqual(config["headers"]["fuzz"], [])
+        self.assertEqual(config["cookies"]["fuzz"], [])
+
+        body_value_changed = copy.deepcopy(item)
+        body_value_changed["seed"]["body"]["payload"] = "different-fuzz-input"
+        self.assertEqual(_candidate_context_key(item, "fixture"),
+                         _candidate_context_key(body_value_changed, "fixture"))
+
+        for section, value in (("query_params", "preview"), ("headers", "header-changed"),
+                               ("cookies", "cookie-changed")):
+            with self.subTest(section=section):
+                changed = copy.deepcopy(item)
+                changed["seed"][section]["payload"] = value
+                self.assertNotEqual(_candidate_context_key(item, "fixture"),
+                                    _candidate_context_key(changed, "fixture"))
+
+    def test_candidate_context_key_respects_fixed_priority_and_top_level_export_fields(self):
+        conflict = {
+            "hook_name": "wp_ajax_nopriv_context",
+            "callback_id": "cb-context",
+            "seed": {
+                "path": "/wp-admin/admin-ajax.php", "method": "POST",
+                "auth_mode": "unauth-capable",
+                "body": {"payload": "fixed-value"},
+                "fixed_params": ["payload"], "fuzzable_params": ["payload"],
+                "input_params": [{
+                    "name": "payload", "source": "POST", "location": "form", "fuzzable": True,
+                }],
+            },
+        }
+        _, config = build_config_for_seed_item(conflict)
+        self.assertEqual(config["body_params"]["fuzz"], [])
+        self.assertIn("payload", config["body_params"]["fixed"])
+        changed_conflict = copy.deepcopy(conflict)
+        changed_conflict["seed"]["body"]["payload"] = "another-fixed-value"
+        self.assertNotEqual(_candidate_context_key(conflict, "fixture"),
+                            _candidate_context_key(changed_conflict, "fixture"))
+
+        nested = copy.deepcopy(conflict)
+        nested["seed"].update({
+            "body": {"action": "demo", "id": "fuzz", "options": {"id": "list"}},
+            "fixed_params": ["action", "options"], "fuzzable_params": ["id"],
+            "input_params": [],
+        })
+        _, config = build_config_for_seed_item(nested)
+        self.assertIn("options", config["body_params"]["fixed"])
+        self.assertIn("id", config["body_params"]["fuzz"])
+        changed_nested = copy.deepcopy(nested)
+        changed_nested["seed"]["body"]["options"]["id"] = "preview"
+        self.assertNotEqual(_candidate_context_key(nested, "fixture"),
+                            _candidate_context_key(changed_nested, "fixture"))
+
+    def test_candidate_context_key_canonicalizes_role_metadata_as_sets(self):
+        item = {
+            "hook_name": "wp_ajax_nopriv_context",
+            "callback_id": "cb-context",
+            "seed": {
+                "path": "/wp-admin/admin-ajax.php", "method": "POST",
+                "body": {"action": "demo", "mode": "list", "payload": "fuzz"},
+                "fixed_params": ["action", "mode"],
+                "fuzzable_params": ["payload", "nonce"],
+                "input_params": [
+                    {"name": "payload", "source": "POST", "location": "form", "fuzzable": True},
+                    {"name": "nonce", "source": "POST", "location": "form", "fuzzable": True},
+                ],
+            },
+        }
+        reordered = copy.deepcopy(item)
+        reordered["seed"]["fixed_params"] = ["mode", "action", "mode"]
+        reordered["seed"]["fuzzable_params"] = ["nonce", "payload", "nonce"]
+        reordered["seed"]["input_params"] = list(reversed(reordered["seed"]["input_params"]))
+        reordered["seed"]["input_params"].append(copy.deepcopy(reordered["seed"]["input_params"][0]))
+        self.assertEqual(_candidate_context_key(item, "fixture"),
+                         _candidate_context_key(reordered, "fixture"))
+
+    def test_candidate_context_key_preserves_fixed_value_types_and_array_order(self):
+        item = {
+            "hook_name": "wp_ajax_nopriv_context",
+            "callback_id": "cb-context",
+            "seed": {"path": "/wp-admin/admin-ajax.php", "method": "POST",
+                     "body": {"action": "context", "choices": [1, "1"]},
+                     "fixed_params": ["action", "choices"]},
+        }
+        reordered = copy.deepcopy(item)
+        reordered["seed"]["body"]["choices"] = ["1", 1]
+        self.assertNotEqual(_candidate_context_key(item, "fixture"), _candidate_context_key(reordered, "fixture"))
+
+    def test_candidate_context_key_tolerates_missing_optional_role_lists(self):
+        for field in ("fixed_params", "fuzzable_params", "input_params"):
+            item = {
+                "hook_name": "wp_ajax_nopriv_context",
+                "callback_id": "cb-context",
+                "seed": {"path": "/wp-admin/admin-ajax.php", "method": "POST", field: None},
+            }
+            with self.subTest(field=field):
+                self.assertRegex(_candidate_context_key(item, "fixture"), r"^[0-9a-f]{64}$")
+
+    def test_batch_deduplicates_by_context_across_initial_and_runtime_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def item(mode, payload, request_id):
+                result = copy.deepcopy(seed_item())
+                result["request_id"] = request_id
+                result["executed_count"] = int(request_id.rsplit("-", 1)[-1])
+                result["seed"].update(
+                    content_type="application/x-www-form-urlencoded",
+                    body={"action": "fixture", "mode": mode, "seed": payload},
+                    fixed_params=["action", "mode"],
+                    fuzzable_params=["seed"],
+                )
+                return result
+
+            initial = [item("list", "first", "req-1"), item("list", "next", "req-2"),
+                       item("preview", "first", "req-3")]
+            rediscovered = [item("list", "later", "req-4"), item("preview", "later", "req-5"),
+                            item("edit", "first", "req-6")]
+            suggested = root / "suggested.json"
+            suggested.write_text(json.dumps({"suggested_seeds": initial}), encoding="utf-8")
+            registry = root / "registry.json"
+            registry.write_text("{}", encoding="utf-8")
+            calls = []
+
+            class FakeCoordinator:
+                def __init__(self, **kwargs):
+                    self.kwargs = kwargs
+                    self.state_path = root / f"candidate-{len(calls) + 1}.json"
+                    current = json.loads(Path(kwargs["suggested_seeds"]).read_text())["suggested_seeds"][0]
+                    calls.append(current)
+                    self.state = {
+                        "terminal_status": "BOUNDED_ONLINE_COMPLETE",
+                        "terminal_reason": "BUDGET_EXPIRED",
+                        "versions": [],
+                        "candidate_queue": rediscovered if len(calls) == 1 else [],
+                    }
+
+                def run(self):
+                    return 0
+
+            args = SimpleNamespace(
+                suggested_seeds=str(suggested), bootstrap_config="", config_root=str(root / "configs"),
+                output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="context-campaign",
+                max_seconds=2, max_versions=2, max_candidates=1, hard_max_candidates=4,
+                campaign_seconds=20, hard_campaign_seconds=40, callback_registry=str(registry), service="fixture",
+            )
+            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch("online_linked.coordinator.export_online_linked_batch", return_value=0), \
+                    patch("sys.stdout", new=io.StringIO()):
+                self.assertEqual(run_online_linked(args), 0)
+
+            state = json.loads((root / "output/online-linked/context-campaign/batch-state.json").read_text())
+            self.assertEqual([row["seed"]["body"]["mode"] for row in calls], ["list", "preview", "edit"])
+            self.assertEqual(len({row["identity"] for row in state["candidates"]}), 1)
+            self.assertEqual(len({row["context_key"] for row in state["candidates"]}), 3)
+            self.assertEqual(len(state["queued_context_keys"]), 3)
+            self.assertEqual(len(state["budget"]["progress_keys"]), 1)
+
+    def test_covered_bootstrap_report_exports_replay_only_and_deduplicates_queue(self):
+        hook_name = "wp_ajax_nopriv_hookphuzz_online_discovery_mode"
+        coverage = {"data": {
+            "registered_callbacks": {"cb-mode": {
+                "callback_id": "cb-mode", "hook_name": hook_name,
+                "callback_repr": "hookphuzz_online_discovery_mode_ajax", "is_active": True,
+                "status": "covered",
+            }},
+            "executed_callbacks": {"cb-mode": {
+                "callback_id": "cb-mode", "hook_name": hook_name,
+                "executed_count": 5,
+            }},
+        }}
+        gap_report, seed_report = ZendRuntimeSeedGenerator().build_reports(coverage)
+        item = seed_report["suggested_seeds"][0]
+        self.assertEqual(item["status"], "covered")
+        self.assertTrue(item["discovery_eligible"])
+        self.assertEqual(gap_report["callbacks"][0]["execute_count"], 5)
+        self.assertEqual(gap_report["summary"]["discovery_eligible_callbacks"], 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            export = export_seed_configs(
+                seed_report, output_config_dir=root / "configs", replay_only=True,
+            )
+            self.assertEqual(len(export["generated"]), 1)
+            config = json.loads(Path(export["generated"][0]["config_path"]).read_text())
+            self.assertEqual(config["config_type"], "replay_only")
+            self.assertFalse(config["metadata"]["fuzzing_ready"])
+
+            duplicate = copy.deepcopy(item)
+            duplicate["request_id"] = "bootstrap-request-2"
+            duplicate["executed_count"] = 8
+            suggested = root / "suggested.json"
+            suggested.write_text(json.dumps({"suggested_seeds": [item, duplicate]}), encoding="utf-8")
+            registry = root / "registry.json"
+            registry.write_text("{}", encoding="utf-8")
+
+            class FakeCoordinator:
+                def __init__(self, **kwargs):
+                    self.state_path = root / "candidate-state.json"
+                    self.state = {
+                        "terminal_status": "BOUNDED_ONLINE_COMPLETE",
+                        "versions": [],
+                        "candidate_queue": [copy.deepcopy(item)],
+                    }
+
+                def run(self):
+                    return 0
+
+            args = SimpleNamespace(
+                suggested_seeds=str(suggested), bootstrap_config="",
+                config_root=str(root / "online-configs"), output_root=str(root / "output"),
+                plugin_slug="fixture", legacy_run_id="covered-bootstrap", max_seconds=2,
+                max_versions=2, max_candidates=1, hard_max_candidates=4,
+                campaign_seconds=20, hard_campaign_seconds=40,
+                callback_registry=str(registry), service="fixture",
+            )
+            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch("online_linked.coordinator.export_online_linked_batch", return_value=0), \
+                    patch("sys.stdout", new=io.StringIO()):
+                self.assertEqual(run_online_linked(args), 0)
+
+            state = json.loads((root / "output/online-linked/covered-bootstrap/batch-state.json").read_text())
+            self.assertEqual(len(state["candidates"]), 1)
+            self.assertEqual(len(state["queued_context_keys"]), 1)
+            self.assertEqual(state["budget"]["progress_keys"], [])
 
     def test_runtime_registration_enqueues_supported_child_with_parent_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2092,6 +2418,13 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             args.hard_max_candidates = None
             batch_path = root / "output/online-linked/run/batch-state.json"
             old_policy = json.loads(batch_path.read_text(encoding="utf-8"))
+            for field in ("context_key_version", "queued_context_keys"):
+                with self.subTest(missing_checkpoint_field=field):
+                    missing_context = copy.deepcopy(old_policy)
+                    missing_context.pop(field)
+                    batch_path.write_text(json.dumps(missing_context), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "context-key"):
+                        run_online_linked(args)
             old_policy["resume_context"].pop("budget_policy")
             batch_path.write_text(json.dumps(old_policy), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "policy.*new run"):
@@ -5445,7 +5778,18 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             coordinator.state.update(terminal_status="PARTIAL", terminal_reason="PENDING_RUNTIME_VERIFICATION")
             coordinator._write_state()
             original = json.loads(coordinator.state_path.read_text())
+            self.assertEqual(original["context_key_version"], 1)
+            self.assertEqual(original["checkpoint"]["candidate_context_key"],
+                             _candidate_context_key(item, "fixture"))
             restored = self.make_coordinator(Path(tmp), [])
+            legacy = copy.deepcopy(original)
+            legacy.pop("context_key_version")
+            legacy["checkpoint"].pop("context_key_version")
+            restored.state_path.write_text(json.dumps(legacy), encoding="utf-8")
+            rejected = self.make_coordinator(Path(tmp), [])
+            with self.assertRaisesRegex(ValueError, "candidate context-key version"):
+                rejected._load_checkpoint()
+            restored.state_path.write_text(json.dumps(original), encoding="utf-8")
             restored.resume = True
             restored.clock.now = 1000
             with patch("online_linked.coordinator.time.time", return_value=original["budget"]["saved_at"]):
@@ -5453,6 +5797,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(restored._deadline, 1000 + original["budget"]["remaining_seconds"])
             self.assertIsNone(restored._hard_deadline)
             self.assertEqual(restored.state["pending_runtime_candidates"], original["pending_runtime_candidates"])
+            self.assertEqual(restored.state["queued_candidate_context_keys"], original["queued_candidate_context_keys"])
             self.assertEqual(restored.state["pending_runtime_candidates"][0]["parameter"]["payload"], "probe")
             self.assertEqual(restored._extend_progress_budget("runtime_callback", "child"), restored._deadline)
             self.assertEqual(len(restored.state["versions"]), 1)
@@ -5487,7 +5832,21 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertEqual(run_online_linked(args), 0)
                 saved = json.loads(batch_path.read_text())
                 self.assertEqual(saved["campaign_status"], "PARTIAL")
+                self.assertEqual(saved["context_key_version"], 1)
                 self.assertTrue((batch_path.parent / "final-configs").is_dir())
+                legacy = copy.deepcopy(saved)
+                legacy.pop("context_key_version")
+                batch_path.write_text(json.dumps(legacy), encoding="utf-8")
+                args.resume = True
+
+                class NeverCoordinator:
+                    def __init__(self, **kwargs):
+                        raise AssertionError("worker must not start for a legacy context checkpoint")
+
+                with patch("online_linked.coordinator.OnlineLinkedCoordinator", NeverCoordinator):
+                    with self.assertRaisesRegex(ValueError, "batch context-key version"):
+                        run_online_linked(args)
+                batch_path.write_text(json.dumps(saved), encoding="utf-8")
                 args.resume = True
                 with patch("online_linked.coordinator.time.time", return_value=saved["budget"]["saved_at"]):
                     self.assertEqual(run_online_linked(args), 0)

@@ -42,6 +42,22 @@ def build_callback(
 
 
 class HookSeedImporterReplayableTests(unittest.TestCase):
+    def test_importer_uses_explicit_discovery_eligibility_with_legacy_fallback(self) -> None:
+        importer = HookSeedImporter(handoff_doc=Path("handoff.md"), hook_gap_report=Path("gap.json"),
+                                    suggested_seeds=Path("seeds.json"))
+        callback = build_callback("cb", "wp_ajax_demo", auth_mode="authenticated")
+        self.assertTrue(importer._is_replayable(callback))
+        callback["status"] = "covered"
+        self.assertFalse(importer._is_replayable(callback))
+        callback["discovery_eligible"] = True
+        self.assertTrue(importer._is_replayable(callback))
+        callback["discovery_eligible"] = False
+        callback["status"] = "uncovered"
+        self.assertFalse(importer._is_replayable(callback))
+        callback["discovery_eligible"] = True
+        callback["is_active"] = False
+        self.assertFalse(importer._is_replayable(callback))
+
     def test_importer_splits_replayable_callbacks_by_auth_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

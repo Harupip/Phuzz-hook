@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 FUZZER_DIR = Path(__file__).resolve().parents[1]
@@ -149,6 +150,45 @@ def build_rest_probe_payload(source_root: Path, *, schema_name: str = "id", sche
 
 
 class SeedGeneratorTests(unittest.TestCase):
+    def test_bootstrap_execution_does_not_remove_runtime_http_candidate(self) -> None:
+        for as_list in (False, True):
+            for count in (0, 5):
+                with self.subTest(as_list=as_list, count=count):
+                    payload = build_live_coverage_payload()
+                    payload["data"]["executed_callbacks"]["cb-auth"]["executed_count"] = count
+                    if as_list:
+                        for key in ("registered_callbacks", "executed_callbacks"):
+                            payload["data"][key] = list(payload["data"][key].values())
+                    original = deepcopy(payload)
+                    gap, report = ZendRuntimeSeedGenerator().build_reports(payload)
+                    items = {row["callback_id"]: row for row in report["suggested_seeds"]}
+                    self.assertIn("cb-auth", items)
+                    self.assertEqual(items["cb-auth"]["status"], "covered" if count else "uncovered")
+                    self.assertTrue(items["cb-auth"]["discovery_eligible"])
+                    self.assertFalse(items["cb-auth"]["fuzzing_ready"])
+                    self.assertNotIn("cb-enqueue", items)
+                    row = next(row for row in gap["callbacks"] if row["callback_id"] == "cb-auth")
+                    self.assertEqual(row["execute_count"], count)
+                    self.assertEqual(gap["summary"]["active_uncovered_callbacks"], 2 if count else 3)
+                    self.assertEqual(payload, original)
+
+    def test_covered_runtime_rest_is_eligible_but_inactive_is_not(self) -> None:
+        payload = {"data": {"registered_callbacks": {"cb-rest": {
+            "callback_id": "cb-rest", "hook_name": "rest_route:fixture/v1/items",
+            "callback_repr": "fixture_rest", "entrypoint_type": "rest_route",
+            "namespace": "fixture/v1", "route": "/items", "methods": ["POST"],
+            "is_active": True,
+        }}, "executed_callbacks": {"cb-rest": {"executed_count": 2}}}}
+        gap, report = ZendRuntimeSeedGenerator().build_reports(payload)
+        self.assertEqual(len(report["suggested_seeds"]), 1)
+        self.assertEqual(report["suggested_seeds"][0]["seed"]["method"], "POST")
+        self.assertEqual(gap["summary"]["uncovered_callbacks"], 0)
+        self.assertEqual(gap["summary"]["discovery_eligible_callbacks"], 1)
+        payload["data"]["registered_callbacks"]["cb-rest"]["is_active"] = False
+        gap, report = ZendRuntimeSeedGenerator().build_reports(payload)
+        self.assertEqual(report["suggested_seeds"], [])
+        self.assertFalse(gap["callbacks"][0]["discovery_eligible"])
+
     def test_zend_runtime_generator_preserves_proven_ajax_and_rest_methods(self) -> None:
         metadata = {"callback_id": "cb", "hook_name": "wp_ajax_fixture", "callback_repr": "fixture_callback"}
         for method in ("POST", "PUT"):
@@ -195,13 +235,15 @@ class SeedGeneratorTests(unittest.TestCase):
             "endpoint": "ADMIN_POST:hookphuzz_admin_post_test",
         }
 
-        _, seed_report = ZendRuntimeSeedGenerator().build_reports(payload)
+        gap_report, seed_report = ZendRuntimeSeedGenerator().build_reports(payload)
         by_hook = {row["hook_name"]: row for row in seed_report["suggested_seeds"]}
 
         fixture = by_hook["admin_post_hookphuzz_admin_post_test"]
         self.assertEqual(fixture["seed"]["method"], "POST")
         self.assertEqual(fixture["seed"]["body"], {"action": "hookphuzz_admin_post_test"})
         self.assertEqual(fixture["seed"]["method_source"], "runtime_observed")
+        self.assertEqual(fixture["status"], "covered")
+        self.assertEqual(next(row for row in gap_report["callbacks"] if row["callback_id"] == "cb-admin-post")["execute_count"], 1)
         self.assertEqual(by_hook["admin_post_unrelated_action"]["generation_status"], "ambiguous_http_method")
         self.assertIsNone(by_hook["admin_post_unrelated_action"]["seed"]["method"])
 
@@ -228,10 +270,9 @@ class SeedGeneratorTests(unittest.TestCase):
 
         _, seed_report = ZendRuntimeSeedGenerator().build_reports(payload)
 
-        self.assertNotIn(
-            "admin_post_hookphuzz_admin_post_test",
-            {row["hook_name"] for row in seed_report["suggested_seeds"]},
-        )
+        item = next(row for row in seed_report["suggested_seeds"] if row["callback_id"] == "cb-admin-post")
+        self.assertIsNone(item["seed"]["method"])
+        self.assertFalse(item["seed"]["replay_allowed"])
 
     def test_zend_runtime_generator_is_source_free(self) -> None:
         runtime_source = (
