@@ -1211,12 +1211,12 @@ static zend_observer_fcall_handlers hookphuzz_observer_init(zend_execute_data *e
     return handlers;
 }
 
-static zend_bool hookphuzz_valid_request_id(const zend_string *request_id)
+static zend_bool hookphuzz_valid_request_id(const zend_string *request_id, size_t max_length)
 {
     size_t index;
     const unsigned char *value = (const unsigned char *) ZSTR_VAL(request_id);
 
-    if (ZSTR_LEN(request_id) == 0 || ZSTR_LEN(request_id) > 128) return 0;
+    if (ZSTR_LEN(request_id) == 0 || ZSTR_LEN(request_id) > max_length) return 0;
     if (!isalnum(value[0])) return 0;
     for (index = 1; index < ZSTR_LEN(request_id); index++) {
         if (!isalnum(value[index]) && value[index] != '.' && value[index] != '_' && value[index] != '-') return 0;
@@ -1297,7 +1297,7 @@ static zend_string *hookphuzz_run_id_from_server(void)
     server = &PG(http_globals)[TRACK_VARS_SERVER];
     if (Z_TYPE_P(server) != IS_ARRAY) return NULL;
     header = zend_hash_str_find(Z_ARRVAL_P(server), ZEND_STRL("HTTP_X_HOOKPHUZZ_RUN_ID"));
-    if (header == NULL || Z_TYPE_P(header) != IS_STRING || !hookphuzz_valid_request_id(Z_STR_P(header))) return NULL;
+    if (header == NULL || Z_TYPE_P(header) != IS_STRING || !hookphuzz_valid_request_id(Z_STR_P(header), 256)) return NULL;
     return zend_string_copy(Z_STR_P(header));
 }
 
@@ -1781,7 +1781,7 @@ PHP_RINIT_FUNCTION(hookphuzz_opcode)
         hookphuzz_log("hookphuzz_opcode: request artifact skipped: missing X-Fuzzer-Covid");
         return SUCCESS;
     }
-    if (!hookphuzz_valid_request_id(header)) {
+    if (!hookphuzz_valid_request_id(header, 128)) {
         hookphuzz_log("hookphuzz_opcode: request artifact skipped: invalid X-Fuzzer-Covid");
         zend_string_release(header);
         return SUCCESS;
