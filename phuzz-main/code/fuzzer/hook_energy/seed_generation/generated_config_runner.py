@@ -97,7 +97,11 @@ def load_request_artifact(name: str) -> Any:
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"Could not read request artifact: {name}")
-    return json.loads(result.stdout)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        size = len(result.stdout.encode("utf-8"))
+        raise RuntimeError(f"REQUEST_JSON_INVALID path={REQUESTS_DIR}/{name} bytes={size} reason={exc}") from exc
 
 
 def load_finding_artifact(name: str) -> Any:

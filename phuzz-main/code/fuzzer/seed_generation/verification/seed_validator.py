@@ -292,6 +292,26 @@ def evaluate_artifact_payloads(candidate: dict[str, Any], payloads: list[Any]) -
     return _build_result(candidate, observed, artifact_count=len(payloads))
 
 
+def request_blindspot_callbacks(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Read v3 descriptors or resolve v4 IDs within the same request."""
+    coverage = payload.get("hook_coverage", {})
+    if not isinstance(coverage, Mapping):
+        return {}
+    if "blindspot_callbacks" in coverage:
+        return _normalize_callback_mapping(coverage["blindspot_callbacks"])
+    registered = _normalize_callback_mapping(coverage.get("registered_callbacks", {}))
+    identifiers = payload.get("blindspot_callback_ids", None if payload.get("schema_version") == "uopz-request-v4" else [])
+    request_id = payload.get("request_id", "unknown")
+    if not isinstance(identifiers, list):
+        raise ValueError(f"REQUEST_BLINDSPOT_IDS_INVALID request_id={request_id}")
+    blindspots = {}
+    for callback_id in identifiers:
+        if not isinstance(callback_id, str) or callback_id not in registered:
+            raise ValueError(f"REQUEST_BLINDSPOT_REFERENCE_MISSING request_id={request_id} callback_id={callback_id}")
+        blindspots[callback_id] = registered[callback_id]
+    return blindspots
+
+
 def _collect_observed_payloads(payloads: list[Any]) -> dict[str, set[str]]:
     observed = {
         "executed_callback_ids": set(),
@@ -328,7 +348,7 @@ def _collect_observed_payloads(payloads: list[Any]) -> dict[str, set[str]]:
 
         executed = _normalize_callback_mapping(hook_coverage.get("executed_callbacks", {}))
         registered = _normalize_callback_mapping(hook_coverage.get("registered_callbacks", {}))
-        blindspots = _normalize_callback_mapping(hook_coverage.get("blindspot_callbacks", {}))
+        blindspots = request_blindspot_callbacks(payload)
 
         for callback_id, entry in executed.items():
             observed["executed_callback_ids"].add(callback_id)

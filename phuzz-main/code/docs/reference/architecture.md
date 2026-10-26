@@ -2,6 +2,8 @@
 
 Đối chiếu working tree ngày **2026-10-09**. Đường dẫn source trong bảng là link từ tài liệu này. Mô hình sử dụng: một người vận hành Docker cục bộ; plugin và candidate online-linked chạy tuần tự. Khả năng đồng bộ nhiều fuzzer của PHUZZ/Composegen là chức năng riêng.
 
+Cập nhật 2026-10-26: [request artifact v4 rút gọn bản sao blindspot](../reports/2026-10-26-request-artifact-compaction.md), kèm số đo, tương thích v3, lỗi ghi file và cách khôi phục. Metadata callback/parent/child và bằng chứng Zend được giữ nguyên.
+
 ## Luồng chính
 
 ```mermaid

@@ -8,6 +8,13 @@ replayable child candidates. Internal/ambiguous/setup-required hooks stay blocke
 Offline recursive tooling below has a separate role. See [current flow](online-linked-flow.md)
 and [architecture](../reference/architecture.md).
 
+2026-10-26: new `uopz-request-v4` request files keep full registered/executed
+metadata and explicit `blindspot_callback_ids`, but omit the duplicate
+`hook_coverage.blindspot_callbacks` descriptors. Resolve those IDs against
+registered callbacks in the same request with
+`seed_validator.request_blindspot_callbacks()`. Historical v3 files and aggregate
+coverage keep their full maps. See the [compaction record, checks and rollback](../reports/2026-10-26-request-artifact-compaction.md).
+
 ## Scope
 
 Implemented scope:

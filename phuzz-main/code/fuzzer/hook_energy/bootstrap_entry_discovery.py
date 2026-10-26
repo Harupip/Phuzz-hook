@@ -321,7 +321,7 @@ def _registry_from_request_artifacts(hook_coverage_dir: Path) -> dict[str, Any]:
             coverage = {}
         registered.update(_normalize_callback_map(coverage.get("registered_callbacks", {})))
         executed.update(_normalize_callback_map(coverage.get("executed_callbacks", {})))
-        blindspots.update(_normalize_callback_map(coverage.get("blindspot_callbacks", {})))
+        blindspots.update(_normalize_callback_map(seed_validator.request_blindspot_callbacks(payload)))
     return _registry_payload(source="request_artifacts", registered=registered, executed=executed, blindspots=blindspots)
 
 

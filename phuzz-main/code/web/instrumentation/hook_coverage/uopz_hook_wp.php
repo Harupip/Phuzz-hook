@@ -100,7 +100,7 @@ $__uopz_legacy_run_id = (string) ($_SERVER['HTTP_X_HOOKPHUZZ_RUN_ID'] ?? '');
 
 // Đây là payload chính sẽ được ghi ra JSON khi request kết thúc.
 $GLOBALS['__uopz_request'] = [
-    'schema_version' => 'uopz-request-v3',
+    'schema_version' => 'uopz-request-v4',
     'request_id' => $__uopz_request_id,
     'legacy_run_id' => $__uopz_legacy_run_id,
     'run_id' => $__uopz_legacy_run_id,
@@ -1415,9 +1415,25 @@ function __uopz_compute_blindspots(): void
 // Ghi file qua temp + rename de tranh JSON dang do khi request bi ngat giua chung.
 function __uopz_write_json_atomic(string $path, array $data): void
 {
+    $json = json_encode($data, JSON_UNESCAPED_UNICODE);
+    if ($json === false) {
+        error_log('HOOKPHUZZ_ARTIFACT_JSON_ENCODE_FAILED path=' . $path . ' reason=' . json_last_error_msg());
+        return;
+    }
     $tmp = $path . '.tmp.' . bin2hex(random_bytes(4));
-    file_put_contents($tmp, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
-    rename($tmp, $path);
+    $written = @file_put_contents($tmp, $json);
+    if ($written !== strlen($json)) {
+        $reason = error_get_last()['message'] ?? 'incomplete write';
+        @unlink($tmp);
+        error_log('HOOKPHUZZ_ARTIFACT_WRITE_FAILED path=' . $path . ' expected_bytes=' . strlen($json)
+            . ' written_bytes=' . ($written === false ? 'false' : $written) . ' reason=' . $reason);
+        return;
+    }
+    if (!@rename($tmp, $path)) {
+        $reason = error_get_last()['message'] ?? 'rename failed';
+        @unlink($tmp);
+        error_log('HOOKPHUZZ_ARTIFACT_RENAME_FAILED path=' . $path . ' reason=' . $reason);
+    }
 }
 
 function __uopz_build_request_export(): array
@@ -1443,8 +1459,8 @@ function __uopz_build_request_export(): array
     $requestExport['hook_coverage'] = [
         'registered_callbacks' => $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'] ?? [],
         'executed_callbacks' => $GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'] ?? [],
-        'blindspot_callbacks' => $GLOBALS['__uopz_request']['hook_coverage']['blindspot_callbacks'] ?? [],
     ];
+    // v4 blindspot IDs refer to full descriptors in registered_callbacks in this request.
     $requestExport['executed_callback_ids'] = array_values(array_keys($GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'] ?? []));
     $requestExport['blindspot_callback_ids'] = array_values(array_keys($GLOBALS['__uopz_request']['hook_coverage']['blindspot_callbacks'] ?? []));
     $requestExport['new_callback_ids'] = [];
