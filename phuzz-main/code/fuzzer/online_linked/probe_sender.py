@@ -17,7 +17,10 @@ from hook_energy.seed_generation.generated_config_runner import (
     ZEND_ARTIFACTS_DIR,
     read_correlated_artifact_pair,
 )
-from seed_generation.verification.seed_validator import evaluate_artifact_payloads
+from seed_generation.verification.seed_validator import (
+    diagnostic_callback_reached, evaluate_artifact_payloads, has_callback_execution_evidence,
+    http_diagnostics, response_details,
+)
 try:
     from fuzzer import _prepare_request
 except ImportError:
@@ -303,34 +306,44 @@ def send_and_wait(
         prepared = prepare_request_from_config(config, request_id=request_id, run_id=run_id)
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         finished_at = clock()
-        return _result(
+        result = _result(
             "prepare_error", run_id, request_id, started_at, started_at, finished_at,
             None, finished_at, None, finished_at, None, str(exc),
         )
+        result["diagnostics"] = http_diagnostics(transport_outcome="not_sent", transport_error=str(exc))
+        result["diagnostics"]["config_validation"]["preparation"] = "failed"
+        return result
     http_started_at = clock()
     response_status = None
+    response_location = None
+    response_info = {"status_code": None, "headers": {}, "body": None}
+    transport_outcome = "not_observed"
+    transport_error = None
     http_error = ""
     try:
         remaining = deadline - clock()
         if remaining <= 0:
             finished_at = clock()
-            return _result(
+            result = _result(
                 "timeout", run_id, request_id, started_at, http_started_at, finished_at,
                 None, finished_at, None, finished_at, None, "HTTP_BUDGET_EXPIRED",
             )
+            result["diagnostics"] = http_diagnostics(transport_outcome="not_sent", transport_error="HTTP_BUDGET_EXPIRED")
+            result["diagnostics"]["config_validation"]["preparation"] = "succeeded"
+            return result
         with session_factory() as session:
             response = session.send(prepared, timeout=remaining, allow_redirects=False)
             response_status = getattr(response, "status_code", None)
+            response_info = response_details(response)
+            response_location = response_info["headers"].get("Location")
+            transport_outcome = "response_received"
     except Exception as exc:
         http_error = str(exc)
+        transport_error = http_error or type(exc).__name__
+        transport_outcome = "timeout" if isinstance(exc, (TimeoutError, requests.Timeout)) else "error"
     http_finished_at = clock()
-    if http_error:
-        return _result(
-            "http_error", run_id, request_id, started_at, http_started_at, http_finished_at,
-            None, http_finished_at, None, http_finished_at, response_status, http_error,
-        )
-
     pair = None
+    correlation = {"outcome": "not_checked"}
     wait_started_at = clock()
     while clock() < deadline:
         pair = read_correlated_artifact_pair(
@@ -339,19 +352,48 @@ def send_and_wait(
             request_id=request_id,
             run_id=run_id,
             expected=expected,
+            diagnostics=correlation,
         )
         if pair is not None:
             break
         remaining = deadline - clock()
-        if remaining > 0:
-            sleeper(min(0.05, remaining))
+        if remaining <= 0:
+            break
+        sleeper(min(0.05, remaining))
     wait_finished_at = clock()
     if pair is None:
-        return _result(
-            "timeout", run_id, request_id, started_at, http_started_at, http_finished_at,
+        request_evidence = correlation.pop("request_evidence", None)
+        artifact_response = request_evidence.get("response") if isinstance(request_evidence, Mapping) else None
+        request_conflicts = [
+            {"artifact": "request", "field": field, "expected": str(run_id).strip(),
+             "actual": str(request_evidence[field]).strip()}
+            for field in ("run_id", "legacy_run_id")
+            if isinstance(request_evidence, Mapping) and request_evidence.get(field)
+            and str(request_evidence[field]).strip() != str(run_id).strip()
+        ]
+        if request_conflicts:
+            correlation["identity_conflicts"] = request_conflicts
+        correlation["timed_out"] = wait_finished_at >= deadline
+        result = _result(
+            "http_error" if http_error else "timeout", run_id, request_id, started_at, http_started_at, http_finished_at,
             wait_started_at, wait_finished_at, None, wait_finished_at, response_status,
-            "CORRELATED_ARTIFACT_TIMEOUT",
+            http_error or "CORRELATED_ARTIFACT_TIMEOUT", response_location,
         )
+        result["diagnostics"] = http_diagnostics(
+            **response_info, target_url=str(getattr(prepared, "url", "") or ""),
+            callback_reached=diagnostic_callback_reached(expected, request_evidence)
+            if isinstance(request_evidence, Mapping) and not request_conflicts else None,
+            transport_outcome=transport_outcome, transport_error=transport_error, correlation=correlation,
+            artifact_status_code=artifact_response.get("status_code") if isinstance(artifact_response, Mapping) else None,
+            php_errors=request_evidence.get("errors")
+            if isinstance(request_evidence, Mapping) and not request_conflicts else None,
+        )
+        if request_evidence:
+            result["diagnostics"]["callback"]["evidence_source"] = (
+                "conflicting_request_identity" if request_conflicts else "request_artifact"
+            )
+        result["diagnostics"]["config_validation"]["preparation"] = "succeeded"
+        return result
 
     verify_started_at = clock()
     candidate = {
@@ -359,6 +401,18 @@ def send_and_wait(
         "callback_id": str(expected.get("callback_id") or ""),
     }
     validation = evaluate_artifact_payloads(candidate, [pair["request"]])
+    coverage = pair["request"].get("hook_coverage")
+    executed = coverage.get("executed_callbacks") if isinstance(coverage, Mapping) else None
+    if isinstance(executed, list):
+        executed = {str(index): entry for index, entry in enumerate(executed)}
+    if candidate["hook_name"] and candidate["callback_id"] and isinstance(executed, Mapping):
+        entries = [entry for key, entry in executed.items() if isinstance(entry, Mapping)
+                   and candidate["callback_id"] in {str(key), str(entry.get("callback_id") or "")}]
+        hooks = [{entry.get("hook_name"), entry.get("fired_hook")} for entry in entries
+                 if entry.get("hook_name") or entry.get("fired_hook")]
+        if hooks and all(candidate["hook_name"] not in names for names in hooks):
+            validation.update(expected_callback_reached=False, status="not_observed",
+                              reason="Expected callback executed on a different hook")
     finished_at = clock()
     result = _result(
         "artifacts_collected",
@@ -372,7 +426,8 @@ def send_and_wait(
         verify_started_at,
         finished_at,
         response_status,
-        "",
+        http_error,
+        response_location,
     )
     result.update({
         "request_name": pair["request_name"],
@@ -383,6 +438,23 @@ def send_and_wait(
         "validation_status": validation["status"],
         "validation_reason": validation["reason"],
     })
+    request_response = pair["request"].get("response")
+    request_identity_conflict = any(
+        item.get("artifact") == "request" for item in correlation.get("identity_conflicts", [])
+    )
+    result["diagnostics"] = http_diagnostics(
+        **response_info, target_url=str(getattr(prepared, "url", "") or ""),
+        callback_reached=result["callback_reached"] if candidate["callback_id"] and not request_identity_conflict
+        and has_callback_execution_evidence(pair["request"]) else None,
+        transport_outcome=transport_outcome,
+        transport_error=transport_error, correlation=correlation, validation_status=validation["status"],
+        artifact_status_code=request_response.get("status_code") if isinstance(request_response, Mapping) else None,
+        php_errors=pair["request"].get("errors") if not request_identity_conflict else None,
+    )
+    result["diagnostics"]["callback"]["evidence_source"] = (
+        "conflicting_request_identity" if request_identity_conflict else "correlated_artifact_pair"
+    )
+    result["diagnostics"]["config_validation"]["preparation"] = "succeeded"
     result["status"] = "callback_reached" if result["callback_reached"] else "request_completed"
     return result
 
@@ -400,12 +472,14 @@ def _result(
     finished_at,
     response_status,
     error,
+    response_location=None,
 ):
     return {
         "status": status,
         "run_id": run_id,
         "request_id": request_id,
         "response_status": response_status,
+        "response_location": response_location,
         "error": error,
         "timing": {
             "send_http": round(http_finished_at - http_started_at, 3),

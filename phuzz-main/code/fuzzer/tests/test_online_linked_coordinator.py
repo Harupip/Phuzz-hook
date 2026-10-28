@@ -356,6 +356,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                         'matched_artifact': 'fresh-gate.json', 'zend_artifact': 'fresh-gate.json',
                         'request_payload': {'request_id': 'fresh-gate', 'legacy_run_id': run_id,
                             'target_plugin': 'fixture', 'http_method': 'POST',
+                            'response': {'status_code': 200},
                             'request_params': {'body_params': {'action': 'fixture', 'seed': 'base'}}},
                         'zend_payload': {'request_id': 'fresh-gate', 'run_id': run_id}}]}
                 return replay(rows, **kwargs)
@@ -538,8 +539,10 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator._extend_progress_budget("verified_parameter", "c"), 115)
 
     def test_get_bootstrap_post_probe_replays_and_pass2_before_new_worker(self):
-        for method_only, post_action in ((False, False), (True, False), (True, True)):
-            with self.subTest(method_only=method_only, post_action=post_action), tempfile.TemporaryDirectory() as tmp:
+        for method_only, post_action, error_replay in ((False, False, None), (True, False, None),
+                                                        (True, True, None), (False, False, 302),
+                                                        (False, False, 403), (False, False, 500)):
+            with self.subTest(method_only=method_only, post_action=post_action, error_replay=error_replay), tempfile.TemporaryDirectory() as tmp:
                 coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [], names=("body_key",))
                 raw = copy.deepcopy(parent["seed_item"])
                 raw["seed"].update({
@@ -584,7 +587,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     request = {
                         "request_id": request_id, "run_id": run_id, "legacy_run_id": run_id,
                         "target_plugin": "fixture", "http_method": method,
-                        "response": {"status_code": 400 if not method_only and "not_sent" not in body else 200},
+                        "response": {"status_code": error_replay or (400 if not method_only and "not_sent" not in body else 200)},
                         "hook_name": parent["hook_name"], "callback_id": parent["callback_id"],
                         "auth_context": "guest", "auth_variant": "unauthenticated",
                         "canonical_identity_id": canonical_identity_id(candidate),
@@ -610,11 +613,25 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                             "source": "POST", "path": ["not_sent"], "operation": "read",
                             "callback_context": {"attributed": True, "root_callback": "fixture_callback", "depth": 0},
                         })
-                    if request["response"]["status_code"] != 200 and not kwargs["expected"]["allow_error_responses"]:
-                        return {"status": "timeout", "error": "STRICT_REPLAY_REQUIRES_NEXT_PARAMETER"}
-                    return {"status": "callback_reached", "callback_reached": True, "validation_status": "callback_reached",
-                            "request_name": request_id + ".json", "request": request,
-                            "zend_name": request_id + ".json", "zend": zend, "timing": {}}
+                    from online_linked.probe_sender import send_and_wait
+                    requests = Path(tmp) / "http-requests"
+                    zend_dir = Path(tmp) / "http-zend"
+                    requests.mkdir(exist_ok=True); zend_dir.mkdir(exist_ok=True)
+                    (requests / (request_id + ".json")).write_text(json.dumps(request))
+                    (zend_dir / (request_id + ".json")).write_text(json.dumps(zend))
+                    class Session:
+                        def __enter__(self): return self
+                        def __exit__(self, *args): return False
+                        def send(self, prepared, timeout, allow_redirects):
+                            self_test.assertFalse(allow_redirects)
+                            return type("Response", (), {"status_code": request["response"]["status_code"]})()
+                    self_test = self
+                    return send_and_wait(
+                        coordinator.config_root / (kwargs["config_slug"] + ".json"),
+                        request_id=request_id, run_id=run_id, timeout_seconds=2,
+                        expected=kwargs["expected"], session_factory=Session,
+                        request_dir=requests, zend_dir=zend_dir,
+                    )
                 coordinator.probe_sender = sender
                 child = coordinator._run_pending_probe(
                     parent=parent, evidence={"request_id": "req-v0", "request": {"request_params": {"query_params": {"action": "fixture"}}}},
@@ -624,6 +641,12 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertIsNotNone(child, coordinator.state)
                 self.assertEqual(child["resolved_method"], "POST")
                 self.assertEqual(child["replay_result"]["pass2_verification"], {"accepted": 1, "total": 1})
+                if error_replay:
+                    self.assertEqual(child["terminal_reason"], "GUARD_SATISFACTION_UNKNOWN")
+                    self.assertFalse(child["replay_result"]["passed"])
+                    self.assertEqual(child["replay_result"]["runner"]["runs"][0]["response_status"], error_replay)
+                else:
+                    self.assertTrue(child["replay_result"]["passed"])
                 self.assertEqual(Path(parent["config_path"]).read_bytes(), original)
                 final = json.loads(Path(child["config_path"]).read_text())
                 self.assertEqual(final["methods"], ["POST"])
@@ -1950,6 +1973,60 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertEqual(coordinator.state['terminal_reason'],
                                  'V0_REGISTRY_MISSING' if missing_registry else 'V0_PASS2_NOT_VERIFIED')
 
+    def test_v0_error_response_keeps_pass2_but_blocks_fuzz_ready_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            coordinator = self.make_coordinator(Path(tmp), log)
+            replay = coordinator.replay_runner
+            def replay_403(*args, **kwargs):
+                report = replay(*args, **kwargs)
+                report['runs'][0]['request_payload']['response'] = {'status_code': 403}
+                return report
+            coordinator.replay_runner = replay_403
+            coordinator.run()
+            version = coordinator.state['versions'][0]
+            self.assertEqual(version['readiness']['pass2_verification'], {'accepted': 1, 'total': 1})
+            self.assertFalse(version['readiness']['passed'])
+            self.assertEqual(coordinator.state['terminal_reason'], 'GUARD_SATISFACTION_UNKNOWN')
+            self.assertNotIn('worker_start', log)
+
+    def test_v0_successful_responses_keep_existing_fuzz_gate(self):
+        for status in (200, 201, 204):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                log = []
+                coordinator = self.make_coordinator(Path(tmp), log)
+                replay = coordinator.replay_runner
+                def replay_success(*args, **kwargs):
+                    report = replay(*args, **kwargs)
+                    if kwargs['legacy_run_id'].endswith('-v0'):
+                        report['runs'][0]['request_payload']['response'] = {'status_code': status}
+                    return report
+                coordinator.replay_runner = replay_success
+                coordinator.run()
+                self.assertTrue(coordinator.state['versions'][0]['readiness']['passed'])
+                self.assertIn('worker_start', log)
+
+    def test_v0_error_response_keeps_replay_only_discovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            coordinator = self.make_coordinator(Path(tmp), log)
+            def build_replay(*args, **kwargs):
+                config = config_for(seed_item())
+                config['config_type'] = 'replay_only'
+                config['body_params']['fuzz'] = []
+                return 'fixture', config
+            coordinator.build_config_fn = build_replay
+            replay = coordinator.replay_runner
+            def replay_403(*args, **kwargs):
+                report = replay(*args, **kwargs)
+                if kwargs['legacy_run_id'].endswith('-v0'):
+                    report['runs'][0]['request_payload']['response'] = {'status_code': 403}
+                return report
+            coordinator.replay_runner = replay_403
+            coordinator.run()
+            self.assertTrue(coordinator.state['versions'][0]['readiness']['probe_only'])
+            self.assertIn('worker_start', log)
+
     def test_v0_selection_matches_method_when_callback_has_multiple_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator = self.make_coordinator(Path(tmp), [])
@@ -2850,6 +2927,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                         'legacy_run_id': kwargs['legacy_run_id'],
                         'target_plugin': 'fixture',
                         'http_method': 'POST',
+                        'response': {'status_code': 200},
                         'request_params': {'body_params': {'action': 'fixture', 'seed': 'base'}},
                     },
                     'zend_payload': {
@@ -3287,6 +3365,98 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(len(coordinator.state["probe_attempts"]), 2)
             self.assertIn("PROBE_BUDGET_EXHAUSTED", json.dumps(coordinator.state["events"]))
             self.assertEqual(parent["known_parameters"], [])
+
+    def test_non_success_replay_reaches_pass2_but_unknown_guard_blocks_fuzzing(self):
+        for status in (301, 302, 303, 304, 307, 308, 400, 403, 404, 500):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                log = []
+                coordinator, parent, evidence, convergence = self.make_probe_context(
+                    Path(tmp), log, names=("a",), accepted=("a",),
+                )
+                def verify_actual_pass2(run, _merged_report, zend_dir, **kwargs):
+                    row = run["runs"][0]
+                    expected = {"suggested_seeds": [{
+                        "hook_name": row["hook_name"], "callback_id": row["callback_id"],
+                        "seed": {
+                            "resolved_method": "POST",
+                            "seed_variant_id": row.get("seed_variant_id", ""),
+                            "zend_canonical_callback": "fixture_callback",
+                            "input_params": [{"name": "a", "source": "POST", "location": "form"}],
+                        },
+                    }]}
+                    return verify_pass2_contract(
+                        run, expected, zend_dir,
+                        pass2_artifacts_dir=kwargs.get("pass2_artifacts_dir"),
+                        runtime_cookie_probes=kwargs.get("runtime_cookie_probes", False),
+                    )
+                coordinator.verify_pass2_fn = verify_actual_pass2
+                original = coordinator.probe_sender
+                def sender(container, **kwargs):
+                    result = original(container, **kwargs)
+                    result["response_status"] = status
+                    result["request"]["response"]["status_code"] = status
+                    return result
+                coordinator.probe_sender = sender
+                child = coordinator._run_pending_probe(
+                    parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                    convergence=convergence, probe=convergence["pending_probes"][0],
+                    seed=parent["seed_item"], deadline=None,
+                )
+                self.assertIsNotNone(child)
+                replay = child["replay_result"]
+                self.assertEqual(replay["pass2_verification"], {"accepted": 1, "total": 1})
+                self.assertEqual(replay["runner"]["runs"][0]["response_status"], status)
+                self.assertEqual(replay["guard_status"], "unknown")
+                self.assertFalse(replay["passed"])
+                self.assertEqual(child["terminal_reason"], "GUARD_SATISFACTION_UNKNOWN")
+                self.assertNotIn("worker_start", log)
+
+    def test_disconnect_after_callback_cannot_prove_child_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), log, names=('a',), accepted=('a',),
+            )
+            original = coordinator.probe_sender
+            def sender(container, **kwargs):
+                result = original(container, **kwargs)
+                if '-replay' in kwargs['run_id'] and 'replay-input' not in kwargs['run_id']:
+                    result['error'] = 'connection closed after callback'
+                return result
+            coordinator.probe_sender = sender
+            child = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports['v0'],
+                convergence=convergence, probe=convergence['pending_probes'][0],
+                seed=parent['seed_item'], deadline=None,
+            )
+            self.assertEqual(child['replay_result']['pass2_verification'], {'accepted': 1, 'total': 1})
+            self.assertFalse(child['replay_result']['passed'])
+            self.assertEqual(child['replay_result']['runner']['runs'][0]['http_error'], 'connection closed after callback')
+            self.assertEqual(child['terminal_reason'], 'GUARD_SATISFACTION_UNKNOWN')
+            self.assertNotIn('worker_start', log)
+
+    def test_disagreeing_response_statuses_cannot_prove_child_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), log, names=('a',), accepted=('a',),
+            )
+            original = coordinator.probe_sender
+            def sender(container, **kwargs):
+                result = original(container, **kwargs)
+                if '-replay' in kwargs['run_id'] and 'replay-input' not in kwargs['run_id']:
+                    result['response_status'] = 200
+                    result['request']['response']['status_code'] = 403
+                return result
+            coordinator.probe_sender = sender
+            child = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports['v0'],
+                convergence=convergence, probe=convergence['pending_probes'][0],
+                seed=parent['seed_item'], deadline=None,
+            )
+            self.assertFalse(child['replay_result']['passed'])
+            self.assertEqual(child['terminal_reason'], 'GUARD_SATISFACTION_UNKNOWN')
+            self.assertNotIn('worker_start', log)
 
     def test_two_successful_probes_use_fuzz_values_in_child_but_keep_replay_values(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5937,6 +6107,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                         "matched_artifact": "fresh-gate.json", "zend_artifact": "fresh-gate.json",
                         "request_payload": {"request_id": "fresh-gate", "legacy_run_id": run_id,
                             "target_plugin": "fixture", "http_method": "POST",
+                            "response": {"status_code": 200},
                             "request_params": {"body_params": {"action": "fixture", "seed": "base"}}},
                         "zend_payload": {"request_id": "fresh-gate", "run_id": run_id}}]}
                 return old_replay(rows, **kwargs)
@@ -5986,6 +6157,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                         "matched_artifact": "fresh-gate.json", "zend_artifact": "fresh-gate.json",
                         "request_payload": {"request_id": "fresh-gate", "legacy_run_id": run_id,
                             "target_plugin": "fixture", "http_method": "POST",
+                            "response": {"status_code": 200},
                             "request_params": {"body_params": {"action": "fixture", "seed": "base"}}},
                         "zend_payload": {"request_id": "fresh-gate", "run_id": run_id}}]}
                 return old_replay(rows, **kwargs)

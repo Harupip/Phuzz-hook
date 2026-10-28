@@ -15,7 +15,7 @@ if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
 from filesystem_paths import filesystem_path
-from seed_generation.verification.seed_validator import evaluate_artifact_payloads
+from seed_generation.verification.seed_validator import diagnostic_callback_reached, evaluate_artifact_payloads, http_diagnostics
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -169,8 +169,18 @@ def read_correlated_artifact_pair(
     request_id: str,
     run_id: str,
     expected: Mapping[str, Any] | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Read one complete request/Zend pair from already-mounted directories."""
+    request_evidence = None
+    def reject(outcome: str, **details: Any) -> None:
+        if diagnostics is not None:
+            diagnostics.clear()
+            diagnostics.update(outcome=outcome, **details)
+            if request_evidence is not None:
+                diagnostics["request_evidence"] = request_evidence
+        return None
+
     expected = expected if isinstance(expected, Mapping) else {}
     request_id = str(request_id).strip()
     run_id = str(run_id).strip()
@@ -182,47 +192,47 @@ def read_correlated_artifact_pair(
         or Path(request_id).name != request_id
         or ".tmp" in request_id
     ):
-        return None
+        return reject("invalid_identity")
 
     request_path = Path(request_dir) / f"{request_id}.json"
     zend_path = Path(zend_dir) / f"{request_id}.json"
     try:
         request_payload = json.loads(filesystem_path(request_path).read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return reject("missing_request_artifact")
     except (OSError, ValueError, json.JSONDecodeError):
-        return None
+        return reject("unreadable_request_artifact")
     if not isinstance(request_payload, Mapping):
-        return None
+        return reject("unreadable_request_artifact")
     if str(request_payload.get("request_id") or "").strip() != request_id:
-        return None
+        return reject("artifact_mismatch", artifact="request", field="request_id")
     if str(request_payload.get("legacy_run_id") or request_payload.get("run_id") or "").strip() != run_id:
-        return None
+        return reject("artifact_mismatch", artifact="request", field="run_id")
     response = request_payload.get("response")
     if not isinstance(response, Mapping):
-        return None
+        return reject("request_artifact_incomplete", field="response")
     try:
-        status_code = int(response.get("status_code"))
-        if status_code != 200:
-            if expected.get("allow_error_responses") is not True or not 400 <= status_code <= 599:
-                return None
-            if not (expected.get("hook_name") or expected.get("callback_id")):
-                return None
-            if not _callback_artifact_is_ready(expected, request_payload):
-                return None
+        if not 200 <= int(response.get("status_code")) <= 599:
+            return reject("request_artifact_incomplete", field="response_status")
     except (TypeError, ValueError):
-        return None
+        return reject("request_artifact_incomplete", field="response_status")
     if expected.get("plugin_slug") and str(request_payload.get("target_plugin") or "") != str(expected["plugin_slug"]):
-        return None
+        return reject("artifact_mismatch", artifact="request", field="target_plugin")
     if expected.get("hook_name") or expected.get("callback_id"):
         coverage = request_payload.get("hook_coverage")
-        if not _artifact_matches_callback(
+        for field in ("hook_name", "callback_id"):
+            if expected.get(field) and request_payload.get(field) and str(request_payload[field]) != str(expected[field]):
+                return reject("artifact_mismatch", artifact="request", field=field)
+        callback_reached = evaluate_artifact_payloads(dict(expected), [request_payload])["expected_callback_reached"]
+        if callback_reached and not _artifact_matches_callback(
             request_payload,
             coverage if isinstance(coverage, Mapping) else {},
             hook_name=str(expected.get("hook_name") or ""),
             callback_id=str(expected.get("callback_id") or ""),
         ):
-            return None
+            return reject("artifact_mismatch", artifact="request", field="callback_identity")
     if expected.get("method") and str(request_payload.get("http_method") or "").upper() != str(expected["method"]).upper():
-        return None
+        return reject("artifact_mismatch", artifact="request", field="http_method")
     auth_context = request_payload.get("auth_context")
     if auth_context is None:
         request_params = request_payload.get("request_params")
@@ -234,18 +244,33 @@ def read_correlated_artifact_pair(
                 None,
             )
     if expected.get("auth_context") and str(auth_context or "") != str(expected["auth_context"]):
-        return None
+        return reject("artifact_mismatch", artifact="request", field="auth_context")
 
+    if diagnostics is not None:
+        request_evidence = request_payload
     try:
         zend_payload = json.loads(filesystem_path(zend_path).read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return reject("missing_zend_artifact")
     except (OSError, ValueError, json.JSONDecodeError):
-        return None
+        return reject("unreadable_zend_artifact")
     if not isinstance(zend_payload, Mapping):
-        return None
+        return reject("unreadable_zend_artifact")
     if str(zend_payload.get("request_id") or "").strip() != request_id:
-        return None
+        return reject("artifact_mismatch", artifact="zend", field="request_id")
     if str(zend_payload.get("run_id") or zend_payload.get("legacy_run_id") or "").strip() != run_id:
-        return None
+        return reject("artifact_mismatch", artifact="zend", field="run_id")
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update(outcome="matched")
+        conflicts = [
+            {"artifact": name, "field": field, "expected": run_id, "actual": str(payload[field]).strip()}
+            for name, payload in (("request", request_payload), ("zend", zend_payload))
+            for field in ("run_id", "legacy_run_id")
+            if payload.get(field) and str(payload[field]).strip() != run_id
+        ]
+        if conflicts:
+            diagnostics["identity_conflicts"] = conflicts
     return {
         "request_name": request_path.name,
         "request": dict(request_payload),
@@ -262,7 +287,7 @@ def _artifact_matches_callback(
     callback_id: str,
 ) -> bool:
     """Match callback identity from either legacy top-level or hook coverage fields."""
-    if request_payload.get("hook_name") or request_payload.get("callback_id"):
+    if request_payload.get("hook_name") and request_payload.get("callback_id"):
         return (
             (not hook_name or str(request_payload.get("hook_name") or "") == hook_name)
             and (not callback_id or str(request_payload.get("callback_id") or "") == callback_id)
@@ -270,6 +295,8 @@ def _artifact_matches_callback(
     entries: list[tuple[str, Mapping[str, Any]]] = []
     for bucket in ("registered_callbacks", "executed_callbacks"):
         mapping = coverage.get(bucket)
+        if isinstance(mapping, list):
+            mapping = {str(index): entry for index, entry in enumerate(mapping)}
         if not isinstance(mapping, Mapping):
             continue
         entries.extend(
@@ -284,6 +311,8 @@ def _artifact_matches_callback(
             for field in ("hook_name", "fired_hook")
             if entry.get(field)
         }
+        if not entry_hooks and request_payload.get("hook_name"):
+            entry_hooks.add(str(request_payload["hook_name"]))
         if callback_id and callback_id not in entry_ids:
             continue
         if hook_name and hook_name not in entry_hooks:
@@ -406,6 +435,34 @@ def run_generated_configs(
         )
         matched_artifact = _matched_artifact(config, artifact_payloads)
         failure_category = _failure_category(process_status, validation["status"])
+        request_diagnostics = []
+        for name, payload in artifact_payloads:
+            if not isinstance(payload, Mapping):
+                continue
+            candidate = {"hook_name": config["hook_name"], "callback_id": config["callback_id"]}
+            artifact_validation = evaluate_artifact_payloads(candidate, [payload])
+            response = payload.get("response") if isinstance(payload.get("response"), Mapping) else {}
+            conflicts = [
+                {"artifact": "request", "field": field, "expected": legacy_run_id,
+                 "actual": str(payload[field]).strip()}
+                for field in ("run_id", "legacy_run_id") if legacy_run_id and payload.get(field)
+                and str(payload[field]).strip() != legacy_run_id
+            ]
+            correlation = {"outcome": "artifact_mismatch" if conflicts else
+                           "request_matches_run" if legacy_run_id else "not_checked"}
+            if conflicts:
+                correlation["identity_conflicts"] = conflicts
+            trusted = bool(legacy_run_id) and not conflicts
+            request_diagnostics.append({
+                "request_artifact": name, "request_id": payload.get("request_id"),
+                "unattributed_php_errors": payload.get("errors") if not trusted else None,
+                **http_diagnostics(
+                    status_code=response.get("status_code"), headers=response.get("headers"), body=response.get("body"),
+                    callback_reached=diagnostic_callback_reached(candidate, payload) if trusted else None,
+                    correlation=correlation, validation_status=artifact_validation["status"],
+                    php_errors=payload.get("errors") if trusted else None,
+                ),
+            })
 
         run_row = {
             "config_slug": slug,
@@ -420,12 +477,20 @@ def run_generated_configs(
             "validation_reason": validation["reason"],
             "callback_reached": validation["expected_callback_reached"],
             "failure_category": failure_category,
+            "failure_category_basis": "legacy_heuristic_unconfirmed" if failure_category else None,
             "requests_created": len(new_artifacts),
             "request_artifacts": new_artifacts,
             "matched_artifact": matched_artifact,
             "exit_code": exit_code,
             "duration_seconds": round(time.monotonic() - started_at, 3),
             "container_name": container_name,
+            "diagnostics": {
+                "requests": request_diagnostics,
+                "process": {"outcome": process_status, "exit_code": exit_code},
+                "correlation": {"outcome": "request_artifacts_only" if request_diagnostics else "no_matching_request_artifact"},
+                "config_validation": {"outcome": "not_assessed"},
+                "fuzz_readiness": {"outcome": "not_assessed"},
+            },
         }
         if process_status == "vuln_found":
             run_row["finding_artifact"] = finding_artifact
@@ -475,6 +540,8 @@ def format_validation_result(report: Mapping[str, Any]) -> dict[str, Any]:
                 'expected_auth_skip': bool(row.get('expected_auth_skip')),
                 'expected_auth_reason': row.get('expected_auth_reason'),
                 'failure_category': row.get('failure_category'),
+                'failure_category_basis': row.get('failure_category_basis'),
+                'diagnostics': row.get('diagnostics'),
                 'reason': row.get('validation_reason'),
                 'matched_artifact': row.get('matched_artifact'),
             }
@@ -748,6 +815,7 @@ def classify_expected_auth_skips(runs: list[dict[str, Any]]) -> int:
             row["expected_auth_skip"] = True
             row["expected_auth_reason"] = "authenticated_counterpart_reached"
             row["failure_category"] = None
+            row["failure_category_basis"] = None
             expected_count += 1
     return expected_count
 
@@ -792,6 +860,13 @@ def _runner_error_row(
         "validation_reason": reason,
         "callback_reached": False,
         "failure_category": "F. instrumentation/generation bug",
+        "failure_category_basis": "legacy_heuristic_unconfirmed",
+        "diagnostics": {
+            "requests": [], "process": {"outcome": "runner_error", "error": reason},
+            "correlation": {"outcome": "not_checked"},
+            "config_validation": {"outcome": "not_assessed"},
+            "fuzz_readiness": {"outcome": "not_assessed"},
+        },
         "requests_created": 0,
         "request_artifacts": [],
         "matched_artifact": None,

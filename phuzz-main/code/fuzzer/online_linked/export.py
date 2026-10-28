@@ -62,10 +62,20 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
             try:
                 content = _verified_config(version)
             except (OSError, ValueError, KeyError, TypeError) as exc:
-                summary["skipped_versions"].append({
+                skipped = {
                     "version": version["version"], "reason": str(exc),
                     "terminal_reason": version.get("terminal_reason"),
-                })
+                }
+                gate = version.get("readiness" if version["version"] == "v0" else "replay_result") or {}
+                runner = gate.get("runner") if isinstance(gate, dict) else None
+                runs = runner.get("runs") if isinstance(runner, dict) else None
+                if isinstance(runs, list) and len(runs) == 1 and isinstance(runs[0], dict) and runs[0].get("diagnostics"):
+                    skipped["diagnostics"] = runs[0]["diagnostics"]
+                    skipped["readiness_evidence"] = {
+                        "config_type": version.get("config_type"), "gate_passed": gate.get("passed"),
+                        "pass2_verification": gate.get("pass2_verification"),
+                    }
+                summary["skipped_versions"].append(skipped)
                 print(f"Config skipped {identity}/{version['version']}: {exc}", file=sys.stderr)
                 continue
             # Per-request evidence changes across equivalent replays; retain it

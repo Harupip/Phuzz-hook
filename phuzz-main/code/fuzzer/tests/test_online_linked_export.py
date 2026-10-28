@@ -310,6 +310,22 @@ class OnlineLinkedExportTests(unittest.TestCase):
         self.assertEqual(export_online_linked_batch(self.batch([candidate])), 0)
         self.assertEqual(list((self.root / "final-configs").iterdir()), [])
 
+    def test_pass2_does_not_export_when_replay_guard_is_unverified(self):
+        version = self.version("v1", gate=False, pass2=(1, 1))
+        version["replay_result"] = {
+            "passed": False,
+            "guard_status": "unknown",
+            "pass2_verification": {"accepted": 1, "total": 1},
+        }
+        candidate, _ = self.write_state(
+            versions=[version], terminal_status="PARTIAL", terminal_reason="GUARD_SATISFACTION_UNKNOWN",
+        )
+        destination = self.root / "final-configs"
+        self.assertEqual(export_online_linked_batch(self.batch([candidate]), destination), 0)
+        self.assertEqual(list(destination.glob("*.json")), [])
+        summary = json.loads(destination.with_name("final-config-summary.json").read_text())
+        self.assertEqual(summary["candidates"][0]["exported_configs"], [])
+
     def test_budget_expiry_preserves_observed_inputs_as_explicit_unverified_draft(self):
         base = self.config()
         base["methods"] = ["GET"]

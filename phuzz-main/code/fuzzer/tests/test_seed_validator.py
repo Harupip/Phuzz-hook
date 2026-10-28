@@ -158,6 +158,7 @@ class SeedValidatorTests(unittest.TestCase):
             )
 
         self.assertTrue(result["result"]["expected_hook_fired"])
+        self.assertFalse(http_client.calls[0]["allow_redirects"])
         self.assertTrue(result["result"]["expected_callback_reached"])
         self.assertEqual(result["result"]["confidence"], "high")
         self.assertEqual(result["observed"]["executed_callback_ids"], ["cb-public"])

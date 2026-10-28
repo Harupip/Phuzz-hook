@@ -29,10 +29,75 @@ from seed_generation.config.config_exporter import export_seed_configs
 
 
 class ProbeSenderTests(unittest.TestCase):
-    def test_discovery_error_evidence_keeps_next_guard_and_strict_replay_default(self):
+    def test_successful_correlated_responses_do_not_time_out_or_imply_callback_execution(self):
+        for status_code, executed, want in (
+            (200, True, "callback_reached"), (201, True, "callback_reached"),
+            (202, True, "callback_reached"), (204, True, "callback_reached"),
+            (206, True, "callback_reached"), (200, False, "request_completed"),
+        ):
+            with self.subTest(status_code=status_code, executed=executed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_path = root / "config.json"
+                config_path.write_text(json.dumps({"target": "http://web/test", "methods": ["POST"]}))
+                request_dir, zend_dir = root / "requests", root / "zend"
+                request_dir.mkdir()
+                zend_dir.mkdir()
+                coverage = {"registered_callbacks": {"cb-fixture": {"hook_name": "wp_ajax_fixture"}}}
+                if executed:
+                    coverage["executed_callbacks"] = {"cb-fixture": {"hook_name": "wp_ajax_fixture"}}
+                (request_dir / "req.json").write_text(json.dumps({
+                    "request_id": "req", "run_id": "run", "response": {"status_code": status_code},
+                    "hook_coverage": coverage,
+                }))
+                (zend_dir / "req.json").write_text(json.dumps({"request_id": "req", "run_id": "run", "events": []}))
+
+                class Session:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        return False
+
+                    def send(self, prepared, timeout, allow_redirects):
+                        return type("Response", (), {"status_code": status_code})()
+
+                result = probe_sender.send_and_wait(
+                    config_path, request_id="req", run_id="run", timeout_seconds=1,
+                    expected={"hook_name": "wp_ajax_fixture", "callback_id": "cb-fixture"},
+                    session_factory=Session, request_dir=request_dir, zend_dir=zend_dir,
+                )
+                self.assertEqual(result["status"], want)
+                self.assertEqual(result["callback_reached"], executed)
+
+    def test_success_response_still_requires_correlated_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            request_dir, zend_dir = root / "requests", root / "zend"
+            request_dir.mkdir()
+            zend_dir.mkdir()
+            request_path, zend_path = request_dir / "req.json", zend_dir / "req.json"
+            request = {"request_id": "req", "run_id": "run", "response": {"status_code": 204}}
+            request_path.write_text(json.dumps(request))
+            read_pair = lambda: generated_config_runner.read_correlated_artifact_pair(
+                request_dir, zend_dir, request_id="req", run_id="run",
+            )
+            self.assertIsNone(read_pair())
+            zend_path.write_text(json.dumps({"request_id": "req", "run_id": "run"}))
+            request_path.write_text(json.dumps({**request, "request_id": "other", "response": {"status_code": 201}}))
+            self.assertIsNone(read_pair())
+            for field in ("request_id", "run_id"):
+                with self.subTest(zend_field=field):
+                    request_path.write_text(json.dumps({**request, "response": {"status_code": 201}}))
+                    zend_path.write_text(json.dumps({"request_id": "req", "run_id": "run", field: "other"}))
+                    self.assertIsNone(read_pair())
+
+    def test_error_evidence_keeps_next_guard_for_probe_and_replay(self):
         for status_code, discovery, want in ((400, True, "callback_reached"),
                                              (403, True, "callback_reached"),
-                                             (400, False, "timeout"), (302, True, "timeout")):
+                                             (500, True, "callback_reached"),
+                                             (400, False, "callback_reached"), (403, False, "callback_reached"),
+                                             (500, False, "callback_reached"), (302, False, "callback_reached"),
+                                             (302, True, "callback_reached")):
             with self.subTest(status_code=status_code, discovery=discovery), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 config_path = root / "config.json"
@@ -67,16 +132,17 @@ class ProbeSenderTests(unittest.TestCase):
                         }))
                         return type("Response", (), {"status_code": status_code})()
 
+                # This test checks error evidence, not sub-second filesystem scheduling.
                 result = probe_sender.send_and_wait(
-                    config_path, request_id="guard", run_id="guard-run", timeout_seconds=0.05,
+                    config_path, request_id="guard", run_id="guard-run", timeout_seconds=1,
                     expected={"plugin_slug": "fixture", "hook_name": "wp_ajax_fixture",
                               "callback_id": "cb-fixture", "method": "POST", "auth_context": "authenticated",
                               "allow_error_responses": discovery},
                     session_factory=Session, request_dir=request_dir, zend_dir=zend_dir,
                 )
-                self.assertEqual(result["status"], want)
+                self.assertEqual(result["status"], want, result)
                 self.assertEqual(result["response_status"], status_code)
-                if discovery and status_code in (400, 403):
+                if status_code in (302, 400, 403, 500):
                     self.assertEqual(result["zend"]["events"][0]["path"], ["b"])
                     self.assertNotIn("passed", result)
 
@@ -131,15 +197,18 @@ class ProbeSenderTests(unittest.TestCase):
             self.assertIsNotNone(read_pair(request, zend))
             for field, value in (("request_id", "other"), ("run_id", "other"),
                                  ("target_plugin", "other"), ("http_method", "GET"),
-                                 ("auth_context", "guest"),
-                                 ("hook_coverage", {"registered_callbacks": {
-                                     "cb-fixture": {"hook_name": "wp_ajax_fixture"},
-                                 }}),
-                                 ("hook_coverage", {"executed_callbacks": {
-                                     "other": {"hook_name": "other_hook"},
-                                 }})):
+                                 ("auth_context", "guest")):
                 with self.subTest(field=field, value=value):
                     self.assertIsNone(read_pair({**request, field: value}, zend))
+            self.assertIsNotNone(read_pair({**request, "hook_coverage": {"registered_callbacks": {
+                "cb-fixture": {"hook_name": "wp_ajax_fixture"},
+            }}}, zend))
+            other = read_pair({**request, "hook_coverage": {"executed_callbacks": {
+                "other": {"hook_name": "other_hook"},
+            }}}, zend)
+            self.assertIsNotNone(other)
+            validation = probe_sender.evaluate_artifact_payloads(expected, [other["request"]])
+            self.assertFalse(validation["expected_callback_reached"])
             for field in ("request_id", "run_id"):
                 with self.subTest(zend_field=field):
                     self.assertIsNone(read_pair(request, {**zend, field: "other"}))
@@ -516,6 +585,7 @@ class ProbeSenderTests(unittest.TestCase):
                     request_dir=root / "requests", zend_dir=root / "zend",
                 )
                 self.assertEqual(result["response_status"], 302, result)
+                self.assertEqual(result["response_location"], "/target", result)
         finally:
             server.shutdown()
             server.server_close()

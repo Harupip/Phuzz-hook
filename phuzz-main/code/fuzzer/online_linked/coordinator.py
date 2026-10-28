@@ -589,6 +589,10 @@ class OnlineLinkedCoordinator:
                 "callback_reached" if reached else "registered_not_executed"
             ),
             "validation_reason": result.get("validation_reason") or result.get("error") or "",
+            "response_status": result.get("response_status"),
+            "response_location": result.get("response_location"),
+            "http_error": result.get("error"),
+            "diagnostics": result.get("diagnostics"),
             "matched_artifact": result.get("request_name"),
             "request_artifacts": [result["request_name"]] if result.get("request_name") else [],
             "zend_artifact": result.get("zend_name"),
@@ -734,6 +738,17 @@ class OnlineLinkedCoordinator:
                 "zend_name": gate_evidence["zend_name"],
                 "consumed": False,
             }
+            response = gate_evidence["request"].get("response")
+            status = response.get("status_code") if isinstance(response, Mapping) else None
+            if version["config_type"] == "fuzzing_ready":
+                try:
+                    guard_unknown = not 200 <= int(status) < 300
+                except (TypeError, ValueError):
+                    guard_unknown = True
+                if guard_unknown:
+                    readiness.update(guard_status="unknown", reason="GUARD_SATISFACTION_UNKNOWN")
+                    self.state.update(terminal_status="PARTIAL", terminal_reason="GUARD_SATISFACTION_UNKNOWN")
+                    return False
             readiness["passed"] = True
             return True
         except (OSError, RuntimeError, ValueError) as exc:
@@ -2291,6 +2306,7 @@ class OnlineLinkedCoordinator:
                 )
             except Exception:
                 sender_result = {"status": "sender_error"}
+            trial_record["diagnostics"] = sender_result.get("diagnostics")
             if sender_result.get("status") in {
                 "parent_stopped", "parent_container_missing", "parent_check_timeout", "parent_check_error",
             }:
@@ -2976,6 +2992,7 @@ class OnlineLinkedCoordinator:
             )
         except Exception as exc:
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_REPLAY_FAILED", deadline, detail=str(exc))
+        attempt["diagnostics"] = sender_result.get("diagnostics")
         if sender_result.get("status") == "parent_stopped":
             exit_code = sender_result.get("parent_exit_code")
             if isinstance(exit_code, int):
@@ -3520,8 +3537,20 @@ class OnlineLinkedCoordinator:
             and verification.get("accepted") == verification.get("total")
             and verification.get("total", 0) > 0
         )
+        request_payload = replay_row.get("request_payload")
+        response = request_payload.get("response") if isinstance(request_payload, Mapping) else None
+        response_status = sender_result.get("response_status")
+        artifact_status = response.get("status_code") if isinstance(response, Mapping) else None
+        if response_status is None and isinstance(response, Mapping):
+            response_status = artifact_status
+        try:
+            non_success_response = (bool(sender_result.get("error")) or not 200 <= int(response_status) <= 299
+                                    or int(artifact_status) != int(response_status))
+        except (TypeError, ValueError):
+            non_success_response = True
         replay_result = {
-            "passed": replay_passed,
+            "passed": replay_passed and not non_success_response,
+            "guard_status": "unknown",
             "budget_expired": deadline_expired,
             "config_path": str(replay_path),
             "config_hash": self.config_hash(replay_path),
@@ -3545,6 +3574,15 @@ class OnlineLinkedCoordinator:
                 "hook_name": child.get("hook_name"), "version": version_name,
                 "probe_id": None, "parameter": None, "timing": dict(replay_result["timing"]),
             })
+
+        if replay_passed and non_success_response:
+            child["status"] = "guard_unverified"
+            child["worker_status"] = "not_started_guard_unverified"
+            child["terminal_reason"] = "GUARD_SATISFACTION_UNKNOWN"
+            self.state.update(terminal_status="PARTIAL", terminal_reason="GUARD_SATISFACTION_UNKNOWN")
+            record_replay_event("DEFERRED", "GUARD_SATISFACTION_UNKNOWN")
+            self._write_state()
+            return False
 
         if replay_passed:
             child["status"] = "replay_pass"

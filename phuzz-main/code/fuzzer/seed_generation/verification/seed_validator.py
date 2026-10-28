@@ -9,12 +9,122 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 try:
     import requests
 except ImportError:
     requests = None
+
+
+def response_details(response: Any) -> dict[str, Any]:
+    names = {name.lower(): name for name in ("Location", "Content-Type", "WWW-Authenticate", "Retry-After", "X-Redirect-By")}
+    try:
+        raw_headers = getattr(response, "headers", None)
+        headers = {names[str(key).lower()]: str(value) for key, value in raw_headers.items()
+                   if str(key).lower() in names} if isinstance(raw_headers, Mapping) else {}
+    except Exception:
+        headers = {}
+    try:
+        body = getattr(response, "text", None)
+        if body is None:
+            content = getattr(response, "content", None)
+            body = content.decode("utf-8", errors="replace") if isinstance(content, bytes) else None
+    except Exception:
+        body = None
+    return {"status_code": getattr(response, "status_code", None), "headers": headers, "body": body}
+
+
+def has_callback_execution_evidence(payload: Any) -> bool:
+    coverage = payload.get("hook_coverage") if isinstance(payload, Mapping) else None
+    return isinstance(coverage, Mapping) and isinstance(coverage.get("executed_callbacks"), (Mapping, list))
+
+
+def diagnostic_callback_reached(candidate: Mapping[str, Any], payload: Mapping[str, Any]) -> bool | None:
+    callback_id = str(candidate.get("callback_id") or "")
+    hook_name = str(candidate.get("hook_name") or "")
+    if not (callback_id or candidate.get("callback_repr")) or not has_callback_execution_evidence(payload):
+        return None
+    reached = bool(evaluate_artifact_payloads(dict(candidate), [payload])["expected_callback_reached"])
+    if reached and hook_name and callback_id:
+        executed = payload["hook_coverage"]["executed_callbacks"]
+        if isinstance(executed, list):
+            executed = {str(index): entry for index, entry in enumerate(executed)}
+        entries = [entry for key, entry in executed.items() if isinstance(entry, Mapping)
+                   and callback_id in {str(key), str(entry.get("callback_id") or "")}]
+        hooks = [{entry.get("hook_name"), entry.get("fired_hook")} for entry in entries
+                 if entry.get("hook_name") or entry.get("fired_hook")]
+        if hooks and all(hook_name not in names for names in hooks):
+            return False
+    return reached
+
+
+def http_diagnostics(
+    *, status_code: Any = None, headers: Any = None, body: Any = None,
+    target_url: str = "", callback_reached: bool | None = None,
+    transport_outcome: str = "not_observed", transport_error: str | None = None,
+    correlation: Mapping[str, Any] | None = None, validation_status: str | None = None,
+    artifact_status_code: Any = None, php_errors: Any = None,
+) -> dict[str, Any]:
+    headers = dict(headers) if isinstance(headers, Mapping) else {}
+    location = next((str(value) for name, value in headers.items() if str(name).lower() == "location" and value), None)
+    try:
+        status = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status = None
+    try:
+        status_mismatch = status is not None and artifact_status_code is not None and status != int(artifact_status_code)
+    except (TypeError, ValueError):
+        status_mismatch = False
+    response_json = None
+    if status in {401, 403, 404}:
+        try:
+            response_json = json.loads(body) if isinstance(body, str) else body
+        except (TypeError, ValueError, RecursionError):
+            pass
+    code = response_json.get("code") if isinstance(response_json, Mapping) else None
+    category, evidence, application_category = None, None, None
+    if status in {301, 302, 303, 307, 308}:
+        category = "redirect"
+        if callback_reached is True and not status_mismatch:
+            category, evidence = "redirect_after_callback", "target_callback_executed"
+        elif callback_reached is False and not status_mismatch and location and target_url:
+            try:
+                target, destination = urlsplit(target_url), urlsplit(urljoin(target_url, location))
+                if (target.scheme, target.netloc) == (destination.scheme, destination.netloc) and destination.path.lower().endswith("/wp-login.php"):
+                    category, evidence = "authentication_redirect", "wordpress_login_location_before_callback"
+            except ValueError:
+                pass
+    elif status == 304:
+        category = "not_modified"
+    elif status is not None and 400 <= status <= 599:
+        category = "unknown_http_failure"
+        if status == 403 and code == "rest_cookie_invalid_nonce":
+            application_category = "nonce_validation_failure"
+        elif status == 403 and code == "rest_forbidden":
+            application_category = "authorization_failure"
+        elif status == 401 and code == "rest_not_logged_in":
+            application_category = "authentication_failure"
+        elif status == 404 and code == "rest_no_route" and callback_reached is not True:
+            application_category = "route_not_found"
+        if application_category:
+            category, evidence = application_category, "response_json_code"
+        elif status >= 500 and callback_reached is True and not status_mismatch:
+            category, evidence = "server_error_after_callback", "target_callback_executed"
+    callback = "executed" if callback_reached is True else "not_executed" if callback_reached is False else "unknown"
+    return {
+        "http": {"status_code": status_code, "location": location, "headers": headers, "body": body,
+                 "category": category, "evidence": evidence, "artifact_status_code": artifact_status_code,
+                 "status_mismatch": status_mismatch},
+        "transport": {"outcome": transport_outcome, "error": transport_error},
+        "correlation": dict(correlation or {"outcome": "not_checked"}),
+        "callback": {"outcome": callback, "category": "callback_not_executed" if callback_reached is False else None,
+                     "validation_status": validation_status},
+        "application": {"category": application_category, "code": code,
+                        "php_errors": php_errors if isinstance(php_errors, list) else []},
+        "config_validation": {"outcome": "not_assessed"},
+        "fuzz_readiness": {"outcome": "not_assessed"},
+    }
 
 
 def load_candidate(candidate_file: Path, candidate_id: str | None) -> dict[str, Any]:
@@ -94,6 +204,9 @@ def validate_candidate(
     status_code = None
     response_size = 0
     error = None
+    transport_error = None
+    response_info = {"status_code": None, "headers": {}, "body": None}
+    transport_outcome = "not_observed"
 
     try:
         response = _send_request(
@@ -103,17 +216,27 @@ def validate_candidate(
             headers=request["headers"],
             timeout=timeout,
             data=request["data"],
+            allow_redirects=False,
         )
         status_code = getattr(response, "status_code", None)
         response_size = _response_size(response)
+        response_info = response_details(response)
+        transport_outcome = "response_received"
     except Exception as exc:
         error = str(exc)
+        transport_error = error or type(exc).__name__
+        transport_outcome = "timeout" if isinstance(exc, (TimeoutError, requests.Timeout if requests else TimeoutError)) else "error"
 
     duration_ms = int(round((time.perf_counter() - started) * 1000))
     after_artifacts = set(list_request_artifacts(hook_coverage_dir))
     new_artifacts = sorted(after_artifacts - before_artifacts)
-    observed = _collect_observed(hook_coverage_dir, new_artifacts)
+    artifact_payloads = [_load_json(Path(hook_coverage_dir) / path) for path in new_artifacts]
+    observed = _collect_observed_payloads(artifact_payloads)
     result = _build_result(candidate, observed, artifact_count=len(new_artifacts))
+    matching_payloads = [payload for payload in artifact_payloads
+                         if isinstance(payload, Mapping) and str(payload.get("request_id") or "") == resolved_validation_id]
+    matched = matching_payloads[0] if len(matching_payloads) == 1 else None
+    callback_evidence = diagnostic_callback_reached(candidate, matched) if matched is not None else None
 
     return {
         "schema_version": 1,
@@ -140,6 +263,13 @@ def validate_candidate(
             "artifact_count": len(new_artifacts),
         },
         "result": result,
+        "diagnostics": http_diagnostics(
+            **response_info, target_url=request["url"],
+            callback_reached=callback_evidence,
+            transport_outcome=transport_outcome, transport_error=transport_error,
+            correlation={"outcome": "request_matched" if matched is not None else "no_matching_request_artifact"},
+            validation_status=result["status"], php_errors=matched.get("errors") if matched else None,
+        ),
         "observed": {
             "executed_callback_ids": sorted(observed["executed_callback_ids"]),
             "executed_hook_names": sorted(observed["executed_hook_names"]),
