@@ -1,6 +1,6 @@
 # Một baseline callback trước khi fuzz
 
-Ngày: 2026-11-01. Trạng thái: thiết kế chờ người dùng duyệt.
+Ngày: 2026-11-01. Trạng thái: người dùng đã duyệt bằng yêu cầu “Tiếp”.
 
 ## Mục tiêu và quyết định
 
