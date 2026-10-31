@@ -1,6 +1,6 @@
 # Single Callback Baseline Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans for native execution, or superpowers:subagent-driven-development if the user chooses delegated execution. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. The user chose Luna execution on a new branch. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let runtime-admitted parameters enter online-linked fuzzing after one callback baseline, without replay-input trials or mandatory Pass 2 parameter revalidation.
 
@@ -19,6 +19,8 @@
 - Preserve existing working-tree changes, including redirect handling and unrelated checklist rows. Inspect task-only hunks before staging; do not commit pre-existing code changes as part of this task.
 - A baseline proves callback reach in the harness, not complete branch execution, complete parameter discovery or a fuzzing/vulnerability PASS.
 - Update `/plugin-test-checklist.md` only for a concrete config completed and scoped validation performed; agent tests never set “Người dùng đã test”.
+- Execute on `feature/single-callback-baseline`, created from the current checkout with its existing WIP preserved. Use `gpt-6-luna` for implementation, runtime testing and delegated review. Do not create another chat or worktree.
+- Because relevant files already contain WIP, review task-only changes against saved working-file snapshots. Leave implementation changes uncommitted unless they can be staged without including pre-existing changes; document this in the report.
 
 ## Review Focus
 
@@ -99,6 +101,7 @@
 - [ ] **Step 3: Run one fresh fixture campaign.**
   From `phuzz-main/code`: `pwsh -NoProfile -NonInteractive -File ./phuzz.ps1 -PluginSlug hookphuzz-online-discovery-fixture -OnlineTimeoutSeconds 30 -OnlineMaxVersions 2 -OnlineMaxCandidates 4 -OnlineCampaignTimeoutSeconds 120`.
   Inspect the new batch/candidate state and request artifacts: config proposals have no trial sends, each handoff has one correctly correlated baseline, eligible workers actually start, and final exports carry the new policy without fake Pass 2 results. Record the real terminal statuses, errors and timings; exit 0/config generation alone is not a fuzzing PASS.
+  Then run the existing real plugin `custom-fonts` in a separate fresh bounded campaign: `pwsh -NoProfile -NonInteractive -File ./phuzz.ps1 -PluginSlug custom-fonts -OnlineTimeoutSeconds 60 -OnlineMaxVersions 3 -OnlineMaxCandidates 32 -OnlineCampaignTimeoutSeconds 180`. Preserve previous plugin results. Inspect callback reach, runtime parameters, baseline evidence, worker execution and exported config separately; report incomplete discovery or startup failures honestly. Do not launch an all-plugin batch.
 - [ ] **Step 4: Update documentation and the verification report.**
   Document one baseline, runtime param admission, legacy-policy handling, budget reservations and the loss of pre-fuzz CMPLOG trial adjustments. Preserve dated historical reports as history. If the fixture task completes a concrete config and scoped checks, update only that config's root checklist row with exact path/date/evidence and “Pass 2 not run under callback_baseline_v1”; otherwise no completion row.
 - [ ] **Step 5: Final verification and review.**
@@ -106,4 +109,4 @@
 
 ## Execution handoff
 
-Recommended: native execution in this chat, because the coordinator/export tasks share one gate contract and the checkout already contains relevant WIP. This is a recommendation, not a user-selected execution method. Delegated execution is available if the user requests it. The plan awaits review before implementation under the writing-plans workflow.
+Approved execution: the user requested a new branch and Luna to run real tests. Branch `feature/single-callback-baseline` is created. Dispatch Luna implementers sequentially for Tasks 1 and 2, then Luna for Task 3 (including the two real Docker campaigns); delegated reviews also use Luna. Preserve task-only snapshots and progress in the plan's ignored SDD workspace. These user-requested execution changes do not require another approval round.
