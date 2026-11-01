@@ -65,3 +65,35 @@ transport, candidate freezing and final BOOL_NOT/JMPZ/JMPNZ changes.
 - Plugin ZIP libraries were already local/untracked; backup ZIP binaries remain
   local and are ignored. Their inventory is committed. Temporary extracted
   third-party source used for inspection is not part of the product change.
+
+## Follow-up: TYPE_CHECK/null
+
+The user's delayed clarification selected both BOOL_NOT and TYPE_CHECK in this
+batch. Commit `b646182` contains the behavior and evidence above; the follow-up
+adds null handling rather than rewriting that commit.
+
+Only the `MAY_BE_NULL` mask is recorded by the new TYPE_CHECK handler. It follows
+existing provenance through a local copy and emits a typed JSON null target.
+REST JSON inputs retain their key with null; query/form inputs propose removing
+the key. Typed-null replacement is rejected unless the candidate actually sends
+an application/json body with a supported method. Fixed/sensitive parameters
+and other type masks remain excluded by the existing checks.
+
+Two review findings were reproduced and fixed: the literal string `"null"` must
+not be confused with typed null inside the C event recorder, and typed-null
+hash metadata must be encoded structurally rather than concatenated with an
+injectable legacy value string. Ordinary mutation also handles a candidate
+containing null without calling a string mutator on it.
+
+Final follow-up suite: 62 tests passed with the same suite command and Docker
+environment shown above. It includes real TYPE_CHECK runs with OPcache off and
+on, using a minimal WP_REST_Request-shaped fixture. The test prepares JSON/query
+requests through production Fuzzer code, then feeds the serialized values to
+real PHP. JSON null and query omission reach separate null branches from an
+initial literal `"null"` value. This is not a full WordPress HTTP campaign.
+
+Follow-up evidence is in `.superpowers/null-guard-2026-11-02/`, including test
+output, module/source hashes and before/after JSON snapshots. The isolated
+module was rebuilt; the running Apache extension was not installed/replaced.
+The next normal launcher run rebuilds the web image. Review found no remaining
+concrete issues after the two fixes. No plugin config was generated or fixed.

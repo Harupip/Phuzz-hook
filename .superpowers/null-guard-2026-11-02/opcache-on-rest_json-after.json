@@ -1,0 +1,259 @@
+{
+  "schema_version": 4,
+  "request_id": "bool-not-test-a639cd3772b34b418fa563257894e619",
+  "pid": 11718,
+  "method": "",
+  "uri": "/",
+  "event_capacity": 65536,
+  "event_count": 7,
+  "dropped_event_count": 0,
+  "events": [
+    {
+      "source": "GET",
+      "path": [
+        "query"
+      ],
+      "operation": "read",
+      "file": "/tmp/bool-not-test-a639cd3772b34b418fa563257894e619.php",
+      "line": 36,
+      "function": null,
+      "class": null,
+      "callback_context": {
+        "attributed": false,
+        "root_callback": null,
+        "current_function": null,
+        "depth": null
+      }
+    },
+    {
+      "source": "GET",
+      "path": [
+        "body"
+      ],
+      "operation": "read",
+      "file": "/tmp/bool-not-test-a639cd3772b34b418fa563257894e619.php",
+      "line": 37,
+      "function": null,
+      "class": null,
+      "callback_context": {
+        "attributed": false,
+        "root_callback": null,
+        "current_function": null,
+        "depth": null
+      }
+    },
+    {
+      "source": "REST",
+      "path": [
+        "JSON"
+      ],
+      "operation": "read",
+      "file": "/tmp/bool-not-test-a639cd3772b34b418fa563257894e619.php",
+      "line": 7,
+      "function": "get_json_params",
+      "class": "WP_REST_Request",
+      "callback_context": {
+        "attributed": true,
+        "root_callback": "hookphuzz_null_check_fixture",
+        "current_function": "WP_REST_Request::get_json_params",
+        "depth": 1
+      }
+    },
+    {
+      "source": "REST",
+      "path": [
+        "JSON",
+        "mode"
+      ],
+      "operation": "read",
+      "file": "/tmp/bool-not-test-a639cd3772b34b418fa563257894e619.php",
+      "line": 12,
+      "function": "hookphuzz_null_check_fixture",
+      "class": null,
+      "callback_context": {
+        "attributed": true,
+        "root_callback": "hookphuzz_null_check_fixture",
+        "current_function": "hookphuzz_null_check_fixture",
+        "depth": 0
+      }
+    },
+    {
+      "source": "GET",
+      "path": [
+        "mode"
+      ],
+      "operation": "null_coalesce",
+      "file": "/tmp/bool-not-test-a639cd3772b34b418fa563257894e619.php",
+      "line": 14,
+      "function": "hookphuzz_null_check_fixture",
+      "class": null,
+      "callback_context": {
+        "attributed": true,
+        "root_callback": "hookphuzz_null_check_fixture",
+        "current_function": "hookphuzz_null_check_fixture",
+        "depth": 0
+      }
+    },
+    {
+      "source": "REST",
+      "path": [
+        "JSON",
+        "nonce"
+      ],
+      "operation": "read",
+      "file": "/tmp/bool-not-test-a639cd3772b34b418fa563257894e619.php",
+      "line": 15,
+      "function": "hookphuzz_null_check_fixture",
+      "class": null,
+      "callback_context": {
+        "attributed": true,
+        "root_callback": "hookphuzz_null_check_fixture",
+        "current_function": "hookphuzz_null_check_fixture",
+        "depth": 0
+      }
+    },
+    {
+      "source": "REST",
+      "path": [
+        "JSON",
+        "after_json_null"
+      ],
+      "operation": "null_coalesce",
+      "file": "/tmp/bool-not-test-a639cd3772b34b418fa563257894e619.php",
+      "line": 18,
+      "function": "hookphuzz_null_check_fixture",
+      "class": null,
+      "callback_context": {
+        "attributed": true,
+        "root_callback": "hookphuzz_null_check_fixture",
+        "current_function": "hookphuzz_null_check_fixture",
+        "depth": 0
+      }
+    }
+  ],
+  "target_loading": {
+    "static_target_count": 1,
+    "file_target_count": 0,
+    "effective_target_count": 1,
+    "target_capacity": 512,
+    "requested_target_count": 1,
+    "load_status": "disabled",
+    "registry_schema_version": null,
+    "duplicate_count": 0,
+    "rejected_count": 0,
+    "capacity_exhausted_count": 0,
+    "loaded_callbacks": [
+      "hookphuzz_null_check_fixture"
+    ]
+  },
+  "callback_summaries": [
+    {
+      "callback": "hookphuzz_null_check_fixture",
+      "event_count": 5,
+      "unique_parameters": [
+        {
+          "source": "REST",
+          "access_forms": [
+            "read"
+          ],
+          "observed_count": 1,
+          "helper_depth": 1,
+          "path": [
+            "JSON"
+          ]
+        },
+        {
+          "source": "REST",
+          "access_forms": [
+            "read"
+          ],
+          "observed_count": 1,
+          "helper_depth": 0,
+          "path": [
+            "JSON",
+            "mode"
+          ]
+        },
+        {
+          "source": "GET",
+          "access_forms": [
+            "null_coalesce"
+          ],
+          "observed_count": 1,
+          "helper_depth": 0,
+          "path": [
+            "mode"
+          ]
+        },
+        {
+          "source": "REST",
+          "access_forms": [
+            "read"
+          ],
+          "observed_count": 1,
+          "helper_depth": 0,
+          "path": [
+            "JSON",
+            "nonce"
+          ]
+        },
+        {
+          "source": "REST",
+          "access_forms": [
+            "null_coalesce"
+          ],
+          "observed_count": 1,
+          "helper_depth": 0,
+          "path": [
+            "JSON",
+            "after_json_null"
+          ]
+        }
+      ]
+    }
+  ],
+  "rest_parameter_events": [
+    {
+      "source": "REST",
+      "bucket": "JSON",
+      "parameter": "mode",
+      "callback": "hookphuzz_null_check_fixture",
+      "observed_count": 1,
+      "path": [
+        "JSON",
+        "mode"
+      ]
+    },
+    {
+      "source": "REST",
+      "bucket": "JSON",
+      "parameter": "nonce",
+      "callback": "hookphuzz_null_check_fixture",
+      "observed_count": 1,
+      "path": [
+        "JSON",
+        "nonce"
+      ]
+    }
+  ],
+  "comparison_events": [
+    {
+      "request_id": "bool-not-test-a639cd3772b34b418fa563257894e619",
+      "callback": "hookphuzz_null_check_fixture",
+      "opcode": "TYPE_CHECK",
+      "source": "GET",
+      "path": [
+        "mode"
+      ],
+      "runtime_value": "null",
+      "comparison_value": null,
+      "provenance_operand": "op1",
+      "line": 23,
+      "callback_context": {
+        "attributed": true,
+        "current_function": "hookphuzz_null_check_fixture",
+        "depth": 0
+      }
+    }
+  ]
+}

@@ -9,6 +9,7 @@ _SUPPORTED_OPCODES = {
     "EMPTY",
     "ISSET",
     "BOOL_NOT",
+    "TYPE_CHECK",
     "JMPZ",
     "JMPNZ",
     "IS_EQUAL",
@@ -125,7 +126,10 @@ def normalize_comparison_events(artifact, fuzz_params):
             continue
         runtime_value = event.get("runtime_value")
         comparison_value = event.get("comparison_value")
-        if not _is_scalar(runtime_value) or not _is_scalar(comparison_value):
+        null_check = opcode == "TYPE_CHECK" and "comparison_value" in event and comparison_value is None
+        if opcode == "TYPE_CHECK" and not null_check:
+            continue
+        if not _is_scalar(runtime_value) or (not null_check and not _is_scalar(comparison_value)):
             continue
         if opcode != "ISSET" and _same_value(runtime_value, comparison_value):
             continue
@@ -174,7 +178,7 @@ def normalize_comparison_events(artifact, fuzz_params):
                 "mutation_source": "cmplog",
             }
         )
-        if opcode == "ISSET":
+        if opcode == "ISSET" or (null_check and normalized_source != "REST_JSON"):
             hints[-1]["mutation"] = "remove"
     return hints
 
@@ -188,8 +192,10 @@ def apply_cmplog_hint(fuzz_params, hint):
     parameter = hint.get("parameter")
     candidate_value = hint.get("candidate_value")
     remove = hint.get("mutation") == "remove"
+    typed_null = (hint.get("opcode") == "TYPE_CHECK" and hint.get("source") == "REST_JSON"
+                  and "candidate_value" in hint and candidate_value is None)
     if (placement not in fuzz_params or not isinstance(parameter, str)
-            or (not remove and not _is_scalar(candidate_value))):
+            or (not remove and not typed_null and not _is_scalar(candidate_value))):
         return None
     placement_params = fuzz_params.get(placement)
     if not isinstance(placement_params, Mapping) or parameter not in placement_params:

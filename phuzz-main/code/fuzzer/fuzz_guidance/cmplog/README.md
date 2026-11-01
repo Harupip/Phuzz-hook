@@ -9,6 +9,7 @@ Fixed fields and nonce/password/secret/token/auth fields are excluded.
 | Callback-attributed `empty` access | Replace the parameter with `""`. |
 | Callback-attributed `isset` access | Remove the parameter, including when its value is already `""`. |
 | Tracked, truthy operand of `BOOL_NOT`, `JMPZ`, or `JMPNZ` | Try `""` and `"0"`. |
+| Tracked `TYPE_CHECK` with the null type mask | JSON: replace with typed `null`; query/form: remove the key. |
 
 `!empty(...)` and `!isset(...)` use the same access evidence as their positive
 forms. Removing a query parameter also removes it from the embedded target URL,
@@ -22,8 +23,16 @@ that are already falsey. `JMPZ`/`JMPNZ` cover conditions whose `BOOL_NOT` is rem
 by OPcache optimization. Boolean results do not retain the original input's
 provenance. Hints still use normal CMPLOG value and transport matching.
 
-This does not add `TYPE_CHECK`/typed-null mutations, general function-transform
-inversion, `strlen`/`count` handling, or parameter/config merging. An unobserved
+Null checks preserve JSON null in the comparison artifact rather than the
+literal string `"null"`. Only a JSON body method with an actual
+`Content-Type: application/json` can apply the typed-null replacement. GET/form
+removal is a trial: it reaches null only if the application treats a missing
+key as null. A subsequent ordinary mutation can turn null back into `""`.
+Request hashes tag null fields structurally, keeping them distinct from strings
+without changing hashes for candidates that contain no null fields.
+
+This does not add general function-transform
+inversion, other type checks, `strlen`/`count` handling, or parameter/config merging. An unobserved
 guard cannot create a hint. `REQUEST`, cookie and REST URL sources retain the
 existing fail-closed placement policy. Empty local-variable syntax is not added
 as a separate access event.

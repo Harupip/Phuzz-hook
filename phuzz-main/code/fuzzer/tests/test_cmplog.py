@@ -203,6 +203,77 @@ class IssetGuardHintTests(unittest.TestCase):
         self.assertIs(worker.ff_interesting_candidates[0], child)
 
 
+class NullTypeCheckHintTests(unittest.TestCase):
+    def artifact(self, source="REST_JSON", value="fuzz", target=None, path=None):
+        return {"request_id": "r-null", "comparison_events": [{
+            "callback": "Demo::handle", "opcode": "TYPE_CHECK", "source": source,
+            "path": path or ["mode"], "runtime_value": value, "comparison_value": target,
+        }]}
+
+    def test_json_keeps_key_and_sends_typed_null_then_can_mutate_again(self):
+        parent = Candidate(http_target="http://web/", http_method="POST",
+                           fixed_params={"headers": {"Content-Type": "application/json"}},
+                           fuzz_params={"body_params": {"mode": "fuzz", "other": "keep"}})
+        worker = object.__new__(Fuzzer)
+        worker.config = {}
+        worker.scoring_formula = SimpleNamespace(calculate_priority=lambda c: 1)
+        worker.fuzzer_id = 1
+        worker.cmplog_hints = normalize_comparison_events(self.artifact(), parent.fuzz_params)
+        self.assertEqual(len(worker.cmplog_hints), 1)
+        self.assertIsNone(worker.cmplog_hints[0]["candidate_value"])
+        self.assertNotEqual(worker.cmplog_hints[0].get("mutation"), "remove")
+        child = worker.ff_mutate(parent)
+        self.assertEqual(json.loads(worker.prepare_request(child).body), {"mode": None, "other": "keep"})
+        self.assertEqual(parent.fuzz_params["body_params"]["mode"], "fuzz")
+        with patch("fuzzer.random.choices", return_value=["body_params"]), patch(
+            "fuzzer.random.choice", return_value="mode",
+        ):
+            next_child = worker.ff_mutate(child)
+        self.assertEqual(next_child.fuzz_params["body_params"]["mode"], "")
+
+    def test_query_and_form_null_checks_remove_key_instead_of_sending_string(self):
+        for source, placement in [("GET", "query_params"), ("POST", "body_params"),
+                                  ("REST_QUERY", "query_params"), ("REST_FORM", "body_params")]:
+            with self.subTest(source=source):
+                fuzz = {placement: {"mode": "fuzz", "other": "keep"}}
+                hints = normalize_comparison_events(self.artifact(source), fuzz)
+                self.assertEqual(len(hints), 1)
+                self.assertEqual(hints[0]["mutation"], "remove")
+                self.assertEqual(apply_cmplog_hint(fuzz, hints[0])["fuzz_params"][placement], {"other": "keep"})
+
+    def test_null_is_distinct_from_literal_none_in_request_hash(self):
+        null = Candidate(fuzz_params={"body_params": {"mode": None}})
+        for value in ("None", 'None__null_fields:[["fuzz", "body_params", "mode"]]'):
+            with self.subTest(value=value):
+                text = Candidate(fuzz_params={"body_params": {"mode": value}})
+                self.assertNotEqual(null.get_params_hash(), text.get_params_hash())
+
+    def test_rejects_non_null_checks_fixed_sensitive_and_stale_values(self):
+        cases = [self.artifact(target="null"), self.artifact(value="stale"),
+                 self.artifact(path=["nonce"]), self.artifact(path=["fixed"]),
+                 self.artifact(source="COOKIE")]
+        missing_target = self.artifact()
+        del missing_target["comparison_events"][0]["comparison_value"]
+        cases.append(missing_target)
+        for artifact in cases:
+            with self.subTest(artifact=artifact):
+                self.assertEqual(normalize_comparison_events(artifact, {
+                    "body_params": {"mode": "fuzz", "nonce": "fuzz"},
+                }), [])
+
+    def test_typed_null_hint_is_not_applied_to_form_request(self):
+        parent = Candidate(http_target="http://web/", http_method="POST",
+                           fuzz_params={"body_params": {"mode": "fuzz"}})
+        worker = object.__new__(Fuzzer)
+        worker.config = {}
+        worker.scoring_formula = SimpleNamespace(calculate_priority=lambda c: 1)
+        worker.fuzzer_id = 1
+        worker.cmplog_hints = normalize_comparison_events(self.artifact(), parent.fuzz_params)
+        child = worker.ff_mutate(parent)
+        self.assertIsNotNone(child.fuzz_params["body_params"]["mode"])
+        self.assertEqual(child.mutation_source, "normal")
+
+
 class CmpLogNormalizationTests(unittest.TestCase):
     def test_bool_not_falsey_targets_preserve_parameter_and_other_inputs(self):
         artifact = {"request_id": "r-bool", "comparison_events": [{

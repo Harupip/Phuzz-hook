@@ -1,0 +1,148 @@
+[
+  {
+    "opcache": false,
+    "hint": {
+      "request_id": "bool-not-test-4374084eafd24c79a307a8e60adfed54",
+      "callback": "hookphuzz_null_check_fixture",
+      "opcode": "TYPE_CHECK",
+      "source": "REST_JSON",
+      "path": [
+        "JSON",
+        "mode"
+      ],
+      "parameter": "mode",
+      "placement": "body_params",
+      "observed_value": "null",
+      "candidate_value": null,
+      "reason": "cmplog",
+      "mutation_source": "cmplog"
+    },
+    "sent": {
+      "query": {
+        "mode": "null",
+        "keep": "query"
+      },
+      "body": {
+        "mode": null,
+        "keep": "body",
+        "nonce": "fuzz"
+      }
+    },
+    "before": {
+      "string": true
+    },
+    "after": {
+      "json_null": "new-json-path",
+      "is_null": true
+    }
+  },
+  {
+    "opcache": false,
+    "hint": {
+      "request_id": "bool-not-test-4374084eafd24c79a307a8e60adfed54",
+      "callback": "hookphuzz_null_check_fixture",
+      "opcode": "TYPE_CHECK",
+      "source": "GET",
+      "path": [
+        "mode"
+      ],
+      "parameter": "mode",
+      "placement": "query_params",
+      "observed_value": "null",
+      "candidate_value": null,
+      "reason": "cmplog",
+      "mutation_source": "cmplog",
+      "mutation": "remove"
+    },
+    "sent": {
+      "query": {
+        "keep": "query"
+      },
+      "body": {
+        "mode": "null",
+        "keep": "body",
+        "nonce": "fuzz"
+      }
+    },
+    "before": {
+      "string": true
+    },
+    "after": {
+      "query_null": "new-query-path",
+      "string": true
+    }
+  },
+  {
+    "opcache": true,
+    "hint": {
+      "request_id": "bool-not-test-d2af5dee80724201a2c062dce7e1c9c6",
+      "callback": "hookphuzz_null_check_fixture",
+      "opcode": "TYPE_CHECK",
+      "source": "REST_JSON",
+      "path": [
+        "JSON",
+        "mode"
+      ],
+      "parameter": "mode",
+      "placement": "body_params",
+      "observed_value": "null",
+      "candidate_value": null,
+      "reason": "cmplog",
+      "mutation_source": "cmplog"
+    },
+    "sent": {
+      "query": {
+        "mode": "null",
+        "keep": "query"
+      },
+      "body": {
+        "mode": null,
+        "keep": "body",
+        "nonce": "fuzz"
+      }
+    },
+    "before": {
+      "string": true
+    },
+    "after": {
+      "json_null": "new-json-path",
+      "is_null": true
+    }
+  },
+  {
+    "opcache": true,
+    "hint": {
+      "request_id": "bool-not-test-d2af5dee80724201a2c062dce7e1c9c6",
+      "callback": "hookphuzz_null_check_fixture",
+      "opcode": "TYPE_CHECK",
+      "source": "GET",
+      "path": [
+        "mode"
+      ],
+      "parameter": "mode",
+      "placement": "query_params",
+      "observed_value": "null",
+      "candidate_value": null,
+      "reason": "cmplog",
+      "mutation_source": "cmplog",
+      "mutation": "remove"
+    },
+    "sent": {
+      "query": {
+        "keep": "query"
+      },
+      "body": {
+        "mode": "null",
+        "keep": "body",
+        "nonce": "fuzz"
+      }
+    },
+    "before": {
+      "string": true
+    },
+    "after": {
+      "query_null": "new-query-path",
+      "string": true
+    }
+  }
+]

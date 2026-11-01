@@ -146,6 +146,13 @@ class Candidate:
             s += f"__{k}:"
             s += '__'.join(['{}:{}'.format(*kv)
                 for kv in sorted(self.fuzz_params[k].items())])
+        # Keep typed null distinct from the literal string "None" in sync/dedup.
+        null_fields = [(kind, bucket, name)
+                       for kind, params in (("fixed", self.fixed_params), ("fuzz", self.fuzz_params))
+                       for bucket, values in params.items() for name, value in values.items()
+                       if value is None and not (kind == "fixed" and bucket == "cookies")]
+        if null_fields:
+            s = json.dumps({"legacy": s, "null_fields": sorted(null_fields)}, sort_keys=True)
         self.hash = hashlib.md5(s.encode()).hexdigest()
         return self.hash
 

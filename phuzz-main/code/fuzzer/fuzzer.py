@@ -698,6 +698,12 @@ class Fuzzer:
 
         while self.cmplog_hints:
             hint = self.cmplog_hints.pop(0)
+            if (hint.get("opcode") == "TYPE_CHECK" and hint.get("candidate_value") is None
+                    and hint.get("mutation") != "remove"):
+                headers = {**c.fuzz_params['headers'], **c.fixed_params['headers']}
+                content_type = headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+                if c.http_method not in ['POST', 'PUT', 'PATCH', 'DELETE'] or content_type != 'application/json':
+                    continue
             applied = apply_cmplog_hint(c.fuzz_params, hint)
             if applied is None:
                 continue
@@ -732,7 +738,7 @@ class Fuzzer:
         param_name = random.choice(list(c.fuzz_params[param_type].keys()))
 
         param_value = c.fuzz_params[param_type][param_name]
-        new_value = mutator.mutate(param_value)
+        new_value = "" if param_value is None else mutator.mutate(param_value)
 
         fuzz_params = copy.deepcopy(c.fuzz_params)
         fuzz_params[param_type][param_name] = new_value

@@ -1,0 +1,6 @@
+{
+  "hookphuzz_opcode.c": "e78abf786f4714efde5cf8591ef8ffb6b423aae9b9cec027673b4790c53f67fc",
+  "php_hookphuzz_opcode.h": "32189901ea558329c7cb022432762c9935159835afb2734b7fb72f2f12042b62",
+  "module_sha256": "41a5e9f1eb46b9fabddd671f01aa9cce5e39c170f5220a340e19e1d2b179c642",
+  "installed_into_apache": false
+}

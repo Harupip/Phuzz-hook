@@ -68,6 +68,7 @@ typedef struct _hookphuzz_comparison_event {
     const char *provenance_operand;
     zend_string *runtime_value;
     zend_string *comparison_value;
+    zend_bool comparison_is_null;
     zend_string *root_callback;
     zend_string *current_function;
     zend_bool attributed;
