@@ -6,6 +6,11 @@ from collections.abc import Mapping
 
 
 _SUPPORTED_OPCODES = {
+    "EMPTY",
+    "ISSET",
+    "BOOL_NOT",
+    "JMPZ",
+    "JMPNZ",
     "IS_EQUAL",
     "IS_NOT_EQUAL",
     "IS_IDENTICAL",
@@ -71,6 +76,32 @@ def _same_value(left, right):
     return False
 
 
+def _guard_comparisons(artifact, fuzz_params):
+    events = artifact.get("events")
+    if not isinstance(events, list):
+        return []
+    comparisons = []
+    for event in events:
+        if not isinstance(event, Mapping) or event.get("operation") not in ("empty", "isset"):
+            continue
+        context = event.get("callback_context")
+        if (not isinstance(context, Mapping) or context.get("attributed") is not True
+                or not isinstance(context.get("root_callback"), str) or not context["root_callback"]):
+            continue
+        source, placement = _placement(event.get("source"), event.get("path"))
+        parameter = _parameter_name(event.get("path"))
+        values = fuzz_params.get(placement)
+        if source is None or not isinstance(values, Mapping) or parameter not in values:
+            continue
+        # Access events carry no value; use the input of this exact request.
+        comparisons.append({
+            "opcode": event["operation"].upper(), "source": source, "path": event["path"],
+            "callback": context["root_callback"], "runtime_value": values[parameter],
+            "comparison_value": "",
+        })
+    return comparisons
+
+
 def normalize_comparison_events(artifact, fuzz_params):
     """Return deduplicated, parameter-specific hints from one Zend artifact."""
 
@@ -79,9 +110,10 @@ def normalize_comparison_events(artifact, fuzz_params):
     request_id = artifact.get("request_id")
     if not isinstance(request_id, str) or not request_id:
         return []
-    raw_events = artifact.get("comparison_events")
+    raw_events = artifact.get("comparison_events", [])
     if not isinstance(raw_events, list):
-        return []
+        raw_events = []
+    raw_events = _guard_comparisons(artifact, fuzz_params) + raw_events
 
     hints = []
     seen = set()
@@ -95,7 +127,7 @@ def normalize_comparison_events(artifact, fuzz_params):
         comparison_value = event.get("comparison_value")
         if not _is_scalar(runtime_value) or not _is_scalar(comparison_value):
             continue
-        if _same_value(runtime_value, comparison_value):
+        if opcode != "ISSET" and _same_value(runtime_value, comparison_value):
             continue
         source = event.get("source")
         path = event.get("path")
@@ -138,10 +170,12 @@ def normalize_comparison_events(artifact, fuzz_params):
                 "placement": placement,
                 "observed_value": runtime_value,
                 "candidate_value": comparison_value,
-                "reason": "cmplog",
+                "reason": opcode.lower() + "_guard" if opcode in {"EMPTY", "ISSET"} else "cmplog",
                 "mutation_source": "cmplog",
             }
         )
+        if opcode == "ISSET":
+            hints[-1]["mutation"] = "remove"
     return hints
 
 
@@ -153,7 +187,9 @@ def apply_cmplog_hint(fuzz_params, hint):
     placement = hint.get("placement")
     parameter = hint.get("parameter")
     candidate_value = hint.get("candidate_value")
-    if placement not in fuzz_params or not isinstance(parameter, str) or not _is_scalar(candidate_value):
+    remove = hint.get("mutation") == "remove"
+    if (placement not in fuzz_params or not isinstance(parameter, str)
+            or (not remove and not _is_scalar(candidate_value))):
         return None
     placement_params = fuzz_params.get(placement)
     if not isinstance(placement_params, Mapping) or parameter not in placement_params:
@@ -161,10 +197,13 @@ def apply_cmplog_hint(fuzz_params, hint):
     observed_value = hint.get("observed_value")
     if observed_value is not None and not _same_value(placement_params[parameter], observed_value):
         return None
-    if _same_value(placement_params[parameter], candidate_value):
+    if not remove and _same_value(placement_params[parameter], candidate_value):
         return None
     updated = copy.deepcopy(fuzz_params)
-    updated[placement][parameter] = candidate_value
+    if remove:
+        del updated[placement][parameter]
+    else:
+        updated[placement][parameter] = candidate_value
     return {
         "fuzz_params": updated,
         "mutated_param_type": placement,

@@ -1,0 +1,34 @@
+{
+  "before": {
+    "isset": true,
+    "not_isset": false,
+    "empty": false,
+    "not_empty": true
+  },
+  "after": {
+    "isset": false,
+    "not_isset": true,
+    "empty": true,
+    "not_empty": false,
+    "hidden": "new-path"
+  },
+  "request_after": "http://web/?keep=1&other=keep",
+  "hint": {
+    "request_id": "isset-guard-ffd54355c20f4815aee9254dda45397a",
+    "callback": "isset_guard_fixture",
+    "opcode": "ISSET",
+    "source": "GET",
+    "path": [
+      "mode"
+    ],
+    "parameter": "mode",
+    "placement": "query_params",
+    "observed_value": "fuzz",
+    "candidate_value": "",
+    "reason": "isset_guard",
+    "mutation_source": "cmplog",
+    "mutation": "remove"
+  },
+  "new_parameter_seen_only_after_removal": true,
+  "scope": "Real PHP Zend artifact -> Fuzzer.ff_mutate -> prepared GET query -> real PHP; not a full plugin campaign"
+}

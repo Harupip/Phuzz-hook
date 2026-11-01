@@ -1,0 +1,55 @@
+{
+  "before": [],
+  "hints": [
+    {
+      "request_id": "bool-not-9885c25b285240f2bc467eb891aff411",
+      "callback": "bool_not_fixture",
+      "opcode": "BOOL_NOT",
+      "source": "GET",
+      "path": [
+        "mode"
+      ],
+      "parameter": "mode",
+      "placement": "query_params",
+      "observed_value": "fuzz",
+      "candidate_value": "",
+      "reason": "cmplog",
+      "mutation_source": "cmplog"
+    },
+    {
+      "request_id": "bool-not-9885c25b285240f2bc467eb891aff411",
+      "callback": "bool_not_fixture",
+      "opcode": "BOOL_NOT",
+      "source": "GET",
+      "path": [
+        "mode"
+      ],
+      "parameter": "mode",
+      "placement": "query_params",
+      "observed_value": "fuzz",
+      "candidate_value": "0",
+      "reason": "cmplog",
+      "mutation_source": "cmplog"
+    }
+  ],
+  "results": [
+    {
+      "value": "",
+      "after": {
+        "not": "new-not-path",
+        "equals_false": "new-false-path"
+      },
+      "request": "http://web/?mode=&nonce=fuzz&guard=fuzz&other=keep"
+    },
+    {
+      "value": "0",
+      "after": {
+        "not": "new-not-path",
+        "equals_false": "new-false-path"
+      },
+      "request": "http://web/?mode=0&nonce=fuzz&guard=fuzz&other=keep"
+    }
+  ],
+  "only_mode_received_bool_hints": true,
+  "scope": "isolated compiled extension + real PHP CLI + production Fuzzer mutation; not full WordPress campaign"
+}

@@ -1,0 +1,8 @@
+{
+  "source_sha256": "fd67a70620d1a400dd286a3a8bf163c894fcd47b7d1f836cffa832eea1b98b65",
+  "built_source_sha256": "fd67a70620d1a400dd286a3a8bf163c894fcd47b7d1f836cffa832eea1b98b65",
+  "module_sha256": "c91502f841bd22e98034caeb409bc6c5ce330bccba39fa065decf044f49e6b87",
+  "build_directory": "/tmp/hookphuzz-bool-not-20261102",
+  "container": "code-web-1",
+  "installed_into_apache": false
+}

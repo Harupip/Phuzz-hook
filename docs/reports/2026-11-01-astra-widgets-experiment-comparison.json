@@ -1,0 +1,234 @@
+{
+  "run_id": "astra-widgets-20261101T111635Z",
+  "reference": "experiment\\02-0day-vulns\\configs\\300000-astra-widgets.1.2.12.zip\\dismiss_notice\\fuzzer-config.astra-notice-dismiss.json",
+  "policy": "semantic; ignore /metadata only",
+  "results": [
+    {
+      "version": "v7",
+      "config_path": "C:\\Users\\hieu\\Desktop\\Phuzz-hook\\Phuzz-hook\\phuzz-main\\code\\fuzzer\\output\\online-linked\\astra-widgets-20261101T111635Z\\final-configs\\fuzzer-config.wp_ajax_astra-notice-dismiss.c93bf2963fc44eaf.json",
+      "status": "MISMATCH",
+      "matched": false,
+      "differences": [
+        {
+          "kind": "CLASSIFICATION_MISMATCH",
+          "path": "/body_params/fixed",
+          "expected": [
+            "nonce"
+          ],
+          "actual": []
+        },
+        {
+          "kind": "MISSING_PARAMETER",
+          "path": "/body_params/nonce",
+          "expected": {
+            "name": "nonce",
+            "value": "fuzz"
+          },
+          "actual": null
+        },
+        {
+          "kind": "UNEXPECTED_PARAMETER",
+          "path": "/headers/Content-Type",
+          "expected": null,
+          "actual": {
+            "name": "Content-Type",
+            "value": "application/x-www-form-urlencoded"
+          }
+        },
+        {
+          "kind": "CLASSIFICATION_MISMATCH",
+          "path": "/headers/fixed",
+          "expected": [],
+          "actual": [
+            "Content\\-Type"
+          ]
+        },
+        {
+          "kind": "VALUE_MISMATCH",
+          "path": "/headers/weight",
+          "expected": null,
+          "actual": 1,
+          "reason": "missing_field"
+        }
+      ],
+      "errors": []
+    },
+    {
+      "version": "v6",
+      "config_path": "C:\\Users\\hieu\\Desktop\\Phuzz-hook\\Phuzz-hook\\phuzz-main\\code\\fuzzer\\output\\online-linked\\astra-widgets-20261101T111635Z\\final-configs\\fuzzer-config.wp_ajax_astra-notice-dismiss.c93bf2963fc44eaf.v6.json",
+      "status": "MISMATCH",
+      "matched": false,
+      "differences": [
+        {
+          "kind": "CLASSIFICATION_MISMATCH",
+          "path": "/body_params/fuzz",
+          "expected": [
+            "notice_id",
+            "repeat_notice_after"
+          ],
+          "actual": [
+            "notice_id"
+          ]
+        },
+        {
+          "kind": "VALUE_MISMATCH",
+          "path": "/body_params/nonce/value",
+          "expected": "fuzz",
+          "actual": "probe"
+        },
+        {
+          "kind": "MISSING_PARAMETER",
+          "path": "/body_params/repeat_notice_after",
+          "expected": {
+            "name": "repeat_notice_after",
+            "value": "fuzz"
+          },
+          "actual": null
+        },
+        {
+          "kind": "UNEXPECTED_PARAMETER",
+          "path": "/headers/Content-Type",
+          "expected": null,
+          "actual": {
+            "name": "Content-Type",
+            "value": "application/x-www-form-urlencoded"
+          }
+        },
+        {
+          "kind": "CLASSIFICATION_MISMATCH",
+          "path": "/headers/fixed",
+          "expected": [],
+          "actual": [
+            "Content\\-Type"
+          ]
+        },
+        {
+          "kind": "VALUE_MISMATCH",
+          "path": "/headers/weight",
+          "expected": null,
+          "actual": 1,
+          "reason": "missing_field"
+        }
+      ],
+      "errors": []
+    },
+    {
+      "version": "v5",
+      "config_path": "C:\\Users\\hieu\\Desktop\\Phuzz-hook\\Phuzz-hook\\phuzz-main\\code\\fuzzer\\output\\online-linked\\astra-widgets-20261101T111635Z\\final-configs\\fuzzer-config.wp_ajax_astra-notice-dismiss.c93bf2963fc44eaf.v5.json",
+      "status": "MISMATCH",
+      "matched": false,
+      "differences": [
+        {
+          "kind": "CLASSIFICATION_MISMATCH",
+          "path": "/body_params/fuzz",
+          "expected": [
+            "notice_id",
+            "repeat_notice_after"
+          ],
+          "actual": [
+            "repeat_notice_after"
+          ]
+        },
+        {
+          "kind": "VALUE_MISMATCH",
+          "path": "/body_params/nonce/value",
+          "expected": "fuzz",
+          "actual": "probe"
+        },
+        {
+          "kind": "MISSING_PARAMETER",
+          "path": "/body_params/notice_id",
+          "expected": {
+            "name": "notice_id",
+            "value": "fuzz"
+          },
+          "actual": null
+        },
+        {
+          "kind": "UNEXPECTED_PARAMETER",
+          "path": "/headers/Content-Type",
+          "expected": null,
+          "actual": {
+            "name": "Content-Type",
+            "value": "application/x-www-form-urlencoded"
+          }
+        },
+        {
+          "kind": "CLASSIFICATION_MISMATCH",
+          "path": "/headers/fixed",
+          "expected": [],
+          "actual": [
+            "Content\\-Type"
+          ]
+        },
+        {
+          "kind": "VALUE_MISMATCH",
+          "path": "/headers/weight",
+          "expected": null,
+          "actual": 1,
+          "reason": "missing_field"
+        }
+      ],
+      "errors": []
+    },
+    {
+      "version": "v4",
+      "config_path": "C:\\Users\\hieu\\Desktop\\Phuzz-hook\\Phuzz-hook\\phuzz-main\\code\\fuzzer\\output\\online-linked\\astra-widgets-20261101T111635Z\\final-configs\\fuzzer-config.wp_ajax_astra-notice-dismiss.c93bf2963fc44eaf.v4.json",
+      "status": "MISMATCH",
+      "matched": false,
+      "differences": [
+        {
+          "kind": "CLASSIFICATION_MISMATCH",
+          "path": "/body_params/fuzz",
+          "expected": [
+            "notice_id",
+            "repeat_notice_after"
+          ],
+          "actual": [
+            "notice_id"
+          ]
+        },
+        {
+          "kind": "VALUE_MISMATCH",
+          "path": "/body_params/nonce/value",
+          "expected": "fuzz",
+          "actual": "probe"
+        },
+        {
+          "kind": "MISSING_PARAMETER",
+          "path": "/body_params/repeat_notice_after",
+          "expected": {
+            "name": "repeat_notice_after",
+            "value": "fuzz"
+          },
+          "actual": null
+        },
+        {
+          "kind": "UNEXPECTED_PARAMETER",
+          "path": "/headers/Content-Type",
+          "expected": null,
+          "actual": {
+            "name": "Content-Type",
+            "value": "application/x-www-form-urlencoded"
+          }
+        },
+        {
+          "kind": "CLASSIFICATION_MISMATCH",
+          "path": "/headers/fixed",
+          "expected": [],
+          "actual": [
+            "Content\\-Type"
+          ]
+        },
+        {
+          "kind": "VALUE_MISMATCH",
+          "path": "/headers/weight",
+          "expected": null,
+          "actual": 1,
+          "reason": "missing_field"
+        }
+      ],
+      "errors": []
+    }
+  ]
+}

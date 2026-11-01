@@ -7,6 +7,25 @@ function hookphuzz_cmplog_fixture(): array
     $copied = $mode;
     $result = [];
 
+    if (!$copied) {
+        $result[] = 'bool_not';
+    }
+    if ($copied == false) {
+        $result[] = 'equals_false';
+    }
+    $nonce = (string) ($_GET['nonce'] ?? '');
+    if (!$nonce) {
+        $result[] = 'missing_nonce';
+    }
+    $constant = 'not-input';
+    if (!$constant) {
+        $result[] = 'constant_bool';
+    }
+    $checked = isset($_GET['other']);
+    if (!$checked) {
+        $result[] = 'missing_other';
+    }
+
     if ($copied === 'strict_target') {
         $result[] = 'strict';
     }

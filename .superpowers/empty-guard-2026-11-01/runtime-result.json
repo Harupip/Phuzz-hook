@@ -1,0 +1,21 @@
+{
+  "before": "Deprecated: Directive 'allow_url_include' is deprecated in Unknown on line 0\nnonempty-branch",
+  "after": "Deprecated: Directive 'allow_url_include' is deprecated in Unknown on line 0\nempty-branch:new-path",
+  "hint": {
+    "request_id": "empty-guard-55a3bd0b67e741c1aa38621af535a596",
+    "callback": "hookphuzz_empty_guard_fixture",
+    "opcode": "EMPTY",
+    "source": "GET",
+    "path": [
+      "mode"
+    ],
+    "parameter": "mode",
+    "placement": "query_params",
+    "observed_value": "fuzz",
+    "candidate_value": "",
+    "reason": "empty_guard",
+    "mutation_source": "cmplog"
+  },
+  "new_parameter_seen_only_after_empty": true,
+  "verification": "real PHP Zend artifact -> Python hint/mutation -> real PHP new branch; CLI fixture, not full campaign"
+}

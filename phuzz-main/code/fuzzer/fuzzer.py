@@ -265,6 +265,8 @@ class Fuzzer:
                 artifact = json.load(artifact_file)
         except (OSError, ValueError):
             return
+        if not isinstance(artifact, dict) or artifact.get("request_id") != candidate.coverage_id:
+            return
         for hint in normalize_comparison_events(artifact, candidate.fuzz_params):
             hint_key = json.dumps(hint, sort_keys=True, default=str)
             if hint_key in self._cmplog_hint_keys:
@@ -699,10 +701,16 @@ class Fuzzer:
             applied = apply_cmplog_hint(c.fuzz_params, hint)
             if applied is None:
                 continue
+            http_target = c.http_target
+            if hint.get("mutation") == "remove" and applied["mutated_param_type"] == "query_params":
+                target = urlparse.urlsplit(http_target)
+                query = [(key, value) for key, value in urlparse.parse_qsl(target.query, keep_blank_values=True)
+                         if key != applied["mutated_param_name"]]
+                http_target = urlparse.urlunsplit(target._replace(query=urlencode(query)))
             return Candidate(
                 parent=c,
                 priority=self.scoring_formula.calculate_priority(c),
-                http_target=c.http_target,
+                http_target=http_target,
                 http_method=c.http_method,
                 fixed_params=copy.deepcopy(c.fixed_params),
                 fuzz_params=applied["fuzz_params"],
@@ -983,7 +991,9 @@ class Fuzzer:
                     #print("TP priority / score:", mutated_candidate.priority, mutated_candidate.score)
                     self.ff_interesting_candidates.append(mutated_candidate)
                     self.ff_interesting_candidates_hashes.add(mutated_candidate_hash)
-                    if mutated_candidate.mutated_param_type and mutated_candidate.mutated_param_name:
+                    if (mutated_candidate.mutated_param_type and mutated_candidate.mutated_param_name
+                            and mutated_candidate.mutated_param_name in mutated_candidate.fuzz_params.get(
+                                mutated_candidate.mutated_param_type, {})):
                         fixed_params = copy.deepcopy(mutated_candidate.fixed_params)
                         fuzz_params = copy.deepcopy(mutated_candidate.fuzz_params)
                         fuzz_weights = copy.deepcopy(mutated_candidate.fuzz_weights)

@@ -1,0 +1,233 @@
+[
+  {
+    "condition": "empty($_GET['x'])",
+    "label": "empty direct",
+    "events": [
+      [
+        "empty",
+        [
+          "x"
+        ]
+      ]
+    ],
+    "comparisons": [],
+    "hint_values": [
+      ""
+    ]
+  },
+  {
+    "condition": "empty($x)",
+    "label": "empty local",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "$x === ''",
+    "label": "strict empty",
+    "events": [],
+    "comparisons": [
+      [
+        "IS_IDENTICAL",
+        "fuzz",
+        ""
+      ]
+    ],
+    "hint_values": [
+      ""
+    ]
+  },
+  {
+    "condition": "$x == ''",
+    "label": "loose empty",
+    "events": [],
+    "comparisons": [
+      [
+        "IS_EQUAL",
+        "fuzz",
+        ""
+      ]
+    ],
+    "hint_values": [
+      ""
+    ]
+  },
+  {
+    "condition": "$x !== ''",
+    "label": "not empty",
+    "events": [],
+    "comparisons": [
+      [
+        "IS_NOT_IDENTICAL",
+        "fuzz",
+        ""
+      ]
+    ],
+    "hint_values": [
+      ""
+    ]
+  },
+  {
+    "condition": "!$x",
+    "label": "truthiness",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "(bool)$x === false",
+    "label": "cast bool",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "$x == false",
+    "label": "loose false",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "$x === false",
+    "label": "strict false",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "$x === null",
+    "label": "null compare",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "is_null($x)",
+    "label": "is_null",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "!isset($_GET['x'])",
+    "label": "isset",
+    "events": [
+      [
+        "isset",
+        [
+          "x"
+        ]
+      ]
+    ],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "!array_key_exists('x', $_GET)",
+    "label": "array_key_exists",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "strlen($x) === 0",
+    "label": "strlen zero",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "strlen($x) < 1",
+    "label": "strlen range",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "trim($x) === ''",
+    "label": "trim empty",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "count($_GET['items']) === 0",
+    "label": "count zero",
+    "events": [
+      [
+        "read",
+        [
+          "items"
+        ]
+      ]
+    ],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "$_GET['items'] === []",
+    "label": "empty array",
+    "events": [
+      [
+        "read",
+        [
+          "items"
+        ]
+      ]
+    ],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "$x == 0",
+    "label": "numeric zero",
+    "events": [],
+    "comparisons": [
+      [
+        "IS_EQUAL",
+        "fuzz",
+        "0"
+      ]
+    ],
+    "hint_values": [
+      "0"
+    ]
+  },
+  {
+    "condition": "$x === '0'",
+    "label": "string zero",
+    "events": [],
+    "comparisons": [
+      [
+        "IS_IDENTICAL",
+        "fuzz",
+        "0"
+      ]
+    ],
+    "hint_values": [
+      "0"
+    ]
+  },
+  {
+    "condition": "$x ?: 'default'",
+    "label": "fallback",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "$x ?? 'default'",
+    "label": "coalesce",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  },
+  {
+    "condition": "filter_var($x, FILTER_VALIDATE_BOOLEAN) === false",
+    "label": "filter bool",
+    "events": [],
+    "comparisons": [],
+    "hint_values": []
+  }
+]
