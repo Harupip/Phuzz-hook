@@ -84,6 +84,7 @@ def build_config_for_seed_item(
             values,
             fixed_params=fixed_params,
             fuzzable_params=section_fuzzable_params,
+            fuzz_action=config_key == "body_params" and not replay_only and not probe_variant,
         )
         config[config_key] = section
         if config_key in {"body_params", "query_params"} or (
@@ -316,6 +317,7 @@ def _build_param_section(
     *,
     fixed_params: set[str],
     fuzzable_params: set[str],
+    fuzz_action: bool = False,
 ) -> dict[str, Any]:
     fixed: list[str] = []
     fuzz: list[str] = []
@@ -323,8 +325,11 @@ def _build_param_section(
 
     for name, value in values.items():
         param_name = str(name)
-        # Keep nonce fields stable so mutations target the handler payload.
-        if param_name in fuzzable_params and param_name not in fixed_params and "nonce" not in param_name.lower():
+        if param_name == "action" and fuzz_action:
+            # Preserve the routing seed; later mutations may select another callback.
+            data.append({"name": param_name, "value": value})
+            fuzz.append(_selector_for_generated_param(param_name))
+        elif param_name in fuzzable_params and param_name not in fixed_params and "nonce" not in param_name.lower():
             data.append({"name": param_name, "value": "fuzz"})
             fuzz.append(_selector_for_generated_param(param_name))
         else:

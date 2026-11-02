@@ -113,8 +113,8 @@ class ConfigComparisonExperimentTests(unittest.TestCase):
 
         self.assertEqual(actual["body_params"]["data"][0], {"name": "action", "value": "wpcf7-update-welcome-panel"})
         self.assertEqual(actual["body_params"]["data"][1], {"name": "visible", "value": "fuzz"})
-        self.assertEqual(actual["body_params"]["fixed"], ["action"])
-        self.assertEqual(actual["body_params"]["fuzz"], ["visible"])
+        self.assertEqual(actual["body_params"]["fixed"], [])
+        self.assertEqual(actual["body_params"]["fuzz"], ["action", "visible"])
         self.assertEqual(result.status, Status.MISMATCH)
         self.assertTrue(any(d.kind == DifferenceKind.SOURCE_MISMATCH for d in result.differences))
 

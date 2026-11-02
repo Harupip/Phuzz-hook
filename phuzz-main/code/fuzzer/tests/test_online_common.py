@@ -4,12 +4,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
-from hook_energy.seed_generation.online_common import select_v0, validate_v0_config
+from hook_energy.seed_generation.online_common import _write_json, select_v0, validate_v0_config
 
 
 def online_config() -> dict:
@@ -34,6 +35,40 @@ def online_config() -> dict:
 
 
 class OnlineCommonTests(unittest.TestCase):
+    def test_checkpoint_retries_transient_windows_replace_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "state.json"
+            path.write_text('{"old": true}', encoding="utf-8")
+            original_replace = Path.replace
+            calls = []
+
+            def replace(source, target):
+                calls.append(source)
+                if len(calls) < 3:
+                    error = PermissionError("temporarily locked")
+                    error.winerror = 5
+                    raise error
+                return original_replace(source, target)
+
+            with patch.object(Path, "replace", replace), patch("hook_energy.seed_generation.online_common.time.sleep"):
+                _write_json(path, {"new": True})
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(json.loads(path.read_text()), {"new": True})
+            self.assertFalse(path.with_name("state.json.tmp").exists())
+
+    def test_checkpoint_replace_failure_is_bounded_and_preserves_old_state(self) -> None:
+        for winerror, expected_calls in ((5, 5), (32, 5), (33, 5), (None, 1)):
+            with self.subTest(winerror=winerror), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "state.json"
+                path.write_text('{"old": true}', encoding="utf-8")
+                error = PermissionError("cannot replace")
+                error.winerror = winerror
+                with patch.object(Path, "replace", side_effect=error) as replace, patch("hook_energy.seed_generation.online_common.time.sleep"):
+                    with self.assertRaises(PermissionError):
+                        _write_json(path, {"new": True})
+                self.assertEqual(replace.call_count, expected_calls)
+                self.assertEqual(json.loads(path.read_text()), {"old": True})
+
     def test_v0_requires_target_method_callback_and_fuzzable_config(self) -> None:
         config = online_config()
         self.assertEqual(validate_v0_config(config), (True, ""))

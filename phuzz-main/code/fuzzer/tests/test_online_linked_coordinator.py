@@ -527,8 +527,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertEqual(final["methods"], ["POST"])
                 self.assertIn("body_key", final["body_params"]["fuzz"])
                 if post_action:
-                    self.assertIn("action", final["body_params"]["fixed"])
-                    self.assertNotIn("action", final["body_params"]["fuzz"])
+                    self.assertNotIn("action", final["body_params"]["fixed"])
+                    self.assertIn("action", final["body_params"]["fuzz"])
                 if not method_only:
                     # The first 400 exposes this key; only a later correlated
                     # probe and strict replay may promote it alongside body_key.
@@ -1517,7 +1517,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             },
         }
         _, config = build_config_for_seed_item(item)
-        self.assertEqual(config["body_params"]["fuzz"], ["payload"])
+        self.assertEqual(config["body_params"]["fuzz"], ["action", "payload"])
         self.assertIn("payload", config["query_params"]["fixed"])
         self.assertEqual(config["headers"]["fuzz"], [])
         self.assertEqual(config["cookies"]["fuzz"], [])

@@ -42,7 +42,10 @@ def build_config_for_candidate(candidate: Mapping[str, Any], *, target_base: str
         values = _mapping_to_strings(http_template.get(source_key, {}))
         if not values:
             continue
-        section, section_fuzz_count = _build_param_section(values, allow_fuzz=config_key in {"query_params", "body_params"})
+        section, section_fuzz_count = _build_param_section(
+            values, allow_fuzz=config_key in {"query_params", "body_params"},
+            fuzz_action=config_key == "body_params",
+        )
         config[config_key] = section
         fuzz_count += section_fuzz_count
 
@@ -50,7 +53,9 @@ def build_config_for_candidate(candidate: Mapping[str, Any], *, target_base: str
         placeholder_section = "body_params" if method in {"POST", "PUT", "PATCH", "DELETE"} else "query_params"
         values = _section_values(config.get(placeholder_section, {}))
         values["hookphuzz_probe"] = "fuzz"
-        config[placeholder_section], _ = _build_param_section(values, allow_fuzz=True)
+        config[placeholder_section], _ = _build_param_section(
+            values, allow_fuzz=True, fuzz_action=placeholder_section == "body_params",
+        )
 
     config["metadata"] = {
         "candidate_id": _optional_string(candidate.get("candidate_id")),
@@ -112,14 +117,14 @@ def write_candidate_configs(
     return written
 
 
-def _build_param_section(values: Mapping[str, str], *, allow_fuzz: bool) -> tuple[dict[str, Any], int]:
+def _build_param_section(values: Mapping[str, str], *, allow_fuzz: bool, fuzz_action: bool = False) -> tuple[dict[str, Any], int]:
     data = [{"name": str(name), "value": str(value)} for name, value in values.items()]
     fixed: list[str] = []
     fuzz: list[str] = []
     for name in values:
         param_name = str(name)
         selector = _selector_for_generated_param(param_name)
-        if allow_fuzz and param_name != "action":
+        if allow_fuzz and (param_name != "action" or fuzz_action):
             fuzz.append(selector)
         else:
             fixed.append(selector)

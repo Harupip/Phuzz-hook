@@ -287,8 +287,8 @@ class EntrypointPipelineTests(unittest.TestCase):
             ajax = json.loads((configs / "wp_ajax_nopriv_demo_lookup-cb-ajax-post.json").read_text())
             self.assertEqual(ajax["target"], "http://web/wp-admin/admin-ajax.php")
             self.assertEqual(ajax["methods"], ["POST"])
-            self.assertEqual(ajax["body_params"]["fixed"], ["action"])
-            self.assertEqual(ajax["body_params"]["fuzz"], ["term"])
+            self.assertEqual(ajax["body_params"]["fixed"], [])
+            self.assertEqual(ajax["body_params"]["fuzz"], ["action", "term"])
 
             rest_get = json.loads((configs / "rest_route_demo_v1_items-cb-rest-get-get.json").read_text())
             self.assertEqual(rest_get["target"], "http://web/wp-json/demo/v1/items")
@@ -387,7 +387,7 @@ class EntrypointPipelineTests(unittest.TestCase):
             get_config = json.loads(get_path.read_text(encoding="utf-8"))
 
             self.assertEqual(post_config["methods"], ["POST"])
-            self.assertEqual(post_config["body_params"]["fuzz"], ["direct_post_value"])
+            self.assertEqual(post_config["body_params"]["fuzz"], ["action", "direct_post_value"])
             self.assertEqual(get_config["methods"], ["GET"])
             self.assertEqual(get_config["query_params"]["fuzz"], ["direct_get_value"])
 

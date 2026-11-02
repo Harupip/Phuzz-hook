@@ -35,13 +35,23 @@ def build_candidate(**overrides):
 
 
 class PhuzzConfigWriterTests(unittest.TestCase):
-    def test_wp_ajax_nopriv_candidate_becomes_admin_ajax_config_with_fixed_action_and_metadata(self) -> None:
+    def test_body_action_can_mutate_while_query_action_stays_fixed(self) -> None:
+        candidate = build_candidate()
+        candidate['http_template']['query_params']['action'] = 'abc'
+        _, config = build_config_for_candidate(candidate, target_base='http://web')
+        self.assertIn('action', config['body_params']['fuzz'])
+        self.assertNotIn('action', config['body_params']['fixed'])
+        self.assertIn({'name': 'action', 'value': 'abc'}, config['body_params']['data'])
+        self.assertIn('action', config['query_params']['fixed'])
+        self.assertNotIn('action', config['query_params']['fuzz'])
+
+    def test_wp_ajax_nopriv_candidate_becomes_admin_ajax_config_with_fuzzed_body_action_and_metadata(self) -> None:
         slug, config = build_config_for_candidate(build_candidate(), target_base="http://web")
 
         self.assertEqual(slug, "cb-public")
         self.assertEqual(config["target"], "http://web/wp-admin/admin-ajax.php")
         self.assertEqual(config["methods"], ["POST"])
-        self.assertEqual(config["body_params"]["fixed"], ["action"])
+        self.assertEqual(config["body_params"]["fixed"], [])
         self.assertIn("item_id", config["body_params"]["fuzz"])
         self.assertEqual(
             config["body_params"]["data"],
@@ -70,7 +80,7 @@ class PhuzzConfigWriterTests(unittest.TestCase):
             },
         )
 
-    def test_placeholder_fuzz_param_is_added_when_candidate_has_only_action(self) -> None:
+    def test_body_action_alone_needs_no_placeholder(self) -> None:
         candidate = build_candidate(
             http_template={
                 "method": "POST",
@@ -81,9 +91,9 @@ class PhuzzConfigWriterTests(unittest.TestCase):
 
         _, config = build_config_for_candidate(candidate, target_base="http://web")
 
-        self.assertEqual(config["body_params"]["fixed"], ["action"])
-        self.assertIn("hookphuzz_probe", config["body_params"]["fuzz"])
-        self.assertIn({"name": "hookphuzz_probe", "value": "fuzz"}, config["body_params"]["data"])
+        self.assertEqual(config["body_params"]["fixed"], [])
+        self.assertEqual(config["body_params"]["fuzz"], ["action"])
+        self.assertEqual(config["body_params"]["data"], [{"name": "action", "value": "abc"}])
 
     def test_bracket_param_selectors_are_escaped_but_legacy_regex_stays_raw(self) -> None:
         candidate = build_candidate(
@@ -101,8 +111,8 @@ class PhuzzConfigWriterTests(unittest.TestCase):
         _, config = build_config_for_candidate(candidate, target_base="http://web")
 
         self.assertIn({"name": "cfx_settings[alert_emails]", "value": "FUZZ"}, config["body_params"]["data"])
-        self.assertEqual(config["body_params"]["fixed"], ["action"])
-        self.assertEqual(config["body_params"]["fuzz"], ["cfx_settings\\[alert_emails\\]", ".*"])
+        self.assertEqual(config["body_params"]["fixed"], [])
+        self.assertEqual(config["body_params"]["fuzz"], ["action", "cfx_settings\\[alert_emails\\]", ".*"])
 
     def test_write_candidate_configs_only_writes_direct_http_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

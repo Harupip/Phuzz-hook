@@ -84,6 +84,31 @@ def build_rest_seed_item(*, method="GET", fuzzable_params=None):
 
 
 class SeedToConfigExporterTests(unittest.TestCase):
+    def test_body_action_is_fuzzed_without_changing_routing_seed(self):
+        item = build_seed_item()
+        item['seed']['query_params']['action'] = 'example_lookup'
+        original = copy.deepcopy(item)
+        _, config = build_config_for_seed_item(item)
+        self.assertIn('action', config['body_params']['fuzz'])
+        self.assertNotIn('action', config['body_params']['fixed'])
+        self.assertIn({'name': 'action', 'value': 'example_lookup'}, config['body_params']['data'])
+        self.assertIn('action', config['query_params']['fixed'])
+        self.assertNotIn('action', config['query_params']['fuzz'])
+        self.assertEqual(item, original)
+        _force_replay_only(config)
+        self.assertIn('action', config['body_params']['fixed'])
+        self.assertEqual(config['body_params']['fuzz'], [])
+
+    def test_body_action_stays_fixed_for_replay_and_probe_configs(self):
+        for probe in (False, True):
+            with self.subTest(probe=probe):
+                item = build_seed_item()
+                item["seed"]["probe_variant"] = probe
+                _, config = build_config_for_seed_item(item, replay_only=not probe)
+                self.assertIn("action", config["body_params"]["fixed"])
+                self.assertNotIn("action", config["body_params"]["fuzz"])
+                self.assertIn({"name": "action", "value": "example_lookup"}, config["body_params"]["data"])
+
     def test_runtime_nonce_inputs_stay_fixed_to_focus_mutations_on_payload(self):
         for bucket in ("body", "query_params", "headers", "cookies"):
             for name in ("nonce", "_wpnonce", "security_nonce", "X-WP-Nonce", "data[nonce]"):
@@ -97,15 +122,15 @@ class SeedToConfigExporterTests(unittest.TestCase):
                     self.assertFalse(any(re.match(selector, name) for selector in section["fuzz"]))
                     self.assertTrue(any(re.match(selector, name) for selector in section["fixed"]))
                     self.assertIn({"name": name, "value": "observed-nonce"}, section["data"])
-                    self.assertEqual(config["body_params"]["fuzz"], ["item_id"])
+                    self.assertEqual(config["body_params"]["fuzz"], ["action", "item_id"])
                     self.assertEqual(item, original)
 
     def test_nonce_alone_does_not_make_config_fuzzing_ready(self):
         item = build_seed_item()
-        item["seed"].update(body={"action": "example_lookup", "nonce": "probe"},
-                             query_params={}, fuzzable_params=["nonce"], input_params=[])
+        item["seed"].update(body={"nonce": "probe"},
+                             query_params={"action": "example_lookup"}, fuzzable_params=["nonce"], input_params=[])
         _, config = build_config_for_seed_item(item)
-        self.assertEqual(config["body_params"]["fixed"], ["action", "nonce"])
+        self.assertEqual(config["body_params"]["fixed"], ["nonce"])
         self.assertEqual(config["body_params"]["fuzz"], [])
         self.assertEqual(config["config_type"], "replay_only")
         self.assertFalse(config["metadata"]["fuzzing_ready"])
@@ -404,7 +429,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
         self.assertEqual(len(merged["suggested_seeds"]), 1)
         self.assertEqual(merged["suggested_seeds"][0]["seed"]["fuzzable_params"], ["term"])
 
-    def test_unauth_seed_becomes_phuzz_config_with_fixed_action_and_fuzzed_params(self):
+    def test_unauth_seed_becomes_phuzz_config_with_fuzzed_body_action(self):
         slug, config = build_config_for_seed_item(build_seed_item(), target_base="http://web")
 
         self.assertEqual(slug, "wp_ajax_nopriv_example_lookup-cb-public")
@@ -418,8 +443,8 @@ class SeedToConfigExporterTests(unittest.TestCase):
                     {"name": "action", "value": "example_lookup"},
                     {"name": "item_id", "value": "fuzz"},
                 ],
-                "fixed": ["action"],
-                "fuzz": ["item_id"],
+                "fixed": [],
+                "fuzz": ["action", "item_id"],
                 "weight": 1,
             },
         )
@@ -465,15 +490,15 @@ class SeedToConfigExporterTests(unittest.TestCase):
             },
         )
 
-    def test_action_only_seed_becomes_replay_only_config(self):
+    def test_body_action_only_seed_becomes_fuzzing_config(self):
         item = build_seed_item()
         item["seed"].update({"body": {"action": "example_lookup"}, "query_params": {}, "fuzzable_params": []})
 
         _, config = build_config_for_seed_item(item, target_base="http://web")
 
-        self.assertEqual(config["config_type"], "replay_only")
-        self.assertEqual(config["body_params"]["fixed"], ["action"])
-        self.assertEqual(config["body_params"]["fuzz"], [])
+        self.assertEqual(config["config_type"], "fuzzing_ready")
+        self.assertEqual(config["body_params"]["fixed"], [])
+        self.assertEqual(config["body_params"]["fuzz"], ["action"])
 
     def test_discovered_file_params_are_metadata_not_fuzz_params(self):
         item = build_seed_item()
@@ -488,22 +513,22 @@ class SeedToConfigExporterTests(unittest.TestCase):
 
         _, config = build_config_for_seed_item(item, target_base="http://web")
 
-        self.assertEqual(config["config_type"], "replay_only")
+        self.assertEqual(config["config_type"], "fuzzing_ready")
         self.assertEqual(config["metadata"]["discovered_file_params"], [{"name": "upload", "source": "FILES"}])
         self.assertNotIn("upload", config["body_params"]["fuzz"])
         self.assertNotIn({"name": "upload", "value": "fuzz"}, config["body_params"]["data"])
 
-    def test_authenticated_ajax_seed_becomes_config_with_fixed_action(self):
+    def test_authenticated_ajax_seed_becomes_config_with_fuzzed_body_action(self):
         slug, config = build_config_for_seed_item(
             build_seed_item(hook_name="wp_ajax_example_lookup", auth_mode="authenticated")
         )
 
         self.assertEqual(slug, "wp_ajax_example_lookup-cb-public")
         self.assertEqual(config["target"], "http://web/wp-admin/admin-ajax.php")
-        self.assertEqual(config["body_params"]["fixed"], ["action"])
-        self.assertEqual(config["body_params"]["fuzz"], ["item_id"])
+        self.assertEqual(config["body_params"]["fixed"], [])
+        self.assertEqual(config["body_params"]["fuzz"], ["action", "item_id"])
 
-    def test_authenticated_admin_post_seed_becomes_config_with_fixed_action(self):
+    def test_authenticated_admin_post_seed_becomes_config_with_fuzzed_body_action(self):
         item = build_seed_item(hook_name="admin_post_export_orders", auth_mode="authenticated")
         item["seed"].update(
             {
@@ -518,8 +543,8 @@ class SeedToConfigExporterTests(unittest.TestCase):
 
         self.assertEqual(slug, "admin_post_export_orders-cb-public")
         self.assertEqual(config["target"], "http://web/wp-admin/admin-post.php")
-        self.assertEqual(config["body_params"]["fixed"], ["action"])
-        self.assertEqual(config["body_params"]["fuzz"], ["order_id"])
+        self.assertEqual(config["body_params"]["fixed"], [])
+        self.assertEqual(config["body_params"]["fuzz"], ["action", "order_id"])
 
     def test_login_form_seed_becomes_config_with_fixed_query_action(self):
         item = build_seed_item(hook_name="login_form_lostpassword")
@@ -580,8 +605,8 @@ class SeedToConfigExporterTests(unittest.TestCase):
         _, config = build_config_for_seed_item(item)
 
         self.assertIn({"name": "cfx_settings[alert_emails]", "value": "fuzz"}, config["body_params"]["data"])
-        self.assertEqual(config["body_params"]["fixed"], ["action", "vx_nonce"])
-        self.assertEqual(config["body_params"]["fuzz"], ["cfx_settings\\[alert_emails\\]"])
+        self.assertEqual(config["body_params"]["fixed"], ["vx_nonce"])
+        self.assertEqual(config["body_params"]["fuzz"], ["action", "cfx_settings\\[alert_emails\\]"])
 
     def test_fixed_bracket_selector_is_escaped(self):
         item = build_seed_item()
@@ -596,7 +621,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
 
         _, config = build_config_for_seed_item(item)
 
-        self.assertEqual(config["body_params"]["fixed"], ["action", "token\\[field\\]"])
+        self.assertEqual(config["body_params"]["fixed"], ["token\\[field\\]"])
 
     def test_legacy_regex_selector_is_not_escaped(self):
         item = build_seed_item()
@@ -611,7 +636,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
 
         _, config = build_config_for_seed_item(item)
 
-        self.assertEqual(config["body_params"]["fuzz"], [".*"])
+        self.assertEqual(config["body_params"]["fuzz"], ["action", ".*"])
 
     def test_rest_seed_becomes_wp_json_config_without_action(self):
         slug, config = build_config_for_seed_item(build_rest_seed_item(), target_base="http://web")
@@ -821,7 +846,7 @@ class SeedToConfigExporterTests(unittest.TestCase):
 
             self.assertEqual(
                 param_summary["summary"],
-                {"total": 3, "fuzzing_ready": 1, "entrypoint_only": 1, "manual_analysis": 1},
+                {"total": 3, "fuzzing_ready": 2, "entrypoint_only": 0, "manual_analysis": 1},
             )
             ready = param_summary["configs"][0]
             self.assertEqual(ready["hook_name"], "wp_ajax_nopriv_example_lookup")
@@ -830,11 +855,11 @@ class SeedToConfigExporterTests(unittest.TestCase):
             self.assertEqual(ready["endpoint_type"], "ajax")
             self.assertEqual(ready["callback_source_file"], "/var/www/html/wp-content/plugins/demo/includes/ajax.php")
             self.assertTrue(ready["callback_source_found"])
-            self.assertEqual(ready["extracted_params"], ["item_id", "page"])
-            self.assertEqual(ready["param_sources"], ["$_POST", "$_GET"])
+            self.assertEqual(ready["extracted_params"], ["action", "item_id", "page"])
+            self.assertEqual(ready["param_sources"], ["default", "$_POST", "$_GET"])
             self.assertTrue(ready["has_fuzz_params"])
             self.assertEqual(ready["status"], "fuzzing_ready")
-            self.assertEqual(param_summary["configs"][1]["status"], "entrypoint_only")
+            self.assertEqual(param_summary["configs"][1]["status"], "fuzzing_ready")
             self.assertEqual(param_summary["configs"][2]["status"], "manual_analysis")
 
     def test_cli_writes_config_and_summary_from_suggested_seeds_file(self):
