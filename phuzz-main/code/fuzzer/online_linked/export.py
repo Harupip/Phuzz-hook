@@ -73,6 +73,8 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
                     skipped["diagnostics"] = runs[0]["diagnostics"]
                     skipped["readiness_evidence"] = {
                         "config_type": version.get("config_type"), "gate_passed": gate.get("passed"),
+                        "verification_policy": gate.get("verification_policy"),
+                        "baseline_evidence": gate.get("baseline_evidence"),
                         "pass2_verification": gate.get("pass2_verification"),
                     }
                 summary["skipped_versions"].append(skipped)
@@ -115,6 +117,9 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
             row = {"version": version["version"], "config_path": str(config_path),
                    "source_config_path": version["config_path"], "config_hash": version["config_hash"],
                    "equivalent_versions": [], "superseded_versions": []}
+            gate = version.get("readiness" if version["version"] == "v0" else "replay_result") or {}
+            if gate.get("verification_policy") == "callback_baseline_v1":
+                row.update(verification_policy=gate["verification_policy"], baseline_evidence=gate["baseline_evidence"])
             exported[request_key] = row
             representatives.append((semantic, version, row))
             summary["exported_configs"].append(row)
@@ -168,7 +173,7 @@ def _export_partial_config(state: dict, versions: list[dict], summary: dict, des
     metadata["partial_export"] = {
         "status": "PARTIAL", "reason": reason,
         "warning": "Discovery stopped before completion. Inputs may be missing or belong to incompatible branches. "
-                   "This combined config has not passed replay or Pass 2; it is not ready for fuzzing.",
+                   "This combined config has not passed a callback baseline; it is not ready for fuzzing.",
         "combined_request_verified": False,
         "verified_parameters": summary["verified_parameters"],
         "pending_parameters": summary["pending_parameters"],
@@ -311,10 +316,7 @@ def _verified_config(version: dict) -> bytes:
 
 def _verified_base(version: dict) -> tuple[bytes, dict]:
     gate = version.get("readiness" if version["version"] == "v0" else "replay_result") or {}
-    pass2 = gate.get("pass2_verification") or {}
-    accepted, total = pass2.get("accepted"), pass2.get("total")
-    if (gate.get("passed") is not True or type(total) is not int or total <= 0
-            or type(accepted) is not int or accepted != total):
+    if gate.get("passed") is not True:
         raise ValueError("GATE_NOT_VERIFIED")
     path = Path(version["config_path"])
     # Only inspect the path inside this version, not ancestor workspace names.
@@ -328,4 +330,79 @@ def _verified_base(version: dict) -> tuple[bytes, dict]:
     config = json.loads(content.decode("utf-8-sig"))
     if config_hash(config) != version.get("config_hash"):
         raise ValueError("CONFIG_HASH_MISMATCH")
+    policy = gate.get("verification_policy")
+    if policy == "callback_baseline_v1":
+        _verify_baseline_gate(version, gate, config)
+    elif policy is None:
+        # Historical records retain their original eligibility contract.
+        pass2 = gate.get("pass2_verification") or {}
+        accepted, total = pass2.get("accepted"), pass2.get("total")
+        if type(total) is not int or total <= 0 or type(accepted) is not int or accepted != total:
+            raise ValueError("GATE_NOT_VERIFIED")
+    else:
+        raise ValueError("UNKNOWN_VERIFICATION_POLICY")
     return content, config
+
+
+def _verify_baseline_gate(version: dict, gate: dict, config: dict) -> None:
+    proof = gate.get("baseline_evidence")
+    fields = {"request_id", "run_id", "plugin_slug", "callback_id", "http_method", "auth_context", "seed_variant_id"}
+    if (not isinstance(proof, dict) or not fields <= proof.keys()
+            or any(not isinstance(proof[key], str) or not proof[key] for key in fields - {"seed_variant_id"})
+            or not isinstance(proof["seed_variant_id"], str)):
+        raise ValueError("BASELINE_EVIDENCE_INCOMPLETE")
+    metadata = config.get("metadata") or {}
+    expected = {
+        "plugin_slug": version.get("plugin_slug"), "callback_id": version.get("callback_id"),
+        "http_method": version.get("resolved_method") or metadata.get("resolved_method"),
+        "auth_context": version.get("auth_context") or metadata.get("auth_context"),
+        "seed_variant_id": version.get("seed_variant_id", metadata.get("seed_variant_id", "")),
+    }
+    if any(proof[key] != value for key, value in expected.items()) or proof["http_method"] not in config.get("methods", []):
+        raise ValueError("BASELINE_IDENTITY_MISMATCH")
+    runner = gate.get("runner") or {}
+    if not isinstance(runner, dict) or gate.get("budget_expired") is True:
+        raise ValueError("BASELINE_RUN_MISMATCH")
+    rows = runner.get("runs") or []
+    if not isinstance(rows, list) or runner.get("legacy_run_id") != proof["run_id"] or len(rows) != 1 or not isinstance(rows[0], dict):
+        raise ValueError("BASELINE_RUN_MISMATCH")
+    row = rows[0]
+    request, zend = row.get("request_payload") or {}, row.get("zend_payload") or {}
+    if (row.get("callback_reached") is not True or row.get("validation_status") != "callback_reached"
+            or row.get("process_status") in {"failed", "runner_error", "window_elapsed"}
+            or row.get("callback_id") != proof["callback_id"] or row.get("hook_name") != version.get("hook_name")
+            or row.get("resolved_method") != proof["http_method"]
+            or str(row.get("seed_variant_id") or "") != proof["seed_variant_id"]
+            or row.get("matched_artifact") != proof["request_id"] + ".json"):
+        raise ValueError("BASELINE_CALLBACK_NOT_VERIFIED")
+    for payload in (request, zend):
+        if not isinstance(payload, dict):
+            raise ValueError("BASELINE_ARTIFACT_MISMATCH")
+        runs = [payload[key] for key in ("run_id", "legacy_run_id") if payload.get(key)]
+        if payload.get("request_id") != proof["request_id"] or not runs or any(run != proof["run_id"] for run in runs):
+            raise ValueError("BASELINE_ARTIFACT_MISMATCH")
+        if payload.get("seed_variant_id") is not None and str(payload["seed_variant_id"]) != proof["seed_variant_id"]:
+            raise ValueError("BASELINE_ARTIFACT_MISMATCH")
+        if payload.get("callback_id") is not None and payload["callback_id"] != proof["callback_id"]:
+            raise ValueError("BASELINE_ARTIFACT_MISMATCH")
+    auth = request.get("auth_context")
+    if auth is None and isinstance(request.get("metadata"), dict):
+        auth = request["metadata"].get("auth_context")
+    if auth is None:
+        params = request.get("request_params") or {}
+        headers = params.get("headers") if isinstance(params, dict) else {}
+        if not isinstance(headers, dict):
+            raise ValueError("BASELINE_REQUEST_MISMATCH")
+        auth = next((value for key, value in headers.items() if key.lower() == "x-hookphuzz-auth-context"), None)
+    if (auth != proof["auth_context"]
+            or (zend.get("request_method") or zend.get("method") or proof["http_method"]).upper() != proof["http_method"]):
+        raise ValueError("BASELINE_REQUEST_MISMATCH")
+    if request.get("target_plugin") != proof["plugin_slug"] or str(request.get("http_method") or request.get("method") or "").upper() != proof["http_method"]:
+        raise ValueError("BASELINE_REQUEST_MISMATCH")
+    response = request.get("response")
+    if not isinstance(response, dict) or not 200 <= int(response.get("status_code", 0)) < 300:
+        raise ValueError("BASELINE_HTTP_NOT_VERIFIED")
+    replay_path = Path(version["replay_config_path"])
+    if (gate.get("config_path") != str(replay_path) or gate.get("config_hash") != version.get("replay_config_hash")
+            or config_hash(json.loads(filesystem_path(replay_path).read_text(encoding="utf-8-sig"))) != gate["config_hash"]):
+        raise ValueError("BASELINE_CONFIG_HASH_MISMATCH")

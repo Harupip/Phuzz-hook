@@ -39,11 +39,9 @@ from hook_energy.seed_generation.online_common import (
 )
 from online_linked.evidence import RuntimeBatchTimeout, read_runtime_batch
 from online_linked.export import export_online_linked_batch
-from online_linked.replay_inputs import propose_replay_inputs
 from hook_energy.seed_generation.zend_runtime.bridge_cli import (
     converge_iteration,
     list_convergence_targets,
-    verify_pass2_contract,
 )
 from seed_generation.config.config_exporter import (
     SeedConfigSkip,
@@ -66,7 +64,6 @@ MaterializeRunner = Callable[..., dict[str, Any]]
 Exporter = Callable[..., dict[str, Any]]
 ReplayRunner = Callable[..., dict[str, Any]]
 ProbeSender = Callable[..., dict[str, Any]]
-Pass2Verifier = Callable[..., dict[str, int]]
 ConfigBuilder = Callable[..., tuple[str, dict[str, Any]]]
 RuntimeBatchReader = Callable[..., dict[str, Any]]
 _CANDIDATE_CONTEXT_KEY_VERSION = 1
@@ -153,7 +150,6 @@ class OnlineLinkedCoordinator:
     """Coordinate immutable online versions without changing worker configs."""
 
     MAX_PROBE_ATTEMPTS = 64
-    MAX_REPLAY_INPUT_TRIALS = 4
 
     def __init__(
         self,
@@ -186,7 +182,6 @@ class OnlineLinkedCoordinator:
         replay_runner: ReplayRunner = run_generated_configs,
         probe_sender: ProbeSender = run_in_container,
         process_factory: Callable[..., Any] = subprocess.Popen,
-        verify_pass2_fn: Pass2Verifier = verify_pass2_contract,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         campaign_deadline: float | None = None,
@@ -243,7 +238,6 @@ class OnlineLinkedCoordinator:
         self.replay_runner = replay_runner
         self.probe_sender = probe_sender
         self.process_factory = process_factory
-        self.verify_pass2_fn = verify_pass2_fn
         self.clock = clock
         self.sleeper = sleeper
         self.campaign_deadline = float(campaign_deadline) if campaign_deadline is not None else None
@@ -280,7 +274,6 @@ class OnlineLinkedCoordinator:
             "versions": [],
             "attempts": [],
             "probe_attempts": [],
-            "replay_input_trials": [],
             "pending_runtime_candidates": [],
             "candidate_queue": [],
             "queued_candidate_ids": [],
@@ -627,7 +620,7 @@ class OnlineLinkedCoordinator:
                 return deadline
             self.campaign_deadline = campaign_deadline
         self._progress_keys.add(identity)
-        reserve = 3 * self._sender_seconds if kind == "verified_parameter" else 0.0
+        reserve = 2 * self._sender_seconds if kind == "verified_parameter" else 0.0
         self._deadline = max(deadline, now + self.max_seconds + reserve) if kind == "verified_parameter" else deadline
         if self._hard_deadline is not None:
             self._deadline = min(self._hard_deadline, self._deadline)
@@ -667,7 +660,10 @@ class OnlineLinkedCoordinator:
             "seed_variant_id": str(seed.get("seed_variant_id") or ""),
         }
         reason = "V0_CALLBACK_NOT_REACHED"
-        readiness: dict[str, Any] = {"passed": False}
+        readiness: dict[str, Any] = {
+            "passed": False, "verification_policy": "callback_baseline_v1",
+            "config_path": str(path), "config_hash": config_hash(replay),
+        }
         version["readiness"] = readiness
         try:
             if not self.registry.get("callback_map", {}).get(version["callback_id"]):
@@ -707,27 +703,19 @@ class OnlineLinkedCoordinator:
                 runtime_cookie_probes=self.runtime_cookie_probes,
             )
             readiness["convergence"] = observation
-            if observation.get("status") == "REPLAY_FAILED" or observation.get("runtime_block_reason") or observation.get("missing_parameters"):
+            if observation.get("runtime_block_reason") or (observation.get("status") == "REPLAY_FAILED" and not observation.get("missing_parameters")):
                 reason = str(observation.get("runtime_block_reason") or "V0_PROVENANCE_NOT_VERIFIED")
                 self._record_event({"kind": "V0_READINESS", "status": "REJECTED", "reason": reason,
                                     "missing_parameters": observation.get("missing_parameters", [])})
                 raise OnlineLinkedError(reason)
-            if version["config_type"] == "fuzzing_ready":
-                expected = copy.deepcopy(self._reports[str(version["version"])])
-                expected["suggested_seeds"][0]["seed"]["zend_canonical_callback"] = self._expected_callback(version)
-                verification = self.verify_pass2_fn(
-                    report, expected, zend_dir, pass2_artifacts_dir=request_dir,
-                    runtime_cookie_probes=self.runtime_cookie_probes,
-                )
-                readiness["pass2_verification"] = verification
-                if not verification.get("total") or verification.get("accepted") != verification["total"]:
-                    raise OnlineLinkedError("V0_PASS2_NOT_VERIFIED")
-            else:
+            if version["config_type"] != "fuzzing_ready":
                 readiness["probe_only"] = True
             gate_evidence = self._load_gate_evidence(
                 version, result_row, request_dir, zend_dir, observation,
             )
-            if gate_evidence is None:
+            if gate_evidence is None or not self._baseline_identity_complete(
+                gate_evidence["request"], gate_evidence["zend"], version,
+            ):
                 raise OnlineLinkedError("V0_PROVENANCE_NOT_VERIFIED")
             self._gate_evidence = gate_evidence
             self._gate_convergence = copy.deepcopy(dict(observation))
@@ -749,6 +737,9 @@ class OnlineLinkedCoordinator:
                     readiness.update(guard_status="unknown", reason="GUARD_SATISFACTION_UNKNOWN")
                     self.state.update(terminal_status="PARTIAL", terminal_reason="GUARD_SATISFACTION_UNKNOWN")
                     return False
+            if self.clock() >= deadline:
+                raise OnlineLinkedError("BUDGET_EXPIRED")
+            readiness["baseline_evidence"] = self._baseline_evidence(gate_evidence, version)
             readiness["passed"] = True
             return True
         except (OSError, RuntimeError, ValueError) as exc:
@@ -1395,9 +1386,8 @@ class OnlineLinkedCoordinator:
             if isinstance(parameter, Mapping) else parameter
             for parameter in (result.get("known_parameters") or [])
         ]
-        # Reserve two sends (trial + replay) and one sender-sized overhead
-        # allowance for verification/handoff, within the hard resource cap.
-        if deadline is not None and deadline - self.clock() < 3 * self._sender_seconds:
+        # Reserve one baseline send and one sender-sized handoff allowance.
+        if deadline is not None and deadline - self.clock() < 2 * self._sender_seconds:
             self._retain_pending_runtime_candidates([
                 {"parameters": [parameter], "evidence": (
                     evidence_by_parameter.get(_parameter_key(parameter), evidence)
@@ -1431,62 +1421,26 @@ class OnlineLinkedCoordinator:
             })
             return None
         next_version = f"v{1 + len(self.state['attempts'])}"
-        attempt_id = self._next_replay_input_attempt_id()
-        expected_parameters = [
-            dict(parameter) for parameter in proposed_parameters
-            if isinstance(parameter, Mapping)
-        ]
-        trial_attempt: dict[str, Any] = {
-            "attempt_id": attempt_id,
-            "parent_version": parent["version"],
-            "request_id": evidence.get("request_id"),
-            "status": "exporting",
-            "trial_limit": self.MAX_REPLAY_INPUT_TRIALS,
-            "expected_parameters": [
-                self._safe_parameter_identity(parameter) for parameter in expected_parameters
-            ],
-            "trials": [],
+        attempt = {
+            "version": next_version, "parent_version": parent["version"],
+            "request_id": evidence.get("request_id"), "status": "exporting",
         }
-        self.state.setdefault("replay_input_trials", []).append(trial_attempt)
-        self._write_state()
-        generated_dir = self.config_dir / "replay-input-trials" / attempt_id / "exported"
-        generated_summary_path = self.run_dir / "replay-input-trials" / attempt_id / "generated_config_summary.json"
+        generated_dir = self.config_dir / "versions" / next_version / "exported"
+        generated_summary_path = self.run_dir / "versions" / next_version / "generated_config_summary.json"
+        failure_reason = "CHILD_CONFIG_EXPORT_FAILED"
         try:
             filesystem_path(generated_dir).mkdir(parents=True, exist_ok=True)
             filesystem_path(generated_summary_path.parent).mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            return self._finish_replay_input_attempt(
-                parent, trial_attempt, discovery, "CHILD_CONFIG_PREPARE_FAILED", deadline,
-                detail=str(exc), terminal=False,
-            )
-        if deadline is not None and self.clock() >= deadline:
-            return self._finish_replay_input_attempt(
-                parent, trial_attempt, discovery, "BUDGET_EXPIRED", deadline, terminal=False,
-            )
-        child_failure_reason = "CHILD_CONFIG_EXPORT_FAILED"
-        try:
             generated = self.export_configs_fn(
-                materialized,
-                output_config_dir=generated_dir,
-                summary_path=generated_summary_path,
-                target_base="http://web",
+                materialized, output_config_dir=generated_dir,
+                summary_path=generated_summary_path, target_base="http://web",
                 rest_route_fallback=True, compact_names=True,
             )
-        except (OSError, RuntimeError, ValueError) as exc:
-            trial_attempt["export_error"] = str(exc)
-            generated = {}
-        rows = generated.get("generated") if isinstance(generated, Mapping) else None
-        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
-            return self._finish_replay_input_attempt(
-                parent, trial_attempt, discovery, child_failure_reason, deadline, terminal=False,
-            )
-        generated_path = Path(str(rows[0].get("config_path") or ""))
-        if not filesystem_path(generated_path).is_file():
-            return self._finish_replay_input_attempt(
-                parent, trial_attempt, discovery, "CHILD_CONFIG_MISSING", deadline, terminal=False,
-            )
-        try:
-            child_config = json.loads(filesystem_path(generated_path).read_text(encoding="utf-8-sig"))
+            rows = generated.get("generated") if isinstance(generated, Mapping) else None
+            if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
+                raise OnlineLinkedError("CHILD_CONFIG_EXPORT_FAILED")
+            failure_reason = "CHILD_CONFIG_BUILD_FAILED"
+            child_config = json.loads(filesystem_path(Path(rows[0]["config_path"])).read_text(encoding="utf-8-sig"))
             base_evidence = result.get("base_evidence") if isinstance(result.get("base_evidence"), Mapping) else evidence
             self._restore_request_values(child_config, base_evidence, parent)
             if isinstance(evidence_by_parameter, Mapping):
@@ -1494,88 +1448,34 @@ class OnlineLinkedCoordinator:
                     parameter_evidence = evidence_by_parameter.get(_parameter_key(parameter))
                     if isinstance(parameter_evidence, Mapping):
                         self._restore_request_values(
-                            child_config,
-                            parameter_evidence,
-                            parent,
+                            child_config, parameter_evidence, parent,
                             only_parameters={_parameter_key(parameter)},
                         )
-        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
-            return self._finish_replay_input_attempt(
-                parent, trial_attempt, discovery, "CHILD_CONFIG_BUILD_FAILED", deadline,
-                detail=str(exc), terminal=False,
-            )
-        duplicate_parameters = (
-            proposed_parameters if result.get("_pending_group_dispatch") is True else None
-        )
-        duplicate_version = self._published_config_with_same_request(child_config, duplicate_parameters)
-        if duplicate_version is not None:
-            trial_attempt["status"] = "ignored"
-            trial_attempt["reason"] = "NO_SEMANTIC_PROGRESS"
-            self._record_event({
-                "kind": "PARAMETER_DISCOVERY",
-                "status": "IGNORED",
-                "reason": "NO_SEMANTIC_PROGRESS",
-                "version": parent["version"],
-                "request_id": evidence.get("request_id"),
-                "duplicate_of": duplicate_version.get("version"),
-            })
-            self._write_state()
-            return None
-        selected_trial = self._verify_replay_input_trials(
-            parent=parent,
-            child_config=child_config,
-            materialized=materialized,
-            expected_parameters=expected_parameters,
-            attempt=trial_attempt,
-            deadline=deadline,
-        )
-        if selected_trial is None:
-            return None
-        if deadline is not None and self.clock() >= deadline:
-            return self._finish_replay_input_attempt(
-                parent, trial_attempt, discovery, "BUDGET_EXPIRED", deadline, terminal=False,
-            )
-        attempt = {
-            "version": next_version, "parent_version": parent["version"],
-            "request_id": evidence.get("request_id"), "status": "exporting",
-            "replay_input_attempt_id": trial_attempt["attempt_id"],
-        }
-        self.state["attempts"].append(attempt)
-        self._write_state()
-        config_generation_started_at = self.clock()
-        try:
-            # Only the selected, correlated request may seed the published child.
-            metadata = child_config.get("metadata")
-            if isinstance(metadata, dict):
-                metadata.pop("online_request_seed", None)
-            self._restore_request_values(child_config, selected_trial, parent)
+            duplicate_parameters = proposed_parameters if result.get("_pending_group_dispatch") is True else None
+            if self._published_config_with_same_request(child_config, duplicate_parameters) is not None:
+                self._record_event({**discovery, "event_id": "", "status": "IGNORED",
+                                    "reason": "NO_SEMANTIC_PROGRESS"})
+                return None
+            self.state["attempts"].append(attempt)
+            config_generation_started_at = self.clock()
             replay_config = copy.deepcopy(child_config)
             _replace_fuzzable_values_with_placeholder(child_config)
             child_path = self._write_config(next_version, child_config)
-            config_generation_seconds = round(max(0.0, self.clock() - config_generation_started_at), 3)
             child = self._new_version(
                 next_version, child_config, child_path, parent, discovery["event_id"],
                 materialized["suggested_seeds"][0] if isinstance(transition_report, Mapping) else seed,
-                config_generation_seconds=config_generation_seconds,
+                config_generation_seconds=round(max(0.0, self.clock() - config_generation_started_at), 3),
             )
             child["known_parameters"] = proposed_parameters
-            child["replay_input_trial"] = {
-                "attempt_id": trial_attempt["attempt_id"],
-                "trial": selected_trial.get("trial"),
-                "request_id": selected_trial.get("request_id"),
-                "run_id": selected_trial.get("run_id"),
-            }
             self._reports[next_version] = copy.deepcopy(materialized)
             self.force_replay_only_fn(replay_config)
             replay_path = self._write_config(next_version, replay_config, replay=True)
             child["replay_config_path"] = str(replay_path)
             child["replay_config_hash"] = config_hash(replay_config)
-        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, RuntimeError, ValueError, KeyError) as exc:
             return self._reject_child_attempt(
-                parent, attempt, discovery, "CHILD_CONFIG_BUILD_FAILED", deadline, detail=str(exc),
+                parent, attempt, discovery, failure_reason, deadline, detail=str(exc),
             )
-        trial_attempt["status"] = "selected"
-        trial_attempt["selected_trial"] = selected_trial.get("trial")
         self._write_state()
         if deadline is not None and self.clock() >= deadline:
             child["status"] = "not_started_budget_expired"
@@ -1588,16 +1488,6 @@ class OnlineLinkedCoordinator:
         self._write_state()
         return child
 
-    def _next_replay_input_attempt_id(self) -> str:
-        used = {
-            str(item.get("attempt_id") or "")
-            for item in self.state.get("replay_input_trials", [])
-            if isinstance(item, Mapping)
-        }
-        index = 1
-        while f"attempt-{index:03d}" in used:
-            index += 1
-        return f"attempt-{index:03d}"
 
     @staticmethod
     def _safe_parameter_identity(parameter: Mapping[str, Any]) -> dict[str, str]:
@@ -1822,7 +1712,7 @@ class OnlineLinkedCoordinator:
                     continue
             try:
                 # The published config is the normalized proposal. Replay
-                # payloads contain per-trial fuzz mutations and are not
+                # payloads contain per-request fuzz mutations and are not
                 # semantic progress by themselves.
                 published_path = version["config_path"]
                 published = json.loads(filesystem_path(Path(str(published_path))).read_text(encoding="utf-8-sig"))
@@ -1832,107 +1722,6 @@ class OnlineLinkedCoordinator:
                 return dict(version)
         return None
 
-    def _finish_replay_input_attempt(
-        self,
-        parent: Mapping[str, Any],
-        attempt: dict[str, Any],
-        discovery: Mapping[str, Any],
-        reason: str,
-        deadline: float | None,
-        *,
-        detail: str = "",
-        terminal: bool,
-    ) -> None:
-        attempt["status"] = "failed"
-        attempt["reason"] = reason
-        if detail:
-            attempt["error"] = detail
-        self._record_event({
-            "kind": "REPLAY_INPUT_TRIAL",
-            "status": "REJECTED",
-            "reason": reason,
-            "version": parent.get("version"),
-            "parent_version": parent.get("version"),
-            "attempt_id": attempt.get("attempt_id"),
-            "trial_count": len(attempt.get("trials", [])),
-            "parameter_names": [
-                item.get("name") for item in attempt.get("expected_parameters", [])
-                if isinstance(item, Mapping) and item.get("name")
-            ],
-            **({"detail": detail} if detail else {}),
-        })
-        pending = self.state.get("pending_runtime_candidates")
-        preserve_pending = (
-            terminal
-            and (bool(pending) or (reason == "TRIAL_INPUT_SET_NOT_VERIFIED" and
-                                  bool(self.state.get("pending_probe_queue"))))
-            and (deadline is None or self.clock() < deadline)
-            and bool(self._active_container)
-        )
-        if terminal and not preserve_pending:
-            self._failure = True
-            self.state["terminal_status"] = "NOT_VERIFIED"
-            self.state["terminal_reason"] = reason
-        else:
-            self.state["replay_input_last_reason"] = reason
-            if preserve_pending:
-                attempt["pending_candidates_preserved"] = len(pending or [])
-            self._recover_parent_after_failure(parent, deadline)
-        self._write_state()
-        return None
-
-    def _parameter_transport_rows(
-        self,
-        config: Mapping[str, Any],
-        parameters: Sequence[Mapping[str, Any]],
-    ) -> list[dict[str, str]]:
-        placements = {
-            ("GET", "query"): "query_params",
-            ("POST", "form"): "body_params",
-            ("COOKIE", "cookie"): "cookies",
-            ("REST_GET", "query"): "query_params",
-            ("REST_POST", "form"): "body_params",
-            ("REST_JSON", "json"): "body_params",
-            ("JSON", "json"): "body_params",
-        }
-        rows: list[dict[str, str]] = []
-        seen: set[tuple[str, str, str]] = set()
-        for parameter in parameters:
-            if not isinstance(parameter, Mapping):
-                continue
-            name = str(parameter.get("name") or "").strip()
-            source = str(parameter.get("source") or "").strip().upper()
-            location = str(parameter.get("location") or "").strip().lower()
-            section_name = placements.get((source, location))
-            if not name or not section_name:
-                continue
-            identity = (name, source, location)
-            if identity in seen:
-                continue
-            section = config.get(section_name)
-            if not isinstance(section, Mapping):
-                continue
-            data_names = {
-                str(item.get("name") or "")
-                for item in section.get("data", [])
-                if isinstance(item, Mapping) and str(item.get("name") or "")
-            }
-            if name not in data_names:
-                continue
-            fixed = section.get("fixed", [])
-            fuzz = section.get("fuzz", [])
-            if not isinstance(fixed, list) or not isinstance(fuzz, list):
-                continue
-            try:
-                is_fixed = any(re.match(str(selector), name) for selector in fixed)
-                is_fuzzable = any(re.match(str(selector), name) for selector in fuzz)
-            except re.error:
-                continue
-            if is_fixed or not is_fuzzable:
-                continue
-            seen.add(identity)
-            rows.append({"name": name, "source": source, "location": location})
-        return rows
 
     @staticmethod
     def _request_context_key(request_params: Mapping[str, Any]) -> str:
@@ -1972,7 +1761,7 @@ class OnlineLinkedCoordinator:
         coverage = request.get("hook_coverage")
         if not isinstance(coverage, Mapping):
             return False
-        for bucket in ("executed_callbacks", "registered_callbacks"):
+        for bucket in ("executed_callbacks",):
             entries = coverage.get(bucket)
             if not isinstance(entries, Mapping):
                 continue
@@ -1991,12 +1780,24 @@ class OnlineLinkedCoordinator:
                     return True
         return False
 
-    def _trial_identity_complete(
+    def _baseline_identity_complete(
         self,
         request: Mapping[str, Any],
         zend: Mapping[str, Any],
         parent: Mapping[str, Any],
     ) -> bool:
+        request_id = str(request.get("request_id") or "").strip()
+        if not request_id or zend.get("request_id") != request_id:
+            return False
+        expected_run = str(parent.get("worker_run_id") or "")
+        if not expected_run:
+            return False
+        for payload in (request, zend):
+            run_ids = [str(payload[key]) for key in ("run_id", "legacy_run_id") if payload.get(key)]
+            if not run_ids or any(value != expected_run for value in run_ids):
+                return False
+            if payload.get("seed_variant_id") is not None and str(payload["seed_variant_id"]) != str(parent.get("seed_variant_id") or ""):
+                return False
         if str(request.get("target_plugin") or "").strip() != self.plugin_slug:
             return False
         if not self._request_callback_matches(request, parent):
@@ -2011,518 +1812,18 @@ class OnlineLinkedCoordinator:
             return False
         return True
 
-    @staticmethod
-    def _event_parameter_name(event: Mapping[str, Any]) -> str:
-        path = event.get("path")
-        if not isinstance(path, (list, tuple)):
-            return ""
-        parts = list(path)
-        if len(parts) > 1 and str(parts[0]).upper() in {"GET", "POST", "REQUEST", "JSON"}:
-            parts = parts[1:]
-        if not parts or not all(isinstance(part, str) and part for part in parts):
-            return ""
-        return str(parts[0]) + "".join(f"[{part}]" for part in parts[1:])
-
-    def _trial_parameter_verified(
-        self,
-        parameter: Mapping[str, Any],
-        evidence: Mapping[str, Any],
-        parent: Mapping[str, Any],
-    ) -> bool:
-        if not self._admission_complete(parameter, evidence, parent):
-            return False
-        request = evidence.get("request")
-        zend = evidence.get("zend")
-        if not isinstance(request, Mapping) or not isinstance(zend, Mapping):
-            return False
-        expected_callback = _canonical_callback_name(self._expected_callback(parent))
-        name = str(parameter.get("name") or "")
-        path = parameter.get("path")
-        if not name or not isinstance(path, list):
-            path = [name]
-        try:
-            helper_depth = int(parameter.get("helper_depth"))
-        except (TypeError, ValueError):
-            return False
-        if helper_depth < 0:
-            return False
-        check_parameter = dict(parameter)
-        check_parameter.pop("access_forms", None)
-        events = zend.get("events")
-        matching_events: list[Mapping[str, Any]] = []
-        if isinstance(events, list):
-            for event in events:
-                if not isinstance(event, Mapping) or self._event_parameter_name(event) != name:
-                    continue
-                context = event.get("callback_context")
-                if not isinstance(context, Mapping) or context.get("attributed") is not True:
-                    continue
-                if _canonical_callback_name(context.get("root_callback")) != expected_callback:
-                    continue
-                if str(event.get("operation") or "").lower() in {
-                    "empty", "isset", "read",
-                }:
-                    matching_events.append(event)
-        if matching_events:
-            # Historical helper depth identifies the parameter; this trial's
-            # attributed event supplies the depth that the verifier must check.
-            for event in matching_events:
-                context = event.get("callback_context")
-                if not isinstance(context, Mapping):
-                    continue
-                try:
-                    current_depth = int(context.get("depth"))
-                except (TypeError, ValueError):
-                    continue
-                check_parameter = dict(parameter)
-                check_parameter.pop("access_forms", None)
-                check_parameter["helper_depth"] = current_depth
-                if str(event.get("source") or "").upper() == "REQUEST":
-                    check_parameter["source"] = "REQUEST"
-                if runtime_parameter_is_accepted(
-                    check_parameter,
-                    request,
-                    zend,
-                    canonical_callback=expected_callback,
-                    request_method=str(parent.get("resolved_method") or ""),
-                    runtime_cookie_probes=self.runtime_cookie_probes,
-                ):
-                    return True
-            return False
-
-        # Raw events are authoritative when present; summaries remain a
-        # compatibility path only for legacy artifacts without raw events.
-        if isinstance(events, list) and events:
-            return False
-
-        # Legacy Zend artifacts may only carry callback summaries. They still
-        # need an explicit operation; callback reach alone is not evidence.
-        summaries = zend.get("callback_summaries")
-        if not isinstance(summaries, list):
-            return False
-        parameter_source = str(parameter.get("source") or "").upper()
-        for summary in summaries:
-            if not isinstance(summary, Mapping):
-                continue
-            callback = _canonical_callback_name(summary.get("callback") or summary.get("callback_repr"))
-            if callback != expected_callback:
-                continue
-            values = summary.get("unique_parameters")
-            if not isinstance(values, list):
-                continue
-            for value in values:
-                if not isinstance(value, Mapping):
-                    continue
-                value_name = str(value.get("name") or value.get("parameter") or "")
-                value_path = value.get("path")
-                if value_name and value_name != name:
-                    continue
-                if value_path is not None and value_path != path:
-                    continue
-                if not value_name and value_path != path:
-                    continue
-                row_source = str(value.get("source") or "").upper()
-                if row_source not in {parameter_source, "REQUEST"}:
-                    continue
-                forms = value.get("access_forms")
-                operations = {
-                    str(item).lower() for item in forms
-                    if str(item).strip()
-                } if isinstance(forms, list) else set()
-                if not operations.intersection({"empty", "isset", "read"}):
-                    continue
-                row_parameter = dict(check_parameter)
-                if row_source == "REQUEST":
-                    row_parameter["source"] = "REQUEST"
-                row_parameter["access_forms"] = sorted(operations)
-                if runtime_parameter_is_accepted(
-                    row_parameter,
-                    request,
-                    zend,
-                    canonical_callback=expected_callback,
-                    request_method=str(parent.get("resolved_method") or ""),
-                    operations=operations,
-                    runtime_cookie_probes=self.runtime_cookie_probes,
-                ):
-                    return True
-        return False
-
-    @staticmethod
-    def _apply_request_value(config: dict[str, Any], section_name: str, name: str, value: Any) -> bool:
-        section = config.get(section_name)
-        if not isinstance(section, dict):
-            return False
-        for row in section.get("data", []):
-            if not isinstance(row, dict) or str(row.get("name") or "") != name:
-                continue
-            row["value"] = copy.deepcopy(value)
-            row.pop("seeds", None)
-            return True
-        return False
-
-    def _apply_request_params_to_config(
-        self, config: dict[str, Any], request_params: Mapping[str, Any],
-    ) -> None:
-        headers = config.get("headers", {}).get("data", [])
-        is_json = any(
-            isinstance(row, Mapping)
-            and str(row.get("name") or "").lower() == "content-type"
-            and "json" in str(row.get("value") or "").lower()
-            for row in headers
-        ) if isinstance(headers, list) else False
-        for section_name in ("query_params", "body_params", "cookies"):
-            bucket = "json_params" if section_name == "body_params" and is_json else section_name
-            values = request_params.get(bucket)
-            if not isinstance(values, Mapping):
-                continue
-            section = config.get(section_name)
-            if not isinstance(section, Mapping):
-                continue
-            for row in section.get("data", []):
-                if not isinstance(row, Mapping):
-                    continue
-                name = str(row.get("name") or "")
-                if name in values:
-                    self._apply_request_value(config, section_name, name, values[name])
-                    continue
-                parts = [part for part in re.split(r"\[|\]", name) if part]
-                current: Any = values
-                found = bool(parts)
-                for part in parts:
-                    if isinstance(current, Mapping) and part in current:
-                        current = current[part]
-                    elif isinstance(current, list) and part.isdigit() and int(part) < len(current):
-                        current = current[int(part)]
-                    else:
-                        found = False
-                        break
-                if found:
-                    self._apply_request_value(config, section_name, name, current)
-
-    @staticmethod
-    def _safe_hint_provenance(hint: Mapping[str, Any]) -> dict[str, Any]:
+    def _baseline_evidence(self, evidence: Mapping[str, Any], version: Mapping[str, Any]) -> dict[str, str]:
+        request = evidence["request"]
         return {
-            key: copy.deepcopy(hint.get(key))
-            for key in (
-                "request_id", "run_id", "callback", "parameter", "source",
-                "transport_source", "location", "path", "opcode",
-                "reason", "mutation_source",
-            )
-            if hint.get(key) is not None
+            "request_id": str(evidence["request_id"]),
+            "run_id": str(evidence["worker_run_id"]),
+            "plugin_slug": self.plugin_slug,
+            "callback_id": str(version["callback_id"]),
+            "http_method": str(request.get("http_method") or request.get("method") or "").upper(),
+            "auth_context": self._request_auth_context(request),
+            "seed_variant_id": str(version.get("seed_variant_id") or ""),
         }
 
-    @staticmethod
-    def _bounded_trial_run_id(parent_run_id: Any, attempt_id: Any, trial_name: Any) -> str:
-        raw_parent = str(parent_run_id or "")
-        parent_hash = hashlib.sha256(raw_parent.encode("utf-8")).hexdigest()[:12]
-        return f"ri-{parent_hash}-replay-input-{attempt_id}-{trial_name}"
-
-    def _verify_replay_input_trials(
-        self,
-        *,
-        parent: Mapping[str, Any],
-        child_config: Mapping[str, Any],
-        materialized: Mapping[str, Any],
-        expected_parameters: Sequence[Mapping[str, Any]],
-        attempt: dict[str, Any],
-        deadline: float | None,
-    ) -> dict[str, Any] | None:
-        # Trial correlation follows the new config; the parent remains immutable.
-        parent = {**parent, "resolved_method": child_config.get("metadata", {}).get("resolved_method")
-                  or parent.get("resolved_method"),
-                  "seed_variant_id": child_config.get("metadata", {}).get("seed_variant_id")
-                  or parent.get("seed_variant_id")}
-        transports = self._parameter_transport_rows(child_config, expected_parameters)
-        attempt["parameter_transports"] = [dict(row) for row in transports]
-        queue: list[dict[str, Any]] = [{"config": copy.deepcopy(dict(child_config)), "hint": None}]
-        seen_contexts: set[str] = set()
-        trial_root = self.config_dir / "replay-input-trials" / str(attempt["attempt_id"])
-        mirror_root = self.run_dir / "replay-input-trials" / str(attempt["attempt_id"])
-        for trial_index in range(self.MAX_REPLAY_INPUT_TRIALS):
-            if not queue:
-                break
-            if deadline is not None and self.clock() >= deadline:
-                self._finish_replay_input_attempt(
-                    parent, attempt, {}, "BUDGET_EXPIRED", deadline, terminal=False,
-                )
-                return None
-            item = queue.pop(0)
-            trial_name = f"t{trial_index}"
-            trial_run_id = self._bounded_trial_run_id(
-                parent["worker_run_id"], attempt["attempt_id"], trial_name,
-            )
-            trial_request_id = _request_id(trial_run_id)
-            trial_config_path = trial_root / f"{trial_name}.json"
-            trial_request_dir = mirror_root / trial_name / "request"
-            trial_zend_dir = mirror_root / trial_name / "zend"
-            trial_record: dict[str, Any] = {
-                "trial": trial_name,
-                "request_id": trial_request_id,
-                "run_id": trial_run_id,
-                "config_path": str(trial_config_path),
-                "request_dir": str(trial_request_dir),
-                "zend_dir": str(trial_zend_dir),
-                "status": "pending",
-                "remaining_budget_seconds": (
-                    None if deadline is None else max(0.0, deadline - self.clock())
-                ),
-                "hint_provenance": (
-                    self._safe_hint_provenance(item["hint"])
-                    if isinstance(item.get("hint"), Mapping) else None
-                ),
-            }
-            attempt.setdefault("trials", []).append(trial_record)
-            self._write_state()
-            trial_config = copy.deepcopy(item["config"])
-            try:
-                self.force_replay_only_fn(trial_config)
-                _write_exclusive_json(trial_config_path, trial_config)
-                mirror_config_path = mirror_root / f"{trial_name}.json"
-                _write_exclusive_json(mirror_config_path, trial_config)
-            except (OSError, RuntimeError, ValueError) as exc:
-                self._finish_replay_input_attempt(
-                    parent, attempt, {}, "TRIAL_CONFIG_WRITE_FAILED", deadline,
-                    detail=str(exc), terminal=True,
-                )
-                return None
-            trial_record["config_mirror_path"] = str(mirror_root / f"{trial_name}.json")
-            parent_reason = self._check_replay_trial_parent(deadline)
-            if parent_reason:
-                self._finish_replay_input_attempt(
-                    parent, attempt, {}, parent_reason, deadline, terminal=parent_reason != "BUDGET_EXPIRED",
-                )
-                return None
-            try:
-                sender_result = self._run_light_sender(
-                    config_path=trial_config_path,
-                    request_id=trial_request_id,
-                    run_id=trial_run_id,
-                    hook_name=str(parent.get("hook_name") or ""),
-                    callback_id=str(parent.get("callback_id") or ""),
-                    method=str(parent.get("resolved_method") or ""),
-                    auth_context=str(parent.get("auth_context") or "authenticated"),
-                    seed_variant_id=str(parent.get("seed_variant_id") or ""),
-                    deadline=deadline,
-                )
-            except Exception:
-                sender_result = {"status": "sender_error"}
-            trial_record["diagnostics"] = sender_result.get("diagnostics")
-            if sender_result.get("status") in {
-                "parent_stopped", "parent_container_missing", "parent_check_timeout", "parent_check_error",
-            }:
-                status = str(sender_result.get("status"))
-                reasons = {
-                    "parent_stopped": "PARENT_WORKER_EXITED_DURING_TRIAL",
-                    "parent_container_missing": "PARENT_CONTAINER_MISSING",
-                    "parent_check_timeout": "PARENT_CHECK_TIMEOUT",
-                    "parent_check_error": "PARENT_CHECK_ERROR",
-                }
-                if status == "parent_stopped" and isinstance(sender_result.get("parent_exit_code"), int):
-                    self._handle_worker_exit(int(sender_result["parent_exit_code"]))
-                self._finish_replay_input_attempt(
-                    parent, attempt, {}, reasons[status], deadline, terminal=True,
-                )
-                return None
-            parent_reason = self._check_replay_trial_parent(deadline)
-            if parent_reason:
-                self._finish_replay_input_attempt(
-                    parent, attempt, {}, parent_reason, deadline, terminal=parent_reason != "BUDGET_EXPIRED",
-                )
-                return None
-            trial_row = self._sender_runner_row(
-                {
-                    "config_slug": trial_config_path.relative_to(self.config_root).with_suffix("").as_posix(),
-                    "hook_name": str(parent.get("hook_name") or ""),
-                    "callback_id": str(parent.get("callback_id") or ""),
-                    "entrypoint_type": str(parent.get("entrypoint_type") or ""),
-                    "resolved_method": str(parent.get("resolved_method") or ""),
-                    "seed_variant_id": str(parent.get("seed_variant_id") or ""),
-                },
-                sender_result,
-                trial_run_id,
-            )
-            if (
-                trial_row.get("callback_reached") is not True
-                or trial_row.get("validation_status") != "callback_reached"
-                or trial_row.get("process_status") in {"failed", "runner_error", "window_elapsed"}
-            ):
-                trial_record["status"] = "failed"
-                trial_record["reason"] = str(sender_result.get("validation_reason") or "TRIAL_CALLBACK_NOT_REACHED")
-                self._finish_replay_input_attempt(
-                    parent, attempt, {}, "TRIAL_CALLBACK_NOT_REACHED", deadline, terminal=True,
-                )
-                return None
-            pair = {
-                "request_name": trial_row.get("matched_artifact"),
-                "request": trial_row.get("request_payload"),
-                "zend_name": trial_row.get("zend_artifact"),
-                "zend": trial_row.get("zend_payload"),
-            }
-            trial_version = {"version": parent.get("version"), "worker_run_id": trial_run_id}
-            evidence = self._correlate_runtime_pair(trial_version, pair)
-            if evidence is None or evidence.get("request_id") != trial_request_id:
-                self._finish_replay_input_attempt(
-                    parent, attempt, {}, "TRIAL_ARTIFACT_CORRELATION_FAILED", deadline, terminal=True,
-                )
-                return None
-            request = evidence.get("request")
-            zend = evidence.get("zend")
-            if (
-                not isinstance(request, Mapping)
-                or not isinstance(zend, Mapping)
-                or not self._trial_identity_complete(request, zend, parent)
-            ):
-                self._finish_replay_input_attempt(
-                    parent, attempt, {}, "TRIAL_IDENTITY_CORRELATION_FAILED", deadline, terminal=True,
-                )
-                return None
-            try:
-                self._save_replay_artifacts(trial_row, trial_request_dir, trial_zend_dir)
-            except (OSError, RuntimeError, ValueError, ReplayArtifactError) as exc:
-                self._finish_replay_input_attempt(
-                    parent, attempt, {}, "TRIAL_ARTIFACT_SAVE_FAILED", deadline,
-                    detail=str(exc), terminal=True,
-                )
-                return None
-            evidence["evidence_origin"] = "replay_input_trial"
-            missing = [
-                self._safe_parameter_identity(parameter)
-                for parameter in expected_parameters
-                if not self._trial_parameter_verified(
-                    {
-                        **dict(parameter),
-                        "request_id": trial_request_id,
-                        "run_id": trial_run_id,
-                        "plugin_slug": self.plugin_slug,
-                    },
-                    evidence,
-                    parent,
-                )
-            ]
-            trial_record["missing_parameters"] = missing
-            try:
-                verification = self.verify_pass2_fn(
-                    {"legacy_run_id": trial_run_id, "runs": [trial_row]},
-                    materialized,
-                    trial_zend_dir,
-                    pass2_artifacts_dir=trial_request_dir,
-                    runtime_cookie_probes=self.runtime_cookie_probes,
-                )
-            except (OSError, RuntimeError, ValueError):
-                self._finish_replay_input_attempt(
-                    parent, attempt, {}, "TRIAL_PASS2_VERIFICATION_FAILED", deadline, terminal=True,
-                )
-                return None
-            if isinstance(verification, Mapping):
-                trial_record["pass2_verification"] = {
-                    "accepted": verification.get("accepted", 0),
-                    "total": verification.get("total", 0),
-                }
-            if not missing and (
-                not isinstance(verification, Mapping)
-                or int(verification.get("total") or 0) < 1
-                or int(verification.get("accepted") or 0) != int(verification.get("total") or 0)
-            ):
-                self._finish_replay_input_attempt(
-                    parent, attempt, {}, "TRIAL_PASS2_VERIFICATION_FAILED", deadline, terminal=True,
-                )
-                return None
-            if not missing:
-                trial_record["status"] = "verified"
-                trial_record["reason"] = "ALL_EXPECTED_PARAMETERS_VERIFIED"
-                attempt["status"] = "verified"
-                self._record_event({
-                    "kind": "REPLAY_INPUT_TRIAL",
-                    "status": "ACCEPTED",
-                    "reason": "ALL_EXPECTED_PARAMETERS_VERIFIED",
-                    "version": parent.get("version"),
-                    "attempt_id": attempt.get("attempt_id"),
-                    "trial": trial_name,
-                    "request_id": trial_request_id,
-                    "run_id": trial_run_id,
-                    "parameter_names": [
-                        item.get("name") for item in attempt.get("expected_parameters", [])
-                        if isinstance(item, Mapping) and item.get("name")
-                    ],
-                })
-                self._write_state()
-                return {
-                    **dict(evidence),
-                    "trial": trial_name,
-                    "request_id": trial_request_id,
-                    "run_id": trial_run_id,
-                    "worker_run_id": trial_run_id,
-                }
-            proposals = propose_replay_inputs(
-                request.get("request_params") if isinstance(request.get("request_params"), Mapping) else {},
-                zend,
-                parameter_transports=transports,
-                expected_request_id=trial_request_id,
-                expected_run_id=trial_run_id,
-                expected_callback=self._expected_callback(parent),
-            )
-            safe_hints = [
-                self._safe_hint_provenance(item.get("hint_provenance", {}))
-                for item in proposals
-                if isinstance(item, Mapping) and isinstance(item.get("hint_provenance"), Mapping)
-            ]
-            trial_record["hint_provenance"] = safe_hints
-            queued = 0
-            current_params = request.get("request_params")
-            current_key = self._request_context_key(current_params) if isinstance(current_params, Mapping) else ""
-            if current_key:
-                seen_contexts.add(current_key)
-            for proposal in proposals:
-                if not isinstance(proposal, Mapping):
-                    continue
-                proposed_params = proposal.get("request_params")
-                if not isinstance(proposed_params, Mapping):
-                    continue
-                context_key = self._request_context_key(proposed_params)
-                if context_key in seen_contexts:
-                    continue
-                seen_contexts.add(context_key)
-                adjusted = copy.deepcopy(trial_config)
-                self._apply_request_params_to_config(adjusted, proposed_params)
-                queue.append({
-                    "config": adjusted,
-                    "hint": proposal.get("hint_provenance"),
-                })
-                queued += 1
-            trial_record["status"] = "missing_parameter_reads"
-            trial_record["reason"] = "TRIAL_MISSING_PARAMETER_READS"
-            trial_record["queued_adjustments"] = queued
-            self._write_state()
-            if not queue:
-                self._finish_replay_input_attempt(
-                    parent, attempt, {}, "TRIAL_INPUT_SET_NOT_VERIFIED", deadline, terminal=True,
-                )
-                return None
-        reason = (
-            "BUDGET_EXPIRED"
-            if deadline is not None and self.clock() >= deadline
-            else "REPLAY_INPUT_TRIAL_LIMIT_REACHED"
-        )
-        self._finish_replay_input_attempt(
-            parent, attempt, {}, reason, deadline, terminal=reason != "BUDGET_EXPIRED",
-        )
-        return None
-
-    def _check_replay_trial_parent(self, deadline: float | None) -> str:
-        if not self._active_container:
-            return "PARENT_CONTAINER_MISSING"
-        remaining = 30.0 if deadline is None else max(0.0, deadline - self.clock())
-        if remaining <= 0:
-            return "BUDGET_EXPIRED"
-        try:
-            exit_code = self._observe_parent_exit(timeout=min(30.0, remaining))
-        except ParentInspectionTimeout:
-            return "PARENT_CHECK_TIMEOUT"
-        except ParentInspectionError:
-            return "PARENT_CHECK_ERROR"
-        if exit_code is not None:
-            return "PARENT_WORKER_EXITED_DURING_TRIAL"
-        return ""
 
     def _probe_context_key(
         self, parent: Mapping[str, Any], probe: Mapping[str, Any], evidence: Mapping[str, Any],
@@ -2669,7 +1970,7 @@ class OnlineLinkedCoordinator:
             if probe_deadline is not None:
                 effective_deadline = probe_deadline
                 if accepted_records:
-                    effective_deadline = min(probe_deadline, deadline - 3 * self._sender_seconds)
+                    effective_deadline = min(probe_deadline, deadline - 2 * self._sender_seconds)
                 if self.clock() + self._sender_seconds >= effective_deadline:
                     deferred = [dict(item["candidate"]) for item in queue[index:]]
                     break
@@ -2681,7 +1982,7 @@ class OnlineLinkedCoordinator:
             )
             if deadline is not None and isinstance(outcome, Mapping) and outcome.get("status") == "accepted":
                 deadline = max(deadline, self._candidate_deadline())
-                probe_deadline = max(probe_deadline, deadline - 3 * self._sender_seconds)
+                probe_deadline = max(probe_deadline, deadline - 2 * self._sender_seconds)
             self.state["pending_probe_queue"] = [row for row in self.state.get("pending_probe_queue", [])
                 if not (row.get("parent_version") == parent["version"] and
                         row.get("candidate") == candidate and row.get("evidence") == candidate_evidence)]
@@ -2761,7 +2062,7 @@ class OnlineLinkedCoordinator:
 
         # Separate reads justify trying a combined request, never publishing a
         # union directly. Admission checks each original evidence pair, then the
-        # existing coherent trial and Pass 2 must verify ALL proposed fields.
+        # a single correlated callback baseline must pass before handoff.
         proposals = list(ordered_groups)
         if len(ordered_groups) > 1:
             proposals.insert(0, {
@@ -2781,7 +2082,7 @@ class OnlineLinkedCoordinator:
         existing = [dict(item) for item in existing if isinstance(item, Mapping)] if isinstance(existing, list) else []
         for group in proposals:
             # Consume only the proposal currently entering admission. If its
-            # replay-input trial fails, the remaining groups keep the parent
+            # callback baseline fails, the remaining groups keep the parent
             # recoverable and are tried as separate coherent proposals.
             if not group.get("combined"):
                 self._discard_pending_runtime_candidates([group])
@@ -3517,16 +2818,18 @@ class OnlineLinkedCoordinator:
             artifact_stage = exc.stage
         except (OSError, RuntimeError, ValueError) as exc:
             artifact_error = str(exc)
+        baseline_version = {**child, "worker_run_id": replay_run_id}
+        baseline = None
         try:
-            verification = self.verify_pass2_fn(
-                replay_report,
-                merged_report,
-                zend_dir,
-                pass2_artifacts_dir=request_dir,
-                runtime_cookie_probes=self.runtime_cookie_probes,
+            baseline = self._load_gate_evidence(
+                baseline_version, replay_row, request_dir, zend_dir, {},
             )
-        except (OSError, RuntimeError, ValueError) as exc:
-            verification = {"accepted": 0, "total": 0, "error": str(exc)}
+            if baseline is not None and not self._baseline_identity_complete(
+                baseline["request"], baseline["zend"], baseline_version,
+            ):
+                baseline = None
+        except (OSError, RuntimeError, ValueError):
+            baseline = None
         deadline_expired = deadline is not None and self.clock() >= deadline
         replay_passed = bool(
             isinstance(replay_row, Mapping)
@@ -3534,8 +2837,7 @@ class OnlineLinkedCoordinator:
             and not artifact_error
             and replay_row.get("validation_status") == "callback_reached"
             and replay_row.get("process_status") not in {"failed", "runner_error", "window_elapsed"}
-            and verification.get("accepted") == verification.get("total")
-            and verification.get("total", 0) > 0
+            and baseline is not None
         )
         request_payload = replay_row.get("request_payload")
         response = request_payload.get("response") if isinstance(request_payload, Mapping) else None
@@ -3555,8 +2857,10 @@ class OnlineLinkedCoordinator:
             "config_path": str(replay_path),
             "config_hash": self.config_hash(replay_path),
             "runner": replay_report,
-            "pass2_verification": verification,
+            "verification_policy": "callback_baseline_v1",
         }
+        if replay_result["passed"]:
+            replay_result["baseline_evidence"] = self._baseline_evidence(baseline, child)
         replay_result["timing"] = dict(sender_result.get("timing") or {})
         replay_result["timing"]["verify"] = round(self.clock() - verify_started_at, 3)
         replay_result["timing"]["total"] = round(self.clock() - replay_started_at, 3)
@@ -3609,7 +2913,7 @@ class OnlineLinkedCoordinator:
                     variant = str(merged_report["suggested_seeds"][0]["seed"].get("seed_variant_id") or "")
                     self._target_key = canonical_identity_id(candidate) + (f"::{variant}" if variant else "")
                 replay_result["timing"]["handoff"] = round(self.clock() - handoff_started_at, 3)
-                record_replay_event("PASS", "PASS2_VERIFIED")
+                record_replay_event("PASS", "CALLBACK_BASELINE_VERIFIED")
                 self._write_state()
                 return True
             replay_result["timing"]["handoff"] = round(self.clock() - handoff_started_at, 3)
@@ -3640,7 +2944,7 @@ class OnlineLinkedCoordinator:
             elif replay_row.get("validation_status") != "callback_reached":
                 child["terminal_reason"] = str(replay_row.get("validation_reason") or "CALLBACK_NOT_REACHED")
             else:
-                child["terminal_reason"] = "PASS2_VERIFICATION_FAILED"
+                child["terminal_reason"] = "CALLBACK_BASELINE_NOT_VERIFIED"
             self._failure = True
             self.state["terminal_status"] = "NOT_VERIFIED"
             self.state["terminal_reason"] = "CHILD_REPLAY_FAILED"
@@ -3649,7 +2953,7 @@ class OnlineLinkedCoordinator:
                 str(
                     replay_result.get("artifact_error")
                     or replay_row.get("validation_reason")
-                    or "PASS2_VERIFICATION_FAILED"
+                    or "CALLBACK_BASELINE_NOT_VERIFIED"
                 ),
             )
             self._write_state()
@@ -3737,6 +3041,7 @@ class OnlineLinkedCoordinator:
             "hook_name": str(metadata.get("hook_name") or seed_item.get("hook_name") or ""),
             "callback_id": str(metadata.get("callback_id") or seed_item.get("callback_id") or ""),
             "canonical_callback": str(metadata.get("callback_repr") or seed_item.get("callback_repr") or ""),
+            "plugin_slug": self.plugin_slug,
             "entrypoint_type": str(config.get("entrypoint_type") or ""),
             "resolved_method": str(metadata.get("resolved_method") or ""),
             "auth_context": str(metadata.get("auth_context") or "authenticated"),

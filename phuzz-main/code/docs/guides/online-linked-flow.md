@@ -1,6 +1,6 @@
 # Luồng online của HookPhuzz
 
-Cập nhật: **2026-10-09**, đối chiếu working tree, gồm WIP batch/ZIP directory. Tài liệu mô tả runtime discovery, coherent replay, budget thích ứng, checkpoint/resume, export nhiều context và config comparison. Các phần kiểm chứng có ngày bên dưới là snapshot lịch sử; lần cập nhật doc này không chạy campaign Docker hay xác nhận real-plugin fuzzing PASS. Xem [kiến trúc/source map](../reference/architecture.md) và [review record](../reports/2026-10-09-documentation-review.md).
+Cập nhật: **2026-11-02**, đối chiếu working tree, gồm WIP batch/ZIP directory. Tài liệu mô tả runtime discovery, một callback baseline, budget thích ứng, checkpoint/resume, export nhiều context và config comparison. Các phần kiểm chứng có ngày bên dưới là snapshot lịch sử; kết quả kiểm chứng baseline và giới hạn campaign Docker ở [báo cáo 2026-11-02](../reports/2026-11-02-callback-baseline-verification.md), không phải real-plugin fuzzing PASS. Xem [kiến trúc/source map](../reference/architecture.md) và [review record](../reports/2026-10-09-documentation-review.md).
 
 Kế hoạch bổ sung: [Online-linked completion](../../../../docs/superpowers/plans/2026-09-06-online-linked-completion.md). Những phần ghi “còn thiếu” bên dưới là công việc tương lai, không phải tính năng đã hoạt động.
 
@@ -17,7 +17,7 @@ Các đường dẫn source bên dưới tính từ `phuzz-main/code`.
 - AJAX chưa biết method dùng GET với `action` trong query; provenance là `bootstrap_probe`, chưa phải `runtime_observed`.
 - Method runtime tương quan hoặc REST route đã biết được giữ nguyên. `$_GET` xác định query, `$_POST` xác định form body; nguồn param không ghi đè method runtime.
 - Zend thấy key POST còn thiếu trong request thì tạo probe POST riêng. Nếu GET chưa thấy param, thử một probe POST không thêm key giả; các probe tiếp theo vẫn chịu giới hạn số lần và ngân sách hiện có.
-- Probe chỉ là replay-only. Key phải có trong request và được Zend ghi nhận ở đúng callback, request ID, run ID và method; config con còn phải qua replay/Pass 2 trước khi publish/fuzz.
+- Probe chỉ là replay-only. Key phải có trong request và được Zend ghi nhận ở đúng callback, request ID, run ID và method; config con còn phải qua callback baseline trước khi publish/fuzz.
 - Khi đổi method, chỉ nhận param được xác minh lại trên method mới. Không sửa artifact/config cũ hoặc dùng replay GET để chứng minh config POST.
 
 ## 2. Luồng đang được nối trong code
@@ -29,13 +29,13 @@ flowchart TD
     C --> D[Chọn candidate tiếp theo]
     D --> E[Tạo v0 và kiểm tra cấu trúc]
     E --> F{Replay và provenance gate đạt?}
-    F -->|fuzzing_ready + Pass 2| G[Chạy PHUZZ v0]
+    F -->|fuzzing_ready + baseline| G[Chạy PHUZZ v0]
     F -->|replay_only hợp lệ| H[Chạy v0 replay-only]
     G --> I[Ghép request và Zend evidence]
     H --> I
     I --> J{Tham số Zend mới hợp lệ?}
-    J -->|Có| K[Coherent trial rồi tạo config con bất biến]
-    K --> M[Replay con trong parent và Pass 2]
+    J -->|Có| K[Tạo config con bất biến]
+    K --> M[Một callback baseline trong parent]
     M -->|Đạt| L[Dừng parent thành công]
     L -->|Còn ngân sách| G2[Chạy worker con]
     G2 --> I
@@ -58,22 +58,20 @@ Sơ đồ biểu diễn đường đi thành công và nhánh phục hồi chín
 | 2 | Truy cập entrypoint, thu hook/route đăng ký trong runtime | Có bootstrap và hook đăng ký runtime; online-linked đọc registration trong request artifact, xác minh parent/request ID, cập nhật registry và queue HTTP child. Internal/ambiguous registrations vẫn blocked. |
 | 3 | Request khởi đầu đúng endpoint, method, auth | Có chuyển seed thành request/config và các gate. Chưa tự chuẩn bị đầy đủ auth, nonce, dữ liệu ứng dụng cho mọi plugin; replay probe không đồng nghĩa đã xác minh method/ngữ cảnh. |
 | 4 | Replay tìm tham số đúng callback, nguồn input | Có ghép exact request ID/run ID/plugin và convergence kiểm tra provenance. Raw direct-argument read giữ provenance từ root `FETCH_FUNC_ARG`; direct `read` hoặc guard `isset`/`empty` có key trong request bucket đều có thể được nhận. |
-| 5 | Tạo, kiểm chứng config đầu; xử lý chưa có tham số | Có `replay_only` và `fuzzing_ready`; v0 phải qua replay callback/provenance và Pass 2 trước khi fuzz. Seed không có tham số chỉ chạy probe/replay bounded hoặc ghi blocked. |
-| 6 | Chạy PHUZZ khi config đủ điều kiện | Có cho candidate đang được xử lý. Worker con phải qua replay/Pass 2 và còn ngân sách. |
+| 5 | Tạo, kiểm chứng config đầu; xử lý chưa có tham số | Có `replay_only` và `fuzzing_ready`; v0 phải qua replay callback/provenance baseline trước khi fuzz. Seed không có tham số chỉ chạy probe/replay bounded hoặc ghi blocked. |
+| 6 | Chạy PHUZZ khi config đủ điều kiện | Có cho candidate đang được xử lý. Worker con phải qua callback baseline và còn ngân sách. |
 | 7 | Thu coverage, lỗi, tham số mới, so sánh khi fuzz | Có trong fuzzer và instrumentation; coordinator đọc cặp request/Zend. |
 | 8 | CmpLog mutation đúng tham số rồi gửi lại | Có `_ingest_cmplog_hints()` → `ff_mutate()` → `ff_send_request()` → coverage/lỗi. Có test đơn vị; không mặc định mọi phép so sánh đều được hỗ trợ hoặc mọi nhánh đều tới được. |
 | 9 | Tạo config khi nhánh/tham số mới, giữ giá trị mở nhánh | Tạo config theo tham số Zend mới, giữ evidence/value riêng cho từng parameter và map COOKIE vào bucket `cookies`. Không tạo config chỉ vì coverage mới. |
-| 10 | Chạy config mới; action mới quay về bước 2, tham số mới về bước 3 | Child parameter config giữ request values rồi replay/Pass 2. Runtime HTTP registration và pending probe được queue với lineage/evidence riêng, dedupe theo context/input, candidate cap và campaign budget; internal/ambiguous child có evidence blocked. |
+| 10 | Chạy config mới; action mới quay về bước 2, tham số mới về bước 3 | Child parameter config giữ request values rồi callback baseline. Runtime HTTP registration và pending probe được queue với lineage/evidence riêng, dedupe theo context/input, candidate cap và campaign budget; internal/ambiguous child có evidence blocked. |
 
-### Coherent replay, branch và giá trị input
+### Callback baseline và giá trị input
 
-Coordinator phục hồi giá trị từ request evidence bằng `_restore_request_values`, thử bộ input qua `_verify_replay_input_trials`, rồi giữ một bản replay với giá trị đã chứng minh. Bản config xuất cho fuzz thay giá trị field fuzz bằng `fuzz`; field fixed/nonce giữ nguyên. Selector dùng `re.match`, và fixed thắng fuzz nếu cùng khớp. Không thay toàn bộ chuỗi `probe` thành `fuzz` trong artifact.
+Coordinator phục hồi giá trị request bằng `_restore_request_values`, dựng config bất biến và gửi một baseline xác nhận callback trước handoff. Bản baseline giữ giá trị mở nhánh; config fuzz thay giá trị field fuzz bằng `fuzz`, giữ fixed/nonce. Không còn coherent trial, tự điều chỉnh input trước fuzz hoặc verifier Pass 2.
 
-Probe khác request/run/input context được xét như proposal riêng, không tự union toàn bộ input. Khi nhánh mới thiếu parameter cũ, coordinator có thể thử proposal từ observation hiện tại; mọi field xuất vẫn cần coherent verification. Điều này chưa chứng minh mọi chuyển nhánh đều được giải quyết: Imsanity `resumable` còn bị trial từ chối do locale evidence.
+Admission của param vẫn cần bằng chứng runtime đúng request/run/callback/nguồn. Baseline kiểm tra identity, callback execution, HTTP/error và deadline, không yêu cầu toàn bộ param được đọc lại. Policy `callback_baseline_v1` và `baseline_evidence` ghi rõ giới hạn này. Baseline không chứng minh đã phủ hết param/nhánh hay fuzzing PASS.
 
-`pending_runtime_candidates` lưu identity còn lại. Khi có evidence mới, `_reconcile_pending_runtime_candidates` đối chiếu lại: field quan sát lại đi theo admission hiện tại (`FRESH_CHILD_CONTEXT`); field không quan sát lại được retire (`NOT_REOBSERVED_ON_CHILD`). Không dùng evidence parent cũ như evidence child. Retire không chứng minh field không tồn tại ở mọi nhánh.
-
-Proposal có request semantics tương đương bị `NO_SEMANTIC_PROGRESS`, trial ghi `ignored`, không tạo child/replay/version mới. So sánh bỏ metadata và biến động giá trị fuzz; giữ khác biệt fixed value, endpoint, method và transport. Pending-group dispatch còn xét parameter identity. Không suy ra mọi khác biệt coverage phải tạo config.
+Proposal tương đương vẫn bị `NO_SEMANTIC_PROGRESS`; fixed value, endpoint, method, auth và transport khác nhau vẫn giữ riêng. CMPLOG mutation trong worker không thay đổi.
 
 ### Giới hạn auth và đăng ký hook
 
@@ -103,7 +101,7 @@ Dedupe dùng parent/callback/context, source/location và toàn bộ input reque
 
 Coordinator dùng reader này cho polling worker; production path không còn list/load từng file. `state.json` ghi `evidence_scan` gồm số file, số cặp, missing Zend, invalid payload, thời gian transport và ngân sách còn lại. Cặp chưa có Zend chỉ là `RETRY`; chỉ cặp correlate đầy đủ mới được đánh dấu seen và chuyển vào admission.
 
-Sau khi v0 replay và callback/provenance đã đạt (thêm Pass 2 nếu v0 là `fuzzing_ready`; v0 `replay_only` chỉ được phép probe), cặp request/Zend exact của v0 được giữ với `evidence_origin: v0_gate`. Coordinator khởi động worker trước, kiểm tra parent container, rồi đưa chính cặp gate đó qua `_handle_convergence_result()` trước polling batch đầu tiên. Probe lần đầu ghi `evidence_origin`, `request_id`, `remaining_budget_seconds` và `first_probe_delay_seconds`; origin `worker_poll` chỉ xuất hiện với evidence đọc từ batch sau đó. Parent checks, auth/provenance, deadline, replay và Pass 2 vẫn là điều kiện admission; gate không thay thế chúng.
+Sau khi v0 replay và callback/provenance đã đạt (v0 `replay_only` chỉ được phép probe), cặp request/Zend exact của v0 được giữ với `evidence_origin: v0_gate`. Coordinator khởi động worker trước, kiểm tra parent container, rồi đưa chính cặp gate đó qua `_handle_convergence_result()` trước polling batch đầu tiên. Probe lần đầu ghi `evidence_origin`, `request_id`, `remaining_budget_seconds` và `first_probe_delay_seconds`; origin `worker_poll` chỉ xuất hiện với evidence đọc từ batch sau đó. Parent checks, auth/provenance, deadline, baseline vẫn là điều kiện handoff; gate không thay thế chúng.
 
 ### Review và sửa bổ sung ngày 2026-09-14
 
@@ -171,8 +169,7 @@ chạy bằng `python -m online_linked.probe_sender` từ `/app`.
 
 Phần chọn config ban đầu, hash và ghi artifact dùng chung nằm trong
 `hook_energy/seed_generation/online_common.py`. Package linked không khởi tạo
-coordinator của mode `online` cũ. Zend, CmpLog, convergence, Pass 2 và request/auth
-vẫn là các dịch vụ dùng chung; định dạng config/state và thư mục đầu ra không đổi.
+coordinator của mode `online` cũ. Zend, CmpLog, convergence và request/auth vẫn dùng các thành phần chung. Gate mới ghi policy `callback_baseline_v1`; thư mục đầu ra giữ nguyên và state lịch sử được đọc theo gate cũ.
 
 Từ `phuzz-main/code`, cần có Docker, `wp-cli.phar`, ZIP plugin và bootstrap config tương ứng. Ví dụ cho plugin đã có sẵn cục bộ:
 
@@ -190,7 +187,7 @@ pwsh -NoProfile -File .\phuzz.ps1 -PluginSlug nmedia-user-file-uploader -OnlineT
 - Initial queue được dedupe theo identity. Effective candidate capacity = `min(hard_max_candidates, max(initial_max_candidates, initial_queue_size))`; 60 candidate đã biết với initial 32/hard 128 có đủ 60 slots, không nhận thêm time/progress credit chỉ vì đã có trong seed.
 - Progress được xác minh và dedupe có thể tăng thời gian/version/candidate slots, tối đa hard cap. Duplicate callback/retry không mua thêm budget. AJAX (kể cả nopriv) được ưu tiên bằng stable sort trước mỗi lần lấy queue item.
 - `StopOnVulnCount` / `HOOKPHUZZ_STOP_ON_VULN`: `0` không dừng theo số finding; các budget và gate khác vẫn hiệu lực.
-- Không admit evidence/trial/gate đến sau deadline. Replay child diễn ra khi parent còn chạy; chỉ sau replay/Pass 2 đạt mới dừng parent và start child nếu còn ngân sách.
+- Không admit evidence/trial/gate đến sau deadline. Replay child diễn ra khi parent còn chạy; chỉ sau callback baseline đạt mới dừng parent và start child nếu còn ngân sách.
 - Các lệnh Docker đang thực thi và cleanup vẫn có timeout riêng; thời gian thực tổng cộng có thể vượt ngân sách fuzz. Không coi `60` là giới hạn wall-clock cứng cho toàn lệnh.
 - Coordinator dừng candidate khi nhận exit code `1337 % 256 = 57`. Batch hiện tiếp tục candidate khác; cần kiểm chứng marker vulnerability giữa các candidate trước khi coi từng kết quả là phát hiện độc lập.
 - Runtime child cập nhật registry theo batch; wrapper dùng `--sync-registry` để nạp lại file vào web container trước replay candidate kế tiếp. Refresh lỗi chặn child.
@@ -206,7 +203,7 @@ pwsh -NoProfile -File .\phuzz.ps1 -PluginSlug nmedia-user-file-uploader -OnlineT
 
 Mặc định không tự sinh hard candidate time; hard versions với env snapshot là 36, loader default là 20. PowerShell wrapper chưa expose hard-cap flags hay `--resume`; muốn điều chỉnh phải gọi Python coordinator với context Docker phù hợp. Hard cap phải là số nguyên dương và không nhỏ hơn initial budget. Đọc `budget`, `budget_progress`, `effective_max_candidates`, `pending_candidates` và `stop_reasons`; không chỉ nhìn giá trị initial.
 
-Candidate khởi đầu với cửa sổ `W = max_seconds`. Param mới được admit gia hạn tới `max(deadline, now + W + 3 * sender_seconds)`, chặn bởi campaign và explicit `--hard-candidate-seconds`. Burst cùng thời điểm không cộng dồn cửa sổ; cùng callback và `(name, source, location)` chỉ nhận credit một lần. Pending name không cấp thời gian; callback mới chỉ cấp campaign work. Sau probe hợp lệ, ưu tiên trial/replay/Pass 2 rồi tiếp tục pending trong cùng run; HTTP lỗi có guard thì thử guard với allowance mới. Gate/correlation không đổi.
+Candidate khởi đầu với cửa sổ `W = max_seconds`. Param mới được admit gia hạn tới `max(deadline, now + W + 3 * sender_seconds)`, chặn bởi campaign và explicit `--hard-candidate-seconds`. Burst cùng thời điểm không cộng dồn cửa sổ; cùng callback và `(name, source, location)` chỉ nhận credit một lần. Pending name không cấp thời gian; callback mới chỉ cấp campaign work. Sau probe hợp lệ, ưu tiên trial/callback baseline rồi tiếp tục pending trong cùng run; HTTP lỗi có guard thì thử guard với allowance mới. Gate/correlation không đổi.
 
 Hết cửa sổ ghi `NO_NEW_PROGRESS`; còn pending thì `PARTIAL` và xuất draft `.partial.json` riêng, `fuzzing_ready=false`. Đây không phải tìm hết param hoặc fuzzing PASS. Count/version và campaign caps vẫn áp dụng.
 
@@ -229,7 +226,7 @@ Truyền lại custom hard caps, COOKIE opt-in và service nếu run gốc có. 
 
 ### Discovery từ error response
 
-Pending probe có thể giữ Zend reads sau HTTP 400–599 nếu request/Zend/callback/method/auth được tương quan đầy đủ (`allow_error_responses=True` trên đường probe). Điều này giúp nhận input được đọc trước khi plugin trả lỗi. V0/final child replay không bật nới gate này; final config vẫn cần replay/readiness hợp lệ, Pass 2 đầy đủ, config hash đúng và `fuzzing_ready`. HTTP lỗi hay callback reached riêng lẻ chưa đủ export.
+Pending probe có thể giữ Zend reads sau HTTP 400–599 nếu request/Zend/callback/method/auth được tương quan đầy đủ (`allow_error_responses=True` trên đường probe). Điều này giúp nhận input được đọc trước khi plugin trả lỗi. V0/final child replay không bật nới gate này; final config mới vẫn cần callback baseline hợp lệ, config hash đúng và `fuzzing_ready`; state lịch sử giữ gate Pass 2 đã lưu. HTTP lỗi hay callback reached riêng lẻ chưa đủ export.
 
 ## 5. Artifact và cách đọc kết quả
 
@@ -260,12 +257,12 @@ fuzzer/output/online-linked/<batch-run-id>/callback-registry.json
 | `VERSION_LIMIT_REACHED` | Hết lượt version; xem max_versions và attempts, không nhầm với số file cuối. |
 | `TRIAL_INPUT_SET_NOT_VERIFIED` / `TRIAL_MISSING_PARAMETER_READS` | Bộ input không vượt coherent trial; đọc missing_parameters và request/Zend cùng trial. Tăng version không tự sửa lỗi này. |
 | `NO_SEMANTIC_PROGRESS` | Proposal tương đương bị bỏ qua; không tiêu thêm child version. |
-| `GATE_NOT_VERIFIED` | Exporter không thấy replay/Pass 2 hợp lệ; khác với lỗi admission ban đầu V0_PREREQUISITE_GATE_FAILED. |
+| `GATE_NOT_VERIFIED` | Exporter không thấy callback baseline hợp lệ; khác với lỗi admission ban đầu V0_PREREQUISITE_GATE_FAILED. |
 | `NO_NEW_ZEND_PARAMETER` | Quan sát đó không bổ sung tham số; không chứng minh không còn nhánh chưa khám phá. |
 | `ACTION_EXPANSION_SETUP_REQUIRED` | Registration có thật nhưng thiếu direct-HTTP mapping, method/route evidence hoặc prerequisite replay; không tạo request suy đoán. |
 | `CALLBACK_REGISTRY_REFRESH_FAILED` | Registry child không nạp lại được vào web container; child candidate bị chặn. |
 | `CANDIDATE_BUDGET_EXPIRED` / `CAMPAIGN_BUDGET_EXPIRED` | Batch dừng mở rộng theo cap candidate hoặc wall-clock campaign; timeout từng candidate vẫn độc lập. |
-| `PARTIAL` | Còn pending work hoặc chạm budget/cap. Có thể vẫn có config đã replay/Pass 2 đạt; không phải discovery đầy đủ. |
+| `PARTIAL` | Còn pending work hoặc chạm budget/cap. Có thể vẫn có config đã callback baseline đạt; không phải discovery đầy đủ. |
 | `HARD_CANDIDATE_COUNT_CAP` / `HARD_CAMPAIGN_TIME_CAP` / `HARD_CANDIDATE_TIME_CAP` / `HARD_VERSION_CAP` | Chạm hard cap; giữ pending/checkpoint. Tăng initial flag không tự sửa prerequisite hay replay failure. |
 | `FILESYSTEM_PATH_UNSUPPORTED` | IO preflight không tạo/ghi/replace/đọc/xóa được file thử; xem operation, path length và path. |
 | `EXPORT_FAILED` | Lỗi ghi/đọc/archive config cuối; giữ batch-state/source và trả exit 2. Thư mục export có thể mới hoàn tất một phần. |
@@ -273,7 +270,9 @@ fuzzer/output/online-linked/<batch-run-id>/callback-registry.json
 
 Lỗi xác minh candidate ghi `NOT_VERIFIED`; budget/cap có thể ghi `PARTIAL` hoặc bounded với reason riêng. Batch tiếp tục candidate khác khi còn ngân sách. Exit 0 còn bao gồm `PARTIAL`/`complete_with_skips`; lỗi input chung hoặc export trả lỗi. Đọc từng state trước khi kết luận.
 
-### 5.1. Coherent replay-input trial
+### 5.1. Lịch sử coherent replay-input trial (đã bỏ 2026-11-02)
+
+Phần này giữ snapshot cũ để đọc artifact lịch sử; các helper/trial/CLI nêu dưới không còn là luồng hiện hành.
 
 Khi convergence phát hiện tham số mới, coordinator dựng một context đầy đủ rồi kiểm tra nó qua parent trước khi công bố child. Các lần kiểm tra nằm riêng dưới:
 
@@ -341,10 +340,10 @@ Ba điều chỉnh sau review:
 | --- | --- |
 | Ghép input và chỉ công bố child sau trial | [coordinator.py](../../fuzzer/online_linked/coordinator.py): `_handle_convergence_result` |
 | Queue, deadline, sender, ghi artifact và xác minh trial | Cùng file: `_verify_replay_input_trials`, `_trial_identity_complete`, `_trial_parameter_verified` |
-| Chọn điều chỉnh một field từ evidence, không IO | [replay_inputs.py](../../fuzzer/online_linked/replay_inputs.py): `propose_replay_inputs` |
+| Chọn điều chỉnh một field từ evidence, không IO | `replay_inputs.py` (đã xóa): `propose_replay_inputs` |
 | Handoff và gate cuối giữ nguyên vai trò | Coordinator: `handoff_to_next_worker`; [export.py](../../fuzzer/online_linked/export.py): `_verified_config` |
 | Regression queue/HTTP/correlation và vòng đời child | [test_online_linked_coordinator.py](../../fuzzer/tests/test_online_linked_coordinator.py) |
-| Regression lọc hint và xung đột REQUEST | [test_online_linked_replay_inputs.py](../../fuzzer/tests/test_online_linked_replay_inputs.py) |
+| Regression lọc hint và xung đột REQUEST | `test_online_linked_replay_inputs.py` (đã xóa) |
 
 Giữ các bất biến: tối đa 4 trial mỗi attempt, dùng chung deadline candidate, không tính trial thành version; không sửa config đã công bố; không thay auth/fixed field bằng CMPLOG; không thu nhỏ tập expected parameters; không start child trước final gate. Helper phải chọn từ bằng chứng runtime, không đọc source plugin để đoán giá trị. Phạm vi sửa này không thay cờ CLI, default budget hoặc chính sách dừng khi gặp vulnerability.
 
@@ -365,7 +364,7 @@ Cuối batch, config được gom vào thư mục phẳng:
 fuzzer/output/online-linked/<batch-run-id>/final-configs/fuzzer-config.<hook>.<identity-hash>.json
 ```
 
-Exporter xét **mọi version hợp lệ** theo thứ tự số giảm dần (`v10` trước `v2`). Mỗi version cần `fuzzing_ready`, gate `passed=true`, Pass 2 `accepted == total > 0`, identity và config hash đúng; probe/replay-only bị loại. Version mới lỗi không làm mất bản cũ hợp lệ.
+Exporter xét **mọi version hợp lệ** theo thứ tự số giảm dần (`v10` trước `v2`). Mỗi version mới cần `fuzzing_ready`, policy `callback_baseline_v1`, gate `passed=true`, baseline evidence/identity và config hash đúng; state lịch sử không policy vẫn cần Pass 2 `accepted == total > 0`; probe/replay-only bị loại. Version mới lỗi không làm mất bản cũ hợp lệ.
 
 Context khác fixed value, method, auth, transport hoặc field không tương thích được giữ riêng. Hai config tương đương chỉ xuất một file; provenance request/run tạm không tạo duplicate. Bản tăng tham số `{a}` → `{a,b}` chỉ thay thế bản cũ khi known-parameter set và mọi field/selector cũ được giữ tương thích; không merge hai nhánh thành một request.
 
@@ -384,10 +383,10 @@ Export copy nguyên byte. Export lại/resume tái dùng file cùng bytes, khôn
 | Launcher riêng của linked | [invoke-online-linked.ps1](../../scripts/wordpress/invoke-online-linked.ps1) |
 | Vòng phiên bản, handoff, deadline, state | [coordinator.py](../../fuzzer/online_linked/coordinator.py) |
 | Batch request/Zend evidence reader | [evidence.py](../../fuzzer/online_linked/evidence.py) |
-| Probe, replay-input, final export | [probe_sender.py](../../fuzzer/online_linked/probe_sender.py), [replay_inputs.py](../../fuzzer/online_linked/replay_inputs.py), [export.py](../../fuzzer/online_linked/export.py) |
+| Probe, callback baseline, final export | [probe_sender.py](../../fuzzer/online_linked/probe_sender.py), [coordinator.py](../../fuzzer/online_linked/coordinator.py), [export.py](../../fuzzer/online_linked/export.py) |
 | Chọn v0, kiểm tra config, hash và artifact helpers dùng chung | [online_common.py](../../fuzzer/hook_energy/seed_generation/online_common.py) |
 | Windows long-path IO và preflight | [filesystem_paths.py](../../fuzzer/filesystem_paths.py) |
-| Convergence và Pass 2 | [bridge_cli.py](../../fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py) |
+| Convergence | [bridge_cli.py](../../fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py) |
 | Materialization và exporter | [convergence.py](../../fuzzer/seed_generation/convergence/convergence.py), [config_exporter.py](../../fuzzer/seed_generation/config/config_exporter.py) |
 | Root fetch provenance và raw events | [hookphuzz_opcode.c](../../fuzzer/zend_discovery/extension/hookphuzz_opcode.c), [direct-argument fixture](../../fuzzer/tests/fixtures/hookphuzz-direct-argument-fixture.php) |
 | CmpLog và mutation | [fuzzer.py](../../fuzzer/fuzzer.py), [hints.py](../../fuzzer/fuzz_guidance/cmplog/hints.py) |
@@ -400,7 +399,7 @@ python -c "import subprocess,sys; r=subprocess.run([sys.executable,'-m','unittes
 
 Fresh validation ngày 2026-09-13: focused online-linked/Zend/exporter/probe suite đạt `234 tests OK`; full discovery đạt `542 tests`, còn `2 errors` và `1 skipped`. Hai lỗi full-suite được ghi nguyên văn và không được tự phân loại baseline trong `2026-09-13-online-linked-luna-results.md` (report lịch sử không có trong checkout này; chưa xác minh lại số liệu). Đây là unit/contract và fixture gates; chưa thay thế real-plugin end-to-end run có đủ auth/nonce/selector setup.
 
-Khi nghiệm thu phải báo riêng: đăng ký → request đúng ngữ cảnh → callback executed → tham số/provenance → config tạo được → replay/Pass 2 → worker đã chạy → coverage/CmpLog → vulnerability. Không gộp HTTP 200, callback reachability hoặc test mock thành PASS toàn tuyến.
+Khi nghiệm thu phải báo riêng: đăng ký → request đúng ngữ cảnh → callback executed → tham số/provenance → config tạo được → callback baseline → worker đã chạy → coverage/CmpLog → vulnerability. Không gộp HTTP 200, callback reachability hoặc test mock thành PASS toàn tuyến.
 
 ## 8. Snapshot kiểm chứng Imsanity và phần còn thiếu (2026-09-22)
 

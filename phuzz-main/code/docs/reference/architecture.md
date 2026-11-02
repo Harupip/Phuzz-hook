@@ -1,6 +1,6 @@
 # Kiến trúc và chức năng HookPhuzz
 
-Đối chiếu working tree ngày **2026-10-09**. Đường dẫn source trong bảng là link từ tài liệu này. Mô hình sử dụng: một người vận hành Docker cục bộ; plugin và candidate online-linked chạy tuần tự. Khả năng đồng bộ nhiều fuzzer của PHUZZ/Composegen là chức năng riêng.
+Đối chiếu working tree ngày **2026-11-02**. Đường dẫn source trong bảng là link từ tài liệu này. Mô hình sử dụng: một người vận hành Docker cục bộ; plugin và candidate online-linked chạy tuần tự. Khả năng đồng bộ nhiều fuzzer của PHUZZ/Composegen là chức năng riêng.
 
 Cập nhật 2026-10-26: [request artifact v4 rút gọn bản sao blindspot](../reports/2026-10-26-request-artifact-compaction.md), kèm số đo, tương thích v3, lỗi ghi file và cách khôi phục. Metadata callback/parent/child và bằng chứng Zend được giữ nguyên.
 
@@ -14,8 +14,7 @@ flowchart TD
     D --> E[v0 replay và correlation gate]
     E --> F[Worker replay-only hoặc fuzzing-ready]
     F --> G[Request/Zend pair + convergence + pending probes]
-    G --> H[Coherent input trial trong parent]
-    H --> I[Child config bất biến + replay + Pass 2]
+    G --> I[Child config bất biến + một callback baseline]
     I --> J[Dừng parent thành công rồi chạy child]
     J --> G
     G --> K[HTTP callback mới có lineage vào queue]
@@ -24,7 +23,7 @@ flowchart TD
     L --> M[Distinct verified final configs + summary]
 ```
 
-Gate thất bại chặn bước tiếp theo. Config `replay_only` phục vụ discovery; chỉ config `fuzzing_ready` đủ replay/Pass 2 mới được xuất. Budget bao gồm replay/probe/verification/fuzz, không bảo đảm worker đã dành toàn bộ thời gian cho fuzz.
+Gate thất bại chặn bước tiếp theo. Config `replay_only` phục vụ discovery; chỉ config `fuzzing_ready` đủ callback baseline mới được xuất. Budget bao gồm replay/probe/verification/fuzz, không bảo đảm worker đã dành toàn bộ thời gian cho fuzz.
 
 ## Chức năng và nơi sở hữu
 
@@ -39,12 +38,11 @@ Gate thất bại chặn bước tiếp theo. Config `replay_only` phục vụ d
 | Runtime-only seed bootstrap | [export_zend_seeds.py](../../fuzzer/cli/export_zend_seeds.py), [candidate_generator.py](../../fuzzer/seed_generation/skeleton/candidate_generator.py) | UOPZ coverage → `hook_gap_report.json`, `suggested_seeds.json`/`.md`; không scan source plugin để suy ra tham số runtime. |
 | Phân loại endpoint và method | [entrypoints](../../fuzzer/discovery/entrypoints/entrypoints.py), [classifier](../../fuzzer/discovery/entrypoints/classifier.py), [method resolution](../../fuzzer/discovery/entrypoints/method_resolution.py), [REST routes](../../fuzzer/discovery/wordpress/rest_routes.py) | AJAX, admin-post, REST hoặc internal/setup-required. GET bootstrap chưa có bằng chứng khác; POST probe cần xác minh lại đúng method. |
 | Identity, normalize và admission | [engine.py](../../fuzzer/zend_discovery/engine.py) | Ghép run/request/plugin/callback/method/auth; `REQUEST` phải có transport duy nhất. Helper/guard cần evidence hiện tại; COOKIE chỉ khi opt-in. |
-| Convergence và Pass 2 | [bridge_cli.py](../../fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py), [convergence.py](../../fuzzer/seed_generation/convergence/convergence.py) | Reads/pending observations → seed proposal; replay xác minh lại expected set. Không union tùy ý tham số từ request khác nhau. |
+| Convergence | [bridge_cli.py](../../fuzzer/hook_energy/seed_generation/zend_runtime/bridge_cli.py), [convergence.py](../../fuzzer/seed_generation/convergence/convergence.py) | Reads/pending observations → seed proposal; giữ admission/provenance và context cố định. Baseline không đòi mọi param được đọc lại. |
 | Sinh config | [config_exporter.py](../../fuzzer/seed_generation/config/config_exporter.py) | Seed → `replay_only`/`fuzzing_ready`; selector theo regex, fixed thắng fuzz, nonce giữ fixed. JSON request dùng `body_params` và Content-Type; `json_params` trong evidence không tự là bucket loader. |
 | Worker lifecycle, budget, resume | [coordinator.py](../../fuzzer/online_linked/coordinator.py) | Immutable `vN`, một worker hoạt động mỗi candidate, AJAX trước; initial/hard budget riêng, progress dedupe, pending/checkpoint và revalidation khi resume. |
 | Batch evidence reader | [evidence.py](../../fuzzer/online_linked/evidence.py) | Một Docker/PHP scan → exact request/Zend pairs + stats; bỏ file tạm, thiếu/sai correlation, output muộn hoặc payload lỗi. |
 | Probe nhẹ trong parent | [probe_sender.py](../../fuzzer/online_linked/probe_sender.py) | Dùng chung request preparation; gửi one-shot bằng `docker exec` trong worker hiện tại, không tạo worker riêng. Error response tương quan có thể giúp discovery; không nới final replay gate. |
-| Coherent replay và CMPLOG proposal | [replay_inputs.py](../../fuzzer/online_linked/replay_inputs.py), [coordinator](../../fuzzer/online_linked/coordinator.py) | Tối đa 4 trial/attempt cùng deadline; điều chỉnh field từ evidence, giữ action/auth/nonce/fixed. Trial không tiêu version và chưa thay final gate. |
 | Export config cuối | [export.py](../../fuzzer/online_linked/export.py) | Giữ context khác nhau; dedupe equivalent, collapse cumulative compatible growth, copy nguyên byte, summary và archive `superseded/` khi export lại. [Contract](../../fuzzer/online_linked/README.md). |
 | Fuzzer core | [fuzzer.py](../../fuzzer/fuzzer.py), [core](../../fuzzer/core/candidate.py) | Load request, seed, choose/mutate/send/score, coverage, sync và checks. Request preparation phục vụ cả worker và probe. |
 | Hook-aware scoring | [scoring.py](../../fuzzer/core/scoring.py), [integration](../../fuzzer/hook_guidance/integration/integration.py), [energy](../../fuzzer/hook_guidance/energy/calculator.py) | Mode 1 PHUZZ / mode 2 PHUZZ+hook; priority additive, energy weighted blend với scale lớn nhất đã thấy trong tracker. |
@@ -71,6 +69,8 @@ Gate thất bại chặn bước tiếp theo. Config `replay_only` phục vụ d
 
 Run ID chứa slug và timestamp có hậu tố `Z`; wrapper hiện dùng `Get-Date` theo timezone host, không chuyển UTC trước khi đặt tên. Đừng dùng hậu tố này làm bằng chứng thời gian UTC. Candidate storage ID là 16 ký tự đầu SHA-256 của full candidate run ID; đọc `state_path`, không đoán thư mục.
 
-Các test liên quan nằm trong [tests](../../fuzzer/tests): wrapper/batch/ZIP, entrypoint/method/REST, Zend/Pass 2, convergence/exporter, coordinator/probe/evidence/replay/export, comparison, scoring/CMPLOG, findings và retention. Test unit/contract không thay fresh campaign. Báo riêng config generation → runtime reads → coherent replay/Pass 2 → worker → coverage/CMPLOG → finding/reproduction.
+Các test liên quan nằm trong [tests](../../fuzzer/tests): wrapper/batch/ZIP, entrypoint/method/REST, Zend admission/baseline, convergence/exporter, coordinator/probe/evidence/replay/export, comparison, scoring/CMPLOG, findings và retention. Test unit/contract không thay fresh campaign. Báo riêng config generation → runtime reads → callback baseline → worker → coverage/CMPLOG → finding/reproduction.
 
 Phạm vi rà lần này: source do dự án quản lý và các luồng chính/callers/tests phục vụ doc. Không audit từng dòng WordPress/plugin bên thứ ba, không chạy lại toàn bộ experiment, build image hoặc fuzzing. Xem [review record](../reports/2026-10-09-documentation-review.md).
+
+Baseline policy hiện tại: `callback_baseline_v1` (2026-11-02). Không còn trial hoặc verifier/CLI Pass 2 đang chạy; export state lịch sử vẫn kiểm tra số Pass 2 đã lưu. Baseline không chứng minh toàn bộ param/nhánh đã chạy.

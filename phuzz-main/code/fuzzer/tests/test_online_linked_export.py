@@ -20,6 +20,72 @@ from online_linked.export import (
 
 
 class OnlineLinkedExportTests(unittest.TestCase):
+    def baseline_version(self, name="v1"):
+        version = self.version(name)
+        proof = {
+            "request_id": "baseline-request", "run_id": "baseline-run",
+            "plugin_slug": "fixture", "callback_id": version["callback_id"],
+            "http_method": "POST", "auth_context": "guest", "seed_variant_id": "post",
+        }
+        version.update(plugin_slug="fixture", resolved_method="POST", auth_context="guest", seed_variant_id="post")
+        gate = {
+            "passed": True, "verification_policy": "callback_baseline_v1",
+            "baseline_evidence": proof,
+            "config_path": version["config_path"], "config_hash": version["config_hash"],
+            "runner": {"legacy_run_id": proof["run_id"], "runs": [{
+                "callback_reached": True, "validation_status": "callback_reached",
+                "process_status": "stopped_on_callback", "callback_id": version["callback_id"],
+                "hook_name": version["hook_name"], "resolved_method": "POST", "seed_variant_id": "post",
+                "matched_artifact": proof["request_id"] + ".json",
+                "request_payload": {
+                    "request_id": proof["request_id"], "run_id": proof["run_id"],
+                    "target_plugin": "fixture", "http_method": "POST", "auth_context": "guest",
+                    "response": {"status_code": 200},
+                },
+                "zend_payload": {"request_id": proof["request_id"], "run_id": proof["run_id"]},
+            }]},
+        }
+        version["replay_config_path"] = version["config_path"]
+        version["replay_config_hash"] = version["config_hash"]
+        version["readiness" if name == "v0" else "replay_result"] = gate
+        return version
+
+    def test_baseline_policy_exports_without_pass2(self):
+        for name in ("v0", "v1"):
+            with self.subTest(name=name):
+                version = self.baseline_version(name)
+                candidate, _ = self.write_state(versions=[version])
+                self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / name), 1)
+
+    def test_baseline_policy_rejects_incomplete_or_mismatched_proof(self):
+        for field in ("request_id", "run_id", "plugin_slug", "callback_id", "http_method", "auth_context", "seed_variant_id"):
+            for value in (None, "wrong"):
+                with self.subTest(field=field, value=value):
+                    version = self.baseline_version()
+                    proof = version["replay_result"]["baseline_evidence"]
+                    if value is None:
+                        proof.pop(field)
+                    else:
+                        proof[field] = value
+                    candidate, _ = self.write_state(versions=[version])
+                    self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / f"{field}-{value}"), 0)
+
+    def test_unknown_verification_policy_cannot_use_legacy_pass2(self):
+        version = self.version("v1")
+        version["replay_result"]["verification_policy"] = "unknown"
+        candidate, _ = self.write_state(versions=[version])
+        self.assertEqual(export_online_linked_batch(self.batch([candidate])), 0)
+
+    def test_baseline_rejects_actual_artifact_context_mismatch(self):
+        for field, value in (("auth_context", "other"), ("seed_variant_id", "other"),
+                             ("http_method", "GET"), ("run_id", "other")):
+            with self.subTest(field=field):
+                version = self.baseline_version()
+                row = version["replay_result"]["runner"]["runs"][0]
+                row["request_payload"][field] = value
+                candidate, _ = self.write_state(versions=[version])
+                self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / field), 0)
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)

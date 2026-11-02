@@ -1,6 +1,6 @@
 # Online-linked final config export
 
-Reviewed against the working tree: **2026-10-09**. For the coordinator, budgets,
+Reviewed against the working tree: **2026-11-02**. For the coordinator, budgets,
 resume and worker lifecycle, see the [online-linked guide](../../docs/guides/online-linked-flow.md).
 
 ## Callback discovery eligibility and context scheduling
@@ -44,8 +44,13 @@ reached, or a vulnerability was proven.
 example, `mode=search` with fuzzable `keyword` and `mode=delete` with fuzzable
 `item_id` are exported separately. Parameters are not merged into one request.
 
-Every exported version still must satisfy the existing replay/readiness gate,
-Pass 2 (`accepted == total > 0`), config hash and `fuzzing_ready` checks. Probe
+New versions use `verification_policy: callback_baseline_v1`: one correlated
+request must execute the expected callback with matching run/request/plugin,
+method, auth and seed variant, an accepted HTTP response and remaining budget.
+There are no input trials or active Pass 2 calls. Baseline evidence does not
+prove every admitted parameter was read again. Historical gates without a policy
+still require their saved Pass 2 (`accepted == total > 0`) evidence. Config hash
+and `fuzzing_ready` checks remain mandatory. Probe
 and replay-only configs remain excluded. A failed latest version does not prevent
 older verified versions from being exported.
 
@@ -56,7 +61,7 @@ is false. `metadata.partial_export` records the stop reason, verified and pendin
 parameters, source state/config, and any parameters whose transport is unresolved.
 There is no parameter-count threshold. Drafts include guard-only observations;
 their combined inputs may belong to incompatible branches and have not passed
-replay/Pass 2 together. Form observations make the draft POST; this inference is
+a verified combined request. Form observations make the draft POST; this inference is
 not runtime method proof. Drafts are for inspection, not automatic fuzzing.
 The summary's separate `partial_configs` list identifies current drafts; older
 draft bytes remain preserved on re-export. They never enter `exported_configs`,
@@ -113,12 +118,12 @@ Related files: `export.py` and `../tests/test_online_linked_export.py`.
 From `phuzz-main/code/fuzzer`:
 
 ```powershell
-python -B -c "import subprocess,sys; r=subprocess.run([sys.executable,'-B','-m','unittest','tests.test_online_linked_export','tests.test_online_linked_replay_inputs','tests.test_online_linked_config_comparison'],timeout=180); sys.exit(r.returncode)"
+python -B -c "import subprocess,sys; r=subprocess.run([sys.executable,'-B','-m','unittest','tests.test_online_linked_export','tests.test_online_linked_config_comparison'],timeout=180); sys.exit(r.returncode)"
 ```
 
 Use a writable temporary directory. On Windows, normalize the temporary path
 if short 8.3 names interfere with path-sensitive comparison tests. These tests
-cover offline export/replay-input/comparison behavior; they do not establish a
+cover offline export/comparison behavior; they do not establish a
 fresh WordPress runtime or fuzzing PASS.
 
-Candidate time uses `progress_idle_v1`: initial window W; each newly admitted parameter renews to max(deadline, now + W + 3 * measured sender cost), bounded by campaign and any explicit `--hard-candidate-seconds`. No implicit candidate hard cap. Pending names buy no time; new callbacks only extend campaign work. Bounded probes hand off early, then service remaining probes in the same run, revalidating ancestor parents. Idle ends with `NO_NEW_PROGRESS`; pending work remains PARTIAL and exports unverified drafts. Resume retains credits/time, subtracts offline time, stores null hard remaining when uncapped, and rejects old-policy checkpoints. Replay/Pass 2 and version/count caps remain unchanged.
+Candidate time uses `progress_idle_v1`: initial window W; each newly admitted parameter renews to max(deadline, now + W + 2 * measured sender cost), bounded by campaign and any explicit `--hard-candidate-seconds`. No implicit candidate hard cap. Pending names buy no time; new callbacks only extend campaign work. Bounded probes hand off early, then service remaining probes in the same run, revalidating ancestor parents. Idle ends with `NO_NEW_PROGRESS`; pending work remains PARTIAL and exports unverified drafts. Resume retains credits/time, subtracts offline time, stores null hard remaining when uncapped, and rejects old-policy checkpoints. One callback baseline replaces trial/Pass 2; version/count caps remain unchanged. The standalone verify-pass2 CLI and trial proposal module were removed; CMPLOG mutations in the fuzzer remain active.

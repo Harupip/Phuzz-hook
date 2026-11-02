@@ -33,7 +33,7 @@ from hook_energy.seed_generation.generated_config_runner import STOP_ON_VULN_EXI
 from online_linked.probe_sender import ParentInspectionTimeout
 from seed_generation.config.config_exporter import SeedConfigSkip, export_seed_configs, build_config_for_seed_item
 from seed_generation.skeleton.candidate_generator import ZendRuntimeSeedGenerator
-from hook_energy.seed_generation.zend_runtime.bridge_cli import converge_iteration, verify_pass2_contract, _materialize_ajax_runtime_probes
+from hook_energy.seed_generation.zend_runtime.bridge_cli import converge_iteration, _materialize_ajax_runtime_probes
 from seed_generation.convergence.convergence import materialize_convergence_seeds
 from zend_discovery.engine import candidate_from_seed_item, canonical_identity_id
 
@@ -79,33 +79,6 @@ def config_for(item: dict, *, include_new: bool = False) -> dict:
     }
 
 
-COHERENT_REPLAY_FIXTURE = {
-    "request_id": "trial-request",
-    "run_id": "trial-run",
-    "callback": "fixture_callback",
-    "request_params": {
-        "body_params": {
-            "action": "fixture",
-            "post_category": "probe",
-            "post_id": "probe",
-            "post_type": "probe",
-        }
-    },
-    "reads": ["post_category", "post_type"],
-    "comparison_events": [
-        {
-            "request_id": "trial-request",
-            "run_id": "trial-run",
-            "callback": "fixture_callback",
-            "opcode": "IS_EQUAL",
-            "source": "REQUEST",
-            "path": ["post_type"],
-            "runtime_value": "probe",
-            "comparison_value": "post",
-        }
-    ],
-}
-
 
 class Clock:
     def __init__(self) -> None:
@@ -119,7 +92,7 @@ class Clock:
 
 
 class OnlineLinkedCoordinatorTests(unittest.TestCase):
-    def test_verified_probe_renews_before_checkpoint_and_large_guard_queue_reaches_trial(self):
+    def test_verified_probe_renews_before_checkpoint_and_large_guard_queue_reaches_baseline(self):
         with tempfile.TemporaryDirectory() as tmp:
             c, parent, evidence, convergence = self.make_probe_context(Path(tmp), [], names=('a',))
             c.max_seconds = 30
@@ -130,7 +103,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             write_state = c._write_state
             checkpoints = []
             admission_time = []
-            trial_inputs = []
+            baseline_inputs = []
             handle = c._handle_convergence_result
 
             def admit_near_deadline(*args, **kwargs):
@@ -155,14 +128,14 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     c.clock.sleep(0.1)
                 write_state()
 
-            def trial(**kwargs):
-                trial_inputs.append((c.clock(), kwargs['result']['new_parameters'], len(checkpoints)))
+            def baseline(**kwargs):
+                baseline_inputs.append((c.clock(), kwargs['result']['new_parameters'], len(checkpoints)))
                 return handle(**kwargs)
 
             c.probe_sender = admit_near_deadline
             c.converge_fn = discover_guards
             with patch.object(c, '_write_state', side_effect=slow_checkpoint), \
-                 patch.object(c, '_handle_convergence_result', side_effect=trial):
+                 patch.object(c, '_handle_convergence_result', side_effect=baseline):
                 result = c._run_pending_probe(parent=parent, evidence=evidence,
                     raw_report=c._reports['v0'], convergence=convergence,
                     probe=convergence['pending_probes'][0], seed=parent['seed_item'], deadline=30)
@@ -171,11 +144,11 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(checkpoints[0][1], 1, 'verified input must earn time before its accepted checkpoint')
             self.assertEqual(len(c.state['budget_progress']), 1)
             self.assertEqual(c.state['budget_progress'][0]['at'], admission_time[0])
-            self.assertLess(trial_inputs[0][0], c._deadline)
-            self.assertEqual([p['name'] for p in trial_inputs[0][1]], ['a'])
+            self.assertLess(baseline_inputs[0][0], c._deadline)
+            self.assertEqual([p['name'] for p in baseline_inputs[0][1]], ['a'])
             self.assertEqual(len(c.state['pending_probe_queue']), 100)
-            self.assertLessEqual(trial_inputs[0][2], 5, 'checkpoint a queue batch, not each guard/event')
-            self.assertTrue(c.state['replay_input_trials'])
+            self.assertLessEqual(baseline_inputs[0][2], 5, 'checkpoint a queue batch, not each guard/event')
+            self.assertNotIn('replay_input_trials', c.state)
             self.assertTrue(result['replay_result']['passed'])
             saved = json.loads(c.state_path.read_text())
             self.assertEqual(len(saved['pending_probe_queue']), 100)
@@ -275,14 +248,6 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             restored.clock.now = 1075
             self.assertEqual(restored._extend_progress_budget('verified_parameter', 'late'), 1075)
 
-    def test_failed_input_trial_keeps_untried_probe_recoverable_but_not_bad_artifacts(self):
-        for reason in ('TRIAL_INPUT_SET_NOT_VERIFIED', 'REPLAY_ARTIFACT_ERROR'):
-            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as tmp:
-                c, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
-                c.state['pending_probe_queue'] = [dict(parent_version='v0', candidate=convergence['pending_probes'][1],
-                    convergence=convergence, evidence=evidence)]
-                c._finish_replay_input_attempt(parent, {}, {}, reason, 20, terminal=True)
-                self.assertEqual(c.state['terminal_status'], None if reason == 'TRIAL_INPUT_SET_NOT_VERIFIED' else 'NOT_VERIFIED')
 
     def test_slow_error_probe_refreshes_guard_budget_before_strict_handoff(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -356,6 +321,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                         'matched_artifact': 'fresh-gate.json', 'zend_artifact': 'fresh-gate.json',
                         'request_payload': {'request_id': 'fresh-gate', 'legacy_run_id': run_id,
                             'target_plugin': 'fixture', 'http_method': 'POST',
+                            "hook_name": rows[0]["hook_name"], "callback_id": rows[0]["callback_id"],
+                            "auth_context": next(v["auth_context"] for v in c.state["versions"] if v.get("worker_run_id") == run_id),
                             'response': {'status_code': 200},
                             'request_params': {'body_params': {'action': 'fixture', 'seed': 'base'}}},
                         'zend_payload': {'request_id': 'fresh-gate', 'run_id': run_id}}]}
@@ -376,97 +343,6 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertFalse(c.state['pending_probe_queue'])
             self.assertTrue(c.state['versions'][-1]['replay_result']['passed'])
 
-    def test_live_loop_recovers_probe_after_failed_input_trial(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            log = []
-            c, parent, evidence, convergence = self.make_probe_context(
-                Path(tmp), log, accepted=('a',),
-            )
-            Path(parent['config_path']).unlink()
-            (c.run_dir / 'versions/v0/v0-config.json').unlink()
-            c.state['versions'] = []
-            c.state['workers'] = []
-            c._active_container = ''
-            queue_after_failure = []
-            failure_contexts = []
-            run_probe = c._run_pending_probe
-
-            def record_probe(**kwargs):
-                result = run_probe(**kwargs)
-                if kwargs['probe']['name'] == 'a':
-                    queue_after_failure.extend(
-                        row['candidate']['name'] for row in c.state['pending_probe_queue']
-                    )
-                return result
-
-            c._run_pending_probe = record_probe
-            finish_trial = c._finish_replay_input_attempt
-
-            def finish_with_only_probe_queue(parent, attempt, discovery, reason, deadline, **kwargs):
-                if reason == 'TRIAL_INPUT_SET_NOT_VERIFIED':
-                    failure_contexts.append({
-                        'pending_runtime_candidates': copy.deepcopy(c.state['pending_runtime_candidates']),
-                        'pending_probe_queue': copy.deepcopy(c.state['pending_probe_queue']),
-                    })
-                    c.state['pending_runtime_candidates'] = []
-                return finish_trial(parent, attempt, discovery, reason, deadline, **kwargs)
-
-            c._finish_replay_input_attempt = finish_with_only_probe_queue
-            run_sender = c._run_light_sender
-
-            def failed_input_trial(**kwargs):
-                if 'replay-input-trials' not in str(kwargs['config_path']):
-                    return run_sender(**kwargs)
-                request_id, run_id = kwargs['request_id'], kwargs['run_id']
-                return {
-                    'status': 'callback_reached', 'callback_reached': True,
-                    'validation_status': 'callback_reached', 'request_name': f'{request_id}.json',
-                    'request': {
-                        'request_id': request_id, 'legacy_run_id': run_id, 'run_id': run_id,
-                        'target_plugin': 'fixture', 'hook_name': parent['hook_name'],
-                        'callback_id': parent['callback_id'], 'auth_context': kwargs['auth_context'],
-                        'http_method': 'POST',
-                        'request_params': {'body_params': {'action': 'fixture', 'a': 'probe-a'}},
-                        'response': {'status_code': 200},
-                    },
-                    'zend_name': f'{request_id}.json',
-                    'zend': {'request_id': request_id, 'run_id': run_id,
-                             'request_method': 'POST', 'events': []},
-                    'timing': {},
-                }
-
-            c._run_light_sender = failed_input_trial
-
-            def initial_probe(version, **kwargs):
-                c._run_pending_probe(
-                    parent=version, evidence=evidence, raw_report=c._reports['v0'],
-                    convergence=convergence, probe=convergence['pending_probes'][0],
-                    seed=version['seed_item'], deadline=kwargs['deadline'],
-                )
-
-            gate = c._gate_v0
-
-            def fresh_gate(version, config, **kwargs):
-                if not version.get('readiness_history'):
-                    return True
-                return gate(version, config, **kwargs)
-
-            with patch.object(c, '_gate_v0', side_effect=fresh_gate), \
-                 patch.object(c, 'read_new_runtime_evidence', return_value=[]), \
-                 patch.object(c, '_consume_gate_evidence', side_effect=initial_probe):
-                result = c.run()
-                self.assertEqual(result, 0, json.dumps(c.state['replay_input_trials']))
-
-            trial = c.state['replay_input_trials'][0]
-            self.assertEqual(trial['reason'], 'TRIAL_INPUT_SET_NOT_VERIFIED')
-            self.assertEqual(trial['status'], 'failed')
-            self.assertFalse(failure_contexts[0]['pending_runtime_candidates'])
-            self.assertEqual([row['candidate']['name'] for row in failure_contexts[0]['pending_probe_queue']], ['b'])
-            self.assertEqual(queue_after_failure, ['b'])
-            self.assertEqual([row['candidate']['name'] for row in c.state['probe_attempts']], ['a', 'b'])
-            self.assertIn('probe:b', log)
-            self.assertEqual([row['version'] for row in c.state['versions']], ['v0'])
-            self.assertEqual(c.state['versions'][0]['known_parameters'], [])
 
     def test_pending_same_parent_needs_no_extra_gate_and_missing_parent_fails_closed(self):
         for missing in (False, True):
@@ -532,13 +408,13 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             coordinator._candidate_deadline()
             coordinator._sender_seconds = 20
             coordinator.clock.now = 20
-            self.assertEqual(coordinator._extend_progress_budget("verified_parameter", "a"), 110)
+            self.assertEqual(coordinator._extend_progress_budget("verified_parameter", "a"), 90)
             coordinator.clock.now = 50
             self.assertEqual(coordinator._extend_progress_budget("verified_parameter", "b"), 115)
             coordinator.clock.now = 115
             self.assertEqual(coordinator._extend_progress_budget("verified_parameter", "c"), 115)
 
-    def test_get_bootstrap_post_probe_replays_and_pass2_before_new_worker(self):
+    def test_get_bootstrap_post_probe_baseline_before_new_worker(self):
         for method_only, post_action, error_replay in ((False, False, None), (True, False, None),
                                                         (True, True, None), (False, False, 302),
                                                         (False, False, 403), (False, False, 500)):
@@ -567,7 +443,6 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 coordinator.converge_fn = converge_iteration
                 coordinator.materialize_fn = materialize_convergence_seeds
                 coordinator.export_configs_fn = export_seed_configs
-                coordinator.verify_pass2_fn = verify_pass2_contract
                 methods = []
                 def sender(container_name, **kwargs):
                     config = json.loads((coordinator.config_root / (kwargs["config_slug"] + ".json")).read_text())
@@ -640,7 +515,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 )
                 self.assertIsNotNone(child, coordinator.state)
                 self.assertEqual(child["resolved_method"], "POST")
-                self.assertEqual(child["replay_result"]["pass2_verification"], {"accepted": 1, "total": 1})
+                self.assertNotIn("pass2_verification", child["replay_result"])
                 if error_replay:
                     self.assertEqual(child["terminal_reason"], "GUARD_SATISFACTION_UNKNOWN")
                     self.assertFalse(child["replay_result"]["passed"])
@@ -1959,21 +1834,16 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual([candidate["seed"]["method"] for candidate in candidates], ["GET", "POST"])
             self.assertEqual(len({candidate["identity"] for candidate in candidates}), 2)
 
-    def test_v0_requires_registry_and_nonempty_pass2_before_fuzzing(self):
-        for missing_registry in (True, False):
-            with self.subTest(missing_registry=missing_registry), tempfile.TemporaryDirectory() as tmp:
-                log = []
-                coordinator = self.make_coordinator(Path(tmp), log)
-                if missing_registry:
-                    coordinator.registry = {'callback_map': {}}
-                else:
-                    coordinator.verify_pass2_fn = lambda *args, **kwargs: {'accepted': 0, 'total': 0}
-                self.assertEqual(coordinator.run(), 2)
-                self.assertNotIn('worker_start', log)
-                self.assertEqual(coordinator.state['terminal_reason'],
-                                 'V0_REGISTRY_MISSING' if missing_registry else 'V0_PASS2_NOT_VERIFIED')
+    def test_v0_requires_callback_registry_before_fuzzing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            coordinator = self.make_coordinator(Path(tmp), log)
+            coordinator.registry = {"callback_map": {}}
+            self.assertEqual(coordinator.run(), 2)
+            self.assertNotIn("worker_start", log)
+            self.assertEqual(coordinator.state["terminal_reason"], "V0_REGISTRY_MISSING")
 
-    def test_v0_error_response_keeps_pass2_but_blocks_fuzz_ready_worker(self):
+    def test_v0_error_response_blocks_fuzz_ready_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = []
             coordinator = self.make_coordinator(Path(tmp), log)
@@ -1985,7 +1855,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             coordinator.replay_runner = replay_403
             coordinator.run()
             version = coordinator.state['versions'][0]
-            self.assertEqual(version['readiness']['pass2_verification'], {'accepted': 1, 'total': 1})
+            self.assertEqual(version["readiness"]["verification_policy"], "callback_baseline_v1")
             self.assertFalse(version['readiness']['passed'])
             self.assertEqual(coordinator.state['terminal_reason'], 'GUARD_SATISFACTION_UNKNOWN')
             self.assertNotIn('worker_start', log)
@@ -2164,8 +2034,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             coordinator.run()
             self.assertEqual(coordinator.state['versions'][0]['known_parameters'], [])
             self.assertEqual(coordinator.state['attempts'], [])
-            self.assertEqual(coordinator.state['replay_input_trials'][0]['reason'], 'CHILD_CONFIG_EXPORT_FAILED')
-            self.assertEqual(coordinator.state['replay_input_trials'][0]['status'], 'failed')
+            self.assertIn("CHILD_CONFIG_EXPORT_FAILED", json.dumps(coordinator.state["events"]))
             coordinator.export_configs_fn = exporter
             coordinator._active_container = coordinator.state["workers"][0]["container_name"]
             coordinator.state["workers"][0]["status"] = "started"
@@ -2926,7 +2795,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                         'request_id': 'v0-probe',
                         'legacy_run_id': kwargs['legacy_run_id'],
                         'target_plugin': 'fixture',
-                        'http_method': 'POST',
+                        'hook_name': item['hook_name'], 'callback_id': item['callback_id'],
+                        'auth_context': next((v['auth_context'] for v in coordinator.state['versions'] if v.get('worker_run_id') == kwargs['legacy_run_id']), 'authenticated'),
+                        'http_method': args[0][0]['resolved_method'],
                         'response': {'status_code': 200},
                         'request_params': {'body_params': {'action': 'fixture', 'seed': 'base'}},
                     },
@@ -2950,17 +2821,6 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 "resolved_method": "POST",
             }]}
 
-        def verify_pass2(*args, **kwargs):
-            if kwargs.get("runtime_cookie_probes"):
-                log.append("runtime_cookie_probes:verify")
-            if args[0].get('legacy_run_id') == f'{legacy_run_id}-v0':
-                log.append('v0_pass2')
-                return {'accepted': 1, 'total': 1}
-            if "replay-input" in str(args[0].get('legacy_run_id') or ''):
-                log.append("trial_pass2")
-                return {'accepted': 1, 'total': 1}
-            log.append("verify_pass2_contract")
-            return {"accepted": 1, "total": 1} if replay_passes else {"accepted": 0, "total": 0}
 
         def run_command(command, **kwargs):
             if command[:2] == ["docker", "inspect"]:
@@ -2995,7 +2855,6 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             export_configs_fn=export_configs,
             force_replay_only_fn=force_replay,
             replay_runner=replay_runner,
-            verify_pass2_fn=verify_pass2,
             run_command=run_command,
             clock=clock,
             sleeper=clock.sleep,
@@ -3020,33 +2879,23 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     or (metadata or {}).get("seed_variant_id") or ""
                 ),
             }
-            is_trial = "replay-input-trials" in kwargs["config_slug"]
             is_probe = "-probe-" in run_id
-            if is_trial:
-                report = {"runs": [{}]}
-            else:
-                try:
-                    report = coordinator.replay_runner(
-                        [row], timeout_seconds=kwargs["timeout_seconds"], service=coordinator.service,
-                        legacy_run_id=run_id, run_command=coordinator.run_command,
-                        list_artifacts=coordinator.list_artifacts, load_artifact=coordinator.load_artifact,
-                        list_zend_artifacts=coordinator.list_zend_artifacts,
-                        poll_interval_seconds=0, fuzzer_node_id=100, stop_on_callback=True,
-                    )
-                except Exception as exc:
-                    return {"status": "sender_error", "error": str(exc)}
-            old_row = report.get("runs", [{}])[0] if isinstance(report, dict) else {}
-            reached = True if is_trial else old_row.get("callback_reached") is True
-            name = str(row.get("seed_variant_id") or "").split("zend_probe_post_", 1)[-1] or "seed"
-            artifact_name = (
-                str(old_row.get("matched_artifact") or f"probe-{name}.json")
-                if is_probe
-                else (
-                    f"{kwargs['request_id']}.json"
-                    if is_trial
-                    else str(old_row.get("matched_artifact") or f"{kwargs['request_id']}.json")
+            try:
+                report = coordinator.replay_runner(
+                    [row], timeout_seconds=kwargs["timeout_seconds"], service=coordinator.service,
+                    legacy_run_id=run_id, run_command=coordinator.run_command,
+                    list_artifacts=coordinator.list_artifacts, load_artifact=coordinator.load_artifact,
+                    list_zend_artifacts=coordinator.list_zend_artifacts,
+                    poll_interval_seconds=0, fuzzer_node_id=100, stop_on_callback=True,
                 )
-            )
+            except Exception as exc:
+                return {"status": "sender_error", "error": str(exc)}
+            old_row = report.get("runs", [{}])[0] if isinstance(report, dict) else {}
+            reached = old_row.get("callback_reached") is True
+            name = str(row.get("seed_variant_id") or "").split("zend_probe_post_", 1)[-1] or "seed"
+            artifact_name = str(old_row.get("matched_artifact") or (
+                f"probe-{name}.json" if is_probe else f"{kwargs['request_id']}.json"
+            ))
             artifact_id = Path(artifact_name).stem
             body = (
                 {"action": "fixture", name: f"probe-{name}"}
@@ -3110,7 +2959,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             )
             self.assertIsNotNone(result)
             self.assertTrue(coordinator.runtime_cookie_probes)
-            self.assertIn("runtime_cookie_probes:verify", log)
+            self.assertEqual(result["replay_result"]["verification_policy"], "callback_baseline_v1")
 
     def make_probe_context(
         self,
@@ -3366,30 +3215,13 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertIn("PROBE_BUDGET_EXHAUSTED", json.dumps(coordinator.state["events"]))
             self.assertEqual(parent["known_parameters"], [])
 
-    def test_non_success_replay_reaches_pass2_but_unknown_guard_blocks_fuzzing(self):
+    def test_non_success_baseline_blocks_fuzzing(self):
         for status in (301, 302, 303, 304, 307, 308, 400, 403, 404, 500):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
                 log = []
                 coordinator, parent, evidence, convergence = self.make_probe_context(
                     Path(tmp), log, names=("a",), accepted=("a",),
                 )
-                def verify_actual_pass2(run, _merged_report, zend_dir, **kwargs):
-                    row = run["runs"][0]
-                    expected = {"suggested_seeds": [{
-                        "hook_name": row["hook_name"], "callback_id": row["callback_id"],
-                        "seed": {
-                            "resolved_method": "POST",
-                            "seed_variant_id": row.get("seed_variant_id", ""),
-                            "zend_canonical_callback": "fixture_callback",
-                            "input_params": [{"name": "a", "source": "POST", "location": "form"}],
-                        },
-                    }]}
-                    return verify_pass2_contract(
-                        run, expected, zend_dir,
-                        pass2_artifacts_dir=kwargs.get("pass2_artifacts_dir"),
-                        runtime_cookie_probes=kwargs.get("runtime_cookie_probes", False),
-                    )
-                coordinator.verify_pass2_fn = verify_actual_pass2
                 original = coordinator.probe_sender
                 def sender(container, **kwargs):
                     result = original(container, **kwargs)
@@ -3404,7 +3236,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 )
                 self.assertIsNotNone(child)
                 replay = child["replay_result"]
-                self.assertEqual(replay["pass2_verification"], {"accepted": 1, "total": 1})
+                self.assertNotIn("pass2_verification", replay)
                 self.assertEqual(replay["runner"]["runs"][0]["response_status"], status)
                 self.assertEqual(replay["guard_status"], "unknown")
                 self.assertFalse(replay["passed"])
@@ -3429,7 +3261,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 convergence=convergence, probe=convergence['pending_probes'][0],
                 seed=parent['seed_item'], deadline=None,
             )
-            self.assertEqual(child['replay_result']['pass2_verification'], {'accepted': 1, 'total': 1})
+            self.assertNotIn("pass2_verification", child["replay_result"])
             self.assertFalse(child['replay_result']['passed'])
             self.assertEqual(child['replay_result']['runner']['runs'][0]['http_error'], 'connection closed after callback')
             self.assertEqual(child['terminal_reason'], 'GUARD_SATISFACTION_UNKNOWN')
@@ -3478,10 +3310,10 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(replay_values["a"], "probe-a")
             self.assertEqual(replay_values["b"], "probe-b")
             seed_metadata = child_config["metadata"]["online_request_seed"]
-            self.assertEqual(seed_metadata["evidence_request_ids"], [seed_metadata["request_id"]])
+            self.assertEqual(set(seed_metadata["evidence_request_ids"]), {"probe-a", "probe-b"})
             self.assertEqual(
                 {row["name"]: row["request_id"] for row in seed_metadata["values"] if row["name"] in {"a", "b"}},
-                {"a": seed_metadata["request_id"], "b": seed_metadata["request_id"]},
+                {"a": "probe-a", "b": "probe-b"},
             )
             self.assertEqual(parent["known_parameters"], [])
 
@@ -3533,7 +3365,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertTrue(policies)
             self.assertTrue(all(discovery == is_probe for is_probe, discovery in policies))
 
-    def test_separate_probes_are_combined_only_after_one_verified_request(self):
+    def test_admitted_probe_parameters_enter_one_callback_baseline(self):
         for names in (("nonce", "notice_id", "repeat_notice_after"),
                       ("repeat_notice_after", "notice_id", "nonce")):
             with self.subTest(names=names), tempfile.TemporaryDirectory() as tmp:
@@ -3551,16 +3383,15 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     ["nonce", "notice_id", "repeat_notice_after"],
                 )
                 self.assertTrue(child["replay_result"]["passed"])
-                trial = coordinator.state["replay_input_trials"][0]
-                self.assertEqual(trial["trials"][0]["missing_parameters"], [])
+                self.assertNotIn("replay_input_trials", coordinator.state)
                 config = json.loads(Path(child["config_path"]).read_text())
                 provenance = config["metadata"]["online_request_seed"]
-                self.assertEqual(provenance["evidence_request_ids"], [provenance["request_id"]])
-                self.assertTrue(all(row["request_id"] == provenance["request_id"]
-                                    for row in provenance["values"]))
+                self.assertEqual(set(provenance["evidence_request_ids"]), {"probe-" + name for name in names})
+                self.assertEqual({row["name"]: row["request_id"] for row in provenance["values"] if row["name"] in names},
+                                 {name: "probe-" + name for name in names})
                 self.assertEqual(coordinator.state["pending_runtime_candidates"], [])
 
-    def test_combined_trial_does_not_inherit_an_individual_probes_missing_fields(self):
+    def test_baseline_does_not_require_missing_historical_reads(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
             old = {"name": "old", "path": ["old"], "source": "POST", "location": "form",
@@ -3584,19 +3415,18 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 seed=parent["seed_item"], deadline=None,
             )
             self.assertIsNotNone(child)
-            trial = coordinator.state["replay_input_trials"][0]
-            self.assertEqual({p["name"] for p in trial["expected_parameters"]}, {"old", "a", "b"})
+            self.assertTrue(child["replay_result"]["passed"])
             self.assertEqual({p["name"] for p in child["known_parameters"]}, {"old", "a", "b"})
             self.assertEqual(coordinator.state["pending_runtime_candidates"], [])
 
-    def test_combined_probe_proposal_does_not_publish_missing_reads(self):
+    def test_baseline_allows_admitted_parameters_not_read_again(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
             original_sender = coordinator.probe_sender
 
             def sender(container_name, **kwargs):
                 result = original_sender(container_name, **kwargs)
-                if "replay-input-trials" in kwargs["config_slug"]:
+                if kwargs["run_id"].endswith("-replay"):
                     # This callback cannot read a and b in the same request.
                     result["zend"]["events"] = [e for e in result["zend"]["events"] if e["path"] != ["a"]]
                     result["zend"]["callback_summaries"][0]["unique_parameters"] = [
@@ -3612,154 +3442,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 seed=parent["seed_item"], deadline=None,
             )
             self.assertIsNotNone(child)
-            self.assertEqual({p["name"] for p in child["known_parameters"]}, {"b"})
-            first_trial = coordinator.state["replay_input_trials"][0]
-            self.assertEqual({p["name"] for p in first_trial["expected_parameters"]}, {"a", "b"})
-            self.assertEqual(first_trial["status"], "failed")
-            self.assertEqual({p["name"] for p in coordinator.state["pending_runtime_candidates"]}, {"a"})
-
-    def limit_trial_reads(self, coordinator, names):
-        original = coordinator.probe_sender
-
-        def sender(container_name, **kwargs):
-            result = original(container_name, **kwargs)
-            if "replay-input-trials" in kwargs["config_slug"] and result.get("zend"):
-                result["zend"]["events"] = [e for e in result["zend"]["events"] if e["path"][0] in names]
-                result["zend"]["callback_summaries"][0]["unique_parameters"] = [
-                    p for p in result["zend"]["callback_summaries"][0]["unique_parameters"] if p["name"] in names
-                ]
-            return result
-
-        coordinator.probe_sender = sender
-        return original
-
-    def test_noncooccurring_probe_candidates_are_not_promoted_as_one_union(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, evidence, convergence = self.make_probe_context(
-                Path(tmp), [], names=("guard_value", "body_candidate"),
-                accepted=("guard_value", "body_candidate"),
-            )
-            self.limit_trial_reads(coordinator, {"guard_value"})
-
-            result = coordinator._run_pending_probe(
-                parent=parent, evidence=evidence,
-                raw_report=coordinator._reports["v0"], convergence=convergence,
-                probe=convergence["pending_probes"][0],
-                seed=parent["seed_item"], deadline=None,
-            )
-
-            self.assertIsNotNone(result, json.dumps(coordinator.state, default=str))
-            child_names = {
-                item["name"] for item in coordinator.state["versions"][1]["known_parameters"]
-            }
-            self.assertEqual(len(child_names), 1)
-            retained_names = {
-                item["name"] for item in coordinator.state.get("pending_runtime_candidates", [])
-            }
-            self.assertEqual(child_names | retained_names, {"guard_value", "body_candidate"})
-
-    def test_remaining_runtime_candidate_is_reprocessed_on_fresh_child_evidence(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, evidence, convergence = self.make_probe_context(
-                Path(tmp), [], names=("a", "b"), accepted=("a", "b"),
-            )
-            original_sender = self.limit_trial_reads(coordinator, {"b"})
-
-            child = coordinator._run_pending_probe(
-                parent=parent, evidence=evidence,
-                raw_report=coordinator._reports["v0"], convergence=convergence,
-                probe=convergence["pending_probes"][0],
-                seed=parent["seed_item"], deadline=None,
-            )
-            self.assertIsNotNone(child)
-            self.assertEqual(
-                {item["name"] for item in coordinator.state["pending_runtime_candidates"]}, {"a"},
-            )
-
-            coordinator.probe_sender = original_sender
-            fresh_evidence = copy.deepcopy(evidence)
-            fresh_evidence["request_id"] = "child-v1-request"
-            fresh_evidence["worker_run_id"] = "child-v1-run"
-            fresh_evidence["request"] = {
-                "request_id": "child-v1-request",
-                "legacy_run_id": "child-v1-run",
-                "target_plugin": "fixture",
-                "http_method": "POST",
-                "request_params": {"body_params": {"action": "fixture", "seed": "base"}},
-            }
-            a_probe = next(
-                item for item in convergence["pending_probes"] if item["name"] == "a"
-            )
-            a_seed = next(
-                item for item in convergence["merged_suggested_seeds"]["suggested_seeds"]
-                if item["seed"]["seed_variant_id"] == a_probe["seed_variant_id"]
-            )
-            fresh_result = {
-                "status": "CONTINUE",
-                "candidate_key": "candidate-fixture",
-                "new_parameters": [],
-                "known_parameters": [],
-                "pending_probes": [a_probe],
-                "merged_suggested_seeds": {"suggested_seeds": [a_seed]},
-            }
-
-            next_child = coordinator._handle_convergence_result(
-                parent=child, evidence=fresh_evidence,
-                raw_report=coordinator._reports["v0"], result=fresh_result,
-                seed=child["seed_item"], deadline=None,
-            )
-
-            self.assertIsNotNone(next_child, json.dumps(coordinator.state, default=str))
-            self.assertEqual([version["version"] for version in coordinator.state["versions"]], ["v0", "v1", "v2"])
-            self.assertEqual(coordinator.state.get("pending_runtime_candidates"), [])
-            requeued = [
-                event for event in coordinator.state["events"]
-                if event.get("kind") == "PENDING_RUNTIME_CANDIDATE"
-                and event.get("parameter") == "a"
-            ]
-            self.assertEqual([event["status"] for event in requeued], ["REQUEUED"])
-            self.assertEqual(coordinator.state["probe_attempts"][-1]["candidate"]["name"], "a")
-            self.assertEqual(coordinator.state["probe_attempts"][-1]["parent_version"], "v1")
-
-    def test_stale_runtime_candidate_is_retired_on_fresh_child_context(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, evidence, convergence = self.make_probe_context(
-                Path(tmp), [], names=("a", "b"), accepted=("a", "b"),
-            )
-            self.limit_trial_reads(coordinator, {"b"})
-            child = coordinator._run_pending_probe(
-                parent=parent, evidence=evidence,
-                raw_report=coordinator._reports["v0"], convergence=convergence,
-                probe=convergence["pending_probes"][0],
-                seed=parent["seed_item"], deadline=None,
-            )
-            self.assertIsNotNone(child)
-
-            fresh_evidence = copy.deepcopy(evidence)
-            fresh_evidence["request_id"] = "child-v1-request"
-            fresh_evidence["worker_run_id"] = "child-v1-run"
-            fresh_evidence["request"] = {
-                "request_id": "child-v1-request",
-                "legacy_run_id": "child-v1-run",
-                "target_plugin": "fixture",
-                "http_method": "POST",
-                "request_params": {"body_params": {"action": "fixture", "seed": "base"}},
-            }
-            coordinator._handle_convergence_result(
-                parent=child, evidence=fresh_evidence,
-                raw_report=coordinator._reports["v0"],
-                result={"status": "CONTINUE", "new_parameters": [], "known_parameters": []},
-                seed=child["seed_item"], deadline=None,
-            )
-
-            self.assertEqual(coordinator.state.get("pending_runtime_candidates"), [])
-            retired = [
-                event for event in coordinator.state["events"]
-                if event.get("kind") == "PENDING_RUNTIME_CANDIDATE"
-                and event.get("parameter") == "a"
-            ]
-            self.assertEqual([event["status"] for event in retired], ["RETIRED"])
-            self.assertEqual(retired[0]["reason"], "NOT_REOBSERVED_ON_CHILD")
+            self.assertEqual({p["name"] for p in child["known_parameters"]}, {"a", "b"})
+            self.assertTrue(child["replay_result"]["passed"])
+            self.assertNotIn("replay_input_trials", coordinator.state)
 
     def test_equivalent_branch_proposal_does_not_create_version_but_new_input_does(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3823,8 +3508,6 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             )
             self.assertIsNone(duplicate)
             self.assertEqual([version["version"] for version in coordinator.state["versions"]], ["v0", "v1"])
-            self.assertEqual(coordinator.state["replay_input_trials"][-1]["status"], "ignored")
-            self.assertEqual(coordinator.state["replay_input_trials"][-1]["reason"], "NO_SEMANTIC_PROGRESS")
             self.assertIn("NO_SEMANTIC_PROGRESS", json.dumps(coordinator.state["events"]))
 
             current_nonce = "valid-b"
@@ -3846,7 +3529,6 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 seed=parent["seed_item"], deadline=None,
             )
             self.assertIsNone(repeated_fixed)
-            self.assertEqual(coordinator.state["replay_input_trials"][-1]["reason"], "NO_SEMANTIC_PROGRESS")
 
             distinct_evidence, distinct_result = branch("b", "request-b", "run-b")
             distinct = coordinator._handle_convergence_result(
@@ -3960,46 +3642,24 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 ["body_candidate"],
             )
 
-    def test_failed_trial_preserves_other_runtime_candidate_and_parent(self):
+    def test_failed_baseline_preserves_runtime_candidates_and_parent(self):
         with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, evidence, convergence = self.make_probe_context(
-                Path(tmp), [], names=("guard_value", "body_candidate"),
-                accepted=("guard_value", "body_candidate"),
-            )
-            original_sender = coordinator.probe_sender
-
-            def sender(container_name, **kwargs):
-                result = original_sender(container_name, **kwargs)
-                if "replay-input-trials" not in str(kwargs.get("config_slug") or ""):
-                    return result
-                request = copy.deepcopy(result["request"])
-                zend = copy.deepcopy(result["zend"])
-                request["request_params"]["body_params"].pop("body_candidate", None)
-                zend["callback_summaries"][0]["unique_parameters"] = [
-                    row for row in zend["callback_summaries"][0]["unique_parameters"]
-                    if row["name"] != "body_candidate"
-                ]
-                zend["events"] = [
-                    row for row in zend["events"]
-                    if row["path"] != ["body_candidate"]
-                ]
-                return {**result, "request": request, "zend": zend}
-
+            coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
+            original = coordinator.probe_sender
+            def sender(container, **kwargs):
+                result = original(container, **kwargs)
+                if kwargs["run_id"].endswith("-replay"):
+                    result["request"]["auth_context"] = "other"
+                return result
             coordinator.probe_sender = sender
-            result = coordinator._run_pending_probe(
-                parent=parent, evidence=evidence,
-                raw_report=coordinator._reports["v0"], convergence=convergence,
-                probe=convergence["pending_probes"][0],
+            child = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
                 seed=parent["seed_item"], deadline=None,
             )
-
-            self.assertIsNotNone(result, json.dumps(coordinator.state, default=str))
-            self.assertIsNone(coordinator.state["terminal_status"])
-            self.assertEqual(
-                {item["name"] for item in result["known_parameters"]}, {"guard_value"},
-            )
-            self.assertEqual({p["name"] for p in coordinator.state["pending_runtime_candidates"]}, {"body_candidate"})
-            self.assertTrue(coordinator._active_container)
+            self.assertFalse(child["replay_result"]["passed"])
+            self.assertEqual(coordinator._active_container, "parent-container")
+            self.assertEqual({p["name"] for p in coordinator.state["pending_runtime_candidates"]}, {"a", "b"})
 
     def test_unbounded_two_probes_keep_independent_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4246,7 +3906,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertNotEqual(coordinator.state.get("terminal_reason"), "BUDGET_EXPIRED")
             self.assertIn("CHILD_CONFIG_EXPORT_FAILED", json.dumps(coordinator.state["events"]))
 
-    def test_measured_sender_cost_reserves_time_for_trial_and_replay(self):
+    def test_measured_sender_cost_reserves_time_for_baseline_and_handoff(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
             coordinator.hard_seconds = 5
@@ -4345,9 +4005,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             child = coordinator.state["versions"][1]
             self.assertEqual({row["name"] for row in child["known_parameters"]}, {"a"})
             self.assertTrue(child["replay_result"]["passed"])
-            verification = child["replay_result"]["pass2_verification"]
-            self.assertGreater(verification["total"], 0)
-            self.assertEqual(verification["accepted"], verification["total"])
+            self.assertEqual(child["replay_result"]["verification_policy"], "callback_baseline_v1")
             self.assertEqual(coordinator._active_version, "v1")
             self.assertTrue(coordinator._active_container)
             self.assertEqual(parent["known_parameters"], [])
@@ -4428,7 +4086,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 "build_config", "list_targets", "worker_start", "list_request_artifacts",
                 "load_request_artifact", "list_zend_artifacts", "load_zend_artifact",
                 "converge_iteration", "materialize_convergence_seeds", "export_seed_configs",
-                "force_replay_only", "run_generated_configs", "verify_pass2_contract",
+                "force_replay_only", "run_generated_configs",
             }}
             self.assertLess(positions["build_config"], positions["list_targets"])
             self.assertLess(positions["list_targets"], positions["worker_start"])
@@ -4437,7 +4095,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertLess(positions["materialize_convergence_seeds"], positions["export_seed_configs"])
             self.assertLess(positions["export_seed_configs"], positions["force_replay_only"])
             self.assertLess(positions["force_replay_only"], positions["run_generated_configs"])
-            self.assertLess(positions["run_generated_configs"], positions["verify_pass2_contract"])
+            self.assertNotIn("verify_pass2_contract", log)
 
     def test_v0_selection_allows_replay_only_seed_without_fuzz_params(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4635,646 +4293,105 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(versions[1]["status"], "fuzzing")
             self.assertIn("new_param", json.dumps(json.loads(Path(versions[1]["config_path"]).read_text())))
 
-    def test_child_waits_for_one_coherent_input_trial_before_worker_start(self):
+
+    def test_child_baseline_sends_once_without_trials_or_pass2(self):
         with tempfile.TemporaryDirectory() as tmp:
-            log: list[str] = []
             coordinator, parent, evidence, convergence = self.make_probe_context(
-                Path(tmp), log,
-                names=("post_category", "post_id", "post_type"),
-                accepted=("post_category", "post_id", "post_type"),
+                Path(tmp), [], names=("a",), accepted=("a",),
             )
-            original_export = coordinator.export_configs_fn
-
-            def export_probe_context(report, **kwargs):
-                result = original_export(report, **kwargs)
-                path = Path(result["generated"][0]["config_path"])
-                config = json.loads(path.read_text(encoding="utf-8"))
-                for row in config["body_params"]["data"]:
-                    if row["name"] in {"post_category", "post_id", "post_type"}:
-                        row["value"] = "probe"
-                path.write_text(json.dumps(config), encoding="utf-8")
-                return result
-
-            coordinator.export_configs_fn = export_probe_context
+            sends = []
             original_sender = coordinator.probe_sender
-            trial_inputs: list[dict[str, Any]] = []
-            worker_counts_at_trial: list[int] = []
 
-            def sender(container_name, **kwargs):
-                if "replay-input-trials" not in kwargs["config_slug"]:
-                    return original_sender(container_name, **kwargs)
-                config_path = coordinator.config_root / f'{kwargs["config_slug"]}.json'
-                config = json.loads(config_path.read_text(encoding="utf-8"))
-                body = {
-                    row["name"]: (
-                        "probe" if str(row.get("value") or "").startswith("probe-") else row.get("value")
-                    )
-                    for row in config["body_params"]["data"]
-                }
-                trial_inputs.append(body)
-                worker_counts_at_trial.append(
-                    len([row for row in coordinator.state["workers"] if row["version"] == "v1"])
-                )
-                trial_number = len(trial_inputs)
-                request_id = kwargs["request_id"]
-                reads = list(COHERENT_REPLAY_FIXTURE["reads"])
-                if trial_number > 1:
-                    reads.append("post_id")
-                request = {
-                    "request_id": request_id,
-                    "legacy_run_id": kwargs["run_id"],
-                    "run_id": kwargs["run_id"],
-                    "target_plugin": "fixture",
-                    "hook_name": parent["hook_name"],
-                    "callback_id": parent["callback_id"],
-                    "auth_context": parent["auth_context"],
-                    "http_method": "POST",
-                    "request_params": {"body_params": body},
-                }
-                zend = {
-                    "request_id": request_id,
-                    "run_id": kwargs["run_id"],
-                    "request_method": "POST",
-                    "callback_summaries": [{
-                        "callback": "fixture_callback",
-                        "unique_parameters": [{
-                            "source": "POST", "path": [name], "helper_depth": 5,
-                            "observed_count": 1, "access_forms": ["read"],
-                        } for name in reads],
-                    }],
-                    "events": [{
-                        "source": "POST", "path": [name], "operation": "read",
-                        "callback_context": {
-                            "attributed": True, "root_callback": "fixture_callback", "depth": 5,
-                        },
-                    } for name in reads],
-                }
-                if trial_number == 1:
-                    zend["comparison_events"] = [{
-                        **COHERENT_REPLAY_FIXTURE["comparison_events"][0],
-                        "request_id": request_id,
-                        "run_id": kwargs["run_id"],
-                    }]
-                return {
-                    "status": "callback_reached",
-                    "callback_reached": True,
-                    "validation_status": "callback_reached",
-                    "request_name": f"{request_id}.json",
-                    "request": request,
-                    "zend_name": f"{request_id}.json",
-                    "zend": zend,
-                    "timing": {},
-                }
+            def sender(container, **kwargs):
+                sends.append(kwargs["run_id"])
+                return original_sender(container, **kwargs)
 
             coordinator.probe_sender = sender
-            result = coordinator._run_pending_probe(
-                parent=parent, evidence=evidence,
-                raw_report=coordinator._reports["v0"], convergence=convergence,
-                probe=convergence["pending_probes"][0],
+            coordinator.verify_pass2_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("online-linked baseline must not call Pass 2")
+            )
+            child = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
                 seed=parent["seed_item"], deadline=None,
             )
 
-            self.assertIsNotNone(result)
-            self.assertEqual(len(trial_inputs), 2)
-            self.assertEqual(worker_counts_at_trial, [0, 0])
-            attempt = coordinator.state["replay_input_trials"][0]
-            self.assertEqual(attempt["status"], "selected")
-            self.assertEqual([p["name"] for p in attempt["trials"][0]["missing_parameters"]], ["post_id"])
-            self.assertEqual(attempt["trials"][1]["missing_parameters"], [])
-            self.assertEqual(trial_inputs[0]["post_type"], "probe")
-            self.assertEqual(trial_inputs[0]["post_id"], "probe")
-            self.assertEqual(len(coordinator.state["versions"]), 2)
-            self.assertEqual(coordinator.state["versions"][1]["status"], "fuzzing")
-
-    def test_replay_trials_try_queued_good_context_after_bad_context_has_no_hint(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [], names=("a",), accepted=("a",))
-            child_config = config_for(parent["seed_item"])
-            child_config["body_params"]["data"].append({"name": "a", "value": "probe"})
-            child_config["body_params"]["fuzz"].append("a")
-            parameter = {
-                "name": "a", "path": ["a"], "source": "POST", "location": "form",
-                "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
-                "fuzzable": True, "plugin_slug": "fixture", "callback_id": "cb-fixture",
-                "canonical_callback": "fixture_callback", "request_method": "POST",
-            }
-            attempt = {
-                "attempt_id": "attempt-queue", "parent_version": "v0",
-                "expected_parameters": [dict(parameter)], "trials": [],
-            }
-            tried: list[str] = []
-
-            def trial_sender(**kwargs):
-                config = json.loads(Path(kwargs["config_path"]).read_text(encoding="utf-8"))
-                body = {
-                    str(row["name"]): row.get("value")
-                    for row in config["body_params"]["data"]
-                    if isinstance(row, Mapping) and row.get("name")
-                }
-                value = str(body["a"])
-                tried.append(value)
-                request_id = kwargs["request_id"]
-                run_id = kwargs["run_id"]
-                zend = {
-                    "request_id": request_id, "run_id": run_id, "request_method": "POST",
-                    "events": [], "callback_summaries": [],
-                }
-                if len(tried) == 1:
-                    zend["comparison_events"] = [
-                        {
-                            "request_id": request_id, "run_id": run_id, "callback": "fixture_callback",
-                            "opcode": "IS_EQUAL", "source": "POST", "path": ["a"],
-                            "runtime_value": "probe", "comparison_value": "bad",
-                        },
-                        {
-                            "request_id": request_id, "run_id": run_id, "callback": "fixture_callback",
-                            "opcode": "IS_EQUAL", "source": "POST", "path": ["a"],
-                            "runtime_value": "probe", "comparison_value": "good",
-                        },
-                    ]
-                elif value == "good":
-                    zend["events"] = [{
-                        "source": "POST", "path": ["a"], "operation": "read",
-                        "callback_context": {
-                            "attributed": True, "root_callback": "fixture_callback", "depth": 1,
-                        },
-                    }]
-                request = {
-                    "request_id": request_id, "legacy_run_id": run_id, "run_id": run_id,
-                    "target_plugin": "fixture", "hook_name": parent["hook_name"],
-                    "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
-                    "http_method": "POST", "request_params": {"body_params": body},
-                    "response": {"status_code": 200},
-                }
-                return {
-                    "status": "callback_reached", "callback_reached": True,
-                    "validation_status": "callback_reached",
-                    "request_name": f"{request_id}.json", "request": request,
-                    "zend_name": f"{request_id}.json", "zend": zend, "timing": {},
-                }
-
-            coordinator._run_light_sender = trial_sender
-            result = coordinator._verify_replay_input_trials(
-                parent=parent, child_config=child_config, materialized={},
-                expected_parameters=[parameter], attempt=attempt, deadline=None,
-            )
-
-            self.assertIsNotNone(result)
-            self.assertEqual(tried, ["probe", "bad", "good"])
-            self.assertEqual(attempt["trials"][1]["queued_adjustments"], 0)
-            self.assertEqual(attempt["trials"][2]["status"], "verified")
-
-    def test_replay_trial_uses_current_attributed_depth_for_historical_parameter(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
-            child_config = config_for(parent["seed_item"])
-            child_config["query_params"] = {
-                "data": [{"name": "locale", "value": "probe"}],
-                "fixed": [], "fuzz": ["locale"], "weight": 1,
-            }
-            parameter = {
-                "name": "locale", "path": ["locale"], "source": "GET", "location": "query",
-                "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
-                "fuzzable": True, "plugin_slug": "fixture", "callback_id": "cb-fixture",
-                "canonical_callback": "fixture_callback", "request_method": "POST",
-            }
-            attempt = {
-                "attempt_id": "attempt-depth", "parent_version": "v0",
-                "expected_parameters": [dict(parameter)], "trials": [],
-            }
-            original_parameter = copy.deepcopy(parameter)
-            original_parent_parameters = copy.deepcopy(parent["known_parameters"])
-            pass2_runs: list[str] = []
-
-            def verify_pass2(run, *args, **kwargs):
-                pass2_runs.append(str(run["legacy_run_id"]))
-                return {"accepted": 1, "total": 1}
-
-            coordinator.verify_pass2_fn = verify_pass2
-
-            def trial_sender(**kwargs):
-                request_id = kwargs["request_id"]
-                run_id = kwargs["run_id"]
-                return {
-                    "status": "callback_reached", "callback_reached": True,
-                    "validation_status": "callback_reached",
-                    "request_name": f"{request_id}.json",
-                    "request": {
-                        "request_id": request_id, "legacy_run_id": run_id, "run_id": run_id,
-                        "target_plugin": "fixture", "hook_name": parent["hook_name"],
-                        "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
-                        "http_method": "POST",
-                        "request_params": {"query_params": {"locale": "probe"}, "body_params": {"action": "fixture"}},
-                    },
-                    "zend_name": f"{request_id}.json",
-                    "zend": {
-                        "request_id": request_id, "run_id": run_id, "request_method": "POST",
-                        "events": [{
-                            "source": "GET", "path": ["locale"], "operation": "read",
-                            "callback_context": {
-                                "attributed": True, "root_callback": "fixture_callback", "depth": 2,
-                            },
-                        }],
-                    },
-                    "timing": {},
-                }
-
-            coordinator._run_light_sender = trial_sender
-            result = coordinator._verify_replay_input_trials(
-                parent=parent, child_config=child_config, materialized={},
-                expected_parameters=[parameter], attempt=attempt, deadline=None,
-            )
-
-            self.assertIsNotNone(result)
-            self.assertEqual(attempt["status"], "verified")
-            self.assertEqual(attempt["trials"][0]["status"], "verified")
-            self.assertEqual(pass2_runs, [result["run_id"]])
-            self.assertEqual(parameter, original_parameter)
-            self.assertEqual(parent["known_parameters"], original_parent_parameters)
-            self.assertEqual(result["zend"]["events"][0]["callback_context"]["depth"], 2)
-
-    def test_trial_parameter_verified_preserves_request_named_input(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
-            parameter = {
-                "name": "request", "path": ["request"], "source": "POST", "location": "form",
-                "helper_depth": 0, "observed_count": 1, "evidence_kind": "zend_runtime",
-                "plugin_slug": "fixture", "request_id": "trial-request", "run_id": "run-v0",
-                "callback_id": "cb-fixture", "canonical_callback": "fixture_callback",
-                "request_method": "POST",
-            }
-            evidence = {
-                "request_id": "trial-request", "worker_run_id": "run-v0",
-                "request": {
-                    "http_method": "POST", "request_params": {"body_params": {"request": "probe"}},
-                },
-                "zend": {
-                    "events": [{
-                        "source": "POST", "path": ["request"], "operation": "read",
-                        "callback_context": {
-                            "attributed": True, "root_callback": "fixture_callback", "depth": 0,
-                        },
-                    }],
-                },
-            }
-            self.assertTrue(coordinator._trial_parameter_verified(parameter, evidence, parent))
-            evidence["request"]["request_params"]["body_params"] = {}
-            self.assertFalse(coordinator._trial_parameter_verified(parameter, evidence, parent))
-
-    def test_event_parameter_name_strips_source_only_when_key_follows(self):
-        for source in ("GET", "POST", "REQUEST", "JSON"):
-            with self.subTest(source=source):
-                self.assertEqual(OnlineLinkedCoordinator._event_parameter_name({"path": [source.lower()]}), source.lower())
-                self.assertEqual(OnlineLinkedCoordinator._event_parameter_name({"path": [source]}), source)
-                self.assertEqual(OnlineLinkedCoordinator._event_parameter_name({"path": [source, "request"]}), "request")
-        self.assertEqual(OnlineLinkedCoordinator._event_parameter_name({"path": ["POST", "item", "id"]}), "item[id]")
-
-    def test_trial_parameter_verified_accepts_legacy_summary_only_artifact(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
-            parameter = {
-                "name": "legacy_field", "path": ["legacy_field"], "source": "POST", "location": "form",
-                "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
-                "fuzzable": True, "plugin_slug": "fixture", "request_id": "summary-request",
-                "run_id": "run-v0", "callback_id": "cb-fixture",
-                "canonical_callback": "fixture_callback", "request_method": "POST",
-                "access_forms": ["isset"],
-            }
-            evidence = {
-                "request_id": "summary-request", "worker_run_id": "run-v0",
-                "request": {
-                    "target_plugin": "fixture", "hook_name": parent["hook_name"],
-                    "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
-                    "http_method": "POST", "request_params": {"body_params": {"legacy_field": "value"}},
-                },
-                "zend": {
-                    "request_method": "POST", "callback_summaries": [{
-                        "callback": "fixture_callback",
-                        "unique_parameters": [{
-                            "name": "legacy_field", "source": "POST", "access_forms": ["read"],
-                        }],
-                    }],
-                },
-            }
-            original_parameter = copy.deepcopy(parameter)
-            original_evidence = copy.deepcopy(evidence)
-
-            self.assertTrue(coordinator._trial_parameter_verified(parameter, evidence, parent))
-            self.assertEqual(parameter, original_parameter)
-            self.assertEqual(evidence, original_evidence)
-
-            request_summary = copy.deepcopy(evidence)
-            request_summary["zend"]["callback_summaries"][0]["unique_parameters"][0].update({
-                "source": "REQUEST", "path": ["legacy_field"],
+            self.assertIsNotNone(child)
+            self.assertEqual(len([run for run in sends if run.endswith("-replay")]), 1)
+            self.assertFalse(any("replay-input" in run for run in sends))
+            result = child["replay_result"]
+            self.assertEqual(result["verification_policy"], "callback_baseline_v1")
+            self.assertTrue(result["passed"])
+            self.assertEqual(set(result["baseline_evidence"]), {
+                "request_id", "run_id", "plugin_slug", "callback_id",
+                "http_method", "auth_context", "seed_variant_id",
             })
-            self.assertTrue(coordinator._trial_parameter_verified(parameter, request_summary, parent))
-            request_summary["request"]["request_params"]["body_params"] = {}
-            self.assertFalse(coordinator._trial_parameter_verified(parameter, request_summary, parent))
+            self.assertNotIn("pass2_verification", result)
+            self.assertNotIn("replay_input_trials", coordinator.state)
 
-    def test_trial_parameter_verified_legacy_summary_keeps_source_row_identity(self):
+    def test_baseline_identity_mismatches_block_child(self):
+        for field, value in (
+            ("callback_id", "other"), ("request_id", "other"), ("run_id", "other"),
+            ("target_plugin", "other"), ("http_method", "GET"),
+            ("auth_context", "other"), ("seed_variant_id", "other"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                coordinator, parent, evidence, convergence = self.make_probe_context(
+                    Path(tmp), [], names=("a",), accepted=("a",),
+                )
+                original_sender = coordinator.probe_sender
+
+                def sender(container, **kwargs):
+                    result = original_sender(container, **kwargs)
+                    if result.get("request") and kwargs["run_id"].endswith("-replay"):
+                        result["request"] = dict(result["request"])
+                        if field in {"request_id", "run_id", "target_plugin", "callback_id", "auth_context", "http_method"}:
+                            result["request"][field] = value
+                        elif field == "seed_variant_id":
+                            result["request"][field] = value
+                    return result
+
+                coordinator.probe_sender = sender
+                child = coordinator._run_pending_probe(
+                    parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                    convergence=convergence, probe=convergence["pending_probes"][0],
+                    seed=parent["seed_item"], deadline=None,
+                )
+                self.assertIsNotNone(child)
+                self.assertFalse(child["replay_result"]["passed"])
+                self.assertNotEqual(child["worker_status"], "started")
+
+    def test_v0_baseline_allows_missing_historical_parameter(self):
         with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
-            parameter = {
-                "name": "legacy_field", "path": ["legacy_field"], "source": "POST", "location": "form",
-                "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
-                "fuzzable": True, "plugin_slug": "fixture", "request_id": "summary-request",
-                "run_id": "run-v0", "callback_id": "cb-fixture",
-                "canonical_callback": "fixture_callback", "request_method": "POST",
+            coordinator = self.make_coordinator(Path(tmp), [], discovers_parameter=False)
+            coordinator.converge_fn = lambda **kwargs: {
+                "status": "REPLAY_FAILED", "missing_parameters": [{"name": "old"}],
+                "new_parameters": [], "known_parameters": [],
             }
-            request = {
-                "target_plugin": "fixture", "hook_name": parent["hook_name"],
-                "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
-                "http_method": "POST", "request_params": {"body_params": {"legacy_field": "value"}},
-            }
+            self.assertEqual(coordinator.run(), 0)
+            readiness = coordinator.state["versions"][0]["readiness"]
+            self.assertTrue(readiness["passed"])
+            self.assertEqual(readiness["verification_policy"], "callback_baseline_v1")
+            self.assertEqual(readiness["baseline_evidence"]["plugin_slug"], "fixture")
 
-            def evidence(rows):
-                return {
-                    "request_id": "summary-request", "worker_run_id": "run-v0", "request": copy.deepcopy(request),
-                    "zend": {
-                        "request_method": "POST", "callback_summaries": [{
-                            "callback": "fixture_callback", "unique_parameters": rows,
-                        }],
-                    },
-                }
 
-            post_read = {
-                "name": "legacy_field", "source": "POST", "path": ["legacy_field"], "access_forms": ["read"],
-            }
-            get_read = {
-                "name": "legacy_field", "source": "GET", "path": ["legacy_field"], "access_forms": ["read"],
-            }
-            post_no_operation = {
-                "name": "legacy_field", "source": "POST", "path": ["legacy_field"], "access_forms": [],
-            }
-
-            self.assertTrue(coordinator._trial_parameter_verified(
-                parameter, evidence([post_read, get_read]), parent,
-            ))
-            self.assertTrue(coordinator._trial_parameter_verified(
-                parameter, evidence([get_read, post_read]), parent,
-            ))
-            self.assertFalse(coordinator._trial_parameter_verified(
-                parameter, evidence([get_read, post_no_operation]), parent,
-            ))
-
-    def test_trial_parameter_verified_rejects_invalid_legacy_summary_or_raw_events(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
-            parameter = {
-                "name": "legacy_field", "path": ["legacy_field"], "source": "POST", "location": "form",
-                "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
-                "fuzzable": True, "plugin_slug": "fixture", "request_id": "summary-request",
-                "run_id": "run-v0", "callback_id": "cb-fixture",
-                "canonical_callback": "fixture_callback", "request_method": "POST",
-            }
-            evidence = {
-                "request_id": "summary-request", "worker_run_id": "run-v0",
-                "request": {
-                    "target_plugin": "fixture", "hook_name": parent["hook_name"],
-                    "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
-                    "http_method": "POST", "request_params": {"body_params": {"legacy_field": "value"}},
-                },
-                "zend": {
-                    "request_method": "POST", "callback_summaries": [{
-                        "callback": "fixture_callback",
-                        "unique_parameters": [{
-                            "name": "legacy_field", "source": "POST", "access_forms": ["read"],
-                        }],
-                    }],
-                },
-            }
-            cases = {}
-            case = copy.deepcopy(evidence)
-            case["zend"]["callback_summaries"][0]["unique_parameters"][0]["access_forms"] = []
-            cases["missing_operation"] = case
-            case = copy.deepcopy(evidence)
-            case["zend"]["callback_summaries"][0]["callback"] = "other_callback"
-            cases["callback"] = case
-            case = copy.deepcopy(evidence)
-            case["zend"]["callback_summaries"][0]["unique_parameters"][0]["source"] = "GET"
-            cases["source"] = case
-            case = copy.deepcopy(evidence)
-            case["zend"]["callback_summaries"][0]["unique_parameters"][0]["path"] = ["other"]
-            cases["path"] = case
-            case = copy.deepcopy(evidence)
-            case["request"]["request_params"]["body_params"] = {}
-            cases["request_key"] = case
-            case = copy.deepcopy(evidence)
-            case["zend"]["events"] = [{
-                "source": "POST", "path": ["legacy_field"], "operation": "read",
-                "callback_context": {
-                    "attributed": True, "root_callback": "other_callback", "depth": 1,
-                },
-            }]
-            cases["invalid_raw_event_not_rescued"] = case
-
-            for name, case in cases.items():
-                with self.subTest(name=name):
-                    self.assertFalse(coordinator._trial_parameter_verified(parameter, case, parent))
-
-    def test_replay_trial_rejects_untrusted_current_provenance(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
-            parameter = {
-                "name": "locale", "path": ["locale"], "source": "GET", "location": "query",
-                "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
-                "fuzzable": True, "plugin_slug": "fixture", "request_id": "trial-request",
-                "run_id": "run-v0", "callback_id": "cb-fixture",
-                "canonical_callback": "fixture_callback", "request_method": "POST",
-            }
-            evidence = {
-                "request_id": "trial-request", "worker_run_id": "run-v0",
-                "request": {
-                    "target_plugin": "fixture", "hook_name": parent["hook_name"],
-                    "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
-                    "http_method": "POST",
-                    "request_params": {"query_params": {"locale": "probe"}},
-                },
-                "zend": {
-                    "request_method": "POST", "events": [{
-                        "source": "GET", "path": ["locale"], "operation": "read",
-                        "callback_context": {
-                            "attributed": True, "root_callback": "fixture_callback", "depth": 2,
-                        },
-                    }],
-                },
-            }
-            self.assertTrue(coordinator._trial_parameter_verified(parameter, evidence, parent))
-
-            cases = {}
-            case = copy.deepcopy(evidence)
-            case["zend"]["events"][0]["callback_context"]["root_callback"] = "other_callback"
-            cases["root_callback"] = case
-            case = copy.deepcopy(evidence)
-            case["parameter"] = {**parameter, "source": "POST", "location": "form"}
-            case["request"]["request_params"] = {"body_params": {"locale": "probe"}}
-            cases["source"] = case
-            case = copy.deepcopy(evidence)
-            case["request"]["request_params"] = {"query_params": {}}
-            cases["request_key"] = case
-            case = copy.deepcopy(evidence)
-            case["request"]["auth_context"] = "authenticated"
-            cases["auth"] = case
-            case = copy.deepcopy(evidence)
-            case["zend"]["events"][0]["callback_context"]["depth"] = -1
-            cases["depth"] = case
-            case = copy.deepcopy(evidence)
-            case["parameter"] = {**parameter, "path": ["other"]}
-            cases["path"] = case
-            case = copy.deepcopy(evidence)
-            case["parameter"] = {**parameter, "request_id": "other-request"}
-            cases["request_id"] = case
-            case = copy.deepcopy(evidence)
-            case["parameter"] = {**parameter, "run_id": "other-run"}
-            cases["run_id"] = case
-
-            for name, case in cases.items():
-                with self.subTest(name=name):
-                    candidate = case.pop("parameter", parameter)
-                    self.assertFalse(coordinator._trial_parameter_verified(candidate, case, parent))
-
-    def test_replay_trial_keeps_source_and_depth_from_one_current_event(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
-            parameter = {
-                "name": "locale", "path": ["locale"], "source": "GET", "location": "query",
-                "helper_depth": 2, "observed_count": 1, "evidence_kind": "zend_runtime",
-                "fuzzable": True, "plugin_slug": "fixture", "request_id": "trial-request",
-                "run_id": "run-v0", "callback_id": "cb-fixture",
-                "canonical_callback": "fixture_callback", "request_method": "POST",
-            }
-            evidence = {
-                "request_id": "trial-request", "worker_run_id": "run-v0",
-                "request": {
-                    "target_plugin": "fixture", "hook_name": parent["hook_name"],
-                    "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
-                    "http_method": "POST",
-                    "request_params": {"query_params": {"locale": "probe"}, "body_params": {"locale": "probe"}},
-                },
-                "zend": {
-                    "request_method": "POST", "events": [
-                        {
-                            "source": "POST", "path": ["locale"], "operation": "read",
-                            "callback_context": {
-                                "attributed": True, "root_callback": "fixture_callback", "depth": 2,
-                            },
-                        },
-                        {
-                            "source": "GET", "path": ["locale"], "operation": "read",
-                            "callback_context": {
-                                "attributed": True, "root_callback": "fixture_callback", "depth": 1,
-                            },
-                        },
-                    ],
-                },
-            }
-            self.assertTrue(coordinator._trial_parameter_verified(parameter, evidence, parent))
-
-    def test_trial_identity_accepts_201_but_rejects_auth_or_callback_mismatch(self):
+    def test_baseline_identity_accepts_201_but_rejects_auth_or_callback_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [])
             request = {
+                "request_id": "baseline", "run_id": parent["worker_run_id"],
                 "target_plugin": "fixture", "hook_name": parent["hook_name"],
                 "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
                 "http_method": "POST", "response": {"status_code": 201},
             }
-            zend = {"request_method": "POST"}
+            zend = {"request_method": "POST", "request_id": "baseline", "run_id": parent["worker_run_id"]}
 
-            self.assertTrue(coordinator._trial_identity_complete(request, zend, parent))
+            self.assertTrue(coordinator._baseline_identity_complete(request, zend, parent))
             for field, value in (("auth_context", "authenticated"), ("callback_id", "other-callback")):
                 with self.subTest(field=field):
                     mismatched = {**request, field: value}
-                    self.assertFalse(coordinator._trial_identity_complete(mismatched, zend, parent))
+                    self.assertFalse(coordinator._baseline_identity_complete(mismatched, zend, parent))
 
-    def test_replay_input_trials_are_bounded_and_fail_closed(self):
-        cases = (
-            ("limit", 4, "REPLAY_INPUT_TRIAL_LIMIT_REACHED"),
-            ("no_hint", 1, "TRIAL_INPUT_SET_NOT_VERIFIED"),
-            ("nonprogress", 1, "TRIAL_INPUT_SET_NOT_VERIFIED"),
-            ("deadline", 2, "BUDGET_EXPIRED"),
-            ("parent_exit", 1, "PARENT_WORKER_EXITED_DURING_TRIAL"),
-        )
-        for mode, expected_trials, expected_reason in cases:
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
-                coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [], names=("a",), accepted=("a",))
-                child_config = config_for(parent["seed_item"])
-                child_config["body_params"]["data"].append({"name": "a", "value": "probe"})
-                child_config["body_params"]["fuzz"].append("a")
-                parameter = {
-                    "name": "a", "path": ["a"], "source": "POST", "location": "form",
-                    "helper_depth": 1, "observed_count": 1, "evidence_kind": "zend_runtime",
-                    "fuzzable": True, "plugin_slug": "fixture", "callback_id": "cb-fixture",
-                    "canonical_callback": "fixture_callback", "request_method": "POST",
-                }
-                attempt = {
-                    "attempt_id": "attempt-001", "parent_version": "v0",
-                    "expected_parameters": [dict(parameter)], "trials": [],
-                }
-                coordinator.state["replay_input_trials"].append(attempt)
-                trial_values: list[Any] = []
-
-                def trial_sender(**kwargs):
-                    config = json.loads(Path(kwargs["config_path"]).read_text(encoding="utf-8"))
-                    body = {
-                        str(row["name"]): row.get("value")
-                        for row in config["body_params"]["data"]
-                        if isinstance(row, Mapping) and row.get("name")
-                    }
-                    trial_values.append(body.get("a"))
-                    if mode == "deadline":
-                        coordinator.sleeper(0.6)
-                    if mode == "parent_exit":
-                        return {"status": "parent_stopped", "error": "parent exited"}
-                    request_id = kwargs["request_id"]
-                    run_id = kwargs["run_id"]
-                    comparison = []
-                    if mode in {"limit", "nonprogress", "deadline"}:
-                        comparison_value = body.get("a") if mode == "nonprogress" else f"v{len(trial_values)}"
-                        comparison = [{
-                            "request_id": request_id, "run_id": run_id,
-                            "callback": "fixture_callback", "opcode": "IS_EQUAL",
-                            "source": "POST", "path": ["a"],
-                            "runtime_value": body.get("a"), "comparison_value": comparison_value,
-                        }]
-                    return {
-                        "status": "callback_reached", "callback_reached": True,
-                        "validation_status": "callback_reached",
-                        "request_name": f"{request_id}.json",
-                        "request": {
-                            "request_id": request_id, "legacy_run_id": run_id, "run_id": run_id,
-                            "target_plugin": "fixture", "hook_name": parent["hook_name"],
-                            "callback_id": parent["callback_id"], "auth_context": parent["auth_context"],
-                            "http_method": "POST", "request_params": {"body_params": body},
-                            "response": {"status_code": 200},
-                        },
-                        "zend_name": f"{request_id}.json",
-                        "zend": {
-                            "request_id": request_id, "run_id": run_id,
-                            "request_method": "POST", "comparison_events": comparison,
-                            "events": [], "callback_summaries": [],
-                        },
-                        "timing": {},
-                    }
-
-                coordinator._run_light_sender = trial_sender
-                deadline = 1.0 if mode == "deadline" else None
-                result = coordinator._verify_replay_input_trials(
-                    parent=parent, child_config=child_config, materialized={},
-                    expected_parameters=[parameter], attempt=attempt, deadline=deadline,
-                )
-
-                self.assertIsNone(result)
-                self.assertEqual(len(attempt["trials"]), expected_trials)
-                self.assertEqual(attempt["reason"], expected_reason)
-                self.assertEqual(len(coordinator.state["attempts"]), 0)
-                self.assertEqual(trial_values[0], "probe")
-                self.assertNotIn("cookie", json.dumps(attempt).lower())
-                if mode == "limit":
-                    self.assertEqual(trial_values, ["probe", "v1", "v2", "v3"])
-                if mode == "deadline":
-                    self.assertEqual(coordinator.state["replay_input_last_reason"], "BUDGET_EXPIRED")
-                if mode == "parent_exit":
-                    self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
 
     def test_failed_ajax_probe_keeps_parent_without_confirming_parameter(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5653,27 +4770,6 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual([v["version"] for v in coordinator.state["versions"]], ["v0"])
             self.assertNotIn("run_generated_configs", log)
 
-    def test_pass2_failure_does_not_use_successful_callback_reason(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            coordinator = self.make_coordinator(Path(tmp), [])
-            replay_runner = coordinator.replay_runner
-
-            def reached_callback(*args, **kwargs):
-                report = replay_runner(*args, **kwargs)
-                report["runs"][0]["validation_reason"] = "Expected callback id was found in executed_callbacks"
-                return report
-
-            coordinator.replay_runner = reached_callback
-            coordinator.verify_pass2_fn = lambda *args, **kwargs: {
-                "accepted": int(
-                    args[0].get('legacy_run_id') == 'run-v0'
-                    or "replay-input" in str(args[0].get('legacy_run_id') or '')
-                ),
-                "total": 1,
-            }
-            self.assertNotEqual(coordinator.run(), 0)
-            self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
-            self.assertEqual(coordinator.state["versions"][1]["terminal_reason"], "PASS2_VERIFICATION_FAILED")
 
     def test_cookie_probe_admission_is_opt_in_and_reaches_child_config(self):
         for enabled, admitted in ((False, False), (True, True)):
@@ -5876,19 +4972,17 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertEqual(replay["runner"]["runs"][0]["callback_reached"], replay_passes)
                 self.assertTrue(replay["budget_expired"])
 
-    def test_deadline_spent_verifying_replay_does_not_admit_a_late_gate(self):
+    def test_deadline_spent_verifying_baseline_does_not_admit_a_late_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator = self.make_coordinator(Path(tmp), [])
             coordinator.hard_seconds = coordinator.max_seconds
-            original_verify = coordinator.verify_pass2_fn
-
-            def verify(report, *args, **kwargs):
-                result = original_verify(report, *args, **kwargs)
-                if str(report.get("legacy_run_id", "")).endswith("-v1-replay"):
+            original = coordinator._baseline_identity_complete
+            def verify(request, zend, version):
+                result = original(request, zend, version)
+                if str(version.get("worker_run_id", "")).endswith("-v1-replay"):
                     coordinator.sleeper(3)
                 return result
-
-            coordinator.verify_pass2_fn = verify
+            coordinator._baseline_identity_complete = verify
             coordinator.run()
             child = coordinator.state["versions"][1]
             self.assertFalse(child["replay_result"]["passed"])
@@ -6107,6 +5201,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                         "matched_artifact": "fresh-gate.json", "zend_artifact": "fresh-gate.json",
                         "request_payload": {"request_id": "fresh-gate", "legacy_run_id": run_id,
                             "target_plugin": "fixture", "http_method": "POST",
+                            "hook_name": rows[0]["hook_name"], "callback_id": rows[0]["callback_id"],
+                            "auth_context": next(v["auth_context"] for v in coordinator.state["versions"] if v.get("worker_run_id") == run_id),
                             "response": {"status_code": 200},
                             "request_params": {"body_params": {"action": "fixture", "seed": "base"}}},
                         "zend_payload": {"request_id": "fresh-gate", "run_id": run_id}}]}
@@ -6157,6 +5253,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                         "matched_artifact": "fresh-gate.json", "zend_artifact": "fresh-gate.json",
                         "request_payload": {"request_id": "fresh-gate", "legacy_run_id": run_id,
                             "target_plugin": "fixture", "http_method": "POST",
+                            "hook_name": rows[0]["hook_name"], "callback_id": rows[0]["callback_id"],
+                            "auth_context": next(v["auth_context"] for v in coordinator.state["versions"] if v.get("worker_run_id") == run_id),
                             "response": {"status_code": 200},
                             "request_params": {"body_params": {"action": "fixture", "seed": "base"}}},
                         "zend_payload": {"request_id": "fresh-gate", "run_id": run_id}}]}

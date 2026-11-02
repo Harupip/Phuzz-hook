@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-01-single-callback-baseline-design.md` (approved 2026-11-01).
 
+**Amendment 2026-11-02:** The user requested removal of unused Pass 2 tooling as well. After online-linked callers are migrated, delete the standalone `verify-pass2` CLI, verifier and helpers/tests used only by it. This supersedes the preservation instructions below. Keep strict eligibility checks for historical Pass 2 state; those checks do not execute the verifier. User subsequently requested a local commit with cross-machine retest and Cookie Notice investigation notes; no push.
+
 ## Global Constraints
 
 - No new mode or CLI flag; preserve discovery admission, callback/request/run/plugin/method/auth correlation and transport/fixed selectors.

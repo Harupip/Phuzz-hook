@@ -12,13 +12,11 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from seed_generation.config.config_exporter import export_seed_configs
     from seed_generation.convergence.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, correlate_pass1_artifact, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment, runtime_parameter_is_accepted
-    from instrumentation.zend.rest.runtime import canonical_rest_parameter_name
+    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, correlate_pass1_artifact, normalize_runtime_evidence, prepare_callback_registry, rest_runtime_block_reason, run_enrichment
 else:
     from seed_generation.config.config_exporter import export_seed_configs
     from seed_generation.convergence.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, correlate_pass1_artifact, normalize_runtime_evidence, prepare_callback_registry, resolve_request_transport, rest_runtime_block_reason, run_enrichment, runtime_parameter_is_accepted
-    from instrumentation.zend.rest.runtime import canonical_rest_parameter_name
+    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, correlate_pass1_artifact, normalize_runtime_evidence, prepare_callback_registry, rest_runtime_block_reason, run_enrichment
 
 
 from filesystem_paths import filesystem_path
@@ -131,7 +129,7 @@ def build_enrichment_inputs(
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run offline Zend enrichment for a generated Pass 1 run.")
-    parser.add_argument("--operation", choices=("prepare-registry", "correlate-enrich", "converge-iteration", "verify-pass2", "combine-final", "list-targets"), default="correlate-enrich")
+    parser.add_argument("--operation", choices=("prepare-registry", "correlate-enrich", "converge-iteration", "combine-final", "list-targets"), default="correlate-enrich")
     parser.add_argument("--plugin-zip")
     parser.add_argument("--plugin-slug")
     parser.add_argument("--legacy-run-id")
@@ -145,8 +143,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--merged-suggested-seeds")
     parser.add_argument("--output-config-dir")
     parser.add_argument("--generated-config-summary")
-    parser.add_argument("--pass2-run-summary")
-    parser.add_argument("--pass2-artifacts-dir")
     parser.add_argument("--convergence-state")
     parser.add_argument("--convergence-state-output")
     parser.add_argument("--convergence-merged-seeds")
@@ -167,20 +163,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_json(Path(args.callback_registry_output), registry)
             print(f"Zend callback registry prepared: registrations={len(registry['registrations'])} output={args.callback_registry_output}")
             return 0
-        if args.operation == "verify-pass2":
-            _require(args, "pass2_run_summary", "zend_events_dir", "merged_suggested_seeds")
-            summary = verify_pass2_contract(
-                _read_json(Path(args.pass2_run_summary)),
-                _read_json(Path(args.merged_suggested_seeds)),
-                Path(args.zend_events_dir),
-                pass2_artifacts_dir=Path(args.pass2_artifacts_dir) if args.pass2_artifacts_dir else None,
-                runtime_cookie_probes=args.runtime_cookie_probes,
-            )
-            print(
-                "Zend Pass 2 verification: "
-                f"accepted={summary['accepted']} total={summary['total']}"
-            )
-            return 0 if summary["accepted"] == summary["total"] and summary["total"] > 0 else 1
         if args.operation == "converge-iteration":
             _require(
                 args, "plugin_slug", "legacy_run_id", "registry", "raw_suggested_seeds",
@@ -735,341 +717,6 @@ def _missing_known_parameters(
         if identity is not None and identity not in observed:
             missing.append(dict(parameter))
     return missing
-
-
-def verify_pass2_contract(
-    pass2_run_summary: Mapping[str, Any],
-    merged_seed_report: Mapping[str, Any],
-    zend_events_dir: Path,
-    *,
-    pass2_artifacts_dir: Path | None = None,
-    runtime_cookie_probes: bool = False,
-) -> dict[str, int]:
-    expected = _expected_pass2_params(
-        merged_seed_report, runtime_cookie_probes=runtime_cookie_probes,
-    )
-    legacy_run_id = str(pass2_run_summary.get("legacy_run_id") or "")
-    total = 0
-    accepted = 0
-    for row in pass2_run_summary.get("runs", []):
-        if not isinstance(row, Mapping) or row.get("callback_reached") is not True:
-            continue
-        hook_name = str(row.get("hook_name") or "")
-        callback_id = str(row.get("callback_id") or "")
-        candidates = [
-            (key, value) for key, value in expected.items()
-            if key[:2] == (hook_name, callback_id)
-        ]
-        if not candidates and hook_name == callback_id:
-            candidates = [
-                (key, value) for key, value in expected.items() if key[1] == callback_id
-            ]
-        if not any(value.get("params") and value.get("callback") for _, value in candidates):
-            continue
-        total += 1
-        artifact_name = str(row.get("matched_artifact") or "")
-        if not artifact_name or Path(artifact_name).name != artifact_name:
-            continue
-        zend_path = zend_events_dir / artifact_name
-        uopz_path = pass2_artifacts_dir / artifact_name if pass2_artifacts_dir is not None else None
-        if not filesystem_path(zend_path).is_file():
-            continue
-        try:
-            zend = _read_json(zend_path)
-            uopz = _read_json(uopz_path) if uopz_path is not None and filesystem_path(uopz_path).is_file() else {}
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(zend, Mapping):
-            continue
-        if not isinstance(uopz, Mapping):
-            uopz = {}
-        zend_run_id = str(zend.get("run_id") or "")
-        if legacy_run_id and zend_run_id and zend_run_id != legacy_run_id:
-            continue
-        if str(zend.get("request_id") or "") != Path(artifact_name).stem:
-            continue
-        if uopz and str(uopz.get("request_id") or "") != Path(artifact_name).stem:
-            continue
-        zend_method = str(zend.get("request_method") or zend.get("method") or "").upper()
-        row_method = str(row.get("resolved_method") or "").upper()
-        if zend_method and row_method and zend_method != row_method:
-            continue
-        request_method = str(uopz.get("http_method") or uopz.get("method") or "").upper()
-        methods = {method for method in (row_method, zend_method, request_method) if method}
-        variants = {
-            str(artifact["seed_variant_id"] or "") for artifact in (row, zend, uopz)
-            if artifact.get("seed_variant_id") is not None
-        }
-        # Missing legacy identity fields are safe only when the remaining match is unique.
-        matches = [
-            value for key, value in candidates
-            if (not methods or methods == {key[2]})
-            and (not variants or variants == {key[3]})
-        ]
-        if len(matches) != 1:
-            continue
-        want = matches[0]
-        want_params = want.get("params")
-        canonical_callback = str(want.get("callback") or "")
-        if not want_params or not canonical_callback:
-            continue
-        expected_method = str(want.get("method") or "").upper()
-        if any(method and expected_method and method != expected_method
-               for method in (zend_method, row_method, request_method)):
-            continue
-        observed = _zend_observed_params(
-            zend, uopz, canonical_callback, runtime_cookie_probes=runtime_cookie_probes,
-        ) | _zend_observed_rest_params(
-            zend,
-            uopz,
-            canonical_callback,
-            rest_identity=want.get("rest_identity") if isinstance(want, Mapping) else None,
-        )
-        if _expected_params_observed(want_params, observed):
-            accepted += 1
-    return {"accepted": accepted, "total": total}
-
-
-def _expected_params_observed(
-    want_params: set[tuple[str, str, str]],
-    observed: set[tuple[str, str, str]],
-) -> bool:
-    return all(_expected_param_observed(param, observed) for param in want_params)
-
-
-def _expected_param_observed(
-    param: tuple[str, str, str],
-    observed: set[tuple[str, str, str]],
-) -> bool:
-    if param in observed:
-        return True
-    name, source, location = param
-    if source == "POST" and location == "form":
-        parent = _bracket_parent_name(name)
-        if parent and (parent, source, location) in observed:
-            return True
-    return False
-
-
-def _bracket_parent_name(name: str) -> str:
-    bracket = name.find("[")
-    if bracket <= 0 or not name.endswith("]"):
-        return ""
-    return name[:bracket]
-
-
-def _expected_pass2_params(
-    merged_seed_report: Mapping[str, Any],
-    *,
-    runtime_cookie_probes: bool = False,
-) -> dict[tuple[str, str, str, str], dict[str, Any]]:
-    expected: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-    for item in merged_seed_report.get("suggested_seeds", []):
-        if not isinstance(item, Mapping):
-            continue
-        seed = item.get("seed") if isinstance(item.get("seed"), Mapping) else {}
-        params = {
-            (str(param.get("name")), source, _param_location(param, source))
-            for param in (seed.get("input_params") or [])
-            if isinstance(param, Mapping)
-            and (source := _param_source(param)) in (
-                {"GET", "POST", "JSON", "URL", "COOKIE"}
-                if runtime_cookie_probes
-                else {"GET", "POST", "JSON", "URL"}
-            )
-            and str(param.get("name"))
-        }
-        value = {
-            "callback": str(seed.get("zend_canonical_callback") or ""),
-            "method": str(seed.get("resolved_method") or seed.get("method") or "").upper(),
-            "params": params,
-            "rest_identity": _expected_rest_identity(item, seed),
-        }
-        callback_id = str(item.get("callback_id") or "")
-        expected[(
-            str(item.get("hook_name") or ""), callback_id,
-            value["method"], str(seed.get("seed_variant_id") or ""),
-        )] = value
-    return expected
-
-
-def _expected_rest_identity(item: Mapping[str, Any], seed: Mapping[str, Any]) -> dict[str, Any]:
-    entrypoint_type = str(item.get("entrypoint_type") or seed.get("entrypoint_type") or "").lower()
-    if entrypoint_type not in {"rest", "rest_route", "rest_api", "wp_rest", "wp_rest_route"}:
-        return {}
-    return {
-        "namespace": str(item.get("namespace") or ""),
-        "route_pattern": str(item.get("route_pattern") or item.get("route") or ""),
-        "endpoint_definition_index": item.get("endpoint_definition_index"),
-        "materialized_route": str(item.get("materialized_route") or seed.get("path") or item.get("route") or ""),
-        "method": str(seed.get("resolved_method") or seed.get("method") or "").upper(),
-    }
-
-
-def _zend_observed_params(
-    zend: Mapping[str, Any],
-    uopz: Mapping[str, Any],
-    canonical_callback: str,
-    *,
-    runtime_cookie_probes: bool = False,
-) -> set[tuple[str, str, str]]:
-    summaries = zend.get("callback_summaries")
-    if not isinstance(summaries, list):
-        return set()
-    matched = [
-        summary for summary in summaries
-        if isinstance(summary, Mapping) and str(summary.get("callback") or "") == canonical_callback
-    ]
-    if len(matched) != 1:
-        return set()
-    params = matched[0].get("unique_parameters")
-    if not isinstance(params, list):
-        return set()
-    observed: set[tuple[str, str, str]] = set()
-    for param in params:
-        if not isinstance(param, Mapping):
-            continue
-        source = str(param.get("source") or "").upper()
-        path = param.get("path")
-        try:
-            helper_depth = int(param.get("helper_depth"))
-            observed_count = int(param.get("observed_count"))
-        except (TypeError, ValueError):
-            continue
-        if (
-            not isinstance(path, list)
-            or len(path) != 1
-            or not isinstance(path[0], str)
-            or observed_count < 1
-        ):
-            continue
-        if not runtime_parameter_is_accepted(
-            param,
-            uopz,
-            zend,
-            canonical_callback=canonical_callback,
-            request_method=str(zend.get("request_method") or zend.get("method") or ""),
-            runtime_cookie_probes=runtime_cookie_probes,
-        ):
-            continue
-        location = {"GET": "query", "POST": "form", "COOKIE": "cookie"}.get(source)
-        if source == "REQUEST":
-            request_params = uopz.get("request_params") if isinstance(uopz.get("request_params"), Mapping) else {}
-            request_headers = uopz.get("headers")
-            if not isinstance(request_headers, Mapping):
-                request_headers = request_params.get("headers")
-            request_headers = dict(request_headers) if isinstance(request_headers, Mapping) else {}
-            content_type = uopz.get("content_type") or uopz.get("request_content_type")
-            if not content_type:
-                content_type = request_params.get("content_type")
-            if content_type and not any(str(key).lower() == "content-type" for key in request_headers):
-                request_headers["Content-Type"] = content_type
-            resolved = resolve_request_transport(
-                path[0],
-                request_method=str(zend.get("request_method") or zend.get("method") or ""),
-                request_params=request_params,
-                headers=request_headers,
-            )
-            if resolved is None:
-                continue
-            source, location = resolved
-        elif source not in {"GET", "POST", "COOKIE"}:
-            continue
-        observed.add((path[0], source, location))
-    return observed
-
-
-def _zend_observed_rest_params(
-    zend: Mapping[str, Any],
-    uopz: Mapping[str, Any],
-    canonical_callback: str,
-    *,
-    rest_identity: Any = None,
-) -> set[tuple[str, str, str]]:
-    events = zend.get("rest_parameter_events")
-    if not isinstance(events, list):
-        return set()
-    request_params = uopz.get("request_params") if isinstance(uopz.get("request_params"), Mapping) else {}
-    json_params = request_params.get("json_params") if isinstance(request_params, Mapping) else None
-    body_params = request_params.get("body_params") if isinstance(request_params, Mapping) else None
-    observed: set[tuple[str, str, str]] = set()
-    seen_locations: dict[str, set[str]] = {}
-    bucket_locations = {"GET": "query", "POST": "form", "JSON": "json", "URL": "path"}
-    for event in events:
-        if not isinstance(event, Mapping) or str(event.get("callback") or "") != canonical_callback:
-            continue
-        if not _rest_runtime_identity_matches(event, uopz, rest_identity):
-            continue
-        if event.get("source") == "REST":
-            bucket = str(event.get("bucket") or "").upper()
-            name = canonical_rest_parameter_name(bucket, event.get("path"), event.get("parameter"))
-            location = bucket_locations.get(bucket, "")
-        else:
-            name = event.get("name")
-            location = str(event.get("location") or "")
-        try:
-            observed_count = int(event.get("observed_count") or 0)
-        except (TypeError, ValueError):
-            continue
-        if (
-            not isinstance(name, str)
-            or not name
-            or location not in {"query", "form", "json", "path"}
-            or observed_count < 1
-            or _security_name(name)
-        ):
-            continue
-        if location == "json" and isinstance(json_params, Mapping) and name not in json_params:
-            continue
-        if location == "form" and isinstance(body_params, Mapping) and name not in body_params:
-            continue
-        seen_locations.setdefault(name, set()).add(location)
-        source = {"query": "GET", "form": "POST", "json": "JSON", "path": "URL"}[location]
-        observed.add((name, source, location))
-    if any(len(locations) != 1 for locations in seen_locations.values()):
-        return set()
-    return observed
-
-
-def _rest_runtime_identity_matches(event: Mapping[str, Any], uopz: Mapping[str, Any], rest_identity: Any) -> bool:
-    if not isinstance(rest_identity, Mapping) or not rest_identity:
-        return True
-    comparable = {
-        key: value
-        for key, value in rest_identity.items()
-        if event.get(key) not in (None, "")
-    }
-    if comparable:
-        return all(event.get(key) == value for key, value in comparable.items())
-    route = str(rest_identity.get("materialized_route") or "")
-    if route.startswith("/wp-json/"):
-        route = route[len("/wp-json") :]
-    endpoint = str(uopz.get("endpoint") or "")
-    if route and endpoint and endpoint != "REST:" + route:
-        return False
-    method = str(rest_identity.get("method") or "").upper()
-    uopz_method = str(uopz.get("http_method") or uopz.get("method") or uopz.get("request_method") or "").upper()
-    return not (method and uopz_method and method != uopz_method)
-
-
-def _param_source(param: Mapping[str, Any]) -> str:
-    source = str(param.get("source") or "").upper()
-    if source:
-        return source
-    location = str(param.get("location") or "")
-    return {
-        "query": "GET", "form": "POST", "body": "POST", "json": "JSON",
-        "path": "URL", "cookie": "COOKIE",
-    }.get(location, "")
-
-
-def _param_location(param: Mapping[str, Any], source: str) -> str:
-    location = str(param.get("location") or "")
-    if location in {"query", "form", "json", "path", "cookie"}:
-        return location
-    return {
-        "GET": "query", "POST": "form", "JSON": "json", "URL": "path", "COOKIE": "cookie",
-    }.get(source, "")
 
 
 def _runtime_candidate_diagnostics(
