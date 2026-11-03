@@ -1259,6 +1259,32 @@ class OnlineLinkedCoordinator:
         if result.get("_pending_group_dispatch") is not True:
             self._reconcile_pending_runtime_candidates(parent, evidence, result)
         branch_failure = result.get("status") == "REPLAY_FAILED" or bool(result.get("missing_parameters"))
+        if branch_failure and not result.get("runtime_block_reason") and _is_ajax(parent):
+            # AJAX keeps the accumulated set: a known field this request did not
+            # touch only describes its path (also for results saved before).
+            observed = list({
+                _parameter_key(parameter): dict(parameter)
+                for parameter in [*(result.get("observed_parameters") or []), *(result.get("new_parameters") or [])]
+                if isinstance(parameter, Mapping) and parameter.get("fuzzable") is True
+            }.values())
+            base = [
+                dict(parameter) for parameter in (result.get("known_parameters") or parent.get("known_parameters") or [])
+                if isinstance(parameter, Mapping)
+            ]
+            base_keys = {_parameter_key(parameter) for parameter in base}
+            new = [
+                dict(parameter) for parameter in (result.get("new_parameters") or [])
+                if isinstance(parameter, Mapping) and parameter.get("fuzzable") is True
+            ] or [parameter for parameter in observed if _parameter_key(parameter) not in base_keys]
+            result = {
+                **result,
+                "status": "CONTINUE",
+                "new_parameters": new,
+                "known_parameters": list({_parameter_key(p): p for p in [*base, *observed]}.values()),
+                "unobserved_known_parameters": list(result.get("missing_parameters") or []),
+                "missing_parameters": [],
+            }
+            branch_failure = False
         if branch_failure or result.get("runtime_block_reason"):
             self._record_event({
                 "kind": "RUNTIME_OBSERVATION", "status": "REJECTED",
@@ -1378,14 +1404,24 @@ class OnlineLinkedCoordinator:
             "callback_id": parent["callback_id"],
             "resolved_method": parent["resolved_method"],
             "request_id": result.get("request_id") or evidence.get("request_id"),
+            "evidence_run_id": str(evidence.get("worker_run_id") or evidence.get("run_id") or parent["worker_run_id"]),
             "parameters": [dict(parameter) for parameter in new_parameters],
         }
-        discovery = self._record_event(discovery)
+        if result.get("unobserved_known_parameters"):
+            discovery["unobserved_known_parameters"] = [
+                self._safe_parameter_identity(parameter) for parameter in result["unobserved_known_parameters"]
+                if isinstance(parameter, Mapping)
+            ]
         proposed_parameters = [
             self._inherit_callback_identity(parameter, parent)
             if isinstance(parameter, Mapping) else parameter
             for parameter in (result.get("known_parameters") or [])
         ]
+        carried = self._failed_batch_parameters(admission_parent, proposed_parameters) if _is_ajax(parent) else []
+        if carried:
+            proposed_parameters = [*carried, *proposed_parameters]
+            discovery["carried_parameters"] = [self._safe_parameter_identity(parameter) for parameter in carried]
+        discovery = self._record_event(discovery)
         # Reserve one baseline send and one sender-sized handoff allowance.
         if deadline is not None and deadline - self.clock() < 2 * self._sender_seconds:
             self._retain_pending_runtime_candidates([
@@ -1488,6 +1524,35 @@ class OnlineLinkedCoordinator:
         self._write_state()
         return child
 
+
+    def _failed_batch_parameters(
+        self, parent: Mapping[str, Any], proposed: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return fields of children whose baseline did not pass in this callback/method context.
+
+        The parent keeps fuzzing after such a failure, so without this the next
+        update would drop that batch instead of replaying it in the union.
+        """
+        method = str(parent.get("resolved_method") or "").upper()
+        seen = {_parameter_key(parameter) for parameter in proposed if isinstance(parameter, Mapping)}
+        carried: list[dict[str, Any]] = []
+        for version in self.state.get("versions", []):
+            if (
+                not isinstance(version, Mapping) or version.get("version") == "v0"
+                or (version.get("replay_result") or {}).get("passed") is True
+                or str(version.get("callback_id") or "") != str(parent.get("callback_id") or "")
+                or str(version.get("resolved_method") or "").upper() != method
+            ):
+                continue
+            for parameter in version.get("known_parameters") or []:
+                if (
+                    isinstance(parameter, Mapping)
+                    and _parameter_key(parameter) not in seen
+                    and str(parameter.get("request_method") or method).upper() == method
+                ):
+                    seen.add(_parameter_key(parameter))
+                    carried.append(dict(parameter))
+        return carried
 
     @staticmethod
     def _safe_parameter_identity(parameter: Mapping[str, Any]) -> dict[str, str]:
@@ -1945,10 +2010,11 @@ class OnlineLinkedCoordinator:
             self._inherit_callback_identity(item, parent) for item in convergence.get("new_parameters", [])
             if isinstance(item, Mapping)
         ] if isinstance(convergence.get("new_parameters"), list) else []
-        accepted_keys: set[tuple[str, str, str]] = set()
+        # Keyed by method too: a proof in one method context never covers another.
+        accepted_keys: set[tuple[str, tuple[str, str, str]]] = set()
         accepted_records: list[dict[str, Any]] = []
         for parameter in accepted:
-            key = _parameter_key(parameter)
+            key = _method_parameter_key(parameter)
             if key in accepted_keys:
                 continue
             accepted_keys.add(key)
@@ -1975,6 +2041,19 @@ class OnlineLinkedCoordinator:
                     deferred = [dict(item["candidate"]) for item in queue[index:]]
                     break
             index += 1
+            if candidate.get("method_probe") is not True and _method_parameter_key(
+                candidate, str(candidate.get("probe_method") or parent.get("resolved_method") or ""),
+            ) in accepted_keys:
+                # A saved per-field probe whose field an earlier trace already proved.
+                self.state["pending_probe_queue"] = [row for row in self.state.get("pending_probe_queue", [])
+                    if not (row.get("parent_version") == parent["version"] and
+                            row.get("candidate") == candidate and row.get("evidence") == candidate_evidence)]
+                self._record_event({
+                    "kind": "PARAMETER_PROBE", "status": "SKIPPED", "reason": "ADMITTED_FROM_TRACE",
+                    "version": parent["version"], "request_id": candidate.get("request_id"),
+                    "candidate": dict(candidate),
+                })
+                continue
             outcome = self._run_pending_probe_once(
                 parent=parent, evidence=candidate_evidence, raw_report=raw_report,
                 convergence=candidate_convergence, probe=candidate,
@@ -2012,15 +2091,21 @@ class OnlineLinkedCoordinator:
             probe_evidence = outcome.get("evidence")
             if not isinstance(parameter, Mapping) or not isinstance(probe_evidence, Mapping):
                 continue
-            parameter_key = _parameter_key(parameter)
-            if parameter_key in accepted_keys:
-                continue
-            accepted_keys.add(parameter_key)
-            accepted_records.append({
-                "parameter": dict(parameter),
-                "evidence": probe_evidence,
-                "result": outcome.get("result") if isinstance(outcome.get("result"), Mapping) else {},
-            })
+            trace_parameters = outcome.get("parameters")
+            if not isinstance(trace_parameters, list) or not trace_parameters:
+                trace_parameters = [parameter]
+            for trace_parameter in trace_parameters:
+                if not isinstance(trace_parameter, Mapping):
+                    continue
+                parameter_key = _method_parameter_key(trace_parameter)
+                if parameter_key in accepted_keys:
+                    continue
+                accepted_keys.add(parameter_key)
+                accepted_records.append({
+                    "parameter": dict(trace_parameter),
+                    "evidence": probe_evidence,
+                    "result": outcome.get("result") if isinstance(outcome.get("result"), Mapping) else {},
+                })
             probe_result = outcome.get("result")
             next_probes = probe_result.get("pending_probes") if isinstance(probe_result, Mapping) else None
             if isinstance(next_probes, list):
@@ -2414,9 +2499,17 @@ class OnlineLinkedCoordinator:
         matching = [
             parameter for parameter in all_probe_parameters
             if isinstance(parameter, Mapping)
-            and (probe.get("method_probe") is True or _parameter_key(parameter) == target_key)
+            # A method probe proves POST only through a POST field, never GET reads.
+            and (_parameter_key(parameter) == target_key if probe.get("method_probe") is not True
+                 else str(parameter.get("source") or "").upper() == "POST")
             and parameter.get("fuzzable") is True
         ]
+        # The probe's target decides success; once it holds, every other
+        # admitted access in the same AJAX trace joins the same proposal.
+        trace_parameters = list({
+            _parameter_key(parameter): parameter for parameter in all_probe_parameters
+            if isinstance(parameter, Mapping) and parameter.get("fuzzable") is True
+        }.values()) if matching and _is_ajax(parent) else matching
         pending_matching = [
             parameter for parameter in all_probe_parameters
             if isinstance(parameter, Mapping)
@@ -2439,15 +2532,26 @@ class OnlineLinkedCoordinator:
                 parent, evidence, attempt, "PROBE_TARGET_MISMATCH", deadline,
                 extra={"unexpected_parameters": unexpected},
             )
-        parameter = self._inherit_callback_identity(matching[0], parent)
-        if not self._probe_admission_complete(parameter, probe_evidence, probe_parent):
+        matching_keys = {_parameter_key(parameter) for parameter in matching}
+        admitted: list[dict[str, Any]] = []
+        for candidate_parameter in trace_parameters:
+            normalized = self._inherit_callback_identity(candidate_parameter, parent)
+            if self._probe_admission_complete(normalized, probe_evidence, probe_parent):
+                admitted.append(normalized)
+        if not any(_parameter_key(parameter) in matching_keys for parameter in admitted):
             return self._finish_probe_failure(
                 parent, evidence, attempt, "PROBE_PROVENANCE_INCOMPLETE", deadline,
                 extra={"unexpected_parameters": unexpected},
             )
-        # Credit the verified read before checkpointing or queuing more guards.
-        key = json.dumps([parent.get("callback_id"), _parameter_key(parameter)])
-        self._extend_progress_budget("verified_parameter", key)
+        unexpected = [
+            parameter for parameter in unexpected
+            if _parameter_key(parameter) not in {_parameter_key(item) for item in admitted}
+        ]
+        parameter = next(item for item in admitted if _parameter_key(item) in matching_keys)
+        # Credit the verified reads before checkpointing or queuing more guards.
+        for item in admitted:
+            key = json.dumps([parent.get("callback_id"), _parameter_key(item)])
+            self._extend_progress_budget("verified_parameter", key)
         if method_transition:
             probe_result = dict(probe_result)
             # Materialize the request just replayed, never its prospective probes.
@@ -2464,6 +2568,7 @@ class OnlineLinkedCoordinator:
             "version": parent["version"], "worker_run_id": probe_run_id,
             "request_id": probe_evidence["request_id"], "probe_id": probe_id,
             "hook_name": probe_row["hook_name"], "candidate": dict(probe), "parameter": dict(parameter),
+            "parameters": [dict(item) for item in admitted],
             "timing": timing,
             "evidence_origin": attempt.get("evidence_origin"),
             "remaining_budget_seconds": attempt.get("remaining_budget_seconds"),
@@ -2473,6 +2578,7 @@ class OnlineLinkedCoordinator:
         return {
             "status": "accepted",
             "parameter": dict(parameter),
+            "parameters": [dict(item) for item in admitted],
             "evidence": probe_evidence,
             "result": probe_result,
         }
@@ -3534,8 +3640,20 @@ class OnlineLinkedCoordinator:
                 request_method=str(parent.get("resolved_method") or ""),
                 operations=operations,
                 runtime_cookie_probes=self.runtime_cookie_probes,
+                accept_absent_key=_is_ajax(parent),
             )
         )
+
+
+def _method_parameter_key(parameter: Mapping[str, Any], method: str = "") -> tuple[str, tuple[str, str, str]]:
+    return (str(method or parameter.get("request_method") or "").upper(), _parameter_key(parameter))
+
+
+def _is_ajax(parent: Mapping[str, Any]) -> bool:
+    return (
+        str(parent.get("entrypoint_type") or "").startswith("ajax")
+        or str(parent.get("hook_name") or "").startswith("wp_ajax_")
+    )
 
 
 def _canonical_callback_name(value: Any) -> str:

@@ -362,10 +362,33 @@ def converge_iteration(
         raise ValueError("convergence state known_parameters must be a list")
     advanced = advance_convergence_state(prior, observed)
     missing = _missing_known_parameters(prior, observed)
+    unobserved: list[dict[str, Any]] = []
+    if candidate.get("entrypoint_type") == "ajax":
+        # AJAX keeps the union: a known field this trace did not touch only
+        # describes the path taken, so it is reported but never dropped.
+        unobserved, missing = missing, []
     pending_candidates = [
         dict(parameter) for parameter in observed
         if isinstance(parameter, Mapping) and parameter.get("candidate_status") == "pending_probe"
+        # A $_POST read under a JSON request stays reported only: a probe child
+        # would still inherit the JSON seed and never reach $_POST.
+        and parameter.get("candidate_reason") != "form_transport_required"
     ]
+    transition_candidates = [
+        parameter for parameter in pending_candidates
+        if parameter.get("candidate_reason") == "method_transition_required"
+    ]
+    if transition_candidates:
+        # One POST request reveals every POST access; probing per field would
+        # only repeat the same method transition.
+        pending_candidates = [
+            parameter for parameter in pending_candidates if parameter not in transition_candidates
+        ] + [{
+            "name": "", "source": "POST", "location": "form", "method_probe": True,
+            "request_method": "GET", "request_id": request_id, "run_id": legacy_run_id,
+            "plugin_slug": plugin_slug, "callback_id": candidate.get("callback_id"),
+            "canonical_callback": canonical_callback,
+        }]
     probe_parameter_names = (
         _rest_get_param_probe_names(candidate, uopz)
         if not prior and not observed and not runtime_block_reason
@@ -455,6 +478,7 @@ def converge_iteration(
         ),
         "new_parameters": advanced["new_parameters"],
         "missing_parameters": missing,
+        "unobserved_known_parameters": unobserved,
         "known_parameters": advanced["known_parameters"],
         "merged_suggested_seeds": merged,
     }

@@ -223,13 +223,185 @@ class ZendDiscoveryTests(unittest.TestCase):
                         next_guard = {"source": "POST", "path": ["cn_param"], "helper_depth": 0,
                                       "observed_count": 1, "access_forms": ["isset"]}
                         result = replay(action_probe, "POST", [guard, next_guard])
-                        self.assertEqual([row["name"] for row in result["pending_probes"]], ["cn_param"])
-                        next_seed = result["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]
-                        self.assertEqual(next_seed["body"], {"action": "demo_fetch_items", "cn_param": "probe"})
+                        # The POST trace itself proves the absent guard; no per-field probe.
+                        self.assertEqual(result["pending_probes"], [])
+                        self.assertEqual([row["name"] for row in result["new_parameters"]], ["cn_param"])
                         self.assertNotIn("action", [row["name"] for row in result["observed_parameters"]])
             known = copy.deepcopy(raw)
             known["seed"]["method_source"] = "runtime_observed"
             self.assertEqual(replay(known, "GET", [])["pending_probes"], [])
+
+    def _batch_trace(self, *, request_method: str = "POST", zend_updates: dict | None = None) -> tuple[dict, dict, dict]:
+        raw = self.raw_seed_item()
+        raw["seed"].update({
+            "method": request_method, "resolved_method": request_method,
+            "body": {"cn_network": "1"} if request_method == "POST" else {},
+            "query_params": {"action": "demo_fetch_items"},
+            "fixed_params": ["action"],
+        })
+        request = self.pass1_artifact_for_raw(raw)
+        request["request_params"] = {
+            "query_params": raw["seed"]["query_params"], "body_params": raw["seed"]["body"],
+        }
+        rows = [
+            ("POST", "nonce", 0, "read", "Demo::fetch", True),
+            ("POST", "notice_action", 0, "empty", "Demo::fetch", True),
+            ("POST", "cn_network", 0, "isset", "Demo::fetch", True),
+            ("POST", "cn_network", 0, "read", "Demo::fetch", True),
+            ("GET", "cn_network", 0, "isset", "Demo::fetch", True),
+            ("POST", "save_cookie_notice_options", 3, "isset", "Demo::fetch", True),
+            ("POST", "reset_cookie_notice_options", 3, "isset", "Demo::fetch", True),
+            ("POST", "other_callback_field", 0, "isset", "Other::callback", True),
+            ("POST", "unattributed_field", 2, "isset", "Demo::fetch", False),
+        ]
+        zend = self.zend_artifact_for_raw(raw)
+        zend["request_method"] = request_method
+        zend["callback_summaries"][0]["unique_parameters"] = [
+            {"source": source, "path": [name], "helper_depth": depth, "observed_count": 1, "access_forms": [operation]}
+            for source, name, depth, operation, _callback, _attributed in rows
+        ]
+        zend["events"] = [
+            {"source": source, "path": [name], "operation": operation,
+             "callback_context": {"attributed": attributed, "root_callback": callback, "depth": depth}}
+            for source, name, depth, operation, callback, attributed in rows
+        ]
+        zend.update(zend_updates or {})
+        return raw, request, zend
+
+    def _converge_trace(self, raw: dict, request: dict, zend: dict, known: list | None = None) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            request_dir, zend_dir = Path(tmp) / "request", Path(tmp) / "zend"
+            request_dir.mkdir()
+            zend_dir.mkdir()
+            name = f"{request['request_id']}.json"
+            (request_dir / name).write_text(json.dumps(request), encoding="utf-8")
+            (zend_dir / name).write_text(json.dumps(zend), encoding="utf-8")
+            return converge_iteration(
+                raw_report={"suggested_seeds": [raw]},
+                pass_run_summary={"runs": [{
+                    "hook_name": raw["hook_name"], "callback_id": raw["callback_id"],
+                    "seed_variant_id": raw["seed"].get("seed_variant_id", ""),
+                    "callback_reached": True, "matched_artifact": name,
+                }]}, pass_artifacts_dir=request_dir, zend_events_dir=zend_dir,
+                registry={"schema_version": 1, "callback_map": {raw["callback_id"]: "Demo::fetch"}},
+                plugin_slug="demo-plugin", legacy_run_id="legacy-1",
+                known_state={"known_parameters": known or []},
+            )
+
+    def test_ajax_trace_adds_every_attributed_read_isset_and_empty_in_one_convergence(self) -> None:
+        # One trace is one update: guards on absent keys are fuzz targets too,
+        # so a callback with N inputs must not need N probes and N versions.
+        raw, request, zend = self._batch_trace()
+        result = self._converge_trace(raw, request, zend)
+
+        expected = {
+            ("POST", "nonce"), ("POST", "notice_action"), ("POST", "cn_network"), ("GET", "cn_network"),
+            ("POST", "save_cookie_notice_options"), ("POST", "reset_cookie_notice_options"),
+        }
+        self.assertEqual({(row["source"], row["name"]) for row in result["new_parameters"]}, expected)
+        self.assertEqual({(row["source"], row["name"]) for row in result["known_parameters"]}, expected)
+        self.assertTrue(all(row["fuzzable"] for row in result["new_parameters"]))
+        self.assertEqual(result["pending_probes"], [])
+        self.assertEqual(result["status"], "CONTINUE")
+        self.assertEqual(len(result["merged_suggested_seeds"]["suggested_seeds"]), 1)
+
+        final = materialize_convergence_seeds(
+            {"suggested_seeds": [raw]}, plugin_slug="demo-plugin",
+            candidate_key=result["candidate_key"], known_parameters=result["known_parameters"],
+        )["suggested_seeds"]
+        self.assertEqual(len(final), 1)
+        seed = final[0]["seed"]
+        self.assertEqual(seed["query_params"], {"action": "demo_fetch_items", "cn_network": "FUZZ"})
+        self.assertIn("action", seed["fixed_params"])
+        self.assertEqual(
+            {name for name, value in seed["body"].items() if value == "FUZZ"},
+            {"nonce", "notice_action", "cn_network", "save_cookie_notice_options", "reset_cookie_notice_options"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = export_seed_configs(
+                {"suggested_seeds": final}, output_config_dir=Path(tmp) / "configs",
+                summary_path=Path(tmp) / "summary.json",
+            )
+            config = json.loads(Path(summary["generated"][0]["config_path"]).read_text(encoding="utf-8"))
+        self.assertIn("nonce", config["body_params"]["fixed"])
+        self.assertIn("action", config["query_params"]["fixed"])
+        self.assertEqual(config["query_params"]["fuzz"], ["cn_network"])
+        self.assertEqual(set(config["body_params"]["fuzz"]), {
+            "notice_action", "cn_network", "save_cookie_notice_options", "reset_cookie_notice_options",
+        })
+
+    def test_ajax_absent_key_guard_still_requires_exact_correlation(self) -> None:
+        # Accepting absent keys widens what counts as input, so every provenance
+        # check must still reject evidence from another request, run or method.
+        for label, raw_update, zend_update in (
+            ("request_id", {}, {"request_id": "other-request"}),
+            ("run_id", {}, {"run_id": "other-run"}),
+            ("method", {}, {"request_method": "GET"}),
+            ("plugin", {"target_plugin": "other-plugin"}, {}),
+        ):
+            with self.subTest(label=label):
+                raw, request, zend = self._batch_trace(zend_updates=zend_update)
+                request.update(raw_update)
+                candidate = candidate_from_seed_item(raw, plugin_slug="demo-plugin", legacy_run_id="legacy-1")
+                registry = {"schema_version": 1, "callback_map": {raw["callback_id"]: "Demo::fetch"}}
+                self.assertEqual(normalize_runtime_evidence(candidate, request, zend, registry), [])
+
+    def test_ajax_json_request_never_admits_absent_post_field(self) -> None:
+        # PHP leaves $_POST empty for a JSON body, so a config built from this
+        # trace would send the field where isset($_POST[...]) can never see it.
+        raw, request, zend = self._batch_trace()
+        request.pop("content_type")
+        request["request_params"]["headers"] = {"Content-Type": "application/json"}
+        request["request_params"]["body_params"] = {}
+
+        result = self._converge_trace(raw, request, zend)
+
+        self.assertEqual({(row["source"], row["name"]) for row in result["new_parameters"]}, {("GET", "cn_network")})
+        rejected = {row["name"]: row for row in result["observed_parameters"] if row["source"] == "POST"}
+        self.assertTrue(rejected)
+        self.assertTrue(all(row["fuzzable"] is False for row in rejected.values()))
+        self.assertEqual({row["candidate_reason"] for row in rejected.values()}, {"form_transport_required"})
+        self.assertEqual(result["pending_probes"], [])
+
+    def test_ajax_get_trace_with_post_guards_needs_one_method_probe_not_one_per_field(self) -> None:
+        raw, request, zend = self._batch_trace(request_method="GET")
+        raw["seed"].update({"method_source": "bootstrap_probe", "method_confidence": "bootstrap_probe"})
+        request = self.pass1_artifact_for_raw(raw)
+        request["request_params"] = {"query_params": raw["seed"]["query_params"], "body_params": {}}
+
+        result = self._converge_trace(raw, request, zend)
+
+        self.assertEqual({(row["source"], row["name"]) for row in result["new_parameters"]}, {("GET", "cn_network")})
+        self.assertEqual(len(result["pending_probes"]), 1)
+        self.assertTrue(result["pending_probes"][0]["method_probe"])
+        self.assertEqual(result["pending_probes"][0]["probe_method"], "POST")
+        post = result["merged_suggested_seeds"]["suggested_seeds"]
+        self.assertEqual(len(post), 1)
+        self.assertEqual(post[0]["seed"]["method"], "POST")
+        self.assertEqual(post[0]["seed"]["method_transition"], {"from": "GET", "to": "POST"})
+
+    def test_ajax_trace_touching_subset_keeps_accumulated_parameters(self) -> None:
+        raw, request, zend = self._batch_trace()
+        first = self._converge_trace(raw, request, zend)
+        zend["callback_summaries"][0]["unique_parameters"] = [
+            row for row in zend["callback_summaries"][0]["unique_parameters"] if row["path"] == ["notice_action"]
+        ] + [{"source": "POST", "path": ["param"], "helper_depth": 0, "observed_count": 1, "access_forms": ["read"]}]
+        zend["events"].append({"source": "POST", "path": ["param"], "operation": "read",
+                               "callback_context": {"attributed": True, "root_callback": "Demo::fetch", "depth": 0}})
+
+        second = self._converge_trace(raw, request, zend, first["known_parameters"])
+
+        self.assertEqual([row["name"] for row in second["new_parameters"]], ["param"])
+        self.assertEqual(
+            {(row["source"], row["name"]) for row in second["known_parameters"]},
+            {(row["source"], row["name"]) for row in first["known_parameters"]} | {("POST", "param")},
+        )
+        self.assertEqual(second["status"], "CONTINUE")
+        self.assertEqual(second["missing_parameters"], [])
+        self.assertIn("save_cookie_notice_options", {row["name"] for row in second["unobserved_known_parameters"]})
+        repeat = self._converge_trace(raw, request, zend, second["known_parameters"])
+        self.assertEqual(repeat["new_parameters"], [])
+        self.assertEqual(repeat["status"], "CONVERGED")
 
     def test_fresh_docker_fixture_records_direct_nested_and_local_reads(self) -> None:
         docker = shutil.which("docker")
@@ -378,13 +550,14 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertEqual(row["canonical_callback"], "Demo::fetch")
             self.assertEqual(row["request_method"], "POST")
 
-    def test_helper_isset_is_retained_as_candidate_without_becoming_fuzzable(self) -> None:
+    def test_helper_isset_on_absent_ajax_key_is_fuzzable(self) -> None:
         candidate = self.pass1_candidate()
         uopz = self.pass1_artifact(
             candidate,
             request_params={
                 "query_params": {},
                 "body_params": {"action": "demo_fetch_items"},
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
             },
         )
         registry = {"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}}
@@ -413,9 +586,9 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(evidence), 1)
         self.assertEqual(evidence[0]["name"], "filter_tag")
         self.assertEqual(evidence[0]["helper_depth"], 5)
-        self.assertFalse(evidence[0]["fuzzable"])
-        self.assertEqual(evidence[0]["candidate_status"], "pending_probe")
-        self.assertEqual(evidence[0]["candidate_reason"], "guard_without_correlated_read")
+        self.assertTrue(evidence[0]["fuzzable"])
+        self.assertNotIn("candidate_status", evidence[0])
+        self.assertEqual(evidence[0]["access_forms"], ["isset"])
 
     def test_isset_with_correlated_request_key_is_admitted_for_fuzzing(self) -> None:
         candidate = self.pass1_candidate()
@@ -453,13 +626,14 @@ class ZendDiscoveryTests(unittest.TestCase):
         self.assertTrue(evidence[0]["fuzzable"])
         self.assertNotIn("candidate_status", evidence[0])
 
-    def test_helper_empty_is_retained_as_candidate_without_becoming_fuzzable(self) -> None:
+    def test_empty_on_absent_ajax_key_is_fuzzable(self) -> None:
         candidate = self.pass1_candidate()
         uopz = self.pass1_artifact(
             candidate,
             request_params={
                 "query_params": {},
                 "body_params": {"action": "demo_fetch_items"},
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
             },
         )
         registry = {"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}}
@@ -487,9 +661,9 @@ class ZendDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(len(evidence), 1)
         self.assertEqual(evidence[0]["name"], "user")
-        self.assertFalse(evidence[0]["fuzzable"])
-        self.assertEqual(evidence[0]["candidate_status"], "pending_probe")
-        self.assertEqual(evidence[0]["candidate_reason"], "guard_without_correlated_read")
+        self.assertTrue(evidence[0]["fuzzable"])
+        self.assertNotIn("candidate_status", evidence[0])
+        self.assertEqual(evidence[0]["access_forms"], ["empty"])
 
     def test_runtime_candidate_diagnostics_accepts_empty_as_supported_guard(self) -> None:
         count, reasons = _runtime_candidate_diagnostics(
@@ -574,9 +748,11 @@ class ZendDiscoveryTests(unittest.TestCase):
         mismatched["legacy_run_id"] = "other-run"
         self.assertEqual(normalize_runtime_evidence(candidate, mismatched, zend, registry), [])
 
-    def test_helper_candidate_with_same_name_in_get_and_post_keeps_two_probe_locations(self) -> None:
+    def test_helper_candidate_with_same_name_in_get_and_post_keeps_two_locations(self) -> None:
         candidate = self.pass1_candidate()
-        uopz = self.pass1_artifact(candidate, request_params={"body_params": {"action": "demo_fetch_items"}})
+        uopz = self.pass1_artifact(candidate, request_params={
+            "body_params": {"action": "demo_fetch_items"}, "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+        })
         registry = {"schema_version": 1, "callback_map": {"ajax-public": "Demo::fetch"}}
         params = [
             {"source": "GET", "path": ["filter_tag"], "access_forms": ["isset"], "helper_depth": 5, "observed_count": 1},
@@ -597,9 +773,10 @@ class ZendDiscoveryTests(unittest.TestCase):
         evidence = normalize_runtime_evidence(candidate, uopz, zend, registry)
 
         self.assertEqual({(row["source"], row["name"]) for row in evidence}, {("GET", "filter_tag"), ("POST", "filter_tag")})
-        self.assertTrue(all(not row["fuzzable"] for row in evidence))
+        self.assertTrue(all(row["fuzzable"] for row in evidence))
+        self.assertEqual({row["location"] for row in evidence}, {"query", "form"})
 
-    def test_convergence_keeps_helper_candidate_pending_as_ajax_probe(self) -> None:
+    def test_convergence_admits_helper_guard_without_per_field_ajax_probe(self) -> None:
         raw = {
             "plugin_slug": "demo-plugin",
             "hook_name": "wp_ajax_nopriv_demo_fetch_items",
@@ -618,7 +795,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             "canonical_identity_id": canonical_identity_id(candidate), "callback_id": "ajax-public",
             "http_method": "POST", "auth_variant": "unauthenticated",
             "hook_coverage": {"executed_callbacks": {"ajax-public": {"callback_id": "ajax-public"}}},
-            "request_params": {"query_params": {}, "body_params": {"action": "demo_fetch_items"}},
+            "request_params": {"query_params": {}, "body_params": {"action": "demo_fetch_items"}, "headers": {"Content-Type": "application/x-www-form-urlencoded"}},
         }
         zend = {
             "run_id": "legacy-1", "request_id": "request-1", "request_method": "POST",
@@ -666,13 +843,13 @@ class ZendDiscoveryTests(unittest.TestCase):
             )
 
         self.assertEqual(result["status"], "CONTINUE")
-        self.assertEqual(len(result["pending_probes"]), 1)
-        self.assertEqual(result["pending_probes"][0]["source"], "POST")
-        probe_seed = result["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]
-        self.assertTrue(probe_seed["probe_variant"])
-        self.assertEqual(probe_seed["body"]["filter_tag"], "probe")
-        self.assertIn("action", probe_seed["fixed_params"])
-        self.assertIn("filter_tag", probe_seed["fixed_params"])
+        self.assertEqual(result["pending_probes"], [])
+        self.assertEqual(result["new_parameters"][0]["name"], "filter_tag")
+        self.assertEqual(result["new_parameters"][0]["helper_depth"], 5)
+        self.assertTrue(result["new_parameters"][0]["fuzzable"])
+        replay_seed = result["merged_suggested_seeds"]["suggested_seeds"][0]["seed"]
+        self.assertNotIn("probe_variant", replay_seed)
+        self.assertIn("action", replay_seed["fixed_params"])
         self.assertEqual(accepted_result["status"], "CONTINUE")
         self.assertEqual(accepted_result["new_parameters"][0]["helper_depth"], 5)
         self.assertTrue(accepted_result["new_parameters"][0]["fuzzable"])
@@ -3163,8 +3340,11 @@ class ZendDiscoveryTests(unittest.TestCase):
 
             self.assertEqual(first_result["new_parameters"][0]["name"], "guard_value")
             self.assertEqual([row["name"] for row in second_result["observed_parameters"]], ["body_candidate"])
-            self.assertEqual([row["name"] for row in second_result["missing_parameters"]], ["guard_value"])
-            self.assertEqual(second_result["status"], "REPLAY_FAILED")
+            # A read attributed to another callback never proves the target field.
+            self.assertEqual([row["name"] for row in second_result["unobserved_known_parameters"]], ["guard_value"])
+            self.assertEqual(second_result["missing_parameters"], [])
+            self.assertEqual(second_result["status"], "CONTINUE")
+            self.assertEqual({row["name"] for row in second_result["known_parameters"]}, {"guard_value", "body_candidate"})
 
     def test_convergence_iteration_probes_correlated_get_param_names_before_converging(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3782,7 +3962,7 @@ class ZendDiscoveryTests(unittest.TestCase):
             self.assertNotEqual(by_variant["items-index-one-form-id"]["seed"].get("block_reason"), "ambiguous_runtime_probe_location")
             self.assertNotEqual(by_variant["items-get-form-id"]["seed"].get("block_reason"), "ambiguous_runtime_probe_location")
 
-    def test_convergence_iteration_does_not_converge_when_known_parameter_is_missing(self) -> None:
+    def test_ajax_convergence_keeps_known_parameter_missing_from_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             item = self.raw_seed_item()
@@ -3816,8 +3996,10 @@ class ZendDiscoveryTests(unittest.TestCase):
                 plugin_slug="demo-plugin", legacy_run_id="legacy-1", known_state={"known_parameters": known},
             )
 
-            self.assertEqual(result["status"], "REPLAY_FAILED")
-            self.assertEqual([row["name"] for row in result["missing_parameters"]], ["age"])
+            self.assertEqual(result["status"], "CONVERGED")
+            self.assertEqual(result["missing_parameters"], [])
+            self.assertEqual([row["name"] for row in result["unobserved_known_parameters"]], ["age"])
+            self.assertEqual({row["name"] for row in result["known_parameters"]}, {"name", "age"})
 
 
     def test_combine_final_seed_reports_requires_every_target(self) -> None:

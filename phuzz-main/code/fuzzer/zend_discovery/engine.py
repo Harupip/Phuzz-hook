@@ -181,6 +181,20 @@ def _runtime_request_details(uopz_artifact: Mapping[str, Any]) -> tuple[Mapping[
     return request_params, headers
 
 
+def _runtime_request_is_form(
+    uopz_artifact: Mapping[str, Any],
+    request_params: Mapping[str, Any],
+    headers: Mapping[str, Any],
+) -> bool:
+    """PHP fills $_POST only for form bodies; a JSON request leaves it empty."""
+    content_type = next(
+        (value for key, value in headers.items() if str(key).lower() == "content-type"), None,
+    ) or uopz_artifact.get("content_type") or uopz_artifact.get("request_content_type") or request_params.get("content_type")
+    return str(content_type or "").split(";", 1)[0].strip().lower() in {
+        "application/x-www-form-urlencoded", "multipart/form-data",
+    }
+
+
 def runtime_parameter_is_accepted(
     parameter: Mapping[str, Any],
     uopz_artifact: Mapping[str, Any],
@@ -191,8 +205,13 @@ def runtime_parameter_is_accepted(
     operations: set[str] | None = None,
     request_has_key: bool | None = None,
     runtime_cookie_probes: bool = False,
+    accept_absent_key: bool = False,
 ) -> bool:
-    """Require a correlated read/guard access and its key in the matching request bucket."""
+    """Require a correlated read/guard access and its key in the matching request bucket.
+
+    With ``accept_absent_key`` (AJAX), an attributed access on an explicit GET/POST
+    transport is accepted without the key; POST still needs a POST trace.
+    """
     source = str(parameter.get("source") or "").upper()
     path = parameter.get("path")
     try:
@@ -219,8 +238,21 @@ def runtime_parameter_is_accepted(
         )
     if not operations or not operations.intersection(_VALUE_OR_GUARD_OPERATIONS):
         return False
+    request_params, request_headers = _runtime_request_details(uopz_artifact)
+    if accept_absent_key and source != "COOKIE":
+        transport = source
+        if source == "REQUEST":
+            resolved = resolve_request_transport(
+                path[0], request_method=request_method,
+                request_params=request_params, headers=request_headers,
+            )
+            transport = resolved[0] if resolved is not None else ""
+        if transport == "GET" or (
+            transport == "POST" and str(request_method or "").upper() == "POST"
+            and _runtime_request_is_form(uopz_artifact, request_params, request_headers)
+        ):
+            return True
     if request_has_key is None:
-        request_params, request_headers = _runtime_request_details(uopz_artifact)
         request_has_key = _runtime_request_contains(
             path[0],
             source,
@@ -416,8 +448,9 @@ def normalize_runtime_evidence(
             request_params=request_params,
             headers=request_headers,
         )
+        accept_absent_key = identity["entrypoint_type"] == "ajax"
         accepted = runtime_parameter_is_accepted(
-            parameter,
+            {**parameter, "source": source},
             uopz_artifact,
             zend_artifact,
             canonical_callback=canonical_callback,
@@ -425,6 +458,7 @@ def normalize_runtime_evidence(
             operations=operations,
             request_has_key=request_has_key,
             runtime_cookie_probes=runtime_cookie_probes,
+            accept_absent_key=accept_absent_key,
         )
         row = {
             "name": name,
@@ -448,7 +482,11 @@ def normalize_runtime_evidence(
             row.update({
                 "candidate_status": "pending_probe",
                 "candidate_reason": (
-                    "request_key_missing" if "read" in operations and not request_has_key
+                    "method_transition_required"
+                    if accept_absent_key and source == "POST"
+                    and str(zend_method or identity["resolved_method"]).upper() != "POST"
+                    else "form_transport_required" if accept_absent_key and source == "POST"
+                    else "request_key_missing" if "read" in operations and not request_has_key
                     else "guard_without_correlated_read"
                 ),
                 "access_forms": sorted(operations),

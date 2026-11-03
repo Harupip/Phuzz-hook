@@ -415,10 +415,13 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator._extend_progress_budget("verified_parameter", "c"), 115)
 
     def test_get_bootstrap_post_probe_baseline_before_new_worker(self):
-        for method_only, post_action, error_replay in ((False, False, None), (True, False, None),
-                                                        (True, True, None), (False, False, 302),
-                                                        (False, False, 403), (False, False, 500)):
-            with self.subTest(method_only=method_only, post_action=post_action, error_replay=error_replay), tempfile.TemporaryDirectory() as tmp:
+        for method_only, post_action, error_replay, get_only in (
+            (False, False, None, False), (True, False, None, False), (True, True, None, False),
+            (False, False, 302, False), (False, False, 403, False), (False, False, 500, False),
+            (True, False, None, True),
+        ):
+            with self.subTest(method_only=method_only, post_action=post_action, error_replay=error_replay,
+                              get_only=get_only), tempfile.TemporaryDirectory() as tmp:
                 coordinator, parent, _, _ = self.make_probe_context(Path(tmp), [], names=("body_key",))
                 raw = copy.deepcopy(parent["seed_item"])
                 raw["seed"].update({
@@ -466,7 +469,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                         "hook_name": parent["hook_name"], "callback_id": parent["callback_id"],
                         "auth_context": "guest", "auth_variant": "unauthenticated",
                         "canonical_identity_id": canonical_identity_id(candidate),
-                        "request_params": {"query_params": query, "body_params": body},
+                        "request_params": {"query_params": query, "body_params": body, "headers": (
+                            {"Content-Type": "application/x-www-form-urlencoded"} if method == "POST" else {}
+                        )},
                         "hook_coverage": {"executed_callbacks": {parent["callback_id"]: {"callback_id": parent["callback_id"]}}},
                     }
                     zend = {
@@ -479,6 +484,25 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                         "events": [{"source": "POST", "path": ["body_key"], "operation": "read",
                                     "callback_context": {"attributed": True, "root_callback": "fixture_callback", "depth": 0}}],
                     }
+                    if get_only:
+                        # The POST trace touches no POST field; only an absent GET guard.
+                        zend["callback_summaries"][0]["unique_parameters"] = [{
+                            "source": "GET", "path": ["page"], "helper_depth": 0,
+                            "observed_count": 1, "access_forms": ["isset"],
+                        }]
+                        zend["events"] = [{"source": "GET", "path": ["page"], "operation": "isset",
+                                           "callback_context": {"attributed": True, "root_callback": "fixture_callback", "depth": 0}}]
+                    elif method_only:
+                        # Guards on keys the probe never sent, one inside a helper.
+                        for name, depth, operation in (("notice_action", 0, "empty"), ("save_options", 3, "isset")):
+                            zend["callback_summaries"][0]["unique_parameters"].append({
+                                "source": "POST", "path": [name], "helper_depth": depth,
+                                "observed_count": 1, "access_forms": [operation],
+                            })
+                            zend["events"].append({
+                                "source": "POST", "path": [name], "operation": operation,
+                                "callback_context": {"attributed": True, "root_callback": "fixture_callback", "depth": depth},
+                            })
                     if not method_only:
                         zend["callback_summaries"][0]["unique_parameters"].append({
                             "source": "POST", "path": ["not_sent"], "helper_depth": 0,
@@ -513,6 +537,11 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     raw_report=report, convergence={"pending_probes": probes, "merged_suggested_seeds": merged},
                     probe=probes[0], seed=raw, deadline=None,
                 )
+                if get_only:
+                    # GET reads alone never prove that the callback takes POST.
+                    self.assertIsNone(child)
+                    self.assertEqual(len(coordinator.state["versions"]), 1)
+                    continue
                 self.assertIsNotNone(child, coordinator.state)
                 self.assertEqual(child["resolved_method"], "POST")
                 self.assertNotIn("pass2_verification", child["replay_result"])
@@ -535,6 +564,16 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     self.assertIn("not_sent", final["body_params"]["fuzz"])
                 else:
                     self.assertNotIn("not_sent", {row["name"] for row in final["body_params"]["data"]})
+                    # One POST method probe plus one callback baseline, never one per field.
+                    self.assertEqual(len(methods), 2)
+                    self.assertEqual(len(coordinator.state["probe_attempts"]), 1)
+                    self.assertEqual([v["version"] for v in coordinator.state["versions"]], ["v0", "v1"])
+                    self.assertTrue({"body_key", "notice_action", "save_options"} <= set(final["body_params"]["fuzz"]))
+                    discovery = next(event for event in coordinator.state["events"]
+                                     if event.get("kind") == "PARAMETER_DISCOVERY" and event.get("status") == "ACCEPTED")
+                    self.assertEqual({p["name"] for p in discovery["parameters"]},
+                                     {"body_key", "notice_action", "save_options"})
+                    self.assertEqual(discovery["evidence_run_id"], "run-v0-probe-p1")
                 self.assertNotIn("probe_variant", final["metadata"])
                 self.assertTrue(all(actual == expected == "POST" for actual, expected in methods))
 
@@ -3542,6 +3581,184 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 ["v0", "v1", "v2", "v3"],
             )
 
+    def _ajax_runtime_row(self, name):
+        return {
+            "name": name, "path": [name], "source": "POST", "location": "form",
+            "helper_depth": 0, "observed_count": 1, "evidence_kind": "zend_runtime",
+            "fuzzable": True, "request_id": "req-v0", "run_id": "run-v0",
+            "plugin_slug": "fixture", "callback_id": "cb-fixture",
+            "canonical_callback": "fixture_callback", "request_method": "POST",
+        }
+
+    def test_ajax_trace_missing_known_field_keeps_union_and_resume_adds_no_version(self):
+        # A saved REPLAY_FAILED result (older checkpoint shape) must not shrink
+        # the AJAX config to the fields this one request touched.
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, _ = self.make_probe_context(Path(tmp), [], names=("a",), accepted=())
+            handoffs = []
+            coordinator.handoff_to_next_worker = lambda *args, **kwargs: handoffs.append(args[1]["version"]) or True
+            coordinator.max_versions = 4
+            parent["known_parameters"] = [self._ajax_runtime_row("a"), self._ajax_runtime_row("b")]
+            saved = {
+                "status": "REPLAY_FAILED", "missing_parameters": [self._ajax_runtime_row("b")],
+                "observed_parameters": [self._ajax_runtime_row("a"), self._ajax_runtime_row("c")],
+                "new_parameters": [], "known_parameters": [],
+            }
+
+            child = coordinator._handle_convergence_result(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                result=copy.deepcopy(saved), seed=parent["seed_item"], deadline=None,
+            )
+
+            self.assertIsNotNone(child)
+            self.assertEqual({p["name"] for p in child["known_parameters"]}, {"a", "b", "c"})
+            discovery = next(event for event in coordinator.state["events"]
+                             if event.get("kind") == "PARAMETER_DISCOVERY" and event.get("status") == "ACCEPTED")
+            self.assertEqual([p["name"] for p in discovery["parameters"]], ["c"])
+            self.assertEqual([p["name"] for p in discovery["unobserved_known_parameters"]], ["b"])
+            self.assertNotIn("MISSING_PARAMETERS", json.dumps(coordinator.state["events"]))
+
+            again = coordinator._handle_convergence_result(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                result=copy.deepcopy(saved), seed=parent["seed_item"], deadline=None,
+            )
+            self.assertIsNone(again)
+            self.assertEqual([v["version"] for v in coordinator.state["versions"]], ["v0", "v1"])
+            self.assertEqual(handoffs, ["v1"])
+
+    def test_legacy_per_field_probe_queue_skips_field_admitted_from_earlier_trace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), log)
+            original_sender, original_converge = coordinator.probe_sender, coordinator.converge_fn
+
+            def sender(container, **kwargs):
+                result = original_sender(container, **kwargs)
+                if kwargs["run_id"].endswith("-probe-p1"):
+                    # The trace of probe a also checks isset() on b, which was never sent.
+                    result["request"].setdefault("request_params", {})["headers"] = {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    }
+                    result["zend"]["callback_summaries"][0]["unique_parameters"].append({
+                        "name": "b", "source": "POST", "path": ["b"], "helper_depth": 5,
+                        "observed_count": 1, "access_forms": ["isset"],
+                    })
+                    result["zend"]["events"].append({
+                        "source": "POST", "path": ["b"], "operation": "isset",
+                        "callback_context": {"attributed": True, "root_callback": "fixture_callback", "depth": 5},
+                    })
+                return result
+
+            def converge(**kwargs):
+                result = original_converge(**kwargs)
+                if kwargs["legacy_run_id"].endswith("-probe-p1"):
+                    extra = {**result["new_parameters"][0], "name": "b", "path": ["b"]}
+                    result["new_parameters"] = result["new_parameters"] + [extra]
+                    result["known_parameters"] = result["new_parameters"]
+                return result
+
+            coordinator.probe_sender, coordinator.converge_fn = sender, converge
+            child = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=None,
+            )
+
+            self.assertIsNotNone(child)
+            self.assertEqual(log.count("probe:a"), 1)
+            self.assertNotIn("probe:b", log)
+            self.assertEqual({p["name"] for p in child["known_parameters"]}, {"a", "b"})
+            self.assertEqual([v["version"] for v in coordinator.state["versions"]], ["v0", "v1"])
+
+    def test_field_admitted_in_get_context_does_not_skip_post_context_probe(self):
+        # Method is part of the context, so a GET proof never stands in for POST.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), log, names=("b",), accepted=("b",),
+            )
+            convergence = {**convergence, "new_parameters": [
+                {**self._ajax_runtime_row("b"), "source": "POST", "request_method": "GET"},
+            ]}
+            coordinator._run_pending_probe(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=None,
+            )
+            self.assertIn("probe:b", log)
+            self.assertNotIn("ADMITTED_FROM_TRACE", json.dumps(coordinator.state["events"]))
+
+    def test_batch_from_failed_child_baseline_joins_next_ajax_update(self):
+        # A failed baseline must not drop its batch: the parent keeps fuzzing,
+        # so the next update has to carry {a, b} together with the new field.
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, _ = self.make_probe_context(Path(tmp), [], names=("a",), accepted=())
+            coordinator.max_versions = 4
+            original = coordinator.probe_sender
+            replays = []
+
+            def sender(container, **kwargs):
+                result = original(container, **kwargs)
+                if kwargs["run_id"].endswith("-replay"):
+                    replays.append(kwargs["run_id"])
+                    if len(replays) == 1:
+                        result["request"]["callback_id"] = "other-callback"
+                return result
+
+            coordinator.probe_sender = sender
+
+            def trace(*names):
+                rows = [self._ajax_runtime_row(name) for name in names]
+                return {"status": "CONTINUE", "new_parameters": rows, "known_parameters": rows,
+                        "observed_parameters": rows}
+
+            failed = coordinator._handle_convergence_result(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                result=trace("a", "b"), seed=parent["seed_item"], deadline=None,
+            )
+            self.assertFalse(failed["replay_result"]["passed"])
+            self.assertEqual(coordinator._active_container, "parent-container")
+
+            child = coordinator._handle_convergence_result(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                result=trace("d"), seed=parent["seed_item"], deadline=None,
+            )
+
+            self.assertEqual(child["version"], "v2")
+            self.assertTrue(child["replay_result"]["passed"])
+            self.assertEqual({p["name"] for p in child["known_parameters"]}, {"a", "b", "d"})
+            config = json.loads(Path(child["config_path"]).read_text(encoding="utf-8"))
+            self.assertTrue({"a", "b", "d"} <= set(config["body_params"]["fuzz"]))
+            discovery = [event for event in coordinator.state["events"]
+                         if event.get("kind") == "PARAMETER_DISCOVERY" and event.get("status") == "ACCEPTED"][-1]
+            self.assertEqual([p["name"] for p in discovery["parameters"]], ["d"])
+            self.assertEqual({p["name"] for p in discovery["carried_parameters"]}, {"a", "b"})
+
+    def test_failed_baseline_of_grouped_trace_keeps_full_draft_and_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
+            original = coordinator.probe_sender
+
+            def sender(container, **kwargs):
+                result = original(container, **kwargs)
+                if kwargs["run_id"].endswith("-replay"):
+                    result["request"]["callback_id"] = "other-callback"
+                return result
+
+            coordinator.probe_sender = sender
+            child = coordinator._run_pending_probe(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=None,
+            )
+            self.assertFalse(child["replay_result"]["passed"])
+            self.assertTrue(child["terminal_reason"])
+            self.assertEqual({p["name"] for p in child["known_parameters"]}, {"a", "b"})
+            draft = json.loads(Path(child["config_path"]).read_text(encoding="utf-8"))
+            self.assertTrue({"a", "b"} <= set(draft["body_params"]["fuzz"]))
+            self.assertEqual(coordinator._active_container, "parent-container")
+            self.assertEqual({p["name"] for p in coordinator.state["pending_runtime_candidates"]}, {"a", "b"})
+
     def test_semantic_progress_keeps_fixed_input_and_transport_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, parent, _, _ = self.make_probe_context(
@@ -3784,11 +4001,12 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(
                 [item["status"] for item in coordinator.state["probe_attempts"]],
-                ["pending", "accepted", "accepted"],
+                ["pending", "accepted"],
                 coordinator.state["events"],
             )
             self.assertEqual(coordinator.state["probe_attempts"][1]["request_id"], "req-v0")
-            self.assertEqual(coordinator.state["probe_attempts"][2]["request_id"], "probe-a")
+            # b is already admitted, so the re-queued probe under probe-a is not sent again.
+            self.assertIn("ADMITTED_FROM_TRACE", json.dumps(coordinator.state["events"]))
             self.assertEqual({item["name"] for item in result["known_parameters"]}, {"b"})
             self.assertIn("CORRELATED_CANDIDATE_NOT_ADMITTED", json.dumps(coordinator.state["events"]))
 

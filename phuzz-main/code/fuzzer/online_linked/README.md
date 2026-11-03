@@ -38,6 +38,34 @@ These rules preserve callback candidates for bounded discovery. They do not
 claim that discovery is complete, a selector was inferred, a branch was
 reached, or a vulnerability was proven.
 
+## AJAX trace batching
+
+For AJAX, one request artifact and its Zend artifact (same request/run ID,
+callback, plugin and method) update the candidate config once. Every attributed
+`read`, `isset()` or `empty()` on an explicit GET/POST transport is accepted from
+that trace, including keys the request did not send and guards in helpers
+attributed to the callback. A name read from both GET and POST stays in both
+places; fixed selectors stay fixed and nonce names are fixed by the exporter.
+A GET bootstrap whose trace touches POST fields gets one POST method probe, and
+the POST trace is then accepted as a whole. An absent POST key is accepted only
+from a form-encoded request: under a JSON body PHP leaves `$_POST` empty, so such
+names are reported as `form_transport_required` and are neither admitted nor
+probed. Cookies keep the existing opt-in and key-presence rule; REST keeps its
+own normalizer.
+
+The known set is the union across traces in the same candidate/context. A known
+field that a later trace does not touch is reported as
+`unobserved_known_parameters` (path information) and is not dropped; this also
+applies to saved `REPLAY_FAILED` results from older checkpoints. A version is
+created only when the set grows, so a repeated or resumed trace adds none, and
+saved per-field probes for fields already admitted are skipped
+(`ADMITTED_FROM_TRACE`). The combined config still needs the callback baseline;
+if it fails, the draft with the full set and the failure reason stay in state
+and the partial-export path, the parent keeps fuzzing, and the next update in
+the same callback/method context carries that batch (`carried_parameters` on
+the discovery event) so the union is replayed again. Guard-derived names prove access, not that their
+branch executed; the baseline proves only that the request reached the callback.
+
 ## What changed
 
 `export_online_linked_batch()` retains distinct verified configs for each candidate. For
