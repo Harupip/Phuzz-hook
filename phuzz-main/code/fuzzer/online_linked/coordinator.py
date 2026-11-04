@@ -4049,6 +4049,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
         "hard_campaign_seconds": hard_campaign_seconds,
         "campaign_status": "running",
         "candidates": [],
+        "non_http_skipped": [],
         "expansion_events": [],
         "resume_context": context,
     }
@@ -4058,6 +4059,14 @@ def run_online_linked(args: argparse.Namespace) -> int:
     queued_context_keys: set[str] = set()
     for index, raw_item in enumerate(items, start=1):
         if not isinstance(raw_item, Mapping):
+            continue
+        if not isinstance(raw_item.get("seed"), Mapping):
+            # No HTTP seed: build_config_for_seed_item raises missing_seed and
+            # bootstrap matching needs a seed, so v0 can never start.
+            batch_state["non_http_skipped"].append({
+                "index": index, "hook_name": str(raw_item.get("hook_name") or ""),
+                "callback_id": str(raw_item.get("callback_id") or ""), "reason": "missing_seed",
+            })
             continue
         identity = _batch_candidate_identity(raw_item, args.plugin_slug)
         context_key = _candidate_context_key(raw_item, args.plugin_slug)

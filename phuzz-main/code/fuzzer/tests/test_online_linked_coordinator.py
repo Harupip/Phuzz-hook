@@ -2458,6 +2458,50 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertEqual(run_online_linked(args), 0)
             self.assertEqual(calls, [hooks[1], hooks[3], "wp_ajax_child", hooks[0], hooks[2]])
 
+    def test_batch_skips_items_without_http_seed_before_spending_candidate_slots(self):
+        # A seedless item (e.g. admin_enqueue_scripts) can never build a v0
+        # config, so it must not consume a max_candidates slot that a real
+        # HTTP entrypoint needs, nor mark the campaign as complete_with_skips.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            suggested = root / "suggested.json"
+            suggested.write_text(json.dumps({"suggested_seeds": [
+                {"hook_name": "admin_enqueue_scripts", "callback_id": "a", "direct_http_supported": False},
+                {"hook_name": "add_meta_boxes", "callback_id": "b", "seed": None},
+                {"hook_name": "wp_ajax_real", "callback_id": "c", "seed": {}},
+            ]}), encoding="utf-8")
+            registry = root / "registry.json"
+            registry.write_text("{}", encoding="utf-8")
+            calls = []
+
+            class Candidate:
+                def __init__(self, **kwargs):
+                    item = json.loads(Path(kwargs["suggested_seeds"]).read_text(encoding="utf-8"))["suggested_seeds"][0]
+                    calls.append(item["hook_name"])
+                    self.state_path = root / f"state-{len(calls)}.json"
+                    self.state = {"terminal_status": "BOUNDED_ONLINE_COMPLETE", "versions": [], "candidate_queue": []}
+
+                def run(self):
+                    return 0
+
+            args = SimpleNamespace(
+                suggested_seeds=str(suggested), bootstrap_config="", config_root=str(root / "configs"),
+                output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="run",
+                max_seconds=1, max_versions=2, max_candidates=1, hard_max_candidates=1,
+                callback_registry=str(registry), service="fuzzer-wordpress-plugin",
+            )
+            with patch("online_linked.coordinator.OnlineLinkedCoordinator", Candidate), \
+                    patch("online_linked.coordinator.export_online_linked_batch", return_value=0):
+                self.assertEqual(run_online_linked(args), 0)
+            self.assertEqual(calls, ["wp_ajax_real"])
+            state = json.loads((root / "output" / "online-linked" / "run" / "batch-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["campaign_status"], "complete")
+            self.assertEqual([row["hook_name"] for row in state["candidates"]], ["wp_ajax_real"])
+            self.assertEqual(
+                [(row["hook_name"], row["reason"]) for row in state["non_http_skipped"]],
+                [("admin_enqueue_scripts", "missing_seed"), ("add_meta_boxes", "missing_seed")],
+            )
+
     def test_online_linked_batch_continues_after_candidate_vulnerability(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
