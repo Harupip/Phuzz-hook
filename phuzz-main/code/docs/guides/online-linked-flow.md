@@ -1,6 +1,6 @@
 # Luồng online của HookPhuzz
 
-Cập nhật: **2026-11-02**, đối chiếu working tree, gồm WIP batch/ZIP directory. Tài liệu mô tả runtime discovery, một callback baseline, budget thích ứng, checkpoint/resume, export nhiều context và config comparison. Các phần kiểm chứng có ngày bên dưới là snapshot lịch sử; kết quả kiểm chứng baseline và giới hạn campaign Docker ở [báo cáo 2026-11-02](../reports/2026-11-02-callback-baseline-verification.md), không phải real-plugin fuzzing PASS. Xem [kiến trúc/source map](../reference/architecture.md) và [review record](../reports/2026-10-09-documentation-review.md).
+Cập nhật: **2026-11-04**, đối chiếu commit `350df27b` (gom tham số theo trace AJAX) và replay-guard discovery (2026-11-04). Tài liệu mô tả runtime discovery, một callback baseline, budget thích ứng, checkpoint/resume, export nhiều context và config comparison. Các phần kiểm chứng có ngày bên dưới là snapshot lịch sử; kết quả kiểm chứng baseline và giới hạn campaign Docker ở [báo cáo 2026-11-02](../reports/2026-11-02-callback-baseline-verification.md), không phải real-plugin fuzzing PASS. Xem [kiến trúc/source map](../reference/architecture.md) và [review record](../reports/2026-10-09-documentation-review.md).
 
 Kế hoạch bổ sung: [Online-linked completion](../../../../docs/superpowers/plans/2026-09-06-online-linked-completion.md). Những phần ghi “còn thiếu” bên dưới là công việc tương lai, không phải tính năng đã hoạt động.
 
@@ -34,7 +34,7 @@ flowchart TD
     G --> I[Ghép request và Zend evidence]
     H --> I
     I --> J{Tham số Zend mới hợp lệ?}
-    J -->|Có| K[Tạo config con bất biến]
+    J -->|Có| K[Gom mọi tham số của trace vào một config con bất biến]
     K --> M[Một callback baseline trong parent]
     M -->|Đạt| L[Dừng parent thành công]
     L -->|Còn ngân sách| G2[Chạy worker con]
@@ -62,7 +62,7 @@ Sơ đồ biểu diễn đường đi thành công và nhánh phục hồi chín
 | 6 | Chạy PHUZZ khi config đủ điều kiện | Có cho candidate đang được xử lý. Worker con phải qua callback baseline và còn ngân sách. |
 | 7 | Thu coverage, lỗi, tham số mới, so sánh khi fuzz | Có trong fuzzer và instrumentation; coordinator đọc cặp request/Zend. |
 | 8 | CmpLog mutation đúng tham số rồi gửi lại | Có `_ingest_cmplog_hints()` → `ff_mutate()` → `ff_send_request()` → coverage/lỗi. Có test đơn vị; không mặc định mọi phép so sánh đều được hỗ trợ hoặc mọi nhánh đều tới được. |
-| 9 | Tạo config khi nhánh/tham số mới, giữ giá trị mở nhánh | Tạo config theo tham số Zend mới, giữ evidence/value riêng cho từng parameter và map COOKIE vào bucket `cookies`. Không tạo config chỉ vì coverage mới. |
+| 9 | Tạo config khi nhánh/tham số mới, giữ giá trị mở nhánh | Với AJAX, một cặp request/Zend cập nhật config một lần với mọi tham số được gán cho callback (xem [Gom tham số theo trace AJAX](#gom-tham-số-theo-trace-ajax)); giữ evidence/value riêng cho từng parameter và map COOKIE vào bucket `cookies`. Chỉ tạo version khi tập tham số tăng; không tạo config chỉ vì coverage mới. |
 | 10 | Chạy config mới; action mới quay về bước 2, tham số mới về bước 3 | Child parameter config giữ request values rồi callback baseline. Runtime HTTP registration và pending probe được queue với lineage/evidence riêng, dedupe theo context/input, candidate cap và campaign budget; internal/ambiguous child có evidence blocked. |
 
 ### Callback baseline và giá trị input
@@ -72,6 +72,31 @@ Coordinator phục hồi giá trị request bằng `_restore_request_values`, d�
 Admission của param vẫn cần bằng chứng runtime đúng request/run/callback/nguồn. Baseline kiểm tra identity, callback execution, HTTP/error và deadline, không yêu cầu toàn bộ param được đọc lại. Policy `callback_baseline_v1` và `baseline_evidence` ghi rõ giới hạn này. Baseline không chứng minh đã phủ hết param/nhánh hay fuzzing PASS.
 
 Proposal tương đương vẫn bị `NO_SEMANTIC_PROGRESS`; fixed value, endpoint, method, auth và transport khác nhau vẫn giữ riêng. CMPLOG mutation trong worker không thay đổi.
+
+Child baseline thất bại ghi `terminal_reason` của version (`REPLAY_ARTIFACT_SAVE_FAILED`, `REPLAY_PROCESS_FAILED`, `CALLBACK_NOT_REACHED` hoặc `CALLBACK_BASELINE_NOT_VERIFIED`) và candidate kết thúc `NOT_VERIFIED/CHILD_REPLAY_FAILED` (`handoff_to_next_worker` trong coordinator). Ngoại lệ duy nhất là child sinh ra trong replay-guard discovery bên dưới.
+
+### Gom tham số theo trace AJAX
+
+Từ commit `350df27b` (2026-11-03). Contract đầy đủ ở [online_linked/README.md](../../fuzzer/online_linked/README.md#ajax-trace-batching).
+
+- Một cặp request/Zend artifact cùng request ID, run ID, callback, plugin và method cập nhật config candidate **một lần**, với mọi `read`, `isset()` và `empty()` được gán cho callback trên GET/POST, kể cả key request chưa gửi và guard trong helper. Trước đó mỗi tham số đi qua probe riêng.
+- Tên đọc ở cả GET và POST giữ ở cả hai nơi. Selector cố định vẫn fixed; nonce được exporter đặt fixed.
+- GET bootstrap có trace chạm field POST được gửi **một POST method probe**. Probe này phải chứng minh ít nhất một field POST, sau đó trace POST được nhận nguyên batch.
+- Key POST vắng mặt chỉ được nhận từ request form-encoded. Body JSON làm `$_POST` rỗng, nên tên đó được báo `form_transport_required`, không admit và không probe.
+- Tập known là hợp của các trace trong cùng candidate/context. Field đã biết mà trace sau không chạm được ghi `unobserved_known_parameters`, không bị xoá (áp dụng cả cho `REPLAY_FAILED` lưu trong checkpoint cũ).
+- Chỉ tạo version khi tập tham số tăng; trace lặp lại hoặc resume không tạo thêm version. Probe từng field đã lưu cho field đã được admit sẽ bị bỏ với `ADMITTED_FROM_TRACE`.
+- Batch có child baseline lỗi được mang sang lần cập nhật kế tiếp cùng callback/method (`carried_parameters` trong discovery event) để replay lại trong tập hợp.
+- Cookie giữ opt-in và quy tắc key-presence hiện có; REST giữ normalizer riêng.
+
+Guard chỉ chứng minh có truy cập, không chứng minh nhánh đã chạy; baseline chỉ chứng minh request tới được callback.
+
+### Replay-guard discovery
+
+Từ 2026-11-04: `coordinator.py` (`_discover_replay_guards`) và `bridge_cli.py` (`probe_unsent_guards`). Kế hoạch: [2026-11-04-online-linked-replay-guard-discovery.md](../../../../docs/superpowers/plans/2026-11-04-online-linked-replay-guard-discovery.md).
+
+- Với AJAX, `isset()`/`empty()` trên field GET/POST mới mà request **không gửi** trong một field probe hoặc child replay trở thành probe pending (`candidate_reason: unsent_guard`) thay vì input được nhận ngay. Method probe vẫn giữ nguyên một batch.
+- Sau khi child AJAX qua callback baseline, coordinator đọc trace replay của child, probe các guard chưa gửi ngay trên parent đang chạy và tạo version con cháu. Version con cháu chỉ thay child (`not_started_superseded`, `SUPERSEDED_BY_vN`) sau khi baseline của chính nó đạt; vòng lặp bị chặn bởi deadline, version và probe caps.
+- Trong vòng này, child baseline lỗi hoặc chạm version cap chỉ ghi event `REPLAY_GUARD_DISCOVERY` (`REJECTED`/`DEFERRED`), không kết thúc candidate; worker được start một lần cho version cuối đã xác minh.
 
 ### Giới hạn auth và đăng ký hook
 
@@ -203,7 +228,7 @@ pwsh -NoProfile -File .\phuzz.ps1 -PluginSlug nmedia-user-file-uploader -OnlineT
 
 Mặc định không tự sinh hard candidate time; hard versions với env snapshot là 36, loader default là 20. PowerShell wrapper chưa expose hard-cap flags hay `--resume`; muốn điều chỉnh phải gọi Python coordinator với context Docker phù hợp. Hard cap phải là số nguyên dương và không nhỏ hơn initial budget. Đọc `budget`, `budget_progress`, `effective_max_candidates`, `pending_candidates` và `stop_reasons`; không chỉ nhìn giá trị initial.
 
-Candidate khởi đầu với cửa sổ `W = max_seconds`. Param mới được admit gia hạn tới `max(deadline, now + W + 3 * sender_seconds)`, chặn bởi campaign và explicit `--hard-candidate-seconds`. Burst cùng thời điểm không cộng dồn cửa sổ; cùng callback và `(name, source, location)` chỉ nhận credit một lần. Pending name không cấp thời gian; callback mới chỉ cấp campaign work. Sau probe hợp lệ, ưu tiên trial/callback baseline rồi tiếp tục pending trong cùng run; HTTP lỗi có guard thì thử guard với allowance mới. Gate/correlation không đổi.
+Candidate khởi đầu với cửa sổ `W = max_seconds`. Param mới được admit gia hạn tới `max(deadline, now + W + 3 * sender_seconds)`, chặn bởi campaign và explicit `--hard-candidate-seconds`. Burst cùng thời điểm không cộng dồn cửa sổ; cùng callback và `(name, source, location)` chỉ nhận credit một lần. Pending name không cấp thời gian; callback mới chỉ cấp campaign work. Sau probe hợp lệ, ưu tiên callback baseline rồi tiếp tục pending trong cùng run; HTTP lỗi có guard thì thử guard với allowance mới. Gate/correlation không đổi.
 
 Hết cửa sổ ghi `NO_NEW_PROGRESS`; còn pending thì `PARTIAL` và xuất draft `.partial.json` riêng, `fuzzing_ready=false`. Đây không phải tìm hết param hoặc fuzzing PASS. Count/version và campaign caps vẫn áp dụng.
 
@@ -251,12 +276,13 @@ fuzzer/output/online-linked/<batch-run-id>/callback-registry.json
 | `BOUNDED_ONLINE_COMPLETE` / `BUDGET_EXPIRED` | Kết thúc phần chạy có giới hạn; không chứng minh discovery đã đầy đủ hay có vulnerability. |
 | `NOT_VERIFIED` / `V0_PREREQUISITE_GATE_FAILED` | Chưa có v0 thỏa điều kiện; cần xem seed, method, callback và config. |
 | `NOT_VERIFIED` / `WORKER_STOP_FAILED` | Không xác nhận được worker đã dừng; giữ tên container, chặn handoff, trả mã lỗi. Xem `stop_error`. |
-| `NOT_VERIFIED` / `CHILD_REPLAY_FAILED` | Replay/Pass 2 không đạt. Dừng worker hiện tại ngay, giữ `replay_result`, artifact và lý do của child, rồi chuyển candidate kế tiếp mà không đợi hết budget. |
+| `NOT_VERIFIED` / `CHILD_REPLAY_FAILED` | Callback baseline của child không đạt; lý do cụ thể nằm ở `terminal_reason` của version. Dừng worker hiện tại ngay, giữ `replay_result`, artifact và lý do của child, rồi chuyển candidate kế tiếp mà không đợi hết budget. State lịch sử trước 2026-11-02 có thể ghi lỗi Pass 2 dưới cùng reason. |
 | `NOT_VERIFIED` / `CHILD_WORKER_START_FAILED` hoặc `PARENT_WORKER_RESTART_FAILED` | Lỗi khởi động worker; không được ghi thành hoàn thành bình thường. |
 | `not_started_budget_expired` | Config có thể đã được tạo hoặc replay, nhưng worker chưa khởi động vì hết ngân sách. |
 | `VERSION_LIMIT_REACHED` | Hết lượt version; xem max_versions và attempts, không nhầm với số file cuối. |
-| `TRIAL_INPUT_SET_NOT_VERIFIED` / `TRIAL_MISSING_PARAMETER_READS` | Bộ input không vượt coherent trial; đọc missing_parameters và request/Zend cùng trial. Tăng version không tự sửa lỗi này. |
+| `TRIAL_INPUT_SET_NOT_VERIFIED` / `TRIAL_MISSING_PARAMETER_READS` | Chỉ có trong state lịch sử trước 2026-11-02 (coherent trial đã bỏ, xem mục 5.1). Code hiện tại không sinh reason này. |
 | `NO_SEMANTIC_PROGRESS` | Proposal tương đương bị bỏ qua; không tiêu thêm child version. |
+| `ADMITTED_FROM_TRACE` | Probe từng field bị bỏ (`SKIPPED`) vì field đã được nhận từ trace batch cùng method. Không phải lỗi. |
 | `GATE_NOT_VERIFIED` | Exporter không thấy callback baseline hợp lệ; khác với lỗi admission ban đầu V0_PREREQUISITE_GATE_FAILED. |
 | `NO_NEW_ZEND_PARAMETER` | Quan sát đó không bổ sung tham số; không chứng minh không còn nhánh chưa khám phá. |
 | `ACTION_EXPANSION_SETUP_REQUIRED` | Registration có thật nhưng thiếu direct-HTTP mapping, method/route evidence hoặc prerequisite replay; không tạo request suy đoán. |

@@ -12,11 +12,11 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from seed_generation.config.config_exporter import export_seed_configs
     from seed_generation.convergence.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, correlate_pass1_artifact, normalize_runtime_evidence, prepare_callback_registry, rest_runtime_block_reason, run_enrichment
+    from zend_discovery.engine import _runtime_request_contains, _runtime_request_details, candidate_from_seed_item, canonical_identity, canonical_identity_id, correlate_pass1_artifact, normalize_runtime_evidence, prepare_callback_registry, rest_runtime_block_reason, run_enrichment
 else:
     from seed_generation.config.config_exporter import export_seed_configs
     from seed_generation.convergence.convergence import advance_convergence_state, canonical_runtime_parameter_identity, materialize_convergence_seeds, merge_enriched_seeds
-    from zend_discovery.engine import candidate_from_seed_item, canonical_identity, canonical_identity_id, correlate_pass1_artifact, normalize_runtime_evidence, prepare_callback_registry, rest_runtime_block_reason, run_enrichment
+    from zend_discovery.engine import _runtime_request_contains, _runtime_request_details, candidate_from_seed_item, canonical_identity, canonical_identity_id, correlate_pass1_artifact, normalize_runtime_evidence, prepare_callback_registry, rest_runtime_block_reason, run_enrichment
 
 
 from filesystem_paths import filesystem_path
@@ -296,8 +296,13 @@ def converge_iteration(
     known_state: Mapping[str, Any],
     candidate_key: str | None = None,
     runtime_cookie_probes: bool = False,
+    probe_unsent_guards: bool = False,
 ) -> dict[str, Any]:
-    """Correlate one replay and materialize its direct runtime discoveries."""
+    """Correlate one replay and materialize its direct runtime discoveries.
+
+    With ``probe_unsent_guards`` (AJAX), an isset()/empty() guard on a new GET/POST
+    field this request never sent becomes a probe proposal instead of accepted input.
+    """
     raw_report, pass_run_summary = _filter_iteration_inputs(
         raw_report,
         pass_run_summary,
@@ -360,6 +365,8 @@ def converge_iteration(
     prior = known_state.get("known_parameters", [])
     if not isinstance(prior, list):
         raise ValueError("convergence state known_parameters must be a list")
+    if probe_unsent_guards and candidate.get("entrypoint_type") == "ajax":
+        observed = _unsent_guards_as_probe_candidates(observed, prior, uopz)
     advanced = advance_convergence_state(prior, observed)
     missing = _missing_known_parameters(prior, observed)
     unobserved: list[dict[str, Any]] = []
@@ -482,6 +489,39 @@ def converge_iteration(
         "known_parameters": advanced["known_parameters"],
         "merged_suggested_seeds": merged,
     }
+
+
+def _unsent_guards_as_probe_candidates(
+    observed: Sequence[Mapping[str, Any]],
+    prior: Sequence[Any],
+    uopz: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Seeing a guard on an absent key proves the access, not a value or branch."""
+    known = {
+        canonical_runtime_parameter_identity(parameter)
+        for parameter in prior if isinstance(parameter, Mapping)
+    }
+    request_params, headers = _runtime_request_details(uopz)
+    rows: list[dict[str, Any]] = []
+    for parameter in observed:
+        row = dict(parameter)
+        source = str(row.get("source") or "").upper()
+        forms = row.get("access_forms")
+        if (
+            row.get("fuzzable") is True
+            and source in {"GET", "POST"}
+            and isinstance(forms, list) and forms
+            and {str(form).lower() for form in forms} <= {"isset", "empty"}
+            and canonical_runtime_parameter_identity(row) not in known
+            and not _runtime_request_contains(
+                str(row.get("name") or ""), source,
+                request_method=str(row.get("request_method") or ""),
+                request_params=request_params, headers=headers,
+            )
+        ):
+            row.update(fuzzable=False, candidate_status="pending_probe", candidate_reason="unsent_guard")
+        rows.append(row)
+    return rows
 
 
 def _normalization_seed_item(seed_item: Mapping[str, Any]) -> Mapping[str, Any]:

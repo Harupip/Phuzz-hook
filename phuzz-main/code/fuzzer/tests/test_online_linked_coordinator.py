@@ -577,6 +577,271 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertNotIn("probe_variant", final["metadata"])
                 self.assertTrue(all(actual == expected == "POST" for actual, expected in methods))
 
+    def _guard_chain_campaign(
+        self, root: Path, *, guards=("cn_param", "cn_nonce"), nonce_callback="fixture_callback",
+        probe_status=200, deadline=None, send_cost=0.0, version_cap=None,
+    ):
+        """Cookie Notice shape: PHP evaluates isset(action, cn_param, cn_nonce) left to right
+        and stops at the first absent field, so each request reveals one more guard."""
+        log: list[str] = []
+        coordinator, parent, _, _ = self.make_probe_context(root, log, names=("cn_param",))
+        if version_cap is not None:
+            coordinator.max_versions = coordinator.hard_versions = version_cap
+        raw = copy.deepcopy(parent["seed_item"])
+        raw["seed"].update({
+            "method": "POST", "resolved_method": "POST", "query_params": {"action": "fixture"},
+            "body": {"action": "fixture"}, "fixed_params": ["action"], "fuzzable_params": [],
+            "input_params": [], "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+        })
+        parent.update(seed_item=raw, entrypoint_type="ajax", resolved_method="POST")
+        Path(parent["config_path"]).write_text(json.dumps(build_config_for_seed_item(raw)[1]), encoding="utf-8")
+        coordinator._reports["v0"] = {"suggested_seeds": [raw]}
+        coordinator.converge_fn = converge_iteration
+        coordinator.materialize_fn = materialize_convergence_seeds
+        coordinator.export_configs_fn = export_seed_configs
+        from hook_energy.seed_generation.zend_runtime.bridge_cli import _candidate_iteration_key
+        coordinator._target_key = _candidate_iteration_key(raw, plugin_slug="fixture", legacy_run_id="run-v0")
+        identity = canonical_identity_id(candidate_from_seed_item(raw, plugin_slug="fixture"))
+        sends: list[dict] = []
+
+        def php(request_id, run_id, method, query, body, auth_context, status):
+            touched = []
+            # A tuple is one PHP expression whose guards are all evaluated together.
+            for group in ("action", *guards):
+                names = group if isinstance(group, tuple) else (group,)
+                touched.extend(names)
+                if any(name not in body for name in names):
+                    break
+            request = {
+                "request_id": request_id, "run_id": run_id, "legacy_run_id": run_id,
+                "target_plugin": "fixture", "http_method": method, "response": {"status_code": status},
+                "hook_name": parent["hook_name"], "callback_id": parent["callback_id"],
+                "auth_context": auth_context, "canonical_identity_id": identity,
+                "request_params": {"query_params": query, "body_params": body,
+                                   "headers": {"Content-Type": "application/x-www-form-urlencoded"}},
+                "hook_coverage": {"executed_callbacks": {parent["callback_id"]: {"callback_id": parent["callback_id"]}}},
+            }
+            owner = {name: (nonce_callback if name == "cn_nonce" else "fixture_callback") for name in touched}
+            zend = {
+                "schema_version": 3, "request_id": request_id, "run_id": run_id, "request_method": method,
+                "target_loading": {"load_status": "loaded", "file_target_count": 1},
+                "callback_summaries": [{"callback": callback, "unique_parameters": [{
+                    "source": "POST", "path": [name], "helper_depth": 0,
+                    "observed_count": 1, "access_forms": ["isset"],
+                } for name in touched if owner[name] == callback]} for callback in sorted(set(owner.values()))],
+                "events": [{"source": "POST", "path": [name], "operation": "isset",
+                            "callback_context": {"attributed": True, "root_callback": owner[name], "depth": 0}}
+                           for name in touched],
+            }
+            return request, zend
+
+        def sender(container_name, **kwargs):
+            from urllib.parse import parse_qsl, urlsplit
+            from online_linked.probe_sender import send_and_wait
+            request_id, run_id = kwargs["request_id"], kwargs["run_id"]
+            requests_dir, zend_dir = root / "http-requests", root / "http-zend"
+            requests_dir.mkdir(exist_ok=True)
+            zend_dir.mkdir(exist_ok=True)
+            test = self
+
+            class Session:
+                def __enter__(self): return self
+                def __exit__(self, *args): return False
+                def send(self, prepared, timeout, allow_redirects):
+                    test.assertFalse(allow_redirects)
+                    raw_body = prepared.body or ""
+                    raw_body = raw_body.decode() if isinstance(raw_body, bytes) else raw_body
+                    query = dict(parse_qsl(urlsplit(prepared.url).query))
+                    body = dict(parse_qsl(raw_body))
+                    status = probe_status if "cn_nonce" in body else 200
+                    sends.append({"run_id": run_id, "query": query, "body": body, "status": status})
+                    coordinator.clock.now += send_cost
+                    log.append(f"send:{run_id}")
+                    request, zend = php(request_id, run_id, prepared.method, query, body,
+                                        str(kwargs["expected"].get("auth_context") or ""), status)
+                    (requests_dir / f"{request_id}.json").write_text(json.dumps(request), encoding="utf-8")
+                    (zend_dir / f"{request_id}.json").write_text(json.dumps(zend), encoding="utf-8")
+                    return type("Response", (), {"status_code": status})()
+
+            return send_and_wait(
+                coordinator.config_root / (kwargs["config_slug"] + ".json"),
+                request_id=request_id, run_id=run_id, timeout_seconds=2, expected=kwargs["expected"],
+                session_factory=Session, request_dir=requests_dir, zend_dir=zend_dir,
+            )
+
+        coordinator.probe_sender = sender
+        # v0 worker request: correct action only, so the trace stops at isset(cn_param).
+        request, zend = php("req-v0", "run-v0", "POST", {"action": "fixture"}, {"action": "fixture"},
+                            parent["auth_context"], 200)
+        evidence = {"request_name": "req-v0.json", "request": request, "zend_name": "req-v0.json",
+                    "zend": zend, "request_id": "req-v0", "worker_run_id": "run-v0"}
+        coordinator.advance_online_version(evidence, deadline=deadline)
+        return coordinator, log, sends
+
+    def test_ajax_child_replay_probes_missing_guard_before_worker_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, log, sends = self._guard_chain_campaign(Path(tmp))
+            versions = {version["version"]: version for version in coordinator.state["versions"]}
+            # v1 replay sends action + cn_param and reveals isset(cn_nonce) for an unsent field.
+            v1_replay = [send for send in sends if send["run_id"].endswith("-v1-replay")]
+            self.assertEqual(len(v1_replay), 1)
+            self.assertEqual(set(v1_replay[0]["body"]), {"action", "cn_param"})
+            # Exactly one probe adds the field, with the right POST action, before any worker start.
+            probes = [send for send in sends if "-probe-" in send["run_id"]]
+            self.assertEqual(len(probes), 1, sends)
+            self.assertEqual(set(probes[0]["body"]), {"action", "cn_param", "cn_nonce"})
+            self.assertEqual(probes[0]["body"]["action"], "fixture")
+            self.assertEqual(probes[0]["query"]["action"], "fixture")
+            self.assertLess(log.index(f"send:{probes[0]['run_id']}"), log.index("worker_start"))
+            self.assertEqual(log.count("worker_start"), 1)
+            # The nonce child keeps its link to v1 and passes its own callback baseline.
+            self.assertEqual(versions["v2"]["parent_version"], "v1")
+            self.assertTrue(versions["v2"]["replay_result"]["passed"])
+            v2_replay = [send for send in sends if send["run_id"].endswith("-v2-replay")]
+            self.assertEqual(set(v2_replay[0]["body"]), {"action", "cn_param", "cn_nonce"})
+            self.assertEqual(coordinator._active_version, "v2")
+            self.assertEqual(versions["v2"]["worker_status"], "started")
+            self.assertNotEqual(versions["v1"]["worker_status"], "started")
+            final = json.loads(Path(versions["v2"]["config_path"]).read_text(encoding="utf-8"))
+            self.assertIn("action", final["query_params"]["fixed"])
+            self.assertIn("cn_nonce", final["body_params"]["fixed"])
+            self.assertTrue({"action", "cn_param"} <= set(final["body_params"]["fuzz"]))
+            self.assertNotIn("cn_nonce", final["body_params"]["fuzz"])
+
+    def test_guard_revealed_by_probe_trace_gets_its_own_probe(self):
+        # p(cn_nonce) passes isset(cn_nonce) and only then reaches isset(next_guard): seeing that
+        # guard proves the access, so next_guard enters a config only after a probe that sent it.
+        for deadline in (None, 100.0):
+            with self.subTest(deadline=deadline), tempfile.TemporaryDirectory() as tmp:
+                coordinator, log, sends = self._guard_chain_campaign(
+                    Path(tmp), guards=("cn_param", "cn_nonce", "next_guard"), deadline=deadline,
+                )
+                probes = [send for send in sends if "-probe-" in send["run_id"]]
+                self.assertEqual([sorted(send["body"]) for send in probes], [
+                    ["action", "cn_nonce", "cn_param"],
+                    ["action", "cn_nonce", "cn_param", "next_guard"],
+                ])
+                events = coordinator.state["events"]
+                next_guard_probe = next(
+                    index for index, event in enumerate(events)
+                    if event.get("kind") == "PARAMETER_PROBE" and event.get("status") == "ACCEPTED"
+                    and (event.get("candidate") or {}).get("name") == "next_guard"
+                )
+                first_admission = next(
+                    index for index, event in enumerate(events)
+                    if event.get("kind") == "PARAMETER_DISCOVERY" and event.get("status") == "ACCEPTED"
+                    and any(p.get("name") == "next_guard" for p in event.get("parameters") or [])
+                )
+                # No config carries next_guard before the probe that sent it was accepted.
+                self.assertLess(next_guard_probe, first_admission)
+                active = coordinator._version(coordinator._active_version)
+                self.assertTrue(active["replay_result"]["passed"])
+                self.assertEqual({p["name"] for p in active["known_parameters"]}, {"cn_param", "cn_nonce", "next_guard"})
+                self.assertEqual(log.count("worker_start"), 1)
+                self.assertLess(log.index(f"send:{probes[1]['run_id']}"), log.index("worker_start"))
+
+    def assert_v1_handoff_without_nonce(self, coordinator, log, sends):
+        versions = {version["version"]: version for version in coordinator.state["versions"]}
+        self.assertEqual(coordinator._active_version, "v1")
+        self.assertEqual(versions["v1"]["worker_status"], "started")
+        self.assertEqual(log.count("worker_start"), 1)
+        config = json.loads(Path(versions["v1"]["config_path"]).read_text(encoding="utf-8"))
+        self.assertNotIn("cn_nonce", {row["name"] for row in config["body_params"]["data"]})
+        return versions
+
+    def test_replay_trace_without_new_guard_keeps_plain_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, log, sends = self._guard_chain_campaign(Path(tmp), guards=("cn_param",))
+            self.assertEqual([send for send in sends if "-probe-" in send["run_id"]], [])
+            self.assert_v1_handoff_without_nonce(coordinator, log, sends)
+            self.assertFalse([e for e in coordinator.state["events"] if e.get("kind") == "REPLAY_GUARD_DISCOVERY"])
+
+    def test_replay_guard_on_other_callback_does_not_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, log, sends = self._guard_chain_campaign(Path(tmp), nonce_callback="other_callback")
+            self.assertEqual([send for send in sends if "-probe-" in send["run_id"]], [])
+            self.assert_v1_handoff_without_nonce(coordinator, log, sends)
+
+    def test_replay_guard_already_probed_is_not_sent_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, log, sends = self._guard_chain_campaign(Path(tmp))
+            versions = {version["version"]: version for version in coordinator.state["versions"]}
+            replay_dir = coordinator.run_dir / "versions" / "v1" / "replay"
+            (request_path,) = (replay_dir / "request").glob("*.json")
+            evidence = {
+                "version": "v1", "worker_run_id": "run-v1-replay", "request_name": request_path.name,
+                "request_id": request_path.stem, "zend_name": request_path.name,
+                "request": json.loads(request_path.read_text(encoding="utf-8")),
+                "zend": json.loads((replay_dir / "zend" / request_path.name).read_text(encoding="utf-8")),
+                "evidence_origin": "child_replay",
+            }
+            before = len(sends)
+            # Re-entering with the same replay trace (e.g. after resume) must not resend the probe.
+            target = coordinator._discover_replay_guards(versions["v1"], evidence, deadline=None)
+            self.assertIs(target, versions["v1"])
+            self.assertEqual(len(sends), before)
+            self.assertTrue(any(
+                event.get("kind") == "PARAMETER_PROBE" and event.get("reason") == "PROBE_ALREADY_ATTEMPTED"
+                for event in coordinator.state["events"]
+            ))
+
+    def test_replay_guard_probe_error_keeps_v1_without_confirming_nonce(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, log, sends = self._guard_chain_campaign(Path(tmp), probe_status=403)
+            self.assertEqual(len([send for send in sends if "-probe-" in send["run_id"]]), 1)
+            versions = self.assert_v1_handoff_without_nonce(coordinator, log, sends)
+            # The probe artifact is kept, but a non-2xx child baseline never confirms the nonce.
+            self.assertEqual(versions["v2"]["status"], "guard_unverified")
+            self.assertEqual(versions["v2"]["terminal_reason"], "GUARD_SATISFACTION_UNKNOWN")
+            self.assertFalse(versions["v2"]["replay_result"]["passed"])
+            self.assertNotEqual(versions["v2"]["worker_status"], "started")
+            self.assertTrue(coordinator.state["probe_attempts"][-1]["config_path"])
+            self.assertIsNone(coordinator.state["terminal_status"])
+            # The failed guard child is a rejected probe, not a batch v1's next update must replay.
+            self.assertEqual(coordinator._failed_batch_parameters(
+                versions["v1"], versions["v1"]["known_parameters"]), [])
+
+    def test_version_cap_during_replay_guard_discovery_still_fuzzes_v1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, log, sends = self._guard_chain_campaign(Path(tmp), version_cap=2)
+            self.assertEqual(len([send for send in sends if "-probe-" in send["run_id"]]), 1)
+            self.assert_v1_handoff_without_nonce(coordinator, log, sends)
+            # The cap keeps the verified nonce as a pending candidate instead of ending v1's run.
+            self.assertIsNone(coordinator.state["terminal_status"])
+            self.assertIn("cn_nonce", json.dumps(coordinator.state["pending_runtime_candidates"]))
+
+    def test_guards_deferred_on_superseded_version_do_not_restart_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, log, sends = self._guard_chain_campaign(
+                Path(tmp), guards=("cn_param", ("cn_nonce", "cn_extra")), deadline=100.0,
+            )
+            versions = {version["version"]: version for version in coordinator.state["versions"]}
+            active = coordinator._active_version
+            final = json.loads(Path(versions[active]["config_path"]).read_text(encoding="utf-8"))
+            self.assertTrue({"cn_nonce", "cn_extra"} <= {row["name"] for row in final["body_params"]["data"]})
+            coordinator._drain_pending_probes()
+            # The started descendant covers every deferred guard: it keeps running, v1 never starts.
+            self.assertEqual(coordinator._active_version, active)
+            self.assertEqual(log.count("worker_stop"), 1)
+            self.assertEqual(log.count("worker_start"), 1)
+            self.assertNotEqual(versions["v1"]["worker_status"], "started")
+
+    def test_replay_guard_probe_deferred_when_budget_is_short(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, log, sends = self._guard_chain_campaign(Path(tmp), deadline=10.0, send_cost=4.0)
+            self.assertEqual([send for send in sends if "-probe-" in send["run_id"]], [])
+            self.assert_v1_handoff_without_nonce(coordinator, log, sends)
+            deferred = [event for event in coordinator.state["events"]
+                        if event.get("kind") == "PARAMETER_PROBE" and event.get("status") == "DEFERRED"]
+            self.assertEqual([event["candidate"]["name"] for event in deferred], ["cn_nonce"])
+            self.assertEqual([row["candidate"]["name"] for row in coordinator.state["pending_probe_queue"]], ["cn_nonce"])
+
+    def test_non_ajax_child_replay_keeps_plain_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("online_linked.coordinator._is_ajax", return_value=False):
+            coordinator, log, sends = self._guard_chain_campaign(Path(tmp))
+            self.assertEqual([send for send in sends if "-probe-" in send["run_id"]], [])
+            self.assert_v1_handoff_without_nonce(coordinator, log, sends)
+
     def test_hard_budget_inputs_reject_zero_negative_bool_and_fraction(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator = self.make_coordinator(Path(tmp), [])
@@ -4044,7 +4309,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
             def converge(**kwargs):
                 run_id = kwargs["legacy_run_id"]
-                seed_variant = kwargs["raw_report"]["suggested_seeds"][0]["seed"]["seed_variant_id"]
+                seed_variant = kwargs["raw_report"]["suggested_seeds"][0]["seed"].get("seed_variant_id")
                 if seed_variant == "zend_probe_post_a":
                     pending_a = {
                         **first_probe, "fuzzable": False,

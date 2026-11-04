@@ -1,0 +1,149 @@
+{
+  "policy": {
+    "mode": "semantic",
+    "allowed_extra_parameters": [],
+    "ignored_metadata_paths": [
+      "/artifact_path",
+      "/config_type",
+      "/entrypoint_type",
+      "/generated_at",
+      "/metadata/artifact_path",
+      "/metadata/callback_id",
+      "/metadata/callback_repr",
+      "/metadata/callback_source_file",
+      "/metadata/callback_start_line",
+      "/metadata/candidate_id",
+      "/metadata/candidate_methods",
+      "/metadata/entrypoint_type",
+      "/metadata/fuzzing_ready",
+      "/metadata/generated_at",
+      "/metadata/generated_by",
+      "/metadata/generated_reason",
+      "/metadata/manual_analysis",
+      "/metadata/method_confidence",
+      "/metadata/method_evidence",
+      "/metadata/method_source",
+      "/metadata/method_status",
+      "/metadata/missing_requirements",
+      "/metadata/observed_request_method",
+      "/metadata/probe_request",
+      "/metadata/probe_variant",
+      "/metadata/route",
+      "/metadata/route_declared_methods",
+      "/metadata/run_id",
+      "/metadata/seed_variant_id",
+      "/metadata/setup_required",
+      "/metadata/source_file",
+      "/metadata/source_line",
+      "/output_dir",
+      "/print_timestamps",
+      "/run_id"
+    ]
+  },
+  "expected": "C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\experiment\\02-0day-vulns\\configs\\1000000-cookie-notice.2.4.8.zip\\get_group_rule_values\\fuzzer-config.cn-get-group-rules-values.json",
+  "actual": "output\\online-linked\\cookie-notice-20261104T111816Z\\final-configs\\fuzzer-config.wp_ajax_cn-get-group-rules-values.8413b262215ac8f6.json",
+  "counts": {
+    "MATCH": 0,
+    "MISMATCH": 1,
+    "NO_REFERENCE": 0,
+    "AMBIGUOUS": 0,
+    "INVALID": 0
+  },
+  "results": [
+    {
+      "status": "MISMATCH",
+      "matched": false,
+      "differences": [
+        {
+          "kind": "VALUE_MISMATCH",
+          "path": "/body_params/cn_nonce/value",
+          "expected": "fuzz",
+          "actual": "probe"
+        },
+        {
+          "kind": "UNEXPECTED_PARAMETER",
+          "path": "/headers/Content-Type",
+          "expected": null,
+          "actual": {
+            "name": "Content-Type",
+            "value": "application/x-www-form-urlencoded"
+          }
+        },
+        {
+          "kind": "CLASSIFICATION_MISMATCH",
+          "path": "/headers/fixed",
+          "expected": [],
+          "actual": [
+            "Content\\-Type"
+          ]
+        },
+        {
+          "kind": "VALUE_MISMATCH",
+          "path": "/headers/weight",
+          "expected": null,
+          "actual": 1,
+          "reason": "missing_field"
+        },
+        {
+          "kind": "VALUE_MISMATCH",
+          "path": "/metadata",
+          "expected": null,
+          "actual": {
+            "hook_name": "wp_ajax_cn-get-group-rules-values",
+            "auth_mode": "authenticated",
+            "resolved_method": "POST",
+            "auth_context": "authenticated",
+            "online_request_seed": {
+              "request_id": "r-56ed80dc6fbb08f4ebbcce07",
+              "run_id": "cookie-notice-20261104T111816Z-candidate-002-wp_ajax_cn-get-group-rules-values-v1-replay",
+              "evidence_request_ids": [
+                "r-56ed80dc6fbb08f4ebbcce07"
+              ],
+              "values": [
+                {
+                  "name": "action",
+                  "bucket": "query_params",
+                  "request_id": "r-56ed80dc6fbb08f4ebbcce07",
+                  "run_id": "cookie-notice-20261104T111816Z-candidate-002-wp_ajax_cn-get-group-rules-values-v1-replay-probe-p2",
+                  "value_origin": "observed"
+                },
+                {
+                  "name": "action",
+                  "bucket": "body_params",
+                  "request_id": "r-56ed80dc6fbb08f4ebbcce07",
+                  "run_id": "cookie-notice-20261104T111816Z-candidate-002-wp_ajax_cn-get-group-rules-values-v1-replay-probe-p2",
+                  "value_origin": "observed"
+                },
+                {
+                  "name": "cn_param",
+                  "bucket": "body_params",
+                  "request_id": "r-56ed80dc6fbb08f4ebbcce07",
+                  "run_id": "cookie-notice-20261104T111816Z-candidate-002-wp_ajax_cn-get-group-rules-values-v1-replay-probe-p2",
+                  "value_origin": "observed"
+                },
+                {
+                  "name": "cn_nonce",
+                  "bucket": "body_params",
+                  "request_id": "r-56ed80dc6fbb08f4ebbcce07",
+                  "run_id": "cookie-notice-20261104T111816Z-candidate-002-wp_ajax_cn-get-group-rules-values-v1-replay-probe-p2",
+                  "value_origin": "observed"
+                },
+                {
+                  "name": "Content-Type",
+                  "bucket": "headers",
+                  "request_id": "r-56ed80dc6fbb08f4ebbcce07",
+                  "run_id": "cookie-notice-20261104T111816Z-candidate-002-wp_ajax_cn-get-group-rules-values-v1-replay-probe-p2",
+                  "value_origin": "observed"
+                }
+              ]
+            }
+          },
+          "reason": "missing_field"
+        }
+      ],
+      "errors": []
+    }
+  ],
+  "reference_errors": [],
+  "input_errors": []
+}

@@ -1,0 +1,535 @@
+{
+  "run": "C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\phuzz-main\\code\\fuzzer\\output\\online-linked\\cookie-notice-20261103T161734Z",
+  "campaign_status": "complete_with_skips",
+  "policy": "semantic with /metadata ignored; active final exports only",
+  "hooks": [
+    {
+      "hook": "wp_ajax_cn-deactivate-plugin",
+      "reference": "C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\experiment\\02-0day-vulns\\configs\\1000000-cookie-notice.2.4.8.zip\\deactivate_plugin\\fuzzer-config.cn-deactivate-plugin.json",
+      "actual": "C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\phuzz-main\\code\\fuzzer\\output\\online-linked\\cookie-notice-20261103T161734Z\\final-configs\\fuzzer-config.wp_ajax_cn-deactivate-plugin.ec864a88e236d0da.json",
+      "version": "v2",
+      "verification_policy": "callback_baseline_v1",
+      "export_sha256": "73a3a84bc7fed41e1f9e056643b71a7d83db3ccaea046e3cdb37cc3a63f8f59c",
+      "recorded_hash_matches": true,
+      "source_bytes_equal": true,
+      "terminal_reason": "BUDGET_EXPIRED",
+      "comparison": {
+        "status": "MISMATCH",
+        "matched": false,
+        "differences": [
+          {
+            "kind": "VALUE_MISMATCH",
+            "path": "/body_params/nonce/value",
+            "expected": "fuzz",
+            "actual": "FUZZ"
+          },
+          {
+            "kind": "UNEXPECTED_PARAMETER",
+            "path": "/body_params/option_id",
+            "expected": null,
+            "actual": {
+              "name": "option_id",
+              "value": "fuzz"
+            }
+          },
+          {
+            "kind": "UNEXPECTED_PARAMETER",
+            "path": "/headers/Content-Type",
+            "expected": null,
+            "actual": {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            }
+          },
+          {
+            "kind": "CLASSIFICATION_MISMATCH",
+            "path": "/headers/fixed",
+            "expected": [],
+            "actual": [
+              "Content\\-Type"
+            ]
+          },
+          {
+            "kind": "VALUE_MISMATCH",
+            "path": "/headers/weight",
+            "expected": null,
+            "actual": 1,
+            "reason": "missing_field"
+          }
+        ],
+        "errors": []
+      },
+      "canonical_config_hash": "af6ebb1e2856d9bf686b91a6b41f565ba3e811cef0c336d9a510a673baf3962c",
+      "missing_data_parameters": [],
+      "missing_fuzz_selectors": [],
+      "baseline_replay": [
+        {
+          "status": 200,
+          "body": "\r\n{\"success\":true}",
+          "request_params": {
+            "query_params": {
+              "action": "cn-deactivate-plugin"
+            },
+            "body_params": {
+              "nonce": "FUZZ",
+              "option_id": "8uzz",
+              "other": "fuzz"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "hook": "wp_ajax_cn-get-group-rules-values",
+      "reference": "C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\experiment\\02-0day-vulns\\configs\\1000000-cookie-notice.2.4.8.zip\\get_group_rule_values\\fuzzer-config.cn-get-group-rules-values.json",
+      "actual": "C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\phuzz-main\\code\\fuzzer\\output\\online-linked\\cookie-notice-20261103T161734Z\\final-configs\\fuzzer-config.wp_ajax_cn-get-group-rules-values.8413b262215ac8f6.json",
+      "version": "v1",
+      "verification_policy": "callback_baseline_v1",
+      "export_sha256": "8a7cd5222c054235ee6a351dc5274bea2116fa0033298c74355585dcfef00d31",
+      "recorded_hash_matches": true,
+      "source_bytes_equal": true,
+      "terminal_reason": "BUDGET_EXPIRED",
+      "comparison": {
+        "status": "MISMATCH",
+        "matched": false,
+        "differences": [
+          {
+            "kind": "MISSING_PARAMETER",
+            "path": "/body_params/cn_nonce",
+            "expected": {
+              "name": "cn_nonce",
+              "value": "fuzz"
+            },
+            "actual": null
+          },
+          {
+            "kind": "CLASSIFICATION_MISMATCH",
+            "path": "/body_params/fixed",
+            "expected": [
+              "cn_nonce"
+            ],
+            "actual": []
+          },
+          {
+            "kind": "UNEXPECTED_PARAMETER",
+            "path": "/headers/Content-Type",
+            "expected": null,
+            "actual": {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            }
+          },
+          {
+            "kind": "CLASSIFICATION_MISMATCH",
+            "path": "/headers/fixed",
+            "expected": [],
+            "actual": [
+              "Content\\-Type"
+            ]
+          },
+          {
+            "kind": "VALUE_MISMATCH",
+            "path": "/headers/weight",
+            "expected": null,
+            "actual": 1,
+            "reason": "missing_field"
+          }
+        ],
+        "errors": []
+      },
+      "canonical_config_hash": "b718b9f59a0fb93fb09971eecb04b4346193e3bb257ea1385d5264323bb362bc",
+      "missing_data_parameters": [
+        "body_params:cn_nonce"
+      ],
+      "missing_fuzz_selectors": [],
+      "baseline_replay": [
+        {
+          "status": 200,
+          "body": "\r\n",
+          "request_params": {
+            "query_params": {
+              "action": "cn-get-group-rules-values"
+            },
+            "body_params": {
+              "action": "cn-get-group-rules-values",
+              "cn_param": "fuzz"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "hook": "wp_ajax_cn_api_request",
+      "reference": "C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\experiment\\02-0day-vulns\\configs\\1000000-cookie-notice.2.4.8.zip\\api_request\\fuzzer-config.cn_api_request.json",
+      "actual": "C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\phuzz-main\\code\\fuzzer\\output\\online-linked\\cookie-notice-20261103T161734Z\\final-configs\\fuzzer-config.wp_ajax_cn_api_request.2c3a5faece5b674c.json",
+      "version": "v1",
+      "verification_policy": "callback_baseline_v1",
+      "export_sha256": "9fa55411e796956443028d8e3607d87652ca66eac92ef3ad67023f3734a6c6a6",
+      "recorded_hash_matches": true,
+      "source_bytes_equal": true,
+      "terminal_reason": "NO_NEW_PROGRESS",
+      "comparison": {
+        "status": "MISMATCH",
+        "matched": false,
+        "differences": [
+          {
+            "kind": "MISSING_PARAMETER",
+            "path": "/body_params/cn_payment_identifier",
+            "expected": {
+              "name": "cn_payment_identifier",
+              "value": "fuzz"
+            },
+            "actual": null
+          },
+          {
+            "kind": "MISSING_PARAMETER",
+            "path": "/body_params/cn_payment_nonce",
+            "expected": {
+              "name": "cn_payment_nonce",
+              "value": "fuzz"
+            },
+            "actual": null
+          },
+          {
+            "kind": "MISSING_PARAMETER",
+            "path": "/body_params/email",
+            "expected": {
+              "name": "email",
+              "value": "fuzz"
+            },
+            "actual": null
+          },
+          {
+            "kind": "CLASSIFICATION_MISMATCH",
+            "path": "/body_params/fixed",
+            "expected": [
+              "cn_payment_nonce",
+              "payment_nonce"
+            ],
+            "actual": []
+          },
+          {
+            "kind": "CLASSIFICATION_MISMATCH",
+            "path": "/body_params/fuzz",
+            "expected": [
+              "cn_nonce",
+              "cn_payment_identifier",
+              "email",
+              "language",
+              "method",
+              "pass",
+              "pass2",
+              "plan",
+              "request",
+              "subscriptionID",
+              "terms"
+            ],
+            "actual": [
+              "request"
+            ]
+          },
+          {
+            "kind": "MISSING_PARAMETER",
+            "path": "/body_params/language",
+            "expected": {
+              "name": "language",
+              "value": "fuzz"
+            },
+            "actual": null
+          },
+          {
+            "kind": "MISSING_PARAMETER",
+            "path": "/body_params/method",
+            "expected": {
+              "name": "method",
+              "value": "fuzz"
+            },
+            "actual": null
+          },
+          {
+            "kind": "MISSING_PARAMETER",
+            "path": "/body_params/pass",
+            "expected": {
+              "name": "pass",
+              "value": "fuzz"
+            },
+            "actual": null
+          },
+          {
+            "kind": "MISSING_PARAMETER",
+            "path": "/body_params/pass2",
+            "expected": {
+              "name": "pass2",
+              "value": "fuzz"
+            },
+            "actual": null
+          },
+          {
+            "kind": "MISSING_PARAMETER",
+            "path": "/body_params/payment_nonce",
+            "expected": {
+              "name": "payment_nonce",
+              "value": "fuzz"
+            },
+            "actual": null
+          },
+          {
+            "kind": "MISSING_PARAMETER",
+            "path": "/body_params/subscriptionID",
+            "expected": {
+              "name": "subscriptionID",
+              "value": "fuzz"
+            },
+            "actual": null
+          },
+          {
+            "kind": "MISSING_PARAMETER",
+            "path": "/body_params/terms",
+            "expected": {
+              "name": "terms",
+              "value": "fuzz"
+            },
+            "actual": null
+          },
+          {
+            "kind": "UNEXPECTED_PARAMETER",
+            "path": "/headers/Content-Type",
+            "expected": null,
+            "actual": {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            }
+          },
+          {
+            "kind": "CLASSIFICATION_MISMATCH",
+            "path": "/headers/fixed",
+            "expected": [],
+            "actual": [
+              "Content\\-Type"
+            ]
+          },
+          {
+            "kind": "VALUE_MISMATCH",
+            "path": "/headers/weight",
+            "expected": null,
+            "actual": 1,
+            "reason": "missing_field"
+          }
+        ],
+        "errors": []
+      },
+      "canonical_config_hash": "d38c56bb7872f9103c957d085712c59f0a1794a0b04f821534e0cb8d84e55868",
+      "missing_data_parameters": [
+        "body_params:cn_payment_identifier",
+        "body_params:cn_payment_nonce",
+        "body_params:email",
+        "body_params:language",
+        "body_params:method",
+        "body_params:pass",
+        "body_params:pass2",
+        "body_params:payment_nonce",
+        "body_params:subscriptionID",
+        "body_params:terms"
+      ],
+      "missing_fuzz_selectors": [
+        "body_params:cn_nonce",
+        "body_params:cn_payment_identifier",
+        "body_params:email",
+        "body_params:language",
+        "body_params:method",
+        "body_params:pass",
+        "body_params:pass2",
+        "body_params:plan",
+        "body_params:subscriptionID",
+        "body_params:terms"
+      ],
+      "baseline_replay": [
+        {
+          "status": 200,
+          "body": "\r\nYou do not have permission to access this page.",
+          "request_params": {
+            "query_params": {
+              "action": "cn_api_request"
+            },
+            "body_params": {
+              "request": "fuzz"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "hook": "wp_ajax_cn_dismiss_notice",
+      "reference": "C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\experiment\\02-0day-vulns\\configs\\1000000-cookie-notice.2.4.8.zip\\ajax_dismiss_admin_notice\\fuzzer-config.cn_dismiss_notice.json",
+      "actual": "C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\phuzz-main\\code\\fuzzer\\output\\online-linked\\cookie-notice-20261103T161734Z\\final-configs\\fuzzer-config.wp_ajax_cn_dismiss_notice.b24f5e2cb1dd0a5a.json",
+      "version": "v1",
+      "verification_policy": "callback_baseline_v1",
+      "export_sha256": "b3f4fcb813a4f06cbced59dfeb99d32d92ea228a709b96cefed0bf7aa507d671",
+      "recorded_hash_matches": true,
+      "source_bytes_equal": true,
+      "terminal_reason": "NO_NEW_PROGRESS",
+      "comparison": {
+        "status": "MISMATCH",
+        "matched": false,
+        "differences": [
+          {
+            "kind": "CLASSIFICATION_MISMATCH",
+            "path": "/body_params/fuzz",
+            "expected": [
+              "cn_network",
+              "notice_action",
+              "param"
+            ],
+            "actual": [
+              "cn_network",
+              "notice_action",
+              "reset_cookie_notice_options",
+              "save_cookie_notice_options"
+            ]
+          },
+          {
+            "kind": "VALUE_MISMATCH",
+            "path": "/body_params/nonce/value",
+            "expected": "fuzz",
+            "actual": "FUZZ"
+          },
+          {
+            "kind": "UNEXPECTED_PARAMETER",
+            "path": "/body_params/notice_action",
+            "expected": null,
+            "actual": {
+              "name": "notice_action",
+              "value": "fuzz"
+            }
+          },
+          {
+            "kind": "MISSING_PARAMETER",
+            "path": "/body_params/param",
+            "expected": {
+              "name": "param",
+              "value": "fuzz"
+            },
+            "actual": null
+          },
+          {
+            "kind": "UNEXPECTED_PARAMETER",
+            "path": "/body_params/reset_cookie_notice_options",
+            "expected": null,
+            "actual": {
+              "name": "reset_cookie_notice_options",
+              "value": "fuzz"
+            }
+          },
+          {
+            "kind": "UNEXPECTED_PARAMETER",
+            "path": "/body_params/save_cookie_notice_options",
+            "expected": null,
+            "actual": {
+              "name": "save_cookie_notice_options",
+              "value": "fuzz"
+            }
+          },
+          {
+            "kind": "UNEXPECTED_PARAMETER",
+            "path": "/headers/Content-Type",
+            "expected": null,
+            "actual": {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            }
+          },
+          {
+            "kind": "CLASSIFICATION_MISMATCH",
+            "path": "/headers/fixed",
+            "expected": [],
+            "actual": [
+              "Content\\-Type"
+            ]
+          },
+          {
+            "kind": "VALUE_MISMATCH",
+            "path": "/headers/weight",
+            "expected": null,
+            "actual": 1,
+            "reason": "missing_field"
+          }
+        ],
+        "errors": []
+      },
+      "canonical_config_hash": "82575f59523aad4bae07884d40377c814e359e01b15a0bb1c008dd4d51e5f32e",
+      "missing_data_parameters": [
+        "body_params:param"
+      ],
+      "missing_fuzz_selectors": [
+        "body_params:param"
+      ],
+      "baseline_replay": [
+        {
+          "status": 200,
+          "body": "\r\n",
+          "request_params": {
+            "query_params": {
+              "action": "cn_dismiss_notice"
+            },
+            "body_params": {
+              "cn_network": "fuzz",
+              "nonce": "FUZZ",
+              "notice_action": "fuzz",
+              "reset_cookie_notice_options": "fuzz",
+              "save_cookie_notice_options": "fuzz"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "hook": "wp_ajax_cn_welcome_screen",
+      "reference": "C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\experiment\\02-0day-vulns\\configs\\1000000-cookie-notice.2.4.8.zip\\welcome_screen\\fuzzer-config.cn_welcome_screen.json",
+      "actual": "C:\\Users\\nghia.cd_extremevn\\Desktop\\Phuzz-hook\\phuzz-main\\code\\fuzzer\\output\\online-linked\\cookie-notice-20261103T161734Z\\final-configs\\fuzzer-config.wp_ajax_cn_welcome_screen.67856a117bebfa91.json",
+      "version": "v1",
+      "verification_policy": "callback_baseline_v1",
+      "export_sha256": "cda2275ff3f1b0dcbaacbe6489f68df0edd35411eb14e1079df7e274cb1977e0",
+      "recorded_hash_matches": true,
+      "source_bytes_equal": true,
+      "terminal_reason": "NO_NEW_PROGRESS",
+      "comparison": {
+        "status": "MATCH",
+        "matched": true,
+        "differences": [],
+        "errors": []
+      },
+      "canonical_config_hash": "b41a1479a2f1551f66df285f7471973f8b2bdc25400675c49cf9d89fdfe0b253",
+      "missing_data_parameters": [],
+      "missing_fuzz_selectors": [],
+      "baseline_replay": [
+        {
+          "status": 200,
+          "body": "\r\nYou do not have permission to access this page.",
+          "request_params": {
+            "query_params": {
+              "action": "cn_welcome_screen",
+              "screen": "fuzz"
+            },
+            "body_params": []
+          }
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "Offline artifact comparison; no live rerun or fuzzing/vulnerability verification.",
+    "Callback baseline success is distinct from application branch success.",
+    "Experiment combines selectors from different branches; exact declaration mismatch does not alone imply a runtime defect."
+  ],
+  "counts": {
+    "MISMATCH": 4,
+    "MATCH": 1
+  },
+  "findings": {
+    "api_request": "Only request is present. Missing 10 fuzz selectors and 2 fixed selectors from reference. request=fuzz is outside the source allowlist; replay body denies access. Source also requires main nonce, absent from both configs.",
+    "get_group_rule_values": "Missing fixed cn_nonce; source requires action, cn_param and cn_nonce together. Replay body is empty.",
+    "dismiss_notice": "Missing param, read only under notice_action=threshold; exported notice_action is fuzz. Extra reset/save options are attributed helper-depth-3 reads, not direct callback reads.",
+    "deactivate_plugin": "option_id and other both fuzz, nonce fixed. Baseline replay uses option_id=8uzz; exported seed remains fuzz, so default request need not enter option 8.",
+    "welcome_screen": "Config declarations match reference; replay screen=fuzz returns permission denial, so matching reference does not prove successful screen rendering."
+  }
+}

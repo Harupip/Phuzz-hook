@@ -209,6 +209,9 @@ class OnlineLinkedCoordinator:
         self.legacy_run_id = legacy_run_id
         self.max_seconds = max_seconds
         self._sender_seconds = 0.0
+        # Set while a passed AJAX replay's guards are probed: children are only verified.
+        self._replay_discovery_active = False
+        self._replay_evidence: dict[str, dict[str, Any]] = {}
         self.max_versions = max_versions
         self.hard_seconds = hard_seconds
         self.hard_versions = hard_versions
@@ -1391,7 +1394,15 @@ class OnlineLinkedCoordinator:
                 {"parameters": new_parameters, "evidence": evidence}
             ], parent)
             reason = "HARD_VERSION_CAP" if self.max_versions >= self.hard_versions else "VERSION_BUDGET_EXPIRED"
-            self.state.update(terminal_status="PARTIAL", terminal_reason=reason)
+            if self._replay_discovery_active:
+                # The verified child still starts; its own run reaches the cap later.
+                self._record_event({
+                    "kind": "REPLAY_GUARD_DISCOVERY", "status": "DEFERRED", "reason": reason,
+                    "version": parent["version"], "request_id": evidence.get("request_id"),
+                    "parameters": [self._safe_parameter_identity(p) for p in new_parameters if isinstance(p, Mapping)],
+                })
+            else:
+                self.state.update(terminal_status="PARTIAL", terminal_reason=reason)
             self._write_state()
             return None
         discovery = {
@@ -1503,6 +1514,8 @@ class OnlineLinkedCoordinator:
                 config_generation_seconds=round(max(0.0, self.clock() - config_generation_started_at), 3),
             )
             child["known_parameters"] = proposed_parameters
+            if self._replay_discovery_active:
+                child["discovery_origin"] = "replay_guard"
             self._reports[next_version] = copy.deepcopy(materialized)
             self.force_replay_only_fn(replay_config)
             replay_path = self._write_config(next_version, replay_config, replay=True)
@@ -1539,6 +1552,8 @@ class OnlineLinkedCoordinator:
         for version in self.state.get("versions", []):
             if (
                 not isinstance(version, Mapping) or version.get("version") == "v0"
+                # A failed replay-guard child is a rejected probe, not a parent batch.
+                or version.get("discovery_origin") == "replay_guard"
                 or (version.get("replay_result") or {}).get("passed") is True
                 or str(version.get("callback_id") or "") != str(parent.get("callback_id") or "")
                 or str(version.get("resolved_method") or "").upper() != method
@@ -2483,6 +2498,10 @@ class OnlineLinkedCoordinator:
                 plugin_slug=self.plugin_slug, legacy_run_id=probe_run_id,
                 known_state={"known_parameters": [] if method_transition else parent.get("known_parameters", [])}, candidate_key=None,
                 runtime_cookie_probes=self.runtime_cookie_probes,
+                # A guard first reached by a field probe on a field it did not send gets its own
+                # probe. A method probe stays one batch: like the worker trace it is the first
+                # request of its method, and only its POST fields may prove that method.
+                probe_unsent_guards=probe.get("method_probe") is not True,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONVERGENCE_FAILED", deadline, detail=str(exc))
@@ -2989,7 +3008,8 @@ class OnlineLinkedCoordinator:
             child["status"] = "guard_unverified"
             child["worker_status"] = "not_started_guard_unverified"
             child["terminal_reason"] = "GUARD_SATISFACTION_UNKNOWN"
-            self.state.update(terminal_status="PARTIAL", terminal_reason="GUARD_SATISFACTION_UNKNOWN")
+            if not self._replay_discovery_active:
+                self.state.update(terminal_status="PARTIAL", terminal_reason="GUARD_SATISFACTION_UNKNOWN")
             record_replay_event("DEFERRED", "GUARD_SATISFACTION_UNKNOWN")
             self._write_state()
             return False
@@ -2998,6 +3018,27 @@ class OnlineLinkedCoordinator:
             child["status"] = "replay_pass"
             child["terminal_reason"] = ""
             self._write_state()
+            if self._replay_discovery_active:
+                # The caller hands off once, after choosing among verified children.
+                self._replay_evidence[version_name] = {**baseline, "evidence_origin": "child_replay"}
+                return True
+            if _is_ajax(child):
+                target = self._discover_replay_guards(
+                    child, {**baseline, "evidence_origin": "child_replay"}, deadline=deadline,
+                )
+                if self.state.get("terminal_status") in {"NOT_VERIFIED", "VULN_FOUND"} or not self._active_container:
+                    child["worker_status"] = "not_started_parent_exited"
+                    child["terminal_reason"] = str(self.state.get("terminal_reason") or "PARENT_WORKER_EXITED")
+                    record_replay_event("PASS", child["terminal_reason"])
+                    self._write_state()
+                    return False
+                if deadline is not None and self._deadline is not None:
+                    deadline = max(deadline, self._deadline)
+                if target is not child:
+                    # record_replay_event reads these names, so its events describe the target.
+                    child, version_name = target, str(target["version"])
+                    replay_result = child["replay_result"]
+                    merged_report = self._reports.get(version_name, merged_report)
             if self._observe_parent_exit() is not None:
                 child["worker_status"] = "not_started_parent_exited"
                 child["terminal_reason"] = str(self.state.get("terminal_reason") or "PARENT_WORKER_EXITED")
@@ -3051,9 +3092,10 @@ class OnlineLinkedCoordinator:
                 child["terminal_reason"] = str(replay_row.get("validation_reason") or "CALLBACK_NOT_REACHED")
             else:
                 child["terminal_reason"] = "CALLBACK_BASELINE_NOT_VERIFIED"
-            self._failure = True
-            self.state["terminal_status"] = "NOT_VERIFIED"
-            self.state["terminal_reason"] = "CHILD_REPLAY_FAILED"
+            if not self._replay_discovery_active:
+                self._failure = True
+                self.state["terminal_status"] = "NOT_VERIFIED"
+                self.state["terminal_reason"] = "CHILD_REPLAY_FAILED"
             record_replay_event(
                 "REJECTED",
                 str(
@@ -3064,6 +3106,122 @@ class OnlineLinkedCoordinator:
             )
             self._write_state()
         return False
+
+    def _discover_replay_guards(
+        self, child: dict[str, Any], evidence: Mapping[str, Any], *, deadline: float | None,
+    ) -> dict[str, Any]:
+        """Probe guards that a passed AJAX replay hit on fields it never sent.
+
+        The running parent sends each probe and child baseline. A descendant replaces
+        ``child`` only after its own callback baseline passes; every round adds one
+        version, so the loop is bounded by the version and probe caps.
+        """
+        current = child
+        while not (deadline is not None and self.clock() >= deadline):
+            if self.state.get("terminal_status") or not self._active_container:
+                break
+            version_name = str(current["version"])
+            raw_report = self._reports.get(version_name)
+            if raw_report is None or not current.get("replay_config_path"):
+                break
+            replay_run_id = str(evidence["worker_run_id"])
+            replay_dir = self.run_dir / "versions" / version_name / "replay"
+            try:
+                result = self.converge_fn(
+                    raw_report=raw_report,
+                    pass_run_summary={"legacy_run_id": replay_run_id, "runs": [{
+                        "config_slug": Path(str(current["replay_config_path"])).relative_to(self.config_root)
+                        .with_suffix("").as_posix(),
+                        "hook_name": current["hook_name"],
+                        "callback_id": current["callback_id"],
+                        "seed_variant_id": str(current.get("seed_variant_id") or ""),
+                        "callback_reached": True,
+                        "matched_artifact": str(evidence["request_name"]),
+                        "resolved_method": current["resolved_method"],
+                        "process_status": "replaying",
+                    }]},
+                    pass_artifacts_dir=replay_dir / "request",
+                    zend_events_dir=replay_dir / "zend",
+                    registry=self.registry,
+                    plugin_slug=self.plugin_slug,
+                    legacy_run_id=replay_run_id,
+                    known_state={"known_parameters": current.get("known_parameters", [])},
+                    candidate_key=None,
+                    runtime_cookie_probes=self.runtime_cookie_probes,
+                    probe_unsent_guards=True,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._record_event({
+                    "kind": "REPLAY_GUARD_DISCOVERY", "status": "REJECTED",
+                    "reason": "CORRELATION_OR_PROVENANCE_INCOMPLETE", "version": version_name,
+                    "request_id": evidence.get("request_id"), "detail": str(exc),
+                })
+                break
+            unsent = {
+                (str(row.get("source") or "").upper(), str(row.get("name") or ""))
+                for row in (result.get("observed_parameters") or [])
+                if isinstance(row, Mapping) and row.get("candidate_reason") == "unsent_guard"
+            }
+            probes = [
+                dict(row) for row in (result.get("pending_probes") or [])
+                if isinstance(row, Mapping)
+                and (str(row.get("source") or "").upper(), str(row.get("name") or "")) in unsent
+            ]
+            if not probes:
+                break
+            self._record_event({
+                "kind": "REPLAY_GUARD_DISCOVERY", "status": "PENDING", "reason": "UNSENT_GUARD",
+                "version": version_name, "worker_run_id": replay_run_id,
+                "request_id": evidence.get("request_id"),
+                "parameters": [self._safe_parameter_identity(row) for row in probes],
+            })
+            convergence = {
+                **result, "new_parameters": [], "pending_probes": probes,
+                "known_parameters": current.get("known_parameters", []),
+            }
+            self._replay_discovery_active = True
+            try:
+                next_child = self._run_pending_probe(
+                    parent={**current, "worker_run_id": replay_run_id}, evidence=evidence,
+                    raw_report=raw_report, convergence=convergence, probe=probes[0],
+                    seed=current.get("seed_item") or {}, deadline=deadline,
+                )
+            finally:
+                self._replay_discovery_active = False
+            next_evidence = self._replay_evidence.pop(str((next_child or {}).get("version") or ""), None)
+            if (
+                next_child is None or next_evidence is None
+                or (next_child.get("replay_result") or {}).get("passed") is not True
+            ):
+                break
+            current["worker_status"] = "not_started_superseded"
+            current["terminal_reason"] = f"SUPERSEDED_BY_{next_child['version']}"
+            covered = {
+                _parameter_key(parameter) for parameter in next_child.get("known_parameters") or []
+                if isinstance(parameter, Mapping)
+            }
+            superseded = {
+                str(version.get("version")) for version in self.state["versions"]
+                if version.get("worker_status") == "not_started_superseded"
+            }
+            queue = self.state.get("pending_probe_queue", [])
+            for row in [row for row in queue if row.get("parent_version") in superseded
+                        and _parameter_key(row.get("candidate") or {}) in covered]:
+                # Otherwise a later drain would stop the descendant to restart this version.
+                queue.remove(row)
+                self._record_event({
+                    "kind": "PARAMETER_PROBE", "status": "SKIPPED", "reason": "ADMITTED_FROM_TRACE",
+                    "version": row.get("parent_version"), "request_id": (row.get("candidate") or {}).get("request_id"),
+                    "candidate": dict(row.get("candidate") or {}),
+                })
+            self._record_event({
+                "kind": "CHILD_REPLAY", "status": "PASS", "reason": current["terminal_reason"],
+                "hook_name": current.get("hook_name"), "version": version_name,
+                "probe_id": None, "parameter": None,
+                "timing": dict((current.get("replay_result") or {}).get("timing") or {}),
+            })
+            current, evidence = next_child, next_evidence
+        return current
 
     def _select_v0(self) -> tuple[Mapping[str, Any], dict[str, Any], str] | None:
         payload = json.loads(filesystem_path(self.suggested_seeds).read_text(encoding="utf-8-sig"))
