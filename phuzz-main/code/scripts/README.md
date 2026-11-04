@@ -23,6 +23,7 @@ Reviewed 2026-10-09, including working-tree batch/ZIP changes. Settings: CLI fla
 | `scripts/wordpress/read-phuzz-env.ps1` | Parse env, resolve validated settings and select preferred ZIP with per-plugin fallback. |
 | `scripts/wordpress/run-wordpress-phuzz.ps1` | Bootstrap WordPress, export runtime seeds, initialize the callback registry and invoke online-linked. |
 | `scripts/wordpress/invoke-online-linked.ps1` | Stop the bootstrap worker and launch `python -m online_linked` with campaign budgets. |
+| `scripts/wordpress/watch-online-linked.ps1` | Read-only live view from a second terminal: versions (v0 → vN) and latest events of the active candidate in the newest (or `-RunId`) run. `-Once` prints a single snapshot. |
 | `scripts/wordpress/run-wordpress-phuzz.sh` | Bash helper for WSL-like shells. It stops the fuzzer service, clears `fuzzer/output`, then calls the PowerShell runner. |
 | `scripts/wordpress/run-wordpress-plugin-matrix.ps1` | Plugin matrix runner. It downloads missing plugin ZIPs, generates temporary Compose overrides, runs each selected plugin, and writes Markdown/JSON reports. |
 | `scripts/benchmarks/benchmark-wordpress-phuzz.ps1` | Benchmark runner. It switches scoring mode, runs repeated fuzz windows, copies artifacts, and calls the benchmark summarizer. |

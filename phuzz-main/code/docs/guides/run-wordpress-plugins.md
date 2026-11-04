@@ -45,6 +45,25 @@ Mỗi plugin có run ID, campaign budget và artifacts riêng. Batch tắt compa
 
 Bootstrap/build/cleanup có thời gian riêng, ngoài campaign budget; hard campaign cap mặc định có thể lên 86400s. Khi chạy bằng automation, đặt outer process timeout theo hard cap cộng phần bootstrap/cleanup và tổng số plugin. Không coi initial `3600` là wall-clock trần toàn lệnh. Không tăng budget để bỏ qua replay/provenance failure.
 
+## Theo dõi khi đang chạy
+
+[watch-online-linked.ps1](../../scripts/wordpress/watch-online-linked.ps1) chỉ đọc file trong `fuzzer/output/online-linked`, không gọi Docker và không ảnh hưởng campaign. Chạy được bằng Windows PowerShell 5.1 (`powershell`), không cần `pwsh`.
+
+1. Cửa sổ 1: chạy `phuzz.ps1` như bình thường.
+2. Cửa sổ 2, từ `phuzz-main/code`, sau khi cửa sổ 1 qua bước `Waiting for live hook coverage snapshot` (trước đó run mới chưa có thư mục output, script sẽ hiện run cũ):
+
+```powershell
+.\scripts\wordpress\watch-online-linked.ps1
+# Nếu Windows báo "running scripts is disabled on this system":
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\wordpress\watch-online-linked.ps1
+```
+
+Script làm mới mỗi 5 giây, Ctrl+C để thoát; tự chuyển sang candidate kế tiếp. Kiểm tra dòng `Run: <slug>-<giờ>` để chắc đang xem run hiện tại. Tùy chọn: `-IntervalSeconds <s>`, `-EventCount <n>` (`0` ẩn event), `-RunId <run-id>`, `-Once` (in một lần rồi thoát, dùng để xem lại run đã xong).
+
+Màn hình gồm trạng thái campaign, candidate đang chạy, bảng version (`version`, `parent_version`, `status`, `worker_status`, `terminal_reason`, tham số đã biết) và các event gần nhất (bỏ `RUNTIME_OBSERVATION`). Nội dung config của version nằm ở `fuzzer/configs/online-linked/<slug>/<storage-id>/versions/vN/vN-config.json` (trường `config_path` trong `state.json`).
+
+Candidate báo `V0_PREREQUISITE_GATE_FAILED` và `No version yet.` là không dựng được v0, thường là hook nội bộ không có direct HTTP mapping (`missing_requirements: ['direct_http_mapping']`); không có file config cho candidate đó. Script không hiển thị request đang fuzz, coverage hay finding.
+
 ## Đọc kết quả và debug
 
 Mở `fuzzer/output/online-linked/<run-id>/batch-state.json`, lấy `state_path` của candidate. Đọc `readiness`/`replay_result`, Pass 2, worker status và terminal reason riêng; rồi xem `final-config-summary.json` → `exported_configs`. Final files active nằm ở `final-configs/*.json`, bản được thay thế ở `final-configs/superseded/`.
