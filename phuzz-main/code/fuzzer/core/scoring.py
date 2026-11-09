@@ -123,7 +123,7 @@ def calculate_hook_coverage_energy(request_data, state=None, config=None, update
 # Use explicit constants here so mode changes stay visible inside this file.
 SCORING_MODE_PHUZZ = 1
 SCORING_MODE_PHUZZ_HOOK = 2
-ACTIVE_SCORING_MODE = _env_int("PHUZZ_SCORING_MODE", SCORING_MODE_PHUZZ_HOOK)
+ACTIVE_SCORING_MODE = _env_int("PHUZZ_SCORING_MODE", SCORING_MODE_PHUZZ)
 
 DEFAULT_HOOK_REQUESTS_DIR = _env_str("FUZZER_HOOK_REQUESTS_DIR", "/shared-tmpfs/hook-coverage/requests")
 DEFAULT_HOOK_PRIORITY_WEIGHT = _env_float("FUZZER_HOOK_PRIORITY_WEIGHT", 1.0)

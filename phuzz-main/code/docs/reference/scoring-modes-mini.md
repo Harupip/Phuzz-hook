@@ -6,8 +6,7 @@ kiểm chứng hiện tại trong [review record](../reports/2026-10-09-document
 ## Da lam duoc gi
 
 - `DefaultScoringFormula` trong `core/scoring.py` bay gio la bo chon mode scoring.
-- Mac dinh mode moi la `2`, tuc `PHUZZ+hook`.
-- Mode cu `1`, tuc `PHUZZ`, van con de anh tat hook feedback khi can doi chieu.
+- Compose và Python mặc định dùng mode `1` (`PHUZZ`). Có thể chọn mode `2` (`PHUZZ+hook`) để đối chiếu.
 - Co the doi mode va tham so blend bang file `phuzz-main/code/fuzzer/scoring.env`.
 - Hook energy da duoc noi truc tiep vao `calculate_priority(...)` va `calculate_energy(...)`.
 - `priority` van cong additive theo hook signal, nhung `energy` da chuyen sang weighted blend giua PHUZZ base va hook energy.
@@ -32,7 +31,7 @@ kiểm chứng hiện tại trong [review record](../reports/2026-10-09-document
   - Them hang so:
     - `SCORING_MODE_PHUZZ = 1`
     - `SCORING_MODE_PHUZZ_HOOK = 2`
-    - `ACTIVE_SCORING_MODE` doc tu `PHUZZ_SCORING_MODE`, mac dinh `2`
+    - `ACTIVE_SCORING_MODE` doc tu `PHUZZ_SCORING_MODE`, mac dinh `1`
     - `DEFAULT_HOOK_REQUESTS_DIR` doc tu `FUZZER_HOOK_REQUESTS_DIR`
     - `DEFAULT_HOOK_PRIORITY_WEIGHT` doc tu `FUZZER_HOOK_PRIORITY_WEIGHT`
     - `DEFAULT_HOOK_ENERGY_BASE_WEIGHT` doc tu `FUZZER_HOOK_ENERGY_BASE_WEIGHT`
@@ -84,6 +83,11 @@ kiểm chứng hiện tại trong [review record](../reports/2026-10-09-document
   - `hook_energy`
   - `hook_energy_avg`
 
+### Bonus khi online-linked chuyển config
+
+- Sau callback baseline, coordinator so sánh config đang chạy với config cuối được chọn. Mỗi cặp `(bucket, name)` mới có selector fuzz cấp thêm một lượt mutation.
+- Worker mới cộng bonus vào energy của candidate đầu tiên scheduler chọn. Các vòng sau dùng energy theo mode. Lệnh khởi động và log `[energy]` ghi lại bonus.
+
 ## Cach doi mode bang env
 
 Sua file `phuzz-main/code/fuzzer/scoring.env`:
@@ -91,12 +95,6 @@ Sua file `phuzz-main/code/fuzzer/scoring.env`:
 ```env
 # 1 = PHUZZ goc
 # 2 = PHUZZ + hook coverage feedback
-PHUZZ_SCORING_MODE=2
-```
-
-Neu muon quay ve PHUZZ goc:
-
-```env
 PHUZZ_SCORING_MODE=1
 ```
 
@@ -109,7 +107,7 @@ PHUZZ_SCORING_MODE=2
 ## Bien moi truong lien quan
 
 - `PHUZZ_SCORING_MODE`
-  - mac dinh: `2`
+  - mac dinh: `1`
   - `1` = PHUZZ goc, `2` = PHUZZ+hook
 - `FUZZER_HOOK_REQUESTS_DIR`
   - mac dinh: `/shared-tmpfs/hook-coverage/requests`

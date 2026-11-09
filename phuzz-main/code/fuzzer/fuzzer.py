@@ -899,6 +899,9 @@ class Fuzzer:
 
     def fuzz_fast(self):
         counter = 0
+        parameter_bonus = int(os.environ.get("HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS", "0"))
+        if parameter_bonus < 0:
+            raise ValueError("HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS must be non-negative")
 
         self.ff_candidates = [] 
         # Th is self.seen_mutations
@@ -936,6 +939,11 @@ class Fuzzer:
 
             # This is the handoff from score/priority land into scheduler budget.
             energy = self.calculate_energy(candidate)
+            if parameter_bonus:
+                print(f"[energy] base={energy} new_parameter_bonus={parameter_bonus} final={energy + parameter_bonus}")
+                energy += parameter_bonus
+                candidate.final_energy = energy
+                parameter_bonus = 0
             #print(energy)
             # This loop is where integer `energy` becomes actual mutation attempts.
             for i in range(energy):

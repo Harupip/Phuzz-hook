@@ -707,6 +707,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertIn("cn_nonce", final["body_params"]["fixed"])
             self.assertTrue({"action", "cn_param"} <= set(final["body_params"]["fuzz"]))
             self.assertNotIn("cn_nonce", final["body_params"]["fuzz"])
+            self.assertIn("HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS=1", coordinator.state["workers"][-1]["command"])
 
     def test_guard_revealed_by_probe_trace_gets_its_own_probe(self):
         # p(cn_nonce) passes isset(cn_nonce) and only then reaches isset(next_guard): seeing that
@@ -5526,6 +5527,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             child_start_index = log.index("worker_start", log.index("worker_start") + 1)
             self.assertLess(replay_index, stop_index)
             self.assertLess(replay_index, child_start_index)
+            initial, child = coordinator.state["workers"]
+            self.assertFalse(any(arg.startswith("HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS=") for arg in initial["command"]))
+            self.assertIn("HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS=1", child["command"])
             replay_event = [event for event in coordinator.state["events"] if event.get("kind") == "CHILD_REPLAY"][-1]
             self.assertEqual(replay_event["timing"], coordinator.state["versions"][1]["replay_result"]["timing"])
 

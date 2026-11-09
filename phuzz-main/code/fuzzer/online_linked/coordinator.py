@@ -109,6 +109,22 @@ def _config_name_is_fuzzable(section: Mapping[str, Any], name: str) -> bool:
     return is_fuzzable and not is_fixed
 
 
+def _config_fuzzable_fields(path: Path) -> set[tuple[str, str]]:
+    config = json.loads(filesystem_path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(config, Mapping):
+        raise ValueError("Expected a config object")
+    fields = set()
+    for bucket in ("query_params", "body_params", "headers", "cookies"):
+        section = config.get(bucket, {})
+        for row in section.get("data", []):
+            name = str(row.get("name") or "")
+            if bucket == "headers" and name.lower() in {"host", "cookie"}:
+                continue
+            if _config_name_is_fuzzable(section, name):
+                fields.add((bucket, name))
+    return fields
+
+
 def _replace_fuzzable_values_with_placeholder(config: dict[str, Any]) -> None:
     """Use PHUZZ's fuzz sentinel in the published fuzzing config only."""
     for section_name in ("query_params", "body_params", "headers", "cookies"):
@@ -3046,6 +3062,17 @@ class OnlineLinkedCoordinator:
                 self._write_state()
                 return False
             handoff_started_at = self.clock()
+            parameter_bonus = 0
+            try:
+                parameter_bonus = len(
+                    _config_fuzzable_fields(Path(child["config_path"]))
+                    - _config_fuzzable_fields(Path(parent["config_path"]))
+                )
+            except (OSError, ValueError, re.error) as exc:
+                self._record_event({
+                    "kind": "PARAMETER_ENERGY_BONUS", "status": "SKIPPED",
+                    "version": version_name, "reason": "CONFIG_FIELDS_UNAVAILABLE", "detail": str(exc),
+                })
             if not self._stop_worker(parent, "HANDOFF_TO_" + str(child["version"])):
                 child["worker_status"] = "not_started_parent_stop_failed"
                 child["terminal_reason"] = "WORKER_STOP_FAILED"
@@ -3053,7 +3080,7 @@ class OnlineLinkedCoordinator:
                 record_replay_event("PASS", "WORKER_STOP_FAILED")
                 self._write_state()
                 return False
-            if self._start_worker(child, deadline=deadline):
+            if self._start_worker(child, deadline=deadline, parameter_bonus=parameter_bonus):
                 self._active_version = str(child["version"])
                 if child.get("resolved_method") != parent.get("resolved_method"):
                     candidate = candidate_from_seed_item(merged_report["suggested_seeds"][0], plugin_slug=self.plugin_slug)
@@ -3318,7 +3345,9 @@ class OnlineLinkedCoordinator:
         self._write_state()
         return record
 
-    def _start_worker(self, version: dict[str, Any], *, deadline: float | None = None) -> bool:
+    def _start_worker(
+        self, version: dict[str, Any], *, deadline: float | None = None, parameter_bonus: int = 0,
+    ) -> bool:
         if self._active_container:
             return False
         if deadline is not None and self.clock() >= deadline:
@@ -3340,8 +3369,10 @@ class OnlineLinkedCoordinator:
             "-e", f"HOOKPHUZZ_LEGACY_RUN_ID={worker_run_id}",
             "-e", f"HOOKPHUZZ_FINDING_ARTIFACT=/shared-tmpfs/fuzzer-findings/{worker_run_id}.json",
             "-e", "HOOKPHUZZ_CMPLOG=1",
-            self.service,
         ]
+        if parameter_bonus:
+            command.extend(["-e", f"HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS={parameter_bonus}"])
+        command.append(self.service)
         try:
             timeout = 30 if deadline is None else min(30, max(0.0, deadline - self.clock()))
             result = self.run_command(command, timeout=timeout, check=False, capture_output=True, text=True)

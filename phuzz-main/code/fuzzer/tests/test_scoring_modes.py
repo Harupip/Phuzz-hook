@@ -8,13 +8,14 @@ import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
     sys.path.insert(0, str(FUZZER_DIR))
 
 from core.candidate import Candidate
+from fuzzer import Fuzzer
 from core.scoring import (
     ACTIVE_SCORING_MODE,
     DefaultScoringFormula,
@@ -87,13 +88,33 @@ def build_child_candidate(
 
 
 class ScoringModeTests(unittest.TestCase):
-    def test_default_formula_uses_hook_mode_by_default(self) -> None:
+    def test_default_formula_uses_original_phuzz_mode(self) -> None:
         formula = DefaultScoringFormula()
         self.assertEqual(formula.mode, ACTIVE_SCORING_MODE)
-        self.assertEqual(formula.mode, SCORING_MODE_PHUZZ_HOOK)
+        self.assertEqual(formula.mode, SCORING_MODE_PHUZZ)
         self.assertEqual(DEFAULT_HOOK_ENERGY_BASE_WEIGHT, 0.8)
         self.assertEqual(DEFAULT_HOOK_ENERGY_WEIGHT, 0.8)
         self.assertEqual(DEFAULT_HOOK_MIN_ENERGY_SCALE, 4)
+
+    def test_discovery_bonus_extends_only_the_first_scheduler_round(self) -> None:
+        worker = object.__new__(Fuzzer)
+        worker.stop_on_vuln_count = 0
+        worker.scoring_formula = DefaultScoringFormula(mode=SCORING_MODE_PHUZZ)
+        first = build_child_candidate(coverage_id="first", parent_score=7)
+        second = build_child_candidate(coverage_id="second", parent_score=7)
+        with patch.dict(os.environ, {"HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS": "2"}), patch.multiple(
+            worker, create=True,
+            generate_initial_candidates=Mock(return_value=[]),
+            ff_sync_candidates=Mock(return_value=(0, 0, 0)),
+            ff_choose_next=Mock(side_effect=[first, second, StopIteration]),
+            ff_mutate=Mock(return_value=None),
+        ):
+            with self.assertRaises(StopIteration):
+                worker.fuzz_fast()
+            attempts = [call.args[0] for call in worker.ff_mutate.call_args_list]
+        self.assertEqual(attempts, [first] * 9 + [second] * 7)
+        self.assertEqual((first.base_energy, first.final_energy), (7, 9))
+        self.assertEqual((second.base_energy, second.final_energy), (7, 7))
 
     def test_phuzz_mode_keeps_original_priority_and_energy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
