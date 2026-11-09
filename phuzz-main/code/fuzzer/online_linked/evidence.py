@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 
@@ -198,3 +200,50 @@ def read_runtime_batch(
     if stats is not None and not isinstance(stats, Mapping):
         raise RuntimeError("RUNTIME_BATCH_INVALID_OUTPUT")
     return dict(envelope)
+
+
+def correlate_runtime_pair(
+    version: Mapping[str, Any], pair: Mapping[str, Any], *, plugin_slug: str,
+) -> dict[str, Any] | None:
+    request_name = str(pair.get("request_name") or "")
+    zend_name = str(pair.get("zend_name") or "")
+    request_payload = pair.get("request")
+    zend_payload = pair.get("zend")
+    if (
+        Path(request_name).name != request_name
+        or Path(request_name).suffix != ".json"
+        or Path(zend_name).suffix != ".json"
+        or Path(zend_name).name != zend_name
+        or not isinstance(request_payload, Mapping)
+        or not isinstance(zend_payload, Mapping)
+    ):
+        return None
+    request_id = str(request_payload.get("request_id") or "").strip()
+    if (
+        not request_id
+        or Path(request_name).stem != request_id
+        or Path(zend_name).stem != request_id
+        or ".tmp" in request_id
+        or re.fullmatch(r"[A-Za-z0-9_.-]+", request_id) is None
+    ):
+        return None
+    worker_run_id = str(version.get("worker_run_id") or "")
+    request_run_id = str(request_payload.get("legacy_run_id") or request_payload.get("run_id") or "").strip()
+    if request_run_id != worker_run_id:
+        return None
+    if str(request_payload.get("target_plugin") or "").strip() != plugin_slug:
+        return None
+    if str(zend_payload.get("request_id") or "").strip() != request_id:
+        return None
+    zend_run_id = str(zend_payload.get("run_id") or zend_payload.get("legacy_run_id") or "").strip()
+    if zend_run_id != worker_run_id:
+        return None
+    return {
+        "version": str(version["version"]),
+        "worker_run_id": worker_run_id,
+        "request_name": request_name,
+        "request_id": request_id,
+        "request": dict(request_payload),
+        "zend_name": zend_name,
+        "zend": dict(zend_payload),
+    }

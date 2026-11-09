@@ -1,4 +1,4 @@
-from .coordinator import main
+from .coordination.campaign import main
 
 
 if __name__ == "__main__":

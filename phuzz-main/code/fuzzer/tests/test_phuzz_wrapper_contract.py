@@ -117,7 +117,8 @@ function Invoke-Compose {
         script = (CODE_DIR / "scripts" / "wordpress" / "run-wordpress-phuzz.ps1").read_text(encoding="utf-8-sig")
         self.assertIn("invoke-online-linked.ps1", script)
         self.assertIn('-BootstrapConfig $requiredConfig', script)
-        self.assertIn('"HOOKPHUZZ_CMPLOG=1"', (CODE_DIR / "fuzzer" / "online_linked" / "coordinator.py").read_text(encoding="utf-8"))
+        worker_module = CODE_DIR / "fuzzer" / "online_linked" / "coordination" / "worker.py"
+        self.assertIn('"HOOKPHUZZ_CMPLOG=1"', worker_module.read_text(encoding="utf-8"))
         launcher = (CODE_DIR / "scripts" / "wordpress" / "invoke-online-linked.ps1").read_text(encoding="utf-8")
         self.assertIn('"--bootstrap-config", $BootstrapConfig', launcher)
         self.assertIn("$env:COMPOSE_FILE", launcher)

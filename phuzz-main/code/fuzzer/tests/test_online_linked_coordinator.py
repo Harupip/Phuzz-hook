@@ -22,13 +22,9 @@ FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(FUZZER_DIR))
 
-from online_linked.coordinator import (
-    OnlineLinkedCoordinator,
-    OnlineLinkedError,
-    _candidate_context_key,
-    _batch_candidate_identity,
-    run_online_linked,
-)
+from online_linked.coordination.campaign import run_online_linked
+from online_linked.coordination.candidate_identity import _batch_candidate_identity, _candidate_context_key
+from online_linked.coordinator import OnlineLinkedCoordinator, OnlineLinkedError
 from hook_energy.seed_generation.generated_config_runner import STOP_ON_VULN_EXIT_CODE
 from core import online_handoff as handoff
 from online_linked.probe_sender import ParentInspectionTimeout
@@ -940,9 +936,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     legacy_run_id="run", max_seconds=2, max_versions=2, max_candidates=1,
                     hard_max_candidates=5, campaign_seconds=1, hard_campaign_seconds=hard_seconds,
                     callback_registry=str(registry), service="fixture")
-                with patch("online_linked.coordinator.OnlineLinkedCoordinator", Candidate), \
-                        patch("online_linked.coordinator.time.monotonic", side_effect=lambda: now[0]), \
-                        patch("online_linked.coordinator.export_online_linked_batch", return_value=0):
+                with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", Candidate), \
+                        patch("online_linked.coordination.campaign.time.monotonic", side_effect=lambda: now[0]), \
+                        patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0):
                     run_online_linked(args)
                 state = json.loads((root / "output/online-linked/run/batch-state.json").read_text())
                 self.assertEqual(len(calls), expected_runs)
@@ -973,8 +969,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             args = SimpleNamespace(suggested_seeds=str(suggested), bootstrap_config="",
                 config_root=str(root / "configs"), output_root=str(root / "output"), plugin_slug="fixture",
                 legacy_run_id="run", max_seconds=2, max_versions=2, callback_registry=str(registry), service="fixture")
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", Candidate), \
-                    patch("online_linked.coordinator.export_online_linked_batch", return_value=0):
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", Candidate), \
+                    patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0):
                 run_online_linked(args)
             state = json.loads((root / "output/online-linked/run/batch-state.json").read_text())
             self.assertEqual(state["campaign_status"], "PARTIAL")
@@ -1040,9 +1036,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     plugin_slug="fixture", legacy_run_id="run", max_seconds=2, max_versions=2,
                     max_candidates=32, hard_max_candidates=hard_cap, campaign_seconds=1,
                     hard_campaign_seconds=4, callback_registry=str(registry), service="fixture")
-                with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
-                        patch("online_linked.coordinator.time.monotonic", side_effect=lambda: now[0]), \
-                        patch("online_linked.coordinator.export_online_linked_batch", return_value=0):
+                with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
+                        patch("online_linked.coordination.campaign.time.monotonic", side_effect=lambda: now[0]), \
+                        patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0):
                     self.assertEqual(run_online_linked(args), 0)
                 state = json.loads((root / "output/online-linked/run/batch-state.json").read_text())
                 self.assertEqual(len(calls), hard_cap)
@@ -1113,9 +1109,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     plugin_slug="fixture", legacy_run_id="run", max_seconds=2, max_versions=2,
                     max_candidates=32, hard_max_candidates=128, campaign_seconds=10,
                     hard_campaign_seconds=20, callback_registry=str(registry), service="fixture")
-                with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
-                        patch("online_linked.coordinator.time.monotonic", side_effect=lambda: now[0]), \
-                        patch("online_linked.coordinator.export_online_linked_batch", return_value=0), \
+                with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
+                        patch("online_linked.coordination.campaign.time.monotonic", side_effect=lambda: now[0]), \
+                        patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0), \
                         patch("sys.stdout", new=io.StringIO()):
                     self.assertEqual(run_online_linked(args), 0)
                 state = json.loads((root / "output/online-linked/run/batch-state.json").read_text())
@@ -1742,6 +1738,10 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         self.assertEqual(_batch_candidate_identity(ajax_initial, "fixture"), _batch_candidate_identity(ajax_runtime, "fixture"))
 
     def test_candidate_context_key_deduplicates_provenance_and_fuzzable_values(self):
+        self.assertEqual(
+            _candidate_context_key(seed_item(), "fixture"),
+            "8b7b3ed1b0fcaf9eeeaeeea7577e5f8e0245214074a65c13b09a0829b5fc2570",
+        )
         item = {
             "hook_name": "wp_ajax_nopriv_context",
             "callback_id": "cb-context",
@@ -1982,8 +1982,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 max_seconds=2, max_versions=2, max_candidates=1, hard_max_candidates=4,
                 campaign_seconds=20, hard_campaign_seconds=40, callback_registry=str(registry), service="fixture",
             )
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
-                    patch("online_linked.coordinator.export_online_linked_batch", return_value=0), \
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0), \
                     patch("sys.stdout", new=io.StringIO()):
                 self.assertEqual(run_online_linked(args), 0)
 
@@ -2052,8 +2052,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 campaign_seconds=20, hard_campaign_seconds=40,
                 callback_registry=str(registry), service="fixture",
             )
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
-                    patch("online_linked.coordinator.export_online_linked_batch", return_value=0), \
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0), \
                     patch("sys.stdout", new=io.StringIO()):
                 self.assertEqual(run_online_linked(args), 0)
 
@@ -2467,8 +2467,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="run",
                 max_seconds=1, max_versions=2, callback_registry=str(registry), service="fuzzer-wordpress-plugin",
             )
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", Candidate), \
-                    patch("online_linked.coordinator.export_online_linked_batch", return_value=0):
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", Candidate), \
+                    patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0):
                 self.assertEqual(run_online_linked(args), 0)
             self.assertEqual(calls, [hooks[1], hooks[3], "wp_ajax_child", hooks[0], hooks[2]])
 
@@ -2504,8 +2504,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 max_seconds=1, max_versions=2, max_candidates=1, hard_max_candidates=1,
                 callback_registry=str(registry), service="fuzzer-wordpress-plugin",
             )
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", Candidate), \
-                    patch("online_linked.coordinator.export_online_linked_batch", return_value=0):
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", Candidate), \
+                    patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0):
                 self.assertEqual(run_online_linked(args), 0)
             self.assertEqual(calls, ["wp_ajax_real"])
             state = json.loads((root / "output" / "online-linked" / "run" / "batch-state.json").read_text(encoding="utf-8"))
@@ -2556,9 +2556,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 callback_registry=str(registry),
                 service="fuzzer-wordpress-plugin",
             )
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
                     patch(
-                        "online_linked.coordinator.export_online_linked_batch",
+                        "online_linked.coordination.campaign.export_online_linked_batch",
                         return_value=0,
                     ):
                 self.assertEqual(run_online_linked(args), 0)
@@ -2607,9 +2607,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="run",
                     max_seconds=1, max_versions=2, callback_registry=str(registry), service="fuzzer-wordpress-plugin",
                 )
-                with patch("online_linked.coordinator.OnlineLinkedCoordinator", Candidate), \
+                with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", Candidate), \
                         patch(
-                            "online_linked.coordinator.export_online_linked_batch",
+                            "online_linked.coordination.campaign.export_online_linked_batch",
                             return_value=0,
                         ):
                     result = run_online_linked(args)
@@ -2673,9 +2673,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 callback_registry=str(registry),
                 service="fuzzer-wordpress-plugin",
             )
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
                     patch(
-                        "online_linked.coordinator.export_online_linked_batch",
+                        "online_linked.coordination.campaign.export_online_linked_batch",
                         return_value=0,
                     ):
                 self.assertEqual(run_online_linked(args), 0)
@@ -2689,12 +2689,12 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
             calls.clear()
             args.sync_registry = True
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
                     patch(
-                        "online_linked.coordinator.export_online_linked_batch",
+                        "online_linked.coordination.campaign.export_online_linked_batch",
                         return_value=0,
                     ), \
-                    patch("online_linked.coordinator._sync_callback_registry_to_web",
+                    patch("online_linked.coordination.campaign._sync_callback_registry_to_web",
                           side_effect=subprocess.TimeoutExpired("docker cp", 30)):
                 self.assertEqual(run_online_linked(args), 0)
             batch_state = json.loads((root / "output" / "online-linked" / "run" / "batch-state.json").read_text())
@@ -2706,11 +2706,11 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(batch_state["expansion_events"][0]["reason"], "CALLBACK_REGISTRY_REFRESH_FAILED")
             args.resume = True
             old_budget = batch_state["budget"]
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
-                    patch("online_linked.coordinator.export_online_linked_batch", return_value=0), \
-                    patch("online_linked.coordinator._sync_callback_registry_to_web") as sync, \
-                    patch("online_linked.coordinator.time.monotonic", return_value=10000.0), \
-                    patch("online_linked.coordinator.time.time", return_value=old_budget["saved_at"]):
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0), \
+                    patch("online_linked.coordination.campaign._sync_callback_registry_to_web") as sync, \
+                    patch("online_linked.coordination.campaign.time.monotonic", return_value=10000.0), \
+                    patch("online_linked.coordination.campaign.time.time", return_value=old_budget["saved_at"]):
                 self.assertEqual(run_online_linked(args), 0)
             resumed = json.loads((root / "output/online-linked/run/batch-state.json").read_text())
             self.assertEqual(len(calls), 2, "completed parent must not run again")
@@ -2780,13 +2780,13 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 max_seconds=60, max_versions=2, max_candidates=2, campaign_seconds=1,
                 callback_registry=str(registry), service="fuzzer-wordpress-plugin", sync_registry=True,
             )
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
                     patch(
-                        "online_linked.coordinator.export_online_linked_batch",
+                        "online_linked.coordination.campaign.export_online_linked_batch",
                         return_value=0,
                     ), \
-                    patch("online_linked.coordinator._sync_callback_registry_to_web") as sync, \
-                    patch("online_linked.coordinator.time.monotonic", side_effect=lambda: 2.0 if calls else 0.0):
+                    patch("online_linked.coordination.campaign._sync_callback_registry_to_web") as sync, \
+                    patch("online_linked.coordination.campaign.time.monotonic", side_effect=lambda: 2.0 if calls else 0.0):
                 self.assertEqual(run_online_linked(args), 0)
 
             self.assertEqual(len(calls), 1)
@@ -2853,8 +2853,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 callback_registry=str(registry),
                 service="fuzzer-wordpress-plugin",
             )
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
-                    patch("online_linked.coordinator.export_online_linked_batch",
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch("online_linked.coordination.campaign.export_online_linked_batch",
                           create=True,
                           side_effect=export):
                 self.assertEqual(run_online_linked(args), 0)
@@ -2906,9 +2906,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 service="fuzzer-wordpress-plugin",
             )
             error_output = io.StringIO()
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
                     patch(
-                        "online_linked.coordinator.export_online_linked_batch",
+                        "online_linked.coordination.campaign.export_online_linked_batch",
                         create=True,
                         side_effect=OSError("disk full"),
                     ), redirect_stderr(error_output):
@@ -5887,7 +5887,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     return 0
 
             batch_path = root / "output/online-linked/campaign/batch-state.json"
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator):
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator):
                 with patch.dict(os.environ, {"HOOKPHUZZ_PRIORITY_ENERGY_MODE": "bogus"}):
                     with self.assertRaisesRegex(ValueError, "HOOKPHUZZ_PRIORITY_ENERGY_MODE"):
                         run_online_linked(args)
@@ -5901,7 +5901,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 for checkpoint, env_mode in ((saved, "seed-plus-bonus"), (legacy, "carryover")):
                     batch_path.write_text(json.dumps(checkpoint), encoding="utf-8")
                     with patch.dict(os.environ, {"HOOKPHUZZ_PRIORITY_ENERGY_MODE": env_mode}), \
-                            patch("online_linked.coordinator.time.time", return_value=saved["budget"]["saved_at"]):
+                            patch("online_linked.coordination.campaign.time.time", return_value=saved["budget"]["saved_at"]):
                         run_online_linked(args)
             # Resume keeps the saved mode; a checkpoint without one uses the default.
             self.assertEqual(modes, ["carryover", "carryover", "seed-plus-bonus"])
@@ -6118,7 +6118,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     self.state_path.write_text(json.dumps(self.state), encoding="utf-8")
                     return 0
             batch_path = root / "output/online-linked/campaign/batch-state.json"
-            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator):
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator):
                 self.assertEqual(run_online_linked(args), 0)
                 saved = json.loads(batch_path.read_text())
                 self.assertEqual(saved["campaign_status"], "PARTIAL")
@@ -6133,12 +6133,12 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     def __init__(self, **kwargs):
                         raise AssertionError("worker must not start for a legacy context checkpoint")
 
-                with patch("online_linked.coordinator.OnlineLinkedCoordinator", NeverCoordinator):
+                with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", NeverCoordinator):
                     with self.assertRaisesRegex(ValueError, "batch context-key version"):
                         run_online_linked(args)
                 batch_path.write_text(json.dumps(saved), encoding="utf-8")
                 args.resume = True
-                with patch("online_linked.coordinator.time.time", return_value=saved["budget"]["saved_at"]):
+                with patch("online_linked.coordination.campaign.time.time", return_value=saved["budget"]["saved_at"]):
                     self.assertEqual(run_online_linked(args), 0)
             self.assertEqual(json.loads(batch_path.read_text())["campaign_status"], "complete")
 
@@ -6180,21 +6180,21 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                                 "registered_inside_callback": True, "parent_callback_id": parent["callback_id"],
                             }}}}})
                         return 0
-                from online_linked.coordinator import _write_json
+                from online_linked.coordination.campaign import _write_json
                 def write_json(path, content):
                     if interrupt_before_publish and path.name == "callback-registry.json":
                         raise KeyboardInterrupt
                     return _write_json(path, content)
-                with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
-                        patch("online_linked.coordinator._write_json", write_json):
+                with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
+                        patch("online_linked.coordination.campaign._write_json", write_json):
                     with self.assertRaises(KeyboardInterrupt):
                         run_online_linked(args)
                 batch_path = root / "output/online-linked/campaign/batch-state.json"
                 saved = json.loads(batch_path.read_text())
                 self.assertTrue(saved["pending_candidates"])
                 args.resume = True
-                with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator), \
-                        patch("online_linked.coordinator.time.time", return_value=saved["budget"]["saved_at"]):
+                with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
+                        patch("online_linked.coordination.campaign.time.time", return_value=saved["budget"]["saved_at"]):
                     self.assertEqual(run_online_linked(args), 0)
                 published = root / "output/online-linked/campaign/callback-registry.json"
                 self.assertEqual(json.loads(published.read_text())["callback_map"]["cb-child"], "child_callback")

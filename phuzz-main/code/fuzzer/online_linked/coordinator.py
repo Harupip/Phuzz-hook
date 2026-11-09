@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import argparse
 import copy
 import hashlib
 import json
-import os
 import re
 import subprocess
 import sys
@@ -22,7 +20,6 @@ from hook_energy.seed_generation.generated_config_runner import (
     STOP_ON_VULN_EXIT_CODE,
     list_request_artifacts,
     list_zend_artifacts,
-    load_finding_artifact,
     load_request_artifact,
     run_generated_configs,
 )
@@ -39,11 +36,27 @@ from hook_energy.seed_generation.online_common import (
     config_hash,
     validate_v0_config,
 )
-from online_linked.evidence import RuntimeBatchTimeout, read_runtime_batch
+from online_linked.coordination.candidate_identity import (
+    _CANDIDATE_CONTEXT_KEY_VERSION,
+    _candidate_context_key,
+    _candidate_identity,
+    _canonical_callback_name,
+)
+from online_linked.coordination.errors import OnlineLinkedError, ReplayArtifactError
+from online_linked.coordination.replay_artifacts import save_replay_artifacts
+from online_linked.coordination.replay_request import restore_request_values
+from online_linked.coordination.worker import (
+    CommandRunner,
+    handoff_command,
+    remove_container,
+    worker_exit_code,
+    worker_start_command,
+)
+from online_linked.evidence import RuntimeBatchTimeout, correlate_runtime_pair, read_runtime_batch
 from core.online_handoff import DEFAULT_PRIORITY_ENERGY_MODE, priority_energy_mode as _priority_energy_mode
 from online_linked.export import (
     PARAMETER_REPLAY_POLICY, config_fields as _config_fields, config_fuzzable_fields as _config_fuzzable_fields,
-    config_name_is_fuzzable as _config_name_is_fuzzable, export_online_linked_batch, handoff_new_fields,
+    config_name_is_fuzzable as _config_name_is_fuzzable, handoff_new_fields,
     parameter_replay_failures,
 )
 from hook_energy.seed_generation.zend_runtime.bridge_cli import (
@@ -52,8 +65,6 @@ from hook_energy.seed_generation.zend_runtime.bridge_cli import (
 )
 from seed_generation.config.config_exporter import (
     SeedConfigSkip,
-    _fuzzable_params_for_section,
-    _string_set,
     _force_replay_only,
     build_config_for_seed_item,
     export_seed_configs,
@@ -65,7 +76,6 @@ from zend_discovery.engine import (
     candidate_from_seed_item, canonical_identity_id, prepare_callback_registry, resolve_request_transport,
     runtime_parameter_is_accepted,
 )
-CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
 ConvergeRunner = Callable[..., dict[str, Any]]
@@ -76,7 +86,6 @@ ReplayRunner = Callable[..., dict[str, Any]]
 ProbeSender = Callable[..., dict[str, Any]]
 ConfigBuilder = Callable[..., tuple[str, dict[str, Any]]]
 RuntimeBatchReader = Callable[..., dict[str, Any]]
-_CANDIDATE_CONTEXT_KEY_VERSION = 1
 
 
 def _budget_pair(name: str, initial: int, hard: int | None, default: int,
@@ -130,18 +139,6 @@ def _replace_fuzzable_values_with_placeholder(config: dict[str, Any]) -> None:
 
 def _request_id(run_id: str) -> str:
     return "r-" + hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:24]
-
-
-class OnlineLinkedError(ValueError):
-    """A coordinator transition cannot be completed safely."""
-
-
-class ReplayArtifactError(RuntimeError):
-    """A replay artifact could not be loaded, correlated, or persisted."""
-
-    def __init__(self, stage: str, detail: str) -> None:
-        super().__init__(detail)
-        self.stage = stage
 
 
 class OnlineLinkedCoordinator:
@@ -794,7 +791,7 @@ class OnlineLinkedCoordinator:
             return None
         request = json.loads(filesystem_path(request_path).read_text(encoding="utf-8-sig"))
         zend = json.loads(filesystem_path(zend_path).read_text(encoding="utf-8-sig"))
-        evidence = self._correlate_runtime_pair(
+        evidence = correlate_runtime_pair(
             version,
             {
                 "request_name": request_name,
@@ -802,6 +799,7 @@ class OnlineLinkedCoordinator:
                 "zend_name": zend_name,
                 "zend": zend,
             },
+            plugin_slug=self.plugin_slug,
         )
         if evidence is None:
             return None
@@ -877,7 +875,7 @@ class OnlineLinkedCoordinator:
                 stats["invalid_payloads"] = int(stats.get("invalid_payloads") or 0) + 1
                 stats["last_reason"] = "HOST_CORRELATION_REJECTED"
                 continue
-            runtime_evidence = self._correlate_runtime_pair(version, pair)
+            runtime_evidence = correlate_runtime_pair(version, pair, plugin_slug=self.plugin_slug)
             if runtime_evidence is None:
                 continue
             runtime_evidence["evidence_origin"] = "worker_poll"
@@ -919,52 +917,6 @@ class OnlineLinkedCoordinator:
             evidence.append(runtime_evidence)
         self._write_state()
         return evidence
-
-    def _correlate_runtime_pair(
-        self, version: Mapping[str, Any], pair: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        request_name = str(pair.get("request_name") or "")
-        zend_name = str(pair.get("zend_name") or "")
-        request_payload = pair.get("request")
-        zend_payload = pair.get("zend")
-        if (
-            Path(request_name).name != request_name
-            or Path(request_name).suffix != ".json"
-            or Path(zend_name).suffix != ".json"
-            or Path(zend_name).name != zend_name
-            or not isinstance(request_payload, Mapping)
-            or not isinstance(zend_payload, Mapping)
-        ):
-            return None
-        request_id = str(request_payload.get("request_id") or "").strip()
-        if (
-            not request_id
-            or Path(request_name).stem != request_id
-            or Path(zend_name).stem != request_id
-            or ".tmp" in request_id
-            or re.fullmatch(r"[A-Za-z0-9_.-]+", request_id) is None
-        ):
-            return None
-        worker_run_id = str(version.get("worker_run_id") or "")
-        request_run_id = str(request_payload.get("legacy_run_id") or request_payload.get("run_id") or "").strip()
-        if request_run_id != worker_run_id:
-            return None
-        if str(request_payload.get("target_plugin") or "").strip() != self.plugin_slug:
-            return None
-        if str(zend_payload.get("request_id") or "").strip() != request_id:
-            return None
-        zend_run_id = str(zend_payload.get("run_id") or zend_payload.get("legacy_run_id") or "").strip()
-        if zend_run_id != worker_run_id:
-            return None
-        return {
-            "version": str(version["version"]),
-            "worker_run_id": worker_run_id,
-            "request_name": request_name,
-            "request_id": request_id,
-            "request": dict(request_payload),
-            "zend_name": zend_name,
-            "zend": dict(zend_payload),
-        }
 
     def _reject_runtime_batch(
         self, version: Mapping[str, Any], reason: str, *, detail: str = "",
@@ -2770,148 +2722,7 @@ class OnlineLinkedCoordinator:
         self, config: dict[str, Any], evidence: Mapping[str, Any], parent: Mapping[str, Any],
         *, only_parameters: set[tuple[str, str, str]] | None = None,
     ) -> None:
-        """Seed child inputs from this correlated request, retaining fuzz selectors."""
-        request = evidence.get("request") or {}
-        if not isinstance(request, Mapping):
-            raise OnlineLinkedError("UNSUPPORTED_REQUEST: expected an object")
-        params = request.get("request_params")
-        if params is None:
-            params = {}
-        if not isinstance(params, Mapping):
-            raise OnlineLinkedError("UNSUPPORTED_REQUEST_PARAMS: expected an object")
-        parent_config = json.loads(filesystem_path(Path(str(parent["config_path"]))).read_text(encoding="utf-8-sig"))
-        headers = config.get("headers", {}).get("data", [])
-        is_json = any(
-            str(row.get("name", "")).lower() == "content-type"
-            and "json" in str(row.get("value", "")).lower() for row in headers
-        )
-        values = []
-        section_identity = {
-            "query_params": ("GET", "query"),
-            "body_params": ("POST", "form"),
-            "headers": ("HEADER", "header"),
-            "cookies": ("COOKIE", "cookie"),
-        }
-        for section_name in ("query_params", "body_params", "headers", "cookies"):
-            section = config.get(section_name)
-            if not isinstance(section, dict):
-                continue
-            bucket = "json_params" if section_name == "body_params" and is_json else section_name
-            observed, source_status, source_reason = self._request_bucket_values(params, bucket)
-            parent_section = parent_config.get(section_name, {})
-            if not isinstance(parent_section, Mapping):
-                parent_section = {}
-            fixed = parent_section.get("fixed", [])
-            if not isinstance(fixed, list):
-                raise OnlineLinkedError(f"UNSUPPORTED_CONFIG_BUCKET: {section_name}.fixed must be a list")
-            for row in section.get("data", []):
-                name = str(row["name"])
-                transport, location = section_identity[section_name]
-                if only_parameters is not None and (name, transport, location) not in only_parameters:
-                    continue
-                value = observed
-                path = [name] if name in observed else [part for part in re.split(r"\[|\]", name) if part]
-                found = True
-                for part in path:
-                    if isinstance(value, Mapping) and part in value:
-                        value = value[part]
-                    elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
-                        value = value[int(part)]
-                    else:
-                        found = False
-                        break
-                if found:
-                    row["value"] = copy.deepcopy(value)
-                    row.pop("seeds", None)
-                if any(re.match(selector, name) for selector in fixed):
-                    selector = re.escape(name)
-                    if selector not in section.setdefault("fixed", []):
-                        section["fixed"].append(selector)
-                    section["fuzz"] = [item for item in section.get("fuzz", []) if item != selector]
-                value_record = {
-                    "name": name,
-                    "bucket": bucket,
-                    "request_id": evidence.get("request_id"),
-                    "run_id": evidence.get("worker_run_id") or evidence.get("run_id") or parent["worker_run_id"],
-                    "value_origin": "observed" if found else ("probe" if source_status == "observed" else source_status),
-                }
-                if not found:
-                    value_record["reason"] = source_reason or "REQUEST_VALUE_MISSING"
-                values.append(value_record)
-        metadata = config.setdefault("metadata", {})
-        if not isinstance(metadata, dict):
-            raise OnlineLinkedError("PROBE_CONFIG_METADATA_INVALID")
-        previous = metadata.get("online_request_seed")
-        previous_values = previous.get("values", []) if isinstance(previous, Mapping) else []
-        records: dict[tuple[str, str], dict[str, Any]] = {}
-        for value in previous_values if isinstance(previous_values, list) else []:
-            if isinstance(value, Mapping):
-                records[(str(value.get("bucket") or ""), str(value.get("name") or ""))] = dict(value)
-        for value in values:
-            records[(str(value.get("bucket") or ""), str(value.get("name") or ""))] = value
-        request_ids = []
-        if isinstance(previous, Mapping):
-            request_ids.extend(str(item) for item in previous.get("evidence_request_ids", []) if str(item))
-            if previous.get("request_id") and previous.get("request_id") != "multiple":
-                request_ids.append(str(previous["request_id"]))
-        request_id = str(evidence.get("request_id") or "")
-        if request_id:
-            request_ids.append(request_id)
-        request_ids = list(dict.fromkeys(request_ids))
-        metadata["online_request_seed"] = {
-            "request_id": request_ids[0] if len(request_ids) == 1 else "multiple",
-            "run_id": parent["worker_run_id"],
-            "evidence_request_ids": request_ids,
-            "values": list(records.values()),
-        }
-
-    @staticmethod
-    def _request_bucket_values(
-        params: Mapping[str, Any], bucket: str,
-    ) -> tuple[Mapping[str, Any], str, str]:
-        """Decode producer buckets without treating names or falsey values as data loss."""
-        if bucket == "json_params":
-            if "json_params" not in params:
-                status = str(params.get("json_params_status") or "").strip().lower()
-                if status in {"invalid", "error"}:
-                    return {}, status, str(params.get("json_params_error") or f"JSON_PARAMS_{status.upper()}")
-                return {}, "missing", "JSON_PARAMS_MISSING"
-            status = str(params.get("json_params_status") or "decoded").strip().lower()
-            if status in {"missing", "invalid", "error", "not_json"}:
-                return {}, status, str(params.get("json_params_error") or f"JSON_PARAMS_{status.upper()}")
-            observed = params.get("json_params")
-            if isinstance(observed, Mapping):
-                return observed, "empty" if not observed else "observed", ""
-            json_type = str(params.get("json_params_type") or "").strip().lower()
-            if not json_type:
-                if isinstance(observed, list):
-                    json_type = "array"
-                elif observed is None:
-                    json_type = "null"
-                elif isinstance(observed, bool):
-                    json_type = "boolean"
-                elif isinstance(observed, (int, float)):
-                    json_type = "number"
-                elif isinstance(observed, str):
-                    json_type = "string"
-                else:
-                    json_type = type(observed).__name__
-            raise OnlineLinkedError(
-                f"UNSUPPORTED_REQUEST_BUCKET: json_params must be an object (got {json_type})"
-            )
-
-        if bucket not in params:
-            return {}, "missing", "REQUEST_BUCKET_MISSING"
-        observed = params[bucket]
-        if bucket in {"query_params", "body_params"} and observed == []:
-            return {}, "empty", ""
-        if bucket == "cookies" and isinstance(observed, list):
-            if not all(isinstance(name, str) for name in observed):
-                raise OnlineLinkedError("UNSUPPORTED_REQUEST_BUCKET: cookies must be a list of names")
-            return {}, "names_only", "COOKIE_VALUES_NOT_EXPORTED"
-        if not isinstance(observed, Mapping):
-            raise OnlineLinkedError(f"UNSUPPORTED_REQUEST_BUCKET: {bucket} must be an object")
-        return observed, "observed", ""
+        restore_request_values(config, evidence, parent, only_parameters=only_parameters)
 
     def handoff_to_next_worker(
         self,
@@ -3492,23 +3303,12 @@ class OnlineLinkedCoordinator:
         version["worker_run_id"] = worker_run_id
         handoff_key = f"{version_name}-{uuid.uuid4().hex}"
         version["handoff_key"] = handoff_key
-        command = [
-            "docker", "compose", "run", "-d", "--no-deps", "--name", container_name,
-            "-e", f"FUZZER_CONFIG={runtime_slug}",
-            "-e", f"FUZZER_NODE_ID={1 + int(version_name[1:])}",
-            "-e", f"HOOKPHUZZ_LEGACY_RUN_ID={worker_run_id}",
-            "-e", f"HOOKPHUZZ_FINDING_ARTIFACT=/shared-tmpfs/fuzzer-findings/{worker_run_id}.json",
-            "-e", "HOOKPHUZZ_CMPLOG=1",
-            "-e", f"HOOKPHUZZ_HANDOFF_KEY={handoff_key}",
-            # Immutable config → own candidate sync folder; older selectors never load these files.
-            "-e", f"HOOKPHUZZ_SYNC_NAMESPACE={str(version.get('config_hash') or '')[:16] or version_name}",
-        ]
         # The priority round belongs to the first activation of a verified config only.
         grant = priority_seed is not None and not version.get("priority_seed")
-        if grant:
-            command.extend(["-e", "HOOKPHUZZ_PRIORITY_SEED=" + json.dumps(dict(priority_seed), sort_keys=True,
-                                                                            separators=(",", ":"))])
-        command.append(self.service)
+        command = worker_start_command(
+            version, container_name=container_name, runtime_slug=runtime_slug, service=self.service,
+            priority_seed=priority_seed if grant else None,
+        )
         try:
             timeout = 30 if deadline is None else min(30, max(0.0, deadline - self.clock()))
             result = self.run_command(command, timeout=timeout, check=False, capture_output=True, text=True)
@@ -3541,42 +3341,7 @@ class OnlineLinkedCoordinator:
         return True
 
     def _worker_exit_code(self, timeout: float | None = None) -> int | None:
-        """Return a stopped worker exit code while ignoring a running/unknown worker."""
-
-        if not self._active_container:
-            return None
-        inspect_timeout = 30 if timeout is None else max(0, timeout)
-        if inspect_timeout <= 0:
-            return None
-        try:
-            result = self.run_command(
-                ["docker", "inspect", "-f", "{{if .State.Running}}running{{else}}{{.State.ExitCode}}{{end}}", self._active_container],
-                timeout=inspect_timeout,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.TimeoutExpired as exc:
-            if timeout is not None:
-                raise ParentInspectionTimeout("PARENT_INSPECT_TIMEOUT") from exc
-            return None
-        except Exception as exc:
-            if timeout is not None:
-                raise ParentInspectionError("PARENT_INSPECT_FAILED") from exc
-            return None
-        if int(getattr(result, "returncode", 1)) != 0:
-            if timeout is not None:
-                raise ParentInspectionError("PARENT_INSPECT_FAILED")
-            return None
-        state = str(getattr(result, "stdout", "") or "").strip().lower()
-        if state == "running":
-            return None
-        try:
-            return int(state)
-        except (TypeError, ValueError) as exc:
-            if timeout is not None:
-                raise ParentInspectionError("PARENT_INSPECT_FAILED") from exc
-            return None
+        return worker_exit_code(self._active_container, timeout=timeout, run_command=self.run_command)
 
     def _priority_seed(
         self, parent: Mapping[str, Any], child: Mapping[str, Any], replay_result: Mapping[str, Any],
@@ -3645,21 +3410,9 @@ class OnlineLinkedCoordinator:
         return descriptor, None
 
     def _handoff_command(self, *args: str, deadline: float | None) -> dict[str, Any] | None:
-        """Run one pause-protocol operation inside the active worker container."""
-        timeout = 10.0 if deadline is None else min(10.0, max(0.0, deadline - self.clock()))
-        if timeout <= 0 or not self._active_container:
-            return None
-        try:
-            result = self.run_command(
-                ["docker", "exec", self._active_container, "python", "-m", "core.online_handoff", *args],
-                timeout=timeout, check=False, capture_output=True, text=True,
-            )
-            payload = json.loads(str(getattr(result, "stdout", "") or "null"))
-        except Exception:
-            return None
-        if int(getattr(result, "returncode", 1)) != 0:
-            return None
-        return payload if isinstance(payload, dict) else None
+        return handoff_command(
+            self._active_container, *args, deadline=deadline, clock=self.clock, run_command=self.run_command,
+        )
 
     def _pause_parent(self, parent: Mapping[str, Any], deadline: float | None, *, request_id: str = "") -> bool:
         """Ask the running worker to stop between requests and wait for its matching ACK."""
@@ -3745,40 +3498,9 @@ class OnlineLinkedCoordinator:
         container_name = self._active_container
         if not container_name:
             return True
-        stop_deadline = self.clock() + 30
-        try:
-            result = self.run_command(
-                ["docker", "rm", "-f", container_name],
-                timeout=30,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            stopped = int(getattr(result, "returncode", 1)) == 0
-            error = str(getattr(result, "stderr", "") or "WORKER_STOP_FAILED").strip() if not stopped else ""
-            if not stopped and "removal of container" in error and "is already in progress" in error:
-                # Do not reuse the name until Docker confirms removal has finished.
-                while True:
-                    remaining = stop_deadline - self.clock()
-                    if remaining <= 0:
-                        break
-                    inspection = self.run_command(
-                        ["docker", "container", "inspect", "--format", "{{.State.Status}}", container_name],
-                        timeout=remaining, check=False, capture_output=True, text=True,
-                    )
-                    if int(getattr(inspection, "returncode", 1)) != 0:
-                        detail = str(getattr(inspection, "stderr", "") or "").strip()
-                        stopped = detail in {
-                            f"Error: No such container: {container_name}",
-                            f"Error response from daemon: No such container: {container_name}",
-                        }
-                        if not stopped:
-                            error = detail or error
-                        break
-                    self.sleeper(min(0.5, max(0, stop_deadline - self.clock())))
-        except Exception as exc:
-            stopped = False
-            error = str(exc)
+        stopped, error = remove_container(
+            container_name, clock=self.clock, sleeper=self.sleeper, run_command=self.run_command,
+        )
         status = "stopped" if stopped else "stop_failed"
         for worker in reversed(self.state["workers"]):
             if worker.get("container_name") == container_name:
@@ -3804,84 +3526,13 @@ class OnlineLinkedCoordinator:
         self, row: Mapping[str, Any], request_dir: Path, zend_dir: Path,
         *, strict_correlation: bool | None = None,
     ) -> None:
-        if strict_correlation is None:
-            strict_correlation = bool(row.get("_strict_correlation", True))
-        names = set()
-        matched = str(row.get("matched_artifact") or "")
-        if matched:
-            names.add(matched)
-        names.update(str(name) for name in row.get("request_artifacts", []) if str(name))
-        for name in names:
-            if Path(name).name != name:
-                if strict_correlation:
-                    raise ReplayArtifactError("id_correlation", "artifact name is not a file name")
-                continue
-            payload = row.get("request_payload") if name == matched else None
-            if payload is None:
-                try:
-                    payload = self.load_artifact(name)
-                except (OSError, RuntimeError, ValueError) as exc:
-                    raise ReplayArtifactError("sender_payload", "request payload loader failed") from exc
-            if strict_correlation:
-                self._validate_artifact_payload(payload, name, row, zend=False)
-            try:
-                self._copy_json(request_dir / name, payload)
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise ReplayArtifactError("request_write", "request artifact write failed") from exc
-            zend_name = str(row.get("zend_artifact") or "") if name == matched else ""
-            if zend_name and Path(zend_name).name == zend_name:
-                zend_payload = row.get("zend_payload")
-                if zend_payload is None:
-                    try:
-                        zend_payload = self.load_zend_artifact(zend_name)
-                    except (OSError, RuntimeError, ValueError) as exc:
-                        raise ReplayArtifactError("sender_payload", "Zend payload loader failed") from exc
-                if strict_correlation:
-                    self._validate_artifact_payload(zend_payload, zend_name, row, zend=True)
-                try:
-                    self._copy_json(zend_dir / zend_name, zend_payload)
-                except (OSError, RuntimeError, ValueError) as exc:
-                    raise ReplayArtifactError("zend_write", "Zend artifact write failed") from exc
-            else:
-                if name != matched:
-                    continue
-                if zend_name:
-                    if strict_correlation:
-                        raise ReplayArtifactError("id_correlation", "Zend artifact name is not a file name")
-                    continue
-                zend_names = self.list_zend_artifacts()
-                exact = [candidate for candidate in zend_names if Path(candidate).name == candidate and Path(candidate).stem == Path(name).stem]
-                if len(exact) != 1:
-                    if strict_correlation:
-                        raise ReplayArtifactError("id_correlation", "request and Zend artifact IDs do not match")
-                    continue
-                try:
-                    zend_payload = self.load_zend_artifact(exact[0])
-                except (OSError, RuntimeError, ValueError) as exc:
-                    raise ReplayArtifactError("sender_payload", "Zend payload loader failed") from exc
-                if strict_correlation:
-                    self._validate_artifact_payload(zend_payload, exact[0], row, zend=True)
-                try:
-                    self._copy_json(zend_dir / exact[0], zend_payload)
-                except (OSError, RuntimeError, ValueError) as exc:
-                    raise ReplayArtifactError("zend_write", "Zend artifact write failed") from exc
-
-    @staticmethod
-    def _validate_artifact_payload(
-        payload: Any, name: str, row: Mapping[str, Any], *, zend: bool,
-    ) -> None:
-        if not isinstance(payload, Mapping):
-            raise ReplayArtifactError("sender_payload", "artifact payload is missing")
-        if str(payload.get("request_id") or "") != Path(name).stem:
-            raise ReplayArtifactError("id_correlation", "artifact request ID does not match its name")
-        expected_run_id = str(row.get("legacy_run_id") or "")
-        actual_run_id = str(
-            (payload.get("run_id") if zend else None)
-            or payload.get("legacy_run_id")
-            or ""
+        save_replay_artifacts(
+            row, request_dir, zend_dir, strict_correlation=strict_correlation,
+            load_request=lambda name: self.load_artifact(name),
+            load_zend=lambda name: self.load_zend_artifact(name),
+            list_zend=lambda: self.list_zend_artifacts(),
+            write_json=self._copy_json,
         )
-        if expected_run_id and actual_run_id and actual_run_id != expected_run_id:
-            raise ReplayArtifactError("id_correlation", "artifact run ID does not match the replay")
 
     def _write_config(self, version: str, config: Mapping[str, Any], *, replay: bool = False) -> Path:
         filename = f"{version}-replay.json" if replay else f"{version}-config.json"
@@ -4174,584 +3825,7 @@ def _request_payload_hash(request: Any) -> str:
     })
 
 
-def _canonical_callback_name(value: Any) -> str:
-    return re.sub(r"\s*(?:->|::)\s*", "::", str(value or "").strip())
-
-
-def _candidate_slug(item: Mapping[str, Any], index: int) -> str:
-    raw = str(item.get("hook_name") or item.get("callback_id") or "candidate")
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-.") or "candidate"
-    return f"{index:03d}-{slug}"
-
-
-def _normalize_identity_route(value: Any) -> str:
-    route = str(value or "").strip().replace("\\", "/")
-    if not route:
-        return ""
-    route = "/" + route.lstrip("/")
-    return route if route == "/" else route.rstrip("/")
-
-
-def _candidate_identity(item: Mapping[str, Any], plugin_slug: str) -> str:
-    """Build the sole online-linked identity from normalized candidate fields."""
-    seed = item.get("seed") if isinstance(item.get("seed"), Mapping) else {}
-    route = next((
-        _normalize_identity_route(value)
-        for value in (
-            item.get("route"),
-            item.get("rest_route"),
-            seed.get("route"),
-            seed.get("rest_route"),
-            seed.get("materialized_route"),
-            seed.get("path"),
-        )
-        if _normalize_identity_route(value)
-    ), "")
-    hook_name = str(item.get("hook_name") or "")
-    entrypoint_type = str(seed.get("entrypoint_type") or item.get("entrypoint_type") or "")
-    if not entrypoint_type:
-        if hook_name.startswith("wp_ajax_nopriv_"):
-            entrypoint_type = "ajax_unauthenticated"
-        elif hook_name.startswith("wp_ajax_"):
-            entrypoint_type = "ajax_authenticated"
-        elif hook_name.startswith("admin_post_nopriv_"):
-            entrypoint_type = "admin_post_unauthenticated"
-        elif hook_name.startswith("admin_post_"):
-            entrypoint_type = "admin_post_authenticated"
-        elif hook_name.startswith("rest_route:"):
-            entrypoint_type = "rest_route"
-        elif hook_name in {"heartbeat_received", "heartbeat_nopriv_received"}:
-            entrypoint_type = "heartbeat"
-    method = str(
-        seed.get("resolved_method")
-        or seed.get("method")
-        or item.get("resolved_method")
-        or item.get("method")
-        or ""
-    ).upper()
-    variant = str(seed.get("seed_variant_id") or item.get("seed_variant_id") or "")
-    if not variant and method:
-        variant = method.lower()
-    return "|".join((
-        plugin_slug,
-        str(item.get("callback_id") or ""),
-        entrypoint_type,
-        hook_name,
-        route,
-        method,
-        variant,
-    ))
-
-
-def _batch_candidate_identity(item: Mapping[str, Any], plugin_slug: str) -> str:
-    return _candidate_identity(item, plugin_slug)
-
-
-def _candidate_context_key(item: Mapping[str, Any], plugin_slug: str) -> str:
-    """Fingerprint a request context without provenance or fuzzable values."""
-    seed = item.get("seed") if isinstance(item.get("seed"), Mapping) else {}
-    fixed = _string_set(seed.get("fixed_params", []))
-    fuzzable = _string_set(seed.get("fuzzable_params", []))
-    roles = [{"name": name, "role": "fixed"} for name in sorted(fixed)]
-    roles.extend({"name": name, "role": "fuzzable"}
-                 for name in sorted(fuzzable - fixed))
-    scoped_normalized = {
-        bucket: {
-            name for name in _fuzzable_params_for_section(seed, fuzzable, config_key)
-            if name not in fixed and "nonce" not in name.lower()
-        }
-        for bucket, config_key in (
-            ("body", "body_params"), ("query_params", "query_params"),
-            ("headers", "headers"), ("cookies", "cookies"),
-        )
-    }
-    credential_normalized: dict[str, set[str]] = {}
-    input_roles = {}
-    input_params = seed.get("input_params", [])
-    for parameter in input_params if isinstance(input_params, list) else []:
-        if not isinstance(parameter, Mapping) or not parameter.get("name"):
-            continue
-        name = str(parameter["name"])
-        source = str(parameter.get("source") or "").upper()
-        location = str(parameter.get("location") or "").lower()
-        role = str(parameter.get("role") or "")
-        is_credential = any(token in role.lower() for token in ("nonce", "token"))
-        role_row = {
-            "name": name, "source": source, "location": location, "role": role,
-            "fuzzable": parameter.get("fuzzable") if type(parameter.get("fuzzable")) is bool else None,
-        }
-        input_roles[json.dumps(role_row, sort_keys=True, separators=(",", ":"))] = role_row
-        if not is_credential:
-            continue
-        bucket = (
-            "query_params" if source == "GET" or location == "query" else
-            "cookies" if source == "COOKIE" or location == "cookie" else
-            "headers" if source in {"HEADER", "HEADERS"} or location == "header" else
-            "json_params" if source in {"JSON", "JSON_BODY"} or location == "json" else
-            "body" if source == "POST" or location in {"form", "body"} else None
-        )
-        if bucket is not None:
-            credential_normalized.setdefault(bucket, set()).add(name)
-    roles.extend(input_roles[key] for key in sorted(input_roles))
-
-    def normalize(value: Any, bucket: str, *, top_level: bool = True) -> Any:
-        if isinstance(value, Mapping):
-            result = {}
-            for key, item in value.items():
-                name = str(key)
-                is_fuzzable = name in scoped_normalized.get(bucket, set())
-                is_credential = name in credential_normalized.get(bucket, set())
-                result[key] = ("<fuzzable>" if top_level and (is_fuzzable or is_credential)
-                               else normalize(item, bucket, top_level=False))
-            return result
-        if isinstance(value, list):
-            return [normalize(item, bucket, top_level=False) for item in value]
-        return value
-
-    descriptor = {
-        "identity": _candidate_identity(item, plugin_slug),
-        "path": seed.get("path"),
-        "method": str(seed.get("resolved_method") or seed.get("method") or "").upper(),
-        "content_type": seed.get("content_type"),
-        "auth_mode": seed.get("auth_mode", item.get("auth_mode")),
-        "request_buckets": {
-            bucket: normalize(seed.get(bucket, {}), bucket)
-            for bucket in ("query_params", "body", "json_params", "headers", "cookies")
-        },
-        "fixed_params": sorted(fixed),
-        "fuzzable_params": sorted(fuzzable),
-        "field_roles": roles,
-    }
-    encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _sync_callback_registry_to_web(registry_path: Path) -> None:
-    """Reload callback targets in the running web container before child replay."""
-    result = subprocess.run(
-        ["docker", "compose", "ps", "-q", "web"],
-        timeout=30,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    container_id = str(result.stdout or "").strip()
-    if result.returncode != 0 or not container_id:
-        raise RuntimeError("CALLBACK_REGISTRY_REFRESH_FAILED: web container is unavailable")
-    result = subprocess.run(
-        ["docker", "cp", str(registry_path), f"{container_id}:/shared/hookphuzz-callback-registry.json"],
-        timeout=30,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        detail = str(result.stderr or "").strip()
-        raise RuntimeError(f"CALLBACK_REGISTRY_REFRESH_FAILED: {detail or 'docker cp failed'}")
-
-
-def run_online_linked(args: argparse.Namespace) -> int:
-    for name in ("max_seconds", "max_versions", "max_candidates", "campaign_seconds"):
-        value = getattr(args, name, 1)
-        if type(value) is not int or value < 1:
-            raise ValueError(f"{name} must be a positive integer")
-    max_seconds, hard_seconds = args.max_seconds, getattr(args, "hard_candidate_seconds", None)
-    if hard_seconds is not None:
-        max_seconds, hard_seconds = _budget_pair("candidate seconds", max_seconds,
-            hard_seconds, max_seconds, max_seconds)
-    max_versions, hard_versions = _budget_pair("versions", args.max_versions,
-        getattr(args, "hard_max_versions", None), max(20, args.max_versions * 4), 20)
-    initial_candidates = getattr(args, "max_candidates", 32)
-    initial_campaign_seconds = getattr(args, "campaign_seconds", 3600)
-    max_candidates, hard_max_candidates = _budget_pair("candidates", initial_candidates,
-        getattr(args, "hard_max_candidates", None), max(128, initial_candidates), 128)
-    campaign_seconds, hard_campaign_seconds = _budget_pair("campaign seconds", initial_campaign_seconds,
-        getattr(args, "hard_campaign_seconds", None), max(86400, initial_campaign_seconds), 86400)
-    suggested_path = Path(args.suggested_seeds)
-    payload = json.loads(filesystem_path(suggested_path).read_text(encoding="utf-8-sig"))
-    items = payload.get("suggested_seeds") if isinstance(payload, Mapping) else None
-    if not isinstance(items, list):
-        raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
-
-    batch_dir = Path(args.output_root) / "online-linked" / args.legacy_run_id
-    check_directory_io(batch_dir)
-    check_directory_io(Path(args.config_root) / "online-linked")
-    candidate_input_dir = batch_dir / "candidates"
-    filesystem_path(candidate_input_dir).mkdir(parents=True, exist_ok=True)
-    registry_source = Path(args.callback_registry)
-    batch_registry = batch_dir / "callback-registry.json"
-    context = {
-        "budget_policy": "progress_idle_v1",
-        "plugin_slug": args.plugin_slug, "legacy_run_id": args.legacy_run_id, "service": args.service,
-        "input_hash": hashlib.sha256(filesystem_path(suggested_path).read_bytes()).hexdigest(),
-        "registry_hash": hashlib.sha256(filesystem_path(registry_source).read_bytes()).hexdigest(),
-        "bootstrap_hash": hashlib.sha256(filesystem_path(Path(args.bootstrap_config)).read_bytes()).hexdigest()
-                          if args.bootstrap_config else None,
-        "config_root": str(Path(args.config_root).resolve()),
-        "runtime_cookie_probes": bool(getattr(args, "runtime_cookie_probes", False)),
-        "budgets": [max_seconds, hard_seconds, max_versions, hard_versions,
-                    max_candidates, hard_max_candidates, campaign_seconds, hard_campaign_seconds],
-    }
-    resume = bool(getattr(args, "resume", False))
-    if not resume:
-        filesystem_path(batch_registry).write_text(filesystem_path(registry_source).read_text(encoding="utf-8-sig"), encoding="utf-8")
-    batch_state: dict[str, Any] = {
-        "schema_version": 1,
-        "context_key_version": _CANDIDATE_CONTEXT_KEY_VERSION,
-        "mode": "online-linked-batch",
-        "plugin_slug": args.plugin_slug,
-        "legacy_run_id": args.legacy_run_id,
-        "max_seconds_per_candidate": args.max_seconds,
-        "max_versions_per_candidate": args.max_versions,
-        "max_candidates": max_candidates,
-        "campaign_seconds": campaign_seconds,
-        "hard_max_candidates": hard_max_candidates,
-        "hard_campaign_seconds": hard_campaign_seconds,
-        "campaign_status": "running",
-        "candidates": [],
-        "non_http_skipped": [],
-        "expansion_events": [],
-        "resume_context": context,
-        "priority_energy_mode": DEFAULT_PRIORITY_ENERGY_MODE if resume else _priority_energy_mode(
-            os.environ.get("HOOKPHUZZ_PRIORITY_ENERGY_MODE")),
-    }
-    skipped = False
-    queue: list[tuple[int, Mapping[str, Any], str]] = []
-    queued_ids: set[str] = set()
-    queued_context_keys: set[str] = set()
-    for index, raw_item in enumerate(items, start=1):
-        if not isinstance(raw_item, Mapping):
-            continue
-        if not isinstance(raw_item.get("seed"), Mapping):
-            # No HTTP seed: build_config_for_seed_item raises missing_seed and
-            # bootstrap matching needs a seed, so v0 can never start.
-            batch_state["non_http_skipped"].append({
-                "index": index, "hook_name": str(raw_item.get("hook_name") or ""),
-                "callback_id": str(raw_item.get("callback_id") or ""), "reason": "missing_seed",
-            })
-            continue
-        identity = _batch_candidate_identity(raw_item, args.plugin_slug)
-        context_key = _candidate_context_key(raw_item, args.plugin_slug)
-        if context_key in queued_context_keys:
-            continue
-        queued_ids.add(identity)
-        queued_context_keys.add(context_key)
-        queue.append((index, dict(raw_item), "initial"))
-    # Known input needs slots, not progress credit or extra campaign time.
-    max_candidates = min(hard_max_candidates, max(initial_candidates, len(queue)))
-    started_at = time.monotonic()
-    campaign_deadline = started_at + campaign_seconds
-    hard_campaign_deadline = campaign_deadline + hard_campaign_seconds - campaign_seconds
-    progress_keys: set[tuple[str, str]] = set()
-    blocked_pending: list[tuple[int, Mapping[str, Any], str]] = []
-    active_entry: tuple[int, Mapping[str, Any], str] | None = None
-    batch_state_path = batch_dir / "batch-state.json"
-    if resume:
-        saved = json.loads(batch_state_path.read_text(encoding="utf-8-sig"))
-        if (saved.get("resume_context") or {}).get("budget_policy") != "progress_idle_v1":
-            raise ValueError("resume budget policy incompatible; create a new run")
-        if saved.get("context_key_version") != _CANDIDATE_CONTEXT_KEY_VERSION:
-            raise ValueError("resume batch context-key version missing or unsupported")
-        if not isinstance(saved.get("queued_context_keys"), list):
-            raise ValueError("resume batch context-key queue is missing")
-        if saved.get("resume_context") != context:
-            raise ValueError("resume campaign context or budgets changed")
-        budget = saved["budget"]
-        offline_seconds = max(0.0, time.time() - budget["saved_at"])
-        campaign_deadline = started_at + max(0.0, budget["remaining_seconds"] - offline_seconds)
-        hard_campaign_deadline = started_at + max(0.0, budget["hard_remaining_seconds"] - offline_seconds)
-        max_candidates = saved["effective_max_candidates"]
-        progress_keys = {tuple(key) for key in budget["progress_keys"]}
-        batch_state = saved
-        queue = [(row["index"], row["item"], row["source"]) for row in saved["pending_candidates"]]
-        queued_ids = set(saved["queued_ids"])
-        queued_context_keys = set(saved["queued_context_keys"])
-        batch_state.update(campaign_status="running", terminal_reason=None)
-        # The saved mode wins; a checkpoint from before the option uses the default.
-        batch_state["priority_energy_mode"] = _priority_energy_mode(saved.get("priority_energy_mode"))
-        skipped = any(row.get("terminal_status") == "NOT_VERIFIED" for row in saved["candidates"])
-
-    def checkpoint(registry: Mapping[str, Any] | None = None) -> None:
-        now = time.monotonic()
-        records = {row["index"]: row for row in batch_state["candidates"]}
-        batch_state["pending_candidates"] = [
-            {"index": index, "item": dict(item), "source": source,
-             "state_path": records.get(index, {}).get("state_path"),
-             "terminal_reason": records.get(index, {}).get("terminal_reason")}
-            for index, item, source in queue + ([active_entry] if active_entry else []) + blocked_pending
-        ]
-        registry_bytes = batch_registry.read_bytes()
-        if registry is not None:
-            batch_state["registry_previous_hash"] = hashlib.sha256(registry_bytes).hexdigest()
-            # Match the existing atomic JSON writer, including Windows newlines.
-            registry_text = json.dumps(registry, indent=2, ensure_ascii=False) + "\n"
-            registry_bytes = registry_text.replace("\n", os.linesep).encode("utf-8")
-            batch_state["registry_snapshot"] = registry_bytes.decode("utf-8")
-        else:
-            batch_state.pop("registry_previous_hash", None)
-            batch_state.pop("registry_snapshot", None)
-        batch_state.update(effective_max_candidates=max_candidates, queued_ids=sorted(queued_ids),
-                           queued_context_keys=sorted(queued_context_keys),
-                           campaign_deadline=campaign_deadline, hard_campaign_deadline=hard_campaign_deadline,
-                           registry_snapshot_hash=hashlib.sha256(registry_bytes).hexdigest())
-        batch_state["budget"] = {
-            "remaining_seconds": max(0.0, campaign_deadline - now),
-            "hard_remaining_seconds": max(0.0, hard_campaign_deadline - now),
-            "progress_keys": sorted(progress_keys), "saved_at": time.time(),
-        }
-        _write_json(batch_state_path, batch_state)
-        if registry is not None:
-            # Commit the recoverable snapshot before publishing the mutable file.
-            _write_json(batch_registry, registry)
-
-    if resume and hashlib.sha256(batch_registry.read_bytes()).hexdigest() != batch_state["registry_snapshot_hash"]:
-        snapshot = batch_state.get("registry_snapshot", "").encode("utf-8")
-        if (hashlib.sha256(batch_registry.read_bytes()).hexdigest() != batch_state.get("registry_previous_hash")
-                or hashlib.sha256(snapshot).hexdigest() != batch_state["registry_snapshot_hash"]):
-            raise ValueError("resume campaign registry snapshot changed")
-        _write_json(batch_registry, json.loads(snapshot))
-    if resume and bool(getattr(args, "sync_registry", False)) and queue:
-        _sync_callback_registry_to_web(batch_registry)
-
-    initial_context_keys = {_candidate_context_key(item, args.plugin_slug)
-                            for item in items if isinstance(item, Mapping)}
-
-    def credit_progress(kind: str, key: str) -> float | None:
-        nonlocal campaign_deadline, max_candidates
-        identity = (kind, key)
-        if identity in progress_keys:
-            return None
-        if time.monotonic() < campaign_deadline:
-            if kind == "runtime_callback" and key in initial_context_keys:
-                return None
-            progress_keys.add(identity)
-            campaign_deadline = min(hard_campaign_deadline,
-                                    campaign_deadline + args.max_seconds)
-            if kind == "runtime_callback":
-                max_candidates = min(hard_max_candidates, max_candidates + 1)
-            checkpoint()
-        return campaign_deadline
-
-    next_index = max([entry[0] for entry in queue] + [row["index"] for row in batch_state["candidates"]] + [0]) + 1
-    while queue:
-        queue.sort(key=lambda entry: not str(entry[1].get("hook_name") or "").startswith("wp_ajax_"))
-        previous = next((row for row in batch_state["candidates"] if row["index"] == queue[0][0]), None)
-        if previous is None and len(batch_state["candidates"]) >= max_candidates:
-            reason = "HARD_CANDIDATE_COUNT_CAP" if max_candidates >= hard_max_candidates else "CANDIDATE_BUDGET_EXPIRED"
-            batch_state["campaign_status"] = reason
-            batch_state["expansion_events"].append({"reason": reason})
-            break
-        if time.monotonic() >= campaign_deadline:
-            reason = "HARD_CAMPAIGN_TIME_CAP" if campaign_deadline >= hard_campaign_deadline else "CAMPAIGN_BUDGET_EXPIRED"
-            batch_state["campaign_status"] = reason
-            batch_state["expansion_events"].append({"reason": reason})
-            break
-        index, raw_item, source = queue.pop(0)
-        previous = next((row for row in batch_state["candidates"] if row["index"] == index), None)
-        if previous and previous.get("terminal_status") != "PARTIAL":
-            continue
-        slug = _candidate_slug(raw_item, index)
-        candidate_run_id = f"{args.legacy_run_id}-candidate-{slug}"
-        candidate_input = candidate_input_dir / f"{slug}.json"
-        candidate_record = {
-            "index": index,
-            "hook_name": str(raw_item.get("hook_name") or ""),
-            "callback_id": str(raw_item.get("callback_id") or ""),
-            "run_id": candidate_run_id,
-            "identity": _batch_candidate_identity(raw_item, args.plugin_slug),
-            "context_key": _candidate_context_key(raw_item, args.plugin_slug),
-            "source": source,
-            "item": dict(raw_item),
-            "input_path": str(candidate_input),
-        }
-        if isinstance(raw_item.get("lineage"), Mapping):
-            candidate_record["lineage"] = dict(raw_item["lineage"])
-        try:
-            filesystem_path(candidate_input).write_text(
-                json.dumps({**payload, "suggested_seeds": [dict(raw_item)]}, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            if previous is None:
-                batch_state["candidates"].append(candidate_record)
-            else:
-                batch_state["candidates"][batch_state["candidates"].index(previous)] = candidate_record
-            candidate_record.update(terminal_status="PARTIAL", terminal_reason="CANDIDATE_INTERRUPTED",
-                                    state_path=(previous or {}).get("state_path"))
-            active_entry = (index, raw_item, source)
-            checkpoint()
-            coordinator = OnlineLinkedCoordinator(
-                suggested_seeds=candidate_input,
-                bootstrap_config=Path(args.bootstrap_config) if args.bootstrap_config else None,
-                config_root=Path(args.config_root),
-                output_root=Path(args.output_root),
-                plugin_slug=args.plugin_slug,
-                legacy_run_id=candidate_run_id,
-                max_seconds=args.max_seconds,
-                max_versions=args.max_versions,
-                runtime_cookie_probes=bool(getattr(args, "runtime_cookie_probes", False)),
-                registry_path=batch_registry,
-                service=args.service,
-                load_finding_artifact=load_finding_artifact,
-                campaign_deadline=campaign_deadline,
-                campaign_dir=batch_dir,
-                hard_seconds=hard_seconds,
-                hard_versions=hard_versions,
-                resume=bool(previous and previous.get("state_path") and Path(previous["state_path"]).is_file()),
-                progress_callback=lambda kind, key, identity=candidate_record["identity"]:
-                    credit_progress(kind, key if kind == "runtime_callback" else identity + ":" + key),
-                registry_checkpoint_callback=checkpoint,
-                priority_energy_mode=batch_state["priority_energy_mode"],
-            )
-            candidate_record["state_path"] = str(coordinator.state_path)
-            checkpoint()
-            result = coordinator.run()
-            skipped = skipped or result != 0 or coordinator.state.get("terminal_status") in {"NOT_VERIFIED", "PARTIAL"}
-            candidate_record.update({
-                "exit_code": result,
-                "state_path": str(coordinator.state_path),
-                "terminal_status": coordinator.state.get("terminal_status"),
-                "terminal_reason": coordinator.state.get("terminal_reason"),
-                "versions": len(coordinator.state.get("versions", [])),
-            })
-            if coordinator.state.get("terminal_status") == "PARTIAL":
-                blocked_pending.append((index, dict(raw_item), source))
-            for child in coordinator.state.get("candidate_queue", []):
-                if not isinstance(child, Mapping):
-                    continue
-                child_identity = _batch_candidate_identity(child, args.plugin_slug)
-                child_context_key = _candidate_context_key(child, args.plugin_slug)
-                if child_context_key in queued_context_keys:
-                    continue
-                queued_ids.add(child_identity)
-                queued_context_keys.add(child_context_key)
-                child_item = {**dict(child), "context_key": child_context_key}
-                child_entry = (next_index, child_item, "runtime_registration")
-                next_index += 1
-                if time.monotonic() >= campaign_deadline:
-                    batch_state["campaign_status"] = "CAMPAIGN_BUDGET_EXPIRED"
-                    batch_state["expansion_events"].append({
-                        "reason": "CAMPAIGN_BUDGET_EXPIRED",
-                        "identity": child_identity,
-                        "context_key": child_context_key,
-                        "lineage": dict(child.get("lineage") or {}),
-                    })
-                    queue.append(child_entry)
-                    continue
-                # The coordinator already credited real discoveries. This also
-                # supports stored/fake queues without granting duplicate credit.
-                credit_progress("runtime_callback", child_context_key)
-                if bool(getattr(args, "sync_registry", False)):
-                    try:
-                        _sync_callback_registry_to_web(batch_registry)
-                    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
-                        batch_state["expansion_events"].append({
-                            "reason": "CALLBACK_REGISTRY_REFRESH_FAILED",
-                            "identity": child_identity,
-                            "context_key": child_context_key,
-                            "detail": str(exc),
-                            "lineage": dict(child.get("lineage") or {}),
-                        })
-                        skipped = True
-                        blocked_pending.append(child_entry)
-                        continue
-                    if time.monotonic() >= campaign_deadline:
-                        batch_state["campaign_status"] = "CAMPAIGN_BUDGET_EXPIRED"
-                        batch_state["expansion_events"].append({
-                            "reason": "CAMPAIGN_BUDGET_EXPIRED",
-                            "identity": child_identity,
-                            "context_key": child_context_key,
-                            "lineage": dict(child.get("lineage") or {}),
-                        })
-                        queue.append(child_entry)
-                        continue
-                queue.append(child_entry)
-        except Exception as exc:
-            # Candidate-local failures must not discard the remaining batch.
-            skipped = True
-            candidate_record.update({
-                "exit_code": 2,
-                "state_path": candidate_record.get("state_path", ""),
-                "terminal_status": "PARTIAL" if previous else "NOT_VERIFIED",
-                "terminal_reason": f"CANDIDATE_FAILED: {type(exc).__name__}: {exc}",
-                "versions": candidate_record.get("versions", 0),
-            })
-            if previous:
-                blocked_pending.append((index, dict(raw_item), source))
-        active_entry = None
-        if candidate_record not in batch_state["candidates"]:
-            batch_state["candidates"].append(candidate_record)
-        checkpoint()
-
-    if batch_state["campaign_status"] == "running" and time.monotonic() >= campaign_deadline:
-        batch_state["campaign_status"] = "CAMPAIGN_BUDGET_EXPIRED"
-        batch_state["expansion_events"].append({"reason": "CAMPAIGN_BUDGET_EXPIRED"})
-    if batch_state["campaign_status"] == "running":
-        batch_state["campaign_status"] = "complete_with_skips" if skipped else "complete"
-    if queue or blocked_pending or any(row.get("terminal_status") == "PARTIAL" for row in batch_state["candidates"]):
-        batch_state["terminal_reason"] = (batch_state["campaign_status"] if batch_state["campaign_status"]
-            not in {"complete", "complete_with_skips"} else next(
-                (row.get("terminal_reason") for row in batch_state["candidates"] if row.get("terminal_status") == "PARTIAL"),
-                "CALLBACK_REGISTRY_REFRESH_FAILED"))
-        batch_state["campaign_status"] = "PARTIAL"
-        batch_state["stop_reasons"] = list(dict.fromkeys([
-            batch_state["terminal_reason"],
-            *(row.get("terminal_reason") for row in batch_state["candidates"] if row.get("terminal_status") == "PARTIAL"),
-        ]))
-
-    checkpoint()
-    try:
-        export_online_linked_batch(batch_state_path)
-    except Exception as exc:
-        print(f"EXPORT_FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 2
-    print(f"Online-linked batch state: {batch_state_path}")
-    print(f"Online-linked campaign status: {batch_state['campaign_status']}")
-    print(f"Online-linked candidates: {len(batch_state['candidates'])}")
-    print(
-        "Online-linked terminal statuses: "
-        + json.dumps(
-            {
-                status: sum(row.get("terminal_status") == status for row in batch_state["candidates"])
-                for status in sorted({str(row.get("terminal_status") or "") for row in batch_state["candidates"]})
-            },
-            sort_keys=True,
-        )
-    )
-    return 0
-
-
-def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run online-linked Zend expansion with immutable workers.")
-    parser.add_argument("--suggested-seeds", required=True)
-    parser.add_argument("--bootstrap-config", default="")
-    parser.add_argument("--config-root", required=True)
-    parser.add_argument("--output-root", required=True)
-    parser.add_argument("--plugin-slug", required=True)
-    parser.add_argument("--legacy-run-id", required=True)
-    parser.add_argument("--callback-registry", required=True)
-    parser.add_argument("--max-seconds", type=int, choices=range(1, 121), default=120, help="Initial candidate seconds (default 120)")
-    parser.add_argument("--max-versions", type=int, choices=range(1, 21), default=2, help="Initial versions including v0 (default 2)")
-    parser.add_argument("--max-candidates", type=int, choices=range(1, 129), default=32, help="Initial candidate slots (default 32)")
-    parser.add_argument("--campaign-seconds", type=int, choices=range(1, 86401), default=3600, help="Initial campaign seconds (default 3600)")
-    parser.add_argument("--hard-max-candidates", type=int, help="Absolute candidate cap (default max(128, initial))")
-    parser.add_argument("--hard-campaign-seconds", type=int, help="Absolute campaign seconds (default max(86400, initial))")
-    parser.add_argument("--hard-candidate-seconds", type=int, help="Absolute candidate seconds (default: no candidate hard cap)")
-    parser.add_argument("--hard-max-versions", type=int, help="Absolute versions including v0 (default max(20, 4 * initial))")
-    parser.add_argument("--resume", action="store_true", help="Reload this run's checkpoint; retain caps and credits, recheck gates")
-    parser.add_argument("--sync-registry", action="store_true")
-    parser.add_argument("--runtime-cookie-probes", action="store_true")
-    parser.add_argument("--service", default="fuzzer-wordpress-plugin")
-    return parser
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_argument_parser().parse_args(argv)
-    try:
-        return run_online_linked(args)
-    except (OSError, ValueError) as exc:
-        print(f"Online-linked failed: {exc}", file=sys.stderr)
-        return 2
-
-
 if __name__ == "__main__":
+    from online_linked.coordination.campaign import main
+
     raise SystemExit(main())

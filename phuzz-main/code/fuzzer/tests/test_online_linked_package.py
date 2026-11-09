@@ -82,7 +82,7 @@ Write-Output ('RESULT=' + ($global:captured | ConvertTo-Json -Compress -Depth 5)
                     self.assertEqual('error' in payload, exit_code != 0)
 
     def test_package_entrypoints_run_without_starting_workers(self):
-        for module in ('online_linked', 'online_linked.probe_sender'):
+        for module in ('online_linked', 'online_linked.coordinator', 'online_linked.probe_sender'):
             with self.subTest(module=module):
                 result = subprocess.run(
                     [sys.executable, '-B', '-m', module, '--help'],
@@ -94,7 +94,7 @@ Write-Output ('RESULT=' + ($global:captured | ConvertTo-Json -Compress -Depth 5)
     def test_linked_implementation_has_no_old_coordinator_dependency(self):
         package = FUZZER_DIR / 'online_linked'
         self.assertTrue(package.is_dir(), 'linked implementation needs its own package')
-        for path in package.glob('*.py'):
+        for path in package.rglob('*.py'):
             tree = ast.parse(path.read_text(encoding='utf-8'))
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom):
