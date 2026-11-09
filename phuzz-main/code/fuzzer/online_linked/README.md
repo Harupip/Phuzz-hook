@@ -72,11 +72,29 @@ branch executed; the baseline proves only that the request reached the callback.
 example, `mode=search` with fuzzable `keyword` and `mode=delete` with fuzzable
 `item_id` are exported separately. Parameters are not merged into one request.
 
-New versions use `verification_policy: callback_baseline_v1`: one correlated
-request must execute the expected callback with matching run/request/plugin,
-method, auth and seed variant, an accepted HTTP response and remaining budget.
-There are no input trials or active Pass 2 calls. Baseline evidence does not
-prove every admitted parameter was read again. Historical gates without a policy
+Bootstrap/v0-gate versions use `verification_policy: callback_baseline_v1`: one
+correlated request must execute the expected callback with matching
+run/request/plugin, method, auth and seed variant, an accepted HTTP response and
+remaining budget. There are no input trials or active Pass 2 calls; this
+baseline does not prove every admitted parameter was read again.
+
+Handoffs discovered while a worker fuzzes (`evidence_origin: worker_poll`) use
+`verification_policy: parameter_replay_v1`:
+- The coordinator first pauses the running worker. It writes `pause.json` and
+  waits for a `paused.json` ACK with the matching token, via
+  `python -m core.online_handoff`.
+- Every field the child adds must show an attributed Zend read or guard of its
+  exact transport, under the expected root callback, with the key present in
+  the replay request. The HTTP status is diagnostic only.
+- The gate stores `verified_parameters`. The exporter re-checks them against the
+  saved artifacts, the version's `canonical_callback` and the fields the version
+  adds over `parent_version`.
+- A failed replay resumes the paused worker instead of ending the candidate.
+- The new worker receives `HOOKPHUZZ_PRIORITY_SEED`: the replay reference,
+  hash, new fuzzable targets, energy mode and ACK snapshot. It sends the
+  verified seed first, then mutates only those targets before its normal seeds.
+
+Historical gates without a policy
 still require their saved Pass 2 (`accepted == total > 0`) evidence. Config hash
 and `fuzzing_ready` checks remain mandatory. Probe
 and replay-only configs remain excluded. A failed latest version does not prevent

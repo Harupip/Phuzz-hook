@@ -96,7 +96,9 @@ class ScoringModeTests(unittest.TestCase):
         self.assertEqual(DEFAULT_HOOK_ENERGY_WEIGHT, 0.8)
         self.assertEqual(DEFAULT_HOOK_MIN_ENERGY_SCALE, 4)
 
-    def test_discovery_bonus_extends_only_the_first_scheduler_round(self) -> None:
+    def test_scheduler_rounds_keep_phuzz_energy_without_handoff_bonus(self) -> None:
+        # The handoff bonus moved to the priority round (test_online_linked_priority_handoff):
+        # the scheduler's first round must not add it a second time.
         worker = object.__new__(Fuzzer)
         worker.stop_on_vuln_count = 0
         worker.scoring_formula = DefaultScoringFormula(mode=SCORING_MODE_PHUZZ)
@@ -112,9 +114,8 @@ class ScoringModeTests(unittest.TestCase):
             with self.assertRaises(StopIteration):
                 worker.fuzz_fast()
             attempts = [call.args[0] for call in worker.ff_mutate.call_args_list]
-        self.assertEqual(attempts, [first] * 9 + [second] * 7)
-        self.assertEqual((first.base_energy, first.final_energy), (7, 9))
-        self.assertEqual((second.base_energy, second.final_energy), (7, 7))
+        self.assertEqual(attempts, [first] * 7 + [second] * 7)
+        self.assertEqual((first.base_energy, first.final_energy), (7, 7))
 
     def test_phuzz_mode_keeps_original_priority_and_energy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

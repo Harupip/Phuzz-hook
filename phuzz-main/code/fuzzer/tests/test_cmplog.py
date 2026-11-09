@@ -457,7 +457,7 @@ class CmpLogMutationTests(unittest.TestCase):
 
     def test_ff_mutate_consumes_normalized_hints_without_artifact_io(self) -> None:
         source = (FUZZER_DIR / "fuzzer.py").read_text(encoding="utf-8")
-        mutate_body = source.split("    def ff_mutate(self, c):", 1)[1].split(
+        mutate_body = source.split("    def ff_mutate(self, c, *, target=None):", 1)[1].split(
             "    def ff_send_request", 1
         )[0]
 

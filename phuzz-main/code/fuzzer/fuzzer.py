@@ -15,16 +15,21 @@ from queue import PriorityQueue
 from urllib.parse import urlencode
 from itertools import product
 from functools import reduce
-from collections import ChainMap, Counter
+from collections import ChainMap, Counter, OrderedDict
 
 import traceback
 import requests
 from core import utils
-from core.candidate import Candidate
+from core.candidate import Candidate, sync_dir
 from core.mutator import DefaultMutator, EmptyQueueMutator, SingleMutator
-from core.scoring import DefaultScoringFormula
+from core.scoring import DefaultScoringFormula, phuzz_base_energy
 from core.utils import fuzz_open
 from core.finding_artifact import build_finding_record, write_finding_artifact
+from core import online_handoff as handoff
+from core.online_handoff import PauseGate
+
+# Config root inside the worker container; HOOKPHUZZ_PRIORITY_SEED names a replay config below it.
+PRIORITY_CONFIG_DIR = "./configs"
 from fuzz_guidance.cmplog.hints import (
     apply_cmplog_hint,
     normalize_comparison_events,
@@ -694,9 +699,10 @@ class Fuzzer:
         return c
 
 
-    def ff_mutate(self, c):
+    def ff_mutate(self, c, *, target=None):
+        """Mutate one field; ``target`` = (bucket, name) pins it and leaves CmpLog hints queued."""
 
-        while self.cmplog_hints:
+        while target is None and self.cmplog_hints:
             hint = self.cmplog_hints.pop(0)
             if (hint.get("opcode") == "TYPE_CHECK" and hint.get("candidate_value") is None
                     and hint.get("mutation") != "remove"):
@@ -730,12 +736,17 @@ class Fuzzer:
 
         mutator = SingleMutator()
 
-        choice_keys = list(filter(lambda x: c.fuzz_params[x], c.fuzz_params))
-        choice_weights = list(map(lambda x: c.fuzz_weights[x], choice_keys))
-        if not choice_keys or not choice_weights:
-            return None
-        param_type = random.choices(choice_keys, weights=choice_weights)[0]
-        param_name = random.choice(list(c.fuzz_params[param_type].keys()))
+        if target is not None:
+            param_type, param_name = target
+            if param_name not in c.fuzz_params.get(param_type, {}):
+                return None
+        else:
+            choice_keys = list(filter(lambda x: c.fuzz_params[x], c.fuzz_params))
+            choice_weights = list(map(lambda x: c.fuzz_weights[x], choice_keys))
+            if not choice_keys or not choice_weights:
+                return None
+            param_type = random.choices(choice_keys, weights=choice_weights)[0]
+            param_name = random.choice(list(c.fuzz_params[param_type].keys()))
 
         param_value = c.fuzz_params[param_type][param_name]
         new_value = "" if param_value is None else mutator.mutate(param_value)
@@ -852,7 +863,7 @@ class Fuzzer:
         candidate.number_of_new_paths = number_of_new_paths
 
     def ff_sync_candidates(self):
-        sync_path = "/sync-tmpfs/"
+        sync_path = os.path.join(sync_dir(), "")
 
         file_hashes = set(map(lambda x: x.replace(sync_path,"").replace(".json", ""), glob.glob(sync_path + "[a-z0-9]*.json")))
 
@@ -897,26 +908,239 @@ class Fuzzer:
                 if re.match(r, k):
                     candidate.fixed_params['cookies'][k] = v[0] # Always use the first value
 
-    def fuzz_fast(self):
-        counter = 0
-        parameter_bonus = int(os.environ.get("HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS", "0"))
-        if parameter_bonus < 0:
-            raise ValueError("HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS must be non-negative")
+    def _ff_attempt(self, candidate, *, pause_gate, round_id, energy, attempt, target=None):
+        """One mutation attempt of a round; True when the mutation found new paths."""
+        if pause_gate:
+            pause_gate.wait_if_paused(round_id=round_id, allocated_energy=energy, attempts_used=attempt)
+        interesting = False
+        if self.stop_on_vuln_count > 0 and os.path.exists("/sync-tmpfs/vuln_found"):
+            sys.exit(1337)
 
-        self.ff_candidates = [] 
+        mutated_candidate = (self.ff_mutate(candidate) if target is None
+                             else self.ff_mutate(candidate, target=target))
+        if not mutated_candidate:
+            return False
+        mutated_candidate_hash = mutated_candidate.get_params_hash()
+
+        #print("Mutation: ", mutated_candidate_hash, mutated_candidate.fuzz_params)
+        if mutated_candidate_hash in self.seen_mutations:
+            return False
+        else:
+            self.seen_mutations.add(mutated_candidate_hash)
+
+        if os.path.exists(mutated_candidate.get_sync_file()):
+            mutated_candidate = self.ff_load_candidate(mutated_candidate_hash)
+            if mutated_candidate.is_interesting and mutated_candidate_hash not in self.ff_interesting_candidates_hashes:
+                self.ff_interesting_candidates.append(mutated_candidate)
+                self.ff_interesting_candidates_hashes.add(mutated_candidate_hash)
+            return False
+
+        if pause_gate:
+            # A request that arrived while this mutation was generated.
+            pause_gate.wait_if_paused(round_id=round_id, allocated_energy=energy, attempts_used=attempt)
+        self.ff_send_request(mutated_candidate)
+        self._ingest_cmplog_hints(mutated_candidate)
+
+        measured = self.ff_get_coverage(mutated_candidate) != 0
+        self.calculate_score(mutated_candidate)
+        self.calculate_priority(mutated_candidate)
+        self._remember_scored(mutated_candidate, pause_gate, measured=measured)
+
+
+        if self.ff_has_exceptions(mutated_candidate):
+            pass
+
+        if self.ff_has_vulns(mutated_candidate):
+            self.ff_vulnerable_candidates.append(mutated_candidate)
+
+            for vuln_type in mutated_candidate.vulns:
+                stop = int(time.time())
+                diff = stop - self.start_time
+                print(f"\n\n\n\n\n\nFound {vuln_type}! in {diff}s\n\n\n\n\n\n")
+            if self.stop_on_vuln_count > 0 and self.vulnerability_count >= self.stop_on_vuln_count:
+                stop = int(time.time())
+                diff = stop - self.start_time
+                with open("/sync-tmpfs/vuln_found", "w") as f:
+                    f.write(f"Found by {self.fuzzer_id} in {diff}s")
+                sys.exit(1337)
+
+        if self.ff_is_interesting(mutated_candidate):
+            #print("TP priority / score:", mutated_candidate.priority, mutated_candidate.score)
+            self.ff_interesting_candidates.append(mutated_candidate)
+            self.ff_interesting_candidates_hashes.add(mutated_candidate_hash)
+            if (mutated_candidate.mutated_param_type and mutated_candidate.mutated_param_name
+                    and mutated_candidate.mutated_param_name in mutated_candidate.fuzz_params.get(
+                        mutated_candidate.mutated_param_type, {})):
+                fixed_params = copy.deepcopy(mutated_candidate.fixed_params)
+                fuzz_params = copy.deepcopy(mutated_candidate.fuzz_params)
+                fuzz_weights = copy.deepcopy(mutated_candidate.fuzz_weights)
+
+                fixed_params[mutated_candidate.mutated_param_type][mutated_candidate.mutated_param_name] = mutated_candidate.fuzz_params[mutated_candidate.mutated_param_type][mutated_candidate.mutated_param_name]
+                del fuzz_params[mutated_candidate.mutated_param_type][mutated_candidate.mutated_param_name]
+                if not fuzz_params[mutated_candidate.mutated_param_type]:
+                    del fuzz_weights[mutated_candidate.mutated_param_type]
+
+                new_candidate = Candidate(
+                    parent=mutated_candidate.parent,
+                    score=mutated_candidate.parent.score,
+                    priority=mutated_candidate.parent.priority,
+                    http_target=mutated_candidate.http_target,
+                    http_method=mutated_candidate.http_method,
+                    fixed_params=fixed_params,
+                    fuzz_params=fuzz_params,
+                    fuzz_weights=fuzz_weights,
+                    fuzzer_id=self.fuzzer_id
+                    )
+                #print("NEW params: ", new_candidate.fuzz_params, "with prio:", new_candidate.priority)
+                self.ff_interesting_candidates.append(new_candidate)
+                self.ff_interesting_candidates_hashes.add(new_candidate.get_params_hash())
+            interesting = True
+
+        mutated_candidate.write_sync_file()
+        if os.environ["FUZZER_CLEANUP"] == "1":
+            self.cleanup(mutated_candidate)
+        return interesting
+
+    def _remember_scored(self, candidate, pause_gate, *, measured):
+        """Online-linked only: original PHUZZ energy of recent sent requests, by request ID (= coverage ID).
+
+        Numbers only, so no response body or parent chain stays alive. A request without
+        coverage has no measured energy (ff_get_coverage returned 0), so it is not cached.
+        """
+        if pause_gate is None or not measured:
+            return
+        self._scored_energy[candidate.coverage_id] = int(phuzz_base_energy(candidate, candidate.score))
+        while len(self._scored_energy) > 4096:
+            self._scored_energy.popitem(last=False)
+
+    def _phuzz_energy_for(self, request_id):
+        return self._scored_energy.get(request_id)
+
+    def _reject_priority_seed(self, reason, detail=""):
+        """A handoff promised the verified seed first: stop instead of fuzzing without it."""
+        self._priority_log({"status": "REJECTED", "reason": reason, "detail": detail})
+        sys.exit(f"HOOKPHUZZ_PRIORITY_SEED rejected: {reason}")
+
+    def _choose_priority_target(self, targets):
+        return random.choice(targets)
+
+    def _priority_log(self, payload):
+        print("[priority] " + json.dumps(payload, sort_keys=True))
+
+    def _load_priority_seed(self):
+        """Build the verified replay seed of HOOKPHUZZ_PRIORITY_SEED, or None after logging why not."""
+        raw = os.environ.get("HOOKPHUZZ_PRIORITY_SEED", "")
+        if not raw:
+            return None
+        try:
+            descriptor = json.loads(raw)
+            slug = str(descriptor["replay_slug"])
+            if not slug or os.path.isabs(slug) or ".." in slug.replace("\\", "/").split("/"):
+                raise ValueError("replay_slug must stay under the config root")
+            mode = handoff.priority_energy_mode(descriptor.get("mode"))
+            for name in ("allocated_energy", "attempts_used", "seed_phuzz_energy"):
+                if name in descriptor and type(descriptor[name]) is not int:
+                    raise ValueError(f"{name} must be an integer")
+            with open(os.path.join(PRIORITY_CONFIG_DIR, slug + ".json"), encoding="utf-8-sig") as f:
+                replay = json.load(f)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self._reject_priority_seed("PRIORITY_SEED_UNREADABLE", str(exc))
+        if handoff.config_hash(replay) != descriptor.get("replay_hash"):
+            self._reject_priority_seed("REPLAY_HASH_MISMATCH")
+        buckets = ["headers", "cookies", "query_params", "body_params"]
+        targets = []
+        for row in descriptor.get("targets") or []:
+            if (isinstance(row, list) and len(row) == 2 and row[0] in buckets
+                    and row[1] in getattr(self, f"fuzz_{row[0]}", {})):
+                targets.append((row[0], row[1]))
+        if not targets:
+            self._reject_priority_seed("NO_FUZZABLE_TARGET")
+        fixed_params, fuzz_params = {}, {}
+        for bucket in buckets:
+            section = replay.get(bucket) if isinstance(replay.get(bucket), dict) else {}
+            values = {row["name"]: row["value"] for row in section.get("data", [])
+                      if isinstance(row, dict) and "name" in row and "value" in row}
+            # The updated config decides fixed/fuzz; the replay supplies the branch-opening values.
+            fixed_params[bucket] = {name: values.get(name, seeds[0] if seeds else "")
+                                    for name, seeds in getattr(self, f"fixed_{bucket}").items()}
+            fuzz_params[bucket] = {name: values.get(name, seeds[0] if seeds else "")
+                                   for name, seeds in getattr(self, f"fuzz_{bucket}").items()}
+        seed = Candidate(
+            score=100, priority=100, http_target=self.config["target"],
+            http_method=(replay.get("methods") or self.http_methods)[0], is_initial_candidate=True,
+            fixed_params=fixed_params, fuzz_params=fuzz_params,
+            fuzz_weights={bucket: getattr(self, f"weight_{bucket}") for bucket in buckets},
+            fuzzer_id=self.fuzzer_id,
+        )
+        self.ff_reset_cookies(seed)
+        return {"candidate": seed, "targets": targets, "descriptor": {**descriptor, "mode": mode}}
+
+    def _ff_priority_round(self, priority, pause_gate):
+        """Send the verified seed, then mutate only its new fields before any normal seed."""
+        seed, targets, descriptor = priority["candidate"], priority["targets"], priority["descriptor"]
+        if pause_gate:
+            pause_gate.wait_if_paused(round_id=0, allocated_energy=0, attempts_used=0)
+        self.ff_send_request(seed)
+        self._ingest_cmplog_hints(seed)
+        coverage_missing = self.ff_get_coverage(seed) == 0
+        self.calculate_score(seed)
+        self.calculate_priority(seed)
+        if self.ff_is_interesting(seed):
+            self.ff_interesting_candidates.append(seed)
+            self.ff_interesting_candidates_hashes.add(seed.get_params_hash())
+        self.ff_candidates.append(seed)
+        self.seen_mutations.add(seed.get_params_hash())
+        self._remember_scored(seed, pause_gate, measured=not coverage_missing)
+        # The old worker's PHUZZ energy of the verified request itself; else score the rebuilt seed.
+        if type(descriptor.get("seed_phuzz_energy")) is int and descriptor["seed_phuzz_energy"] > 0:
+            seed_energy, seed_source = descriptor["seed_phuzz_energy"], "WORKER_SCORE"
+        elif coverage_missing:
+            seed_energy, seed_source = 1, "SEED_COVERAGE_UNAVAILABLE"
+        else:
+            # seed-plus-bonus is defined on original PHUZZ, not on the scheduler's scoring mode.
+            seed_energy, seed_source = int(phuzz_base_energy(seed, seed.score)), "RESCORED"
+        allocated = int(descriptor.get("allocated_energy") or 0)
+        used = int(descriptor.get("attempts_used") or 0)
+        energy = handoff.priority_energy(descriptor["mode"], seed_energy=seed_energy, target_count=len(targets),
+                                         allocated_energy=allocated, attempts_used=used)
+        per_field = Counter()
+        for attempt in range(energy):
+            target = self._choose_priority_target(targets)
+            per_field[f"{target[0]}:{target[1]}"] += 1
+            self._ff_attempt(seed, pause_gate=pause_gate, round_id=0, energy=energy, attempt=attempt, target=target)
+        self._priority_log({
+            "status": "DONE", "mode": descriptor["mode"], "allocated_energy": allocated, "attempts_used": used,
+            "seed_energy": seed_energy, "seed_energy_source": seed_source,
+            "bonus": len(targets) if descriptor["mode"] == "seed-plus-bonus" else 0,
+            "granted": energy, "attempted": sum(per_field.values()), "per_field": dict(per_field),
+            "seed_coverage": "SEED_COVERAGE_UNAVAILABLE" if coverage_missing else "AVAILABLE",
+        })
+
+    def fuzz_fast(self):
+        self.ff_candidates = []
         # Th is self.seen_mutations
         self.ff_interesting_candidates = []
         self.ff_interesting_candidates_hashes = set()
         self.ff_vulnerable_candidates = []
+        self._scored_energy = OrderedDict()
+        # Online-linked handoff: stop between requests while the coordinator verifies a child.
+        pause_gate = PauseGate.from_env(energy_for=self._phuzz_energy_for)
+
+        # A config activated by a verified handoff fuzzes its new fields first.
+        priority = self._load_priority_seed()
+        if priority is not None:
+            self._ff_priority_round(priority, pause_gate)
 
         # Send initial requests first
         for c in self.generate_initial_candidates():
+            if pause_gate:
+                pause_gate.wait_if_paused(round_id=0, allocated_energy=0, attempts_used=0)
             self.ff_send_request(c)
             self._ingest_cmplog_hints(c)
-            counter += 1
-            self.ff_get_coverage(c)
+            measured = self.ff_get_coverage(c) != 0
             self.calculate_score(c)
             self.calculate_priority(c)
+            self._remember_scored(c, pause_gate, measured=measured)
             if self.ff_is_interesting(c):
                 self.ff_interesting_candidates.append(c)
                 self.ff_interesting_candidates_hashes.add(c.get_params_hash())
@@ -927,7 +1151,7 @@ class Fuzzer:
         print("Synced new candidates (total / new / interesting): ", sync_total, sync_new, sync_interesting)
 
         choose_offset = 0
-        round_time = time.time()
+        round_id = 0
         while True:
             sync_total, sync_new, sync_interesting = self.ff_sync_candidates()
             #print("Synced new candidates (total / new / interesting): ", sync_total, sync_new, sync_interesting)
@@ -939,103 +1163,12 @@ class Fuzzer:
 
             # This is the handoff from score/priority land into scheduler budget.
             energy = self.calculate_energy(candidate)
-            if parameter_bonus:
-                print(f"[energy] base={energy} new_parameter_bonus={parameter_bonus} final={energy + parameter_bonus}")
-                energy += parameter_bonus
-                candidate.final_energy = energy
-                parameter_bonus = 0
             #print(energy)
+            round_id += 1
             # This loop is where integer `energy` becomes actual mutation attempts.
             for i in range(energy):
-                if self.stop_on_vuln_count > 0 and os.path.exists("/sync-tmpfs/vuln_found"):
-                    sys.exit(1337)
-
-                mutated_candidate = self.ff_mutate(candidate)
-                if not mutated_candidate:
-                    continue
-                mutated_candidate_hash = mutated_candidate.get_params_hash()
-
-                #print("Mutation: ", mutated_candidate_hash, mutated_candidate.fuzz_params)
-                if mutated_candidate_hash in self.seen_mutations:
-                    continue
-                else:
-                    self.seen_mutations.add(mutated_candidate_hash)
-
-                if os.path.exists(mutated_candidate.get_sync_file()):
-                    mutated_candidate = self.ff_load_candidate(mutated_candidate_hash)
-                    if mutated_candidate.is_interesting and mutated_candidate_hash not in self.ff_interesting_candidates_hashes:
-                        self.ff_interesting_candidates.append(mutated_candidate)
-                        self.ff_interesting_candidates_hashes.add(mutated_candidate_hash)
-                    continue
-
-                self.ff_send_request(mutated_candidate)
-                self._ingest_cmplog_hints(mutated_candidate)
-                counter += 1
-
-                if counter % 100 == 0:
-                    time_diff = time.time() - round_time
-                    #print(
-                    #    f"Performance: {time_diff}s for 0.1k reqs -> {1.0/(time_diff/100)} reqs/s"
-                    #)
-                    round_time = time.time()
-
-                self.ff_get_coverage(mutated_candidate)
-                self.calculate_score(mutated_candidate)
-                self.calculate_priority(mutated_candidate)
-
-
-                if self.ff_has_exceptions(mutated_candidate):
-                    pass
-
-                if self.ff_has_vulns(mutated_candidate):
-                    self.ff_vulnerable_candidates.append(mutated_candidate)
-
-                    for vuln_type in mutated_candidate.vulns:
-                        stop = int(time.time())
-                        diff = stop - self.start_time
-                        print(f"\n\n\n\n\n\nFound {vuln_type}! in {diff}s\n\n\n\n\n\n")
-                    if self.stop_on_vuln_count > 0 and self.vulnerability_count >= self.stop_on_vuln_count:
-                        stop = int(time.time())
-                        diff = stop - self.start_time
-                        with open("/sync-tmpfs/vuln_found", "w") as f:
-                            f.write(f"Found by {self.fuzzer_id} in {diff}s")
-                        sys.exit(1337)
-
-                if self.ff_is_interesting(mutated_candidate):
-                    #print("TP priority / score:", mutated_candidate.priority, mutated_candidate.score)
-                    self.ff_interesting_candidates.append(mutated_candidate)
-                    self.ff_interesting_candidates_hashes.add(mutated_candidate_hash)
-                    if (mutated_candidate.mutated_param_type and mutated_candidate.mutated_param_name
-                            and mutated_candidate.mutated_param_name in mutated_candidate.fuzz_params.get(
-                                mutated_candidate.mutated_param_type, {})):
-                        fixed_params = copy.deepcopy(mutated_candidate.fixed_params)
-                        fuzz_params = copy.deepcopy(mutated_candidate.fuzz_params)
-                        fuzz_weights = copy.deepcopy(mutated_candidate.fuzz_weights)
-
-                        fixed_params[mutated_candidate.mutated_param_type][mutated_candidate.mutated_param_name] = mutated_candidate.fuzz_params[mutated_candidate.mutated_param_type][mutated_candidate.mutated_param_name]
-                        del fuzz_params[mutated_candidate.mutated_param_type][mutated_candidate.mutated_param_name]
-                        if not fuzz_params[mutated_candidate.mutated_param_type]:
-                            del fuzz_weights[mutated_candidate.mutated_param_type]
-
-                        new_candidate = Candidate(
-                            parent=mutated_candidate.parent,
-                            score=mutated_candidate.parent.score,
-                            priority=mutated_candidate.parent.priority,
-                            http_target=mutated_candidate.http_target,
-                            http_method=mutated_candidate.http_method,
-                            fixed_params=fixed_params,
-                            fuzz_params=fuzz_params,
-                            fuzz_weights=fuzz_weights,
-                            fuzzer_id=self.fuzzer_id
-                            )
-                        #print("NEW params: ", new_candidate.fuzz_params, "with prio:", new_candidate.priority)
-                        self.ff_interesting_candidates.append(new_candidate)
-                        self.ff_interesting_candidates_hashes.add(new_candidate.get_params_hash())
+                if self._ff_attempt(candidate, pause_gate=pause_gate, round_id=round_id, energy=energy, attempt=i):
                     choose_offset = 0
-
-                mutated_candidate.write_sync_file()
-                if os.environ["FUZZER_CLEANUP"] == "1":
-                    self.cleanup(mutated_candidate)
 
 
 if __name__ == "__main__":

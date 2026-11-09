@@ -35,11 +35,12 @@ flowchart TD
     H --> I
     I --> J{Tham số Zend mới hợp lệ?}
     J -->|Có| K[Gom mọi tham số của trace vào một config con bất biến]
-    K --> M[Một callback baseline trong parent]
-    M -->|Đạt| L[Dừng parent thành công]
-    L -->|Còn ngân sách| G2[Chạy worker con]
+    K --> P[Pause parent tại ranh giới request, chờ ACK đúng token]
+    P --> M[Một replay parameter_replay_v1 trong parent]
+    M -->|Đạt + có field fuzzable mới| L[Dừng parent thành công]
+    L -->|Còn ngân sách| G2[Worker con: seed đã xác minh, lượt ưu tiên, rồi queue thường]
     G2 --> I
-    M -->|Lỗi| R[Ghi CHILD_REPLAY_FAILED và cleanup]
+    M -->|Trượt| R[Ghi lỗi trên child, resume parent, tiếp tục polling]
     J -->|Không| N[Tiếp tục quan sát trong ngân sách]
     N --> I
     I -->|Runtime registration A→B| X[Classify B + identity dedupe]
@@ -73,7 +74,18 @@ Admission của param vẫn cần bằng chứng runtime đúng request/run/call
 
 Proposal tương đương vẫn bị `NO_SEMANTIC_PROGRESS`; fixed value, endpoint, method, auth và transport khác nhau vẫn giữ riêng. CMPLOG mutation trong worker không thay đổi.
 
-Child baseline thất bại ghi `terminal_reason` của version (`REPLAY_ARTIFACT_SAVE_FAILED`, `REPLAY_PROCESS_FAILED`, `CALLBACK_NOT_REACHED` hoặc `CALLBACK_BASELINE_NOT_VERIFIED`) và candidate kết thúc `NOT_VERIFIED/CHILD_REPLAY_FAILED` (`handoff_to_next_worker` trong coordinator). Ngoại lệ duy nhất là child sinh ra trong replay-guard discovery bên dưới.
+Child baseline thất bại ghi `terminal_reason` của version (`REPLAY_ARTIFACT_SAVE_FAILED`, `REPLAY_PROCESS_FAILED`, `CALLBACK_NOT_REACHED`, `CALLBACK_BASELINE_NOT_VERIFIED`, `PARAMETER_REPLAY_NOT_VERIFIED`, `REPLAY_TRANSPORT_NOT_VERIFIED`, `NO_NEW_FUZZABLE_TARGET` hoặc `VERIFIED_FIELD_NOT_IN_CONFIG`). Từ 2026-11-09, khi parent đang pause, thất bại này **không** còn kết thúc candidate: coordinator resume đúng worker cũ (cùng token, container còn chạy) và quay lại polling. `NOT_VERIFIED/CHILD_REPLAY_FAILED` chỉ còn khi không có pause (state lịch sử).
+
+### Handoff do phát hiện param khi đang fuzz (2026-11-09)
+
+Áp dụng khi batch đến từ worker đang fuzz (`evidence_origin = worker_poll`, giữ qua probe và replay-guard descendant). Phát hiện từ gate v0 (`v0_gate`) giữ policy `callback_baseline_v1`.
+
+1. **Pause/ACK.** Mỗi worker có `HOOKPHUZZ_HANDOFF_KEY`. Coordinator ghi `pause.json` (token, run ID, request ID mở nhánh) qua `docker exec … python -m core.online_handoff`, rồi chờ `paused.json` đúng token. Worker chỉ ACK khi không còn request đang gửi và báo `round_id`, `allocated_energy`, `attempts_used`, cùng energy PHUZZ gốc của request mở nhánh nếu worker đã đo được coverage của nó. Thời gian chờ ACK không vượt quá phần ngân sách dành cho baseline. ACK muộn thì batch được giữ (`INSUFFICIENT_VERIFICATION_BUDGET`), worker được resume.
+2. **Replay `parameter_replay_v1`.** HTTP status chỉ để chẩn đoán (302/500 vẫn có thể đạt). Mọi field mới so với parent phải có Zend read/guard đúng transport (`$_REQUEST` được tính khi resolve ra đúng transport), dưới đúng root callback, và key phải có trong đúng bucket của request. Không có event thì không tính là bằng chứng. Lỗi gửi hoặc status lệch giữa sender và artifact làm replay trượt (`REPLAY_TRANSPORT_NOT_VERIFIED`). Descendant cuối phải tự chứng minh cả batch; nếu không, ancestor đã đạt được giữ làm đích.
+3. **Field đích.** Đích là các field fuzzable ở config con mà parent chưa fuzz, nằm dưới một field đã xác minh (selector lồng `name[...]` được tính). Không còn field đích thì không chuyển config (`NO_NEW_FUZZABLE_TARGET`). Field đã xác minh mà config con không có thì cũng chặn (`VERIFIED_FIELD_NOT_IN_CONFIG`).
+4. **Worker con.** Coordinator truyền `HOOKPHUZZ_PRIORITY_SEED`: `replay_slug`, `replay_hash`, `targets`, `mode`, `allocated_energy`, `attempts_used`, và `seed_phuzz_energy` khi request mở nhánh trùng hoàn toàn với seed. Trùng nghĩa là cùng request ID, method, route, query/body/JSON, cookie và mọi header trừ `X-Fuzzer-*`/`X-HookPhuzz-*`. Descriptor không chứa giá trị request. Request đầu là seed đã xác minh. Sau đó là lượt ưu tiên, mỗi lượt đổi đúng một field đích chọn ngẫu nhiên, rồi mới tới seed khởi tạo và queue chung. Descriptor không dùng được (hash, slug, target, kiểu số) làm worker thoát trước request đầu. Mỗi version chỉ nhận lượt ưu tiên ở lần kích hoạt đầu.
+5. **Energy.** `HOOKPHUZZ_PRIORITY_ENERGY_MODE`, chốt trong batch checkpoint; checkpoint cũ dùng mặc định. `seed-plus-bonus` (mặc định) = energy PHUZZ gốc của seed + số field đích. `carryover` = `max(1, allocated_energy − attempts_used)` theo ACK. Energy PHUZZ luôn tính bằng công thức gốc (`core/scoring.phuzz_base_energy`), không theo scoring mode đang chạy. Seed thiếu coverage dùng base 1. Log `[priority]` của worker ghi energy, bonus, nguồn energy và số lượt theo field.
+6. **Sync và resume.** Candidate sync nằm trong `/sync-tmpfs/<config-hash-16>/`, nên config cũ không nạp được vào worker mới. `vuln_found` giữ ở `/sync-tmpfs/`. Resume một config con dùng lại policy của nó và lưu replay kích hoạt lại trong `readiness`, không ghi đè bằng chứng handoff mà exporter kiểm lại.
 
 ### Gom tham số theo trace AJAX
 
@@ -276,7 +288,11 @@ fuzzer/output/online-linked/<batch-run-id>/callback-registry.json
 | `BOUNDED_ONLINE_COMPLETE` / `BUDGET_EXPIRED` | Kết thúc phần chạy có giới hạn; không chứng minh discovery đã đầy đủ hay có vulnerability. |
 | `NOT_VERIFIED` / `V0_PREREQUISITE_GATE_FAILED` | Chưa có v0 thỏa điều kiện; cần xem seed, method, callback và config. |
 | `NOT_VERIFIED` / `WORKER_STOP_FAILED` | Không xác nhận được worker đã dừng; giữ tên container, chặn handoff, trả mã lỗi. Xem `stop_error`. |
-| `NOT_VERIFIED` / `CHILD_REPLAY_FAILED` | Callback baseline của child không đạt; lý do cụ thể nằm ở `terminal_reason` của version. Dừng worker hiện tại ngay, giữ `replay_result`, artifact và lý do của child, rồi chuyển candidate kế tiếp mà không đợi hết budget. State lịch sử trước 2026-11-02 có thể ghi lỗi Pass 2 dưới cùng reason. |
+| `NOT_VERIFIED` / `CHILD_REPLAY_FAILED` | Chỉ còn ở state lịch sử hoặc khi không có pause: callback baseline của child không đạt, lý do nằm ở `terminal_reason` của version. Từ 2026-11-09, child trượt khi parent đang pause chỉ ghi lỗi trên child; parent được resume và candidate tiếp tục. |
+| `PARAMETER_REPLAY_NOT_VERIFIED` / `REPLAY_TRANSPORT_NOT_VERIFIED` | `terminal_reason` của child: replay thiếu bằng chứng Zend cho một field mới (`unverified_parameters`), hoặc lỗi gửi/status lệch. Parent tiếp tục fuzz. |
+| `NO_NEW_FUZZABLE_TARGET` / `VERIFIED_FIELD_NOT_IN_CONFIG` | Child đã replay đạt nhưng không có field fuzzable mới so với parent, hoặc config con thiếu field đã xác minh; không chuyển config. |
+| `PARENT_PAUSE_NOT_ACKNOWLEDGED` | Event `DEFERRED` của discovery: worker không ACK đúng token kịp (`WORKER_PAUSE` ghi `PAUSE_ACK_TIMEOUT`, `PAUSE_WORKER_EXITED`…). Batch được giữ để thử lại. |
+| `NOT_VERIFIED` / `PAUSE_RELEASE_FAILED` | Không gỡ được pause của worker còn chạy; dừng candidate thay vì để worker treo. |
 | `NOT_VERIFIED` / `CHILD_WORKER_START_FAILED` hoặc `PARENT_WORKER_RESTART_FAILED` | Lỗi khởi động worker; không được ghi thành hoàn thành bình thường. |
 | `not_started_budget_expired` | Config có thể đã được tạo hoặc replay, nhưng worker chưa khởi động vì hết ngân sách. |
 | `VERSION_LIMIT_REACHED` | Hết lượt version; xem max_versions và attempts, không nhầm với số file cuối. |
@@ -390,7 +406,12 @@ Cuối batch, config được gom vào thư mục phẳng:
 fuzzer/output/online-linked/<batch-run-id>/final-configs/fuzzer-config.<hook>.<identity-hash>.json
 ```
 
-Exporter xét **mọi version hợp lệ** theo thứ tự số giảm dần (`v10` trước `v2`). Mỗi version mới cần `fuzzing_ready`, policy `callback_baseline_v1`, gate `passed=true`, baseline evidence/identity và config hash đúng; state lịch sử không policy vẫn cần Pass 2 `accepted == total > 0`; probe/replay-only bị loại. Version mới lỗi không làm mất bản cũ hợp lệ.
+Exporter xét **mọi version hợp lệ** theo thứ tự số giảm dần (`v10` trước `v2`). Mỗi version mới cần `fuzzing_ready`, gate `passed=true`, baseline evidence/identity và config hash đúng. Theo từng policy:
+- `callback_baseline_v1` cần HTTP 2xx.
+- `parameter_replay_v1` bỏ điều kiện 2xx nhưng kiểm lại Zend proof của từng `verified_parameters`. Callback trong proof phải trùng `canonical_callback` của version (coi `->` và `::` là như nhau), và proof phải phủ đủ field mà version thêm so với `parent_version`.
+- State lịch sử không có policy vẫn cần Pass 2 `accepted == total > 0`.
+
+Probe/replay-only bị loại. Version mới lỗi không làm mất bản cũ hợp lệ.
 
 Context khác fixed value, method, auth, transport hoặc field không tương thích được giữ riêng. Hai config tương đương chỉ xuất một file; provenance request/run tạm không tạo duplicate. Bản tăng tham số `{a}` → `{a,b}` chỉ thay thế bản cũ khi known-parameter set và mọi field/selector cũ được giữ tương thích; không merge hai nhánh thành một request.
 

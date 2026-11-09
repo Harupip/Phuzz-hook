@@ -70,6 +70,63 @@ class OnlineLinkedExportTests(unittest.TestCase):
                     candidate, _ = self.write_state(versions=[version])
                     self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / f"{field}-{value}"), 0)
 
+    def parameter_version(self, status_code=500):
+        version = self.baseline_version()
+        version["canonical_callback"] = "Fixture->callback"
+        version["known_parameters"] = [{"name": "other", "source": "POST", "location": "form"}]
+        gate = version["replay_result"]
+        gate["verification_policy"] = "parameter_replay_v1"
+        gate["verified_parameters"] = [{
+            "bucket": "body_params", "name": "other", "source": "POST", "location": "form",
+            "canonical_callback": "Fixture::callback",
+        }]
+        row = gate["runner"]["runs"][0]
+        row["request_payload"]["response"]["status_code"] = status_code
+        row["request_payload"]["request_params"] = {"body_params": {"option_id": "8uzz", "other": "x"}}
+        row["zend_payload"]["events"] = [{
+            "source": "POST", "path": ["other"], "operation": "read",
+            "callback_context": {"attributed": True, "root_callback": "Fixture::callback", "depth": 0},
+        }]
+        return version
+
+    def test_export_rechecks_parameter_replay_proof(self):
+        candidate, _ = self.write_state(versions=[self.parameter_version(500)])
+        self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / "valid"), 1)
+
+        def wrong_field(version):
+            version["replay_result"]["verified_parameters"][0]["bucket"] = "query_params"
+
+        def wrong_hash(version):
+            version["replay_result"]["config_hash"] = "0" * 64
+
+        def no_read(version):
+            version["replay_result"]["runner"]["runs"][0]["zend_payload"]["events"] = []
+
+        def no_fields(version):
+            version["replay_result"]["verified_parameters"] = []
+
+        def other_callback(version):
+            # Proof row and trace agree with each other, but not with the version's callback.
+            version["replay_result"]["verified_parameters"][0]["canonical_callback"] = "Another::callback"
+            for event in version["replay_result"]["runner"]["runs"][0]["zend_payload"]["events"]:
+                event["callback_context"]["root_callback"] = "Another::callback"
+
+        def short_batch(version):
+            version["known_parameters"].append({"name": "extra", "source": "POST", "location": "form"})
+
+        for name, mutate in (("field", wrong_field), ("hash", wrong_hash), ("read", no_read), ("empty", no_fields),
+                             ("callback", other_callback), ("batch", short_batch)):
+            with self.subTest(tampered=name):
+                version = self.parameter_version(500)
+                mutate(version)
+                candidate, _ = self.write_state(versions=[version])
+                self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / name), 0)
+        # The historical policy keeps its 2xx requirement.
+        version = self.baseline_version()
+        version["replay_result"]["runner"]["runs"][0]["request_payload"]["response"]["status_code"] = 500
+        candidate, _ = self.write_state(versions=[version])
+        self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / "legacy-500"), 0)
+
     def test_unknown_verification_policy_cannot_use_legacy_pass2(self):
         version = self.version("v1")
         version["replay_result"]["verification_policy"] = "unknown"

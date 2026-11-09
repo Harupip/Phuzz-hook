@@ -83,10 +83,12 @@ kiểm chứng hiện tại trong [review record](../reports/2026-10-09-document
   - `hook_energy`
   - `hook_energy_avg`
 
-### Bonus khi online-linked chuyển config
+### Lượt ưu tiên khi online-linked chuyển config
 
-- Sau callback baseline, coordinator so sánh config đang chạy với config cuối được chọn. Mỗi cặp `(bucket, name)` mới có selector fuzz cấp thêm một lượt mutation.
-- Worker mới cộng bonus vào energy của candidate đầu tiên scheduler chọn. Các vòng sau dùng energy theo mode. Lệnh khởi động và log `[energy]` ghi lại bonus.
+- Coordinator tạm dừng worker cũ (pause/ACK), replay theo policy `parameter_replay_v1`, rồi truyền `HOOKPHUZZ_PRIORITY_SEED` cho worker mới: tham chiếu replay config, hash và các `(bucket, name)` mới đã xác minh và còn fuzzable.
+- Worker mới gửi seed đã xác minh trước, rồi chạy một lượt chỉ mutate các field đó (mỗi lượt chọn ngẫu nhiên một field) trước seed khởi tạo và queue chung. Log `[priority]` ghi energy, bonus và số lượt theo field.
+- `HOOKPHUZZ_PRIORITY_ENERGY_MODE`: `seed-plus-bonus` (mặc định, `PHUZZ(seed) + số field`) hoặc `carryover` (`max(1, energy được cấp - lượt đã dùng)` theo ACK). Mode được chốt trong batch checkpoint. Các vòng scheduler sau dùng energy theo mode scoring, không cộng bonus.
+- `PHUZZ(seed)` luôn là công thức PHUZZ gốc (`phuzz_base_energy`), kể cả khi `PHUZZ_SCORING_MODE=2`. Worker mới dùng energy của request mở nhánh mà worker cũ đã đo (`seed_phuzz_energy`) chỉ khi seed gửi y hệt request đó (method, route, query/body, cookie, header trừ `X-Fuzzer-*`/`X-HookPhuzz-*`). Ngoài trường hợp đó, worker chấm lại seed; seed thiếu coverage dùng base 1.
 
 ## Cach doi mode bang env
 

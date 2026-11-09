@@ -11,7 +11,7 @@ import unittest
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
@@ -30,6 +30,7 @@ from online_linked.coordinator import (
     run_online_linked,
 )
 from hook_energy.seed_generation.generated_config_runner import STOP_ON_VULN_EXIT_CODE
+from core import online_handoff as handoff
 from online_linked.probe_sender import ParentInspectionTimeout
 from seed_generation.config.config_exporter import SeedConfigSkip, export_seed_configs, build_config_for_seed_item
 from seed_generation.skeleton.candidate_generator import ZendRuntimeSeedGenerator
@@ -89,6 +90,11 @@ class Clock:
 
     def sleep(self, seconds: float) -> None:
         self.now += seconds
+
+
+def worker_env(worker: Mapping[str, Any]) -> dict[str, str]:
+    command = worker["command"]
+    return dict(command[i + 1].split("=", 1) for i, arg in enumerate(command) if arg == "-e")
 
 
 class OnlineLinkedCoordinatorTests(unittest.TestCase):
@@ -546,8 +552,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertEqual(child["resolved_method"], "POST")
                 self.assertNotIn("pass2_verification", child["replay_result"])
                 if error_replay:
-                    self.assertEqual(child["terminal_reason"], "GUARD_SATISFACTION_UNKNOWN")
-                    self.assertFalse(child["replay_result"]["passed"])
+                    # The status stays a diagnostic; the trace proves the new field.
+                    self.assertTrue(child["replay_result"]["passed"])
+                    self.assertEqual(child["replay_result"]["response_status"], error_replay)
                     self.assertEqual(child["replay_result"]["runner"]["runs"][0]["response_status"], error_replay)
                 else:
                     self.assertTrue(child["replay_result"]["passed"])
@@ -579,7 +586,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
     def _guard_chain_campaign(
         self, root: Path, *, guards=("cn_param", "cn_nonce"), nonce_callback="fixture_callback",
-        probe_status=200, deadline=None, send_cost=0.0, version_cap=None,
+        probe_status=200, deadline=None, send_cost=0.0, version_cap=None, v2_replay_unread=(),
     ):
         """Cookie Notice shape: PHP evaluates isset(action, cn_param, cn_nonce) left to right
         and stops at the first absent field, so each request reveals one more guard."""
@@ -621,6 +628,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                                    "headers": {"Content-Type": "application/x-www-form-urlencoded"}},
                 "hook_coverage": {"executed_callbacks": {parent["callback_id"]: {"callback_id": parent["callback_id"]}}},
             }
+            if run_id.endswith("-v2-replay"):
+                touched = [name for name in touched if name not in v2_replay_unread]
             owner = {name: (nonce_callback if name == "cn_nonce" else "fixture_callback") for name in touched}
             zend = {
                 "schema_version": 3, "request_id": request_id, "run_id": run_id, "request_method": method,
@@ -707,7 +716,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertIn("cn_nonce", final["body_params"]["fixed"])
             self.assertTrue({"action", "cn_param"} <= set(final["body_params"]["fuzz"]))
             self.assertNotIn("cn_nonce", final["body_params"]["fuzz"])
-            self.assertIn("HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS=1", coordinator.state["workers"][-1]["command"])
+            # cn_nonce is proven but fixed in v2: only cn_param gets priority attempts.
+            descriptor = json.loads(worker_env(coordinator.state["workers"][-1])["HOOKPHUZZ_PRIORITY_SEED"])
+            self.assertEqual(descriptor["targets"], [["body_params", "cn_param"]])
 
     def test_guard_revealed_by_probe_trace_gets_its_own_probe(self):
         # p(cn_nonce) passes isset(cn_nonce) and only then reaches isset(next_guard): seeing that
@@ -786,16 +797,18 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 for event in coordinator.state["events"]
             ))
 
-    def test_replay_guard_probe_error_keeps_v1_without_confirming_nonce(self):
+    def test_replay_guard_probe_error_status_is_diagnostic_when_trace_proves_nonce(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, log, sends = self._guard_chain_campaign(Path(tmp), probe_status=403)
             self.assertEqual(len([send for send in sends if "-probe-" in send["run_id"]]), 1)
-            versions = self.assert_v1_handoff_without_nonce(coordinator, log, sends)
-            # The probe artifact is kept, but a non-2xx child baseline never confirms the nonce.
-            self.assertEqual(versions["v2"]["status"], "guard_unverified")
-            self.assertEqual(versions["v2"]["terminal_reason"], "GUARD_SATISFACTION_UNKNOWN")
-            self.assertFalse(versions["v2"]["replay_result"]["passed"])
-            self.assertNotEqual(versions["v2"]["worker_status"], "started")
+            versions = {version["version"]: version for version in coordinator.state["versions"]}
+            replay = versions["v2"]["replay_result"]
+            self.assertTrue(replay["passed"])
+            self.assertEqual(replay["response_status"], 403)
+            # The last descendant proves the whole batch over the running v0, in its own replay.
+            self.assertEqual({row["name"] for row in replay["verified_parameters"]}, {"cn_param", "cn_nonce"})
+            self.assertEqual(coordinator._active_version, "v2")
+            self.assertEqual(log.count("worker_start"), 1)
             self.assertTrue(coordinator.state["probe_attempts"][-1]["config_path"])
             self.assertIsNone(coordinator.state["terminal_status"])
             # The failed guard child is a rejected probe, not a batch v1's next update must replay.
@@ -2326,7 +2339,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
     def test_failed_child_replay_does_not_confirm_parent_parameters(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator = self.make_coordinator(Path(tmp), [], replay_passes=False)
-            self.assertEqual(coordinator.run(), 1)
+            self.assertEqual(coordinator.run(), 0)
             parent, child = coordinator.state['versions']
             self.assertEqual(parent['known_parameters'], [])
             self.assertEqual(child['status'], 'replay_failed')
@@ -2960,8 +2973,14 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         runtime_cookie_probes: bool = False,
         runtime_batch_reader=None,
         campaign_dir: Path | None = None,
+        pause_ack=None,
     ) -> OnlineLinkedCoordinator:
         item = seed_item()
+        control_root = root / "handoff-control"
+        if pause_ack is None:
+            # A worker that stops at attempt 10 of a 20-attempt round and scored the request at 31.
+            pause_ack = lambda request: {**request, "round_id": 1, "allocated_energy": 20, "attempts_used": 9,
+                                         "seed_phuzz_energy": 31}
         raw_report = {"plugin_slug": "fixture", "suggested_seeds": [item]}
         suggested = root / "suggested_seeds.json"
         suggested.write_text(json.dumps(raw_report), encoding="utf-8")
@@ -3174,6 +3193,22 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         def run_command(command, **kwargs):
             if command[:2] == ["docker", "inspect"]:
                 return subprocess.CompletedProcess(command, 0, "running", "")
+            if command[:2] == ["docker", "exec"] and command[3:6] == ["python", "-m", "core.online_handoff"]:
+                # Fake worker: the container's shared tmpfs is a local folder.
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    code = handoff.main(command[6:], root=control_root)
+                if command[6] == "request":
+                    log.append("pause_requested")
+                    ack = pause_ack({"token": command[8], "worker_run_id": command[9],
+                                     **({"request_id": command[10]} if len(command) > 10 else {})})
+                    if ack is not None:
+                        handoff.write_ack(command[7], ack, root=control_root)
+                elif command[6] == "ack" and json.loads(out.getvalue() or "null") is not None:
+                    log.append("pause_ack")
+                elif command[6] == "release":
+                    log.append("pause_released")
+                return subprocess.CompletedProcess(command, code, out.getvalue(), "")
             if command[:3] == ["docker", "compose", "run"]:
                 log.append("worker_start")
             elif command[:3] == ["docker", "rm", "-f"]:
@@ -3308,7 +3343,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             )
             self.assertIsNotNone(result)
             self.assertTrue(coordinator.runtime_cookie_probes)
-            self.assertEqual(result["replay_result"]["verification_policy"], "callback_baseline_v1")
+            self.assertEqual(result["replay_result"]["verification_policy"], "parameter_replay_v1")
 
     def make_probe_context(
         self,
@@ -3327,7 +3362,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         item, config, target_key = coordinator._select_v0()
         config_path = coordinator._write_config("v0", config)
         parent = coordinator._new_version("v0", config, config_path, None, None, item)
-        parent.update(worker_run_id="run-v0", known_parameters=[])
+        parent.update(worker_run_id="run-v0", known_parameters=[], handoff_key="key-v0")
         parent["auth_context"] = "guest"
         coordinator._reports["v0"] = {"plugin_slug": "fixture", "suggested_seeds": [item]}
         coordinator._active_version = "v0"
@@ -3564,7 +3599,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertIn("PROBE_BUDGET_EXHAUSTED", json.dumps(coordinator.state["events"]))
             self.assertEqual(parent["known_parameters"], [])
 
-    def test_non_success_baseline_blocks_fuzzing(self):
+    def test_non_success_baseline_with_parameter_proof_hands_off(self):
         for status in (301, 302, 303, 304, 307, 308, 400, 403, 404, 500):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
                 log = []
@@ -3587,10 +3622,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 replay = child["replay_result"]
                 self.assertNotIn("pass2_verification", replay)
                 self.assertEqual(replay["runner"]["runs"][0]["response_status"], status)
-                self.assertEqual(replay["guard_status"], "unknown")
-                self.assertFalse(replay["passed"])
-                self.assertEqual(child["terminal_reason"], "GUARD_SATISFACTION_UNKNOWN")
-                self.assertNotIn("worker_start", log)
+                self.assertEqual(replay["verification_policy"], "parameter_replay_v1")
+                self.assertTrue(replay["passed"])
+                self.assertIn("worker_start", log)
 
     def test_disconnect_after_callback_cannot_prove_child_guard(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3613,7 +3647,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertNotIn("pass2_verification", child["replay_result"])
             self.assertFalse(child['replay_result']['passed'])
             self.assertEqual(child['replay_result']['runner']['runs'][0]['http_error'], 'connection closed after callback')
-            self.assertEqual(child['terminal_reason'], 'GUARD_SATISFACTION_UNKNOWN')
+            self.assertEqual(child['terminal_reason'], 'REPLAY_TRANSPORT_NOT_VERIFIED')
             self.assertNotIn('worker_start', log)
 
     def test_disagreeing_response_statuses_cannot_prove_child_guard(self):
@@ -3636,7 +3670,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 seed=parent['seed_item'], deadline=None,
             )
             self.assertFalse(child['replay_result']['passed'])
-            self.assertEqual(child['terminal_reason'], 'GUARD_SATISFACTION_UNKNOWN')
+            self.assertEqual(child['terminal_reason'], 'REPLAY_TRANSPORT_NOT_VERIFIED')
             self.assertNotIn('worker_start', log)
 
     def test_two_successful_probes_use_fuzz_values_in_child_but_keep_replay_values(self):
@@ -3714,6 +3748,99 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertTrue(policies)
             self.assertTrue(all(discovery == is_probe for is_probe, discovery in policies))
 
+    def test_parameter_replay_accepts_non_2xx_only_with_exact_batch_evidence(self):
+        # HTTP status is a diagnostic: a 302/500 replay that proves the new field
+        # hands off, while a 200 replay on the wrong branch or identity does not.
+        def replay_case(mutate):
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp.name), log)
+            sender = coordinator.probe_sender
+
+            def edited(container, **kwargs):
+                result = sender(container, **kwargs)
+                if kwargs["run_id"].endswith("-replay") and result.get("request"):
+                    mutate(result)
+                return result
+
+            coordinator.probe_sender = edited
+            coordinator.run()
+            return coordinator, log
+
+        def status(code):
+            def apply(result):
+                result["response_status"] = code
+                result["request"]["response"]["status_code"] = code
+            return apply
+
+        def events_for(result, name):
+            return [event for event in result["zend"]["events"] if event["path"] == [name]]
+
+        for code in (302, 500):
+            with self.subTest(status=code):
+                coordinator, log = replay_case(status(code))
+                replay = coordinator.state["versions"][1]["replay_result"]
+                self.assertTrue(replay["passed"], replay)
+                self.assertEqual(replay["verification_policy"], "parameter_replay_v1")
+                self.assertEqual(replay["response_status"], code)
+                self.assertEqual([(row["bucket"], row["name"]) for row in replay["verified_parameters"]],
+                                 [("body_params", "new_param")])
+                self.assertEqual(log.count("worker_start"), 2)
+
+        def drop_read(result):
+            result["zend"]["events"] = [e for e in result["zend"]["events"] if e["path"] != ["new_param"]]
+
+        def wrong_run(result):
+            result["zend"]["run_id"] = "other-run"
+
+        def wrong_callback(result):
+            for event in events_for(result, "new_param"):
+                event["callback_context"]["root_callback"] = "other_callback"
+
+        def missing_key(result):
+            result["request"]["request_params"]["body_params"].pop("new_param")
+
+        def query_read(result):
+            for event in events_for(result, "new_param"):
+                event["source"] = "GET"
+
+        for name, mutate in (("missing_read", drop_read), ("wrong_run", wrong_run),
+                             ("wrong_callback", wrong_callback), ("missing_key", missing_key),
+                             ("query_read_for_body_target", query_read)):
+            with self.subTest(case=name):
+                coordinator, log = replay_case(mutate)
+                child = coordinator.state["versions"][1]
+                self.assertFalse(child["replay_result"]["passed"])
+                self.assertEqual(child["status"], "replay_failed")
+                self.assertEqual(log.count("worker_start"), 1)
+                self.assertIn("pause_released", log)
+
+        # A batch is all-or-nothing: one unproven field rejects the whole replay.
+        for drop in ((), ("b",)):
+            with self.subTest(batch_drop=drop), tempfile.TemporaryDirectory() as tmp:
+                coordinator, parent, evidence, convergence = self.make_probe_context(
+                    Path(tmp), [], names=("a", "b"), accepted=("a", "b"),
+                )
+                sender = coordinator.probe_sender
+
+                def partial(container, _sender=sender, _drop=drop, **kwargs):
+                    result = _sender(container, **kwargs)
+                    if kwargs["run_id"].endswith("-replay") and result.get("zend"):
+                        result["zend"]["events"] = [e for e in result["zend"]["events"] if e["path"][0] not in _drop]
+                    return result
+
+                coordinator.probe_sender = partial
+                child = coordinator._run_pending_probe(
+                    parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                    convergence=convergence, probe=convergence["pending_probes"][0],
+                    seed=parent["seed_item"], deadline=None,
+                )
+                self.assertIsNotNone(child)
+                replay = child["replay_result"]
+                self.assertEqual(sorted(row["name"] for row in replay["verified_parameters"]), ["a", "b"])
+                self.assertEqual(replay["passed"], not drop)
+
     def test_admitted_probe_parameters_enter_one_callback_baseline(self):
         for names in (("nonce", "notice_id", "repeat_notice_after"),
                       ("repeat_notice_after", "notice_id", "nonce")):
@@ -3768,7 +3895,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual({p["name"] for p in child["known_parameters"]}, {"old", "a", "b"})
             self.assertEqual(coordinator.state["pending_runtime_candidates"], [])
 
-    def test_baseline_allows_admitted_parameters_not_read_again(self):
+    def test_baseline_rejects_batch_when_admitted_parameter_is_not_read_again(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, parent, evidence, convergence = self.make_probe_context(Path(tmp), [])
             original_sender = coordinator.probe_sender
@@ -3792,7 +3919,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             )
             self.assertIsNotNone(child)
             self.assertEqual({p["name"] for p in child["known_parameters"]}, {"a", "b"})
-            self.assertTrue(child["replay_result"]["passed"])
+            self.assertFalse(child["replay_result"]["passed"])
+            self.assertEqual(child["terminal_reason"], "PARAMETER_REPLAY_NOT_VERIFIED")
+            self.assertEqual([row["name"] for row in child["replay_result"]["unverified_parameters"]], ["a"])
             self.assertNotIn("replay_input_trials", coordinator.state)
 
     def test_equivalent_branch_proposal_does_not_create_version_but_new_input_does(self):
@@ -4533,7 +4662,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             child = coordinator.state["versions"][1]
             self.assertEqual({row["name"] for row in child["known_parameters"]}, {"a"})
             self.assertTrue(child["replay_result"]["passed"])
-            self.assertEqual(child["replay_result"]["verification_policy"], "callback_baseline_v1")
+            self.assertEqual(child["replay_result"]["verification_policy"], "parameter_replay_v1")
             self.assertEqual(coordinator._active_version, "v1")
             self.assertTrue(coordinator._active_container)
             self.assertEqual(parent["known_parameters"], [])
@@ -4848,7 +4977,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(len([run for run in sends if run.endswith("-replay")]), 1)
             self.assertFalse(any("replay-input" in run for run in sends))
             result = child["replay_result"]
-            self.assertEqual(result["verification_policy"], "callback_baseline_v1")
+            self.assertEqual(result["verification_policy"], "parameter_replay_v1")
             self.assertTrue(result["passed"])
             self.assertEqual(set(result["baseline_evidence"]), {
                 "request_id", "run_id", "plugin_slug", "callback_id",
@@ -5026,7 +5155,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log: list[str] = []
             coordinator = self.make_coordinator(Path(tmp), log, replay_error=True)
-            self.assertNotEqual(coordinator.run(), 0)
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            self.assertIn("pause_released", log)
             self.assertEqual(len(coordinator.state["versions"]), 2)
             self.assertEqual(coordinator.state["versions"][1]["status"], "replay_failed")
             self.assertEqual([item for item in coordinator.state["workers"] if item["version"] == "v1"], [])
@@ -5036,26 +5166,34 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log: list[str] = []
             coordinator = self.make_coordinator(Path(tmp), log, replay_passes=False, max_versions=2)
-            self.assertNotEqual(coordinator.run(), 0)
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
             self.assertEqual(len(coordinator.state["versions"]), 2)
             self.assertEqual(coordinator.state["versions"][1]["status"], "replay_failed")
             self.assertEqual([item for item in coordinator.state["workers"] if item["version"] == "v1"], [])
             self.assertEqual(log.count("worker_start"), 1)
             state = json.loads(coordinator.state_path.read_text())
-            self.assertEqual(state["terminal_status"], "NOT_VERIFIED")
-            self.assertEqual(state["terminal_reason"], "CHILD_REPLAY_FAILED")
+            self.assertNotEqual(state["terminal_reason"], "CHILD_REPLAY_FAILED")
+            self.assertEqual(state["versions"][1]["terminal_reason"], "REPLAY_PROCESS_FAILED")
+            self.assertIn("pause_released", log)
 
     def test_not_verified_stops_candidate_before_budget_expires(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = []
-            coordinator = self.make_coordinator(Path(tmp), log, replay_passes=False, max_seconds=120)
+            coordinator = self.make_coordinator(Path(tmp), log, max_seconds=120)
+            run_command = coordinator.run_command
+
+            def fail_child(command, **kwargs):
+                if command[:3] == ["docker", "compose", "run"] and "HOOKPHUZZ_LEGACY_RUN_ID=run-v1" in command:
+                    return subprocess.CompletedProcess(command, 1, "", "child failed")
+                return run_command(command, **kwargs)
+
+            coordinator.run_command = fail_child
             started = coordinator.clock()
             self.assertNotEqual(coordinator.run(), 0)
             self.assertLess(coordinator.clock() - started, 1)
             self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
-            self.assertEqual(coordinator.state["terminal_reason"], "CHILD_REPLAY_FAILED")
+            self.assertEqual(coordinator.state["terminal_reason"], "CHILD_WORKER_START_FAILED")
             self.assertEqual(coordinator.state["workers"][0]["status"], "stopped")
-            self.assertEqual(coordinator.state["workers"][0]["terminal_reason"], "CHILD_REPLAY_FAILED")
 
     def test_probe_admission_normalizes_instance_callback_without_weakening_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5250,6 +5388,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertEqual(state["terminal_status"], "NOT_VERIFIED")
                 self.assertEqual(state["terminal_reason"], "WORKER_STOP_FAILED")
                 self.assertEqual(state["workers"][0]["status"], "stop_failed")
+                # The old worker is still the one running: do not leave it paused.
+                self.assertIn("pause_released", log)
 
     def test_shutdown_failure_does_not_report_success(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5447,12 +5587,14 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     return run_command(command, **kwargs)
 
                 coordinator.run_command = fail_after_v0
-                self.assertNotEqual(coordinator.run(), 0)
-                self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
-                self.assertEqual(
-                    coordinator.state["terminal_reason"],
-                    "CHILD_WORKER_START_FAILED" if replay_passes else "CHILD_REPLAY_FAILED",
-                )
+                if replay_passes:
+                    self.assertNotEqual(coordinator.run(), 0)
+                    self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
+                    self.assertEqual(coordinator.state["terminal_reason"], "CHILD_WORKER_START_FAILED")
+                else:
+                    # A rejected baseline resumes the paused parent instead of ending the callback.
+                    self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+                    self.assertNotEqual(coordinator.state["terminal_reason"], "CHILD_REPLAY_FAILED")
                 self.assertEqual(len(coordinator.state["workers"]), 1)
 
     def test_budget_spent_after_replay_prevents_or_allows_child_start(self):
@@ -5528,10 +5670,363 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertLess(replay_index, stop_index)
             self.assertLess(replay_index, child_start_index)
             initial, child = coordinator.state["workers"]
-            self.assertFalse(any(arg.startswith("HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS=") for arg in initial["command"]))
-            self.assertIn("HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS=1", child["command"])
+            self.assertNotIn("HOOKPHUZZ_PRIORITY_SEED", worker_env(initial))
+            self.assertIn("HOOKPHUZZ_PRIORITY_SEED", worker_env(child))
+            self.assertFalse(any("NEW_PARAMETER_ENERGY_BONUS" in arg for arg in initial["command"] + child["command"]))
             replay_event = [event for event in coordinator.state["events"] if event.get("kind") == "CHILD_REPLAY"][-1]
             self.assertEqual(replay_event["timing"], coordinator.state["versions"][1]["replay_result"]["timing"])
+
+    def test_priority_descriptor_follows_verified_targets_and_is_granted_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log)
+            coordinator.priority_energy_mode = "carryover"
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            initial, started = (worker_env(worker) for worker in coordinator.state["workers"])
+            child = coordinator.state["versions"][1]
+            descriptor = json.loads(started["HOOKPHUZZ_PRIORITY_SEED"])
+            self.assertEqual(descriptor, {
+                "replay_slug": Path(child["replay_config_path"]).relative_to(coordinator.config_root)
+                .with_suffix("").as_posix(),
+                "replay_hash": child["replay_config_hash"],
+                "targets": [["body_params", "new_param"]],
+                "mode": "carryover", "allocated_energy": 20, "attempts_used": 9,
+            })
+            # Each immutable config gets its own sync namespace.
+            self.assertNotEqual(initial["HOOKPHUZZ_SYNC_NAMESPACE"], started["HOOKPHUZZ_SYNC_NAMESPACE"])
+            event = next(e for e in coordinator.state["events"] if e.get("kind") == "PRIORITY_SEED")
+            self.assertEqual((event["status"], event["discovery_request_id"], event["pause_round_id"]),
+                             ("GRANTED", "req-v0", 1))
+            # A restarted worker of an activated config never gets the round again.
+            coordinator._stop_worker(child, "TEST_RESTART")
+            self.assertTrue(coordinator._start_worker(child, priority_seed=descriptor))
+            self.assertNotIn("HOOKPHUZZ_PRIORITY_SEED", worker_env(coordinator.state["workers"][-1]))
+
+    def test_seed_energy_is_carried_only_for_the_verified_request(self):
+        # Energy 31 belongs to the old worker's request; it is the seed's only if the replay sends that payload.
+        same_body = {"action": "fixture", "seed": "base", "new_param": "fuzz"}
+        other = lambda request: {**request, "request_id": "another-request", "round_id": 1,
+                                 "allocated_energy": 20, "attempts_used": 9, "seed_phuzz_energy": 31}
+
+        def shape(request, run, *, cookie="old", feature="on", agent="Desktop", accept="text/html"):
+            # Same request as sent, except the fuzzer's own per-request tracking headers.
+            request["http_target"] = "http://web/wp-admin/admin-ajax.php"
+            request["request_params"].update(
+                body_params=dict(same_body), cookies={"profile": cookie},
+                headers={"Content-Type": "application/x-www-form-urlencoded", "X-Feature": feature,
+                         "User-Agent": agent, "Accept": accept,  # WordPress reads both (wp_is_mobile)
+                         "X-Fuzzer-Covid": run, "X-HookPhuzz-Run-ID": run, "X-HookPhuzz-Request-ID": run},
+            )
+
+        for case, pause_ack, replay_shape, expected in (
+                ("other_request", other, None, None), ("payload_changed", None, None, None),
+                ("same_payload", None, {}, 31), ("cookie_changed", None, {"cookie": "new"}, None),
+                ("header_changed", None, {"feature": "off"}, None),
+                ("user_agent_changed", None, {"agent": "Mobile"}, None),
+                ("accept_changed", None, {"accept": "application/json"}, None)):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                coordinator = self.make_coordinator(Path(tmp), [], pause_ack=pause_ack)
+                if replay_shape is not None:
+                    load, sender = coordinator.load_artifact, coordinator.probe_sender
+
+                    def load_same(name, _load=load):
+                        payload = _load(name)
+                        shape(payload, "worker")
+                        return payload
+
+                    def send_same(container, _sender=sender, _replay=replay_shape, **kwargs):
+                        result = _sender(container, **kwargs)
+                        if kwargs["run_id"].endswith("-replay") and result.get("request"):
+                            shape(result["request"], "replay-run", **_replay)
+                        return result
+
+                    coordinator.load_artifact, coordinator.probe_sender = load_same, send_same
+                self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+                descriptor = json.loads(worker_env(coordinator.state["workers"][-1])["HOOKPHUZZ_PRIORITY_SEED"])
+                self.assertEqual(descriptor.get("seed_phuzz_energy"), expected)
+
+    def test_handoff_without_new_fuzzable_field_keeps_parent(self):
+        # The plan switches config only for a new fuzzable param: a batch that is all fixed keeps v0.
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log)
+            export = coordinator.export_configs_fn
+
+            def export_fixed(report, **kwargs):
+                summary = export(report, **kwargs)
+                path = Path(summary["generated"][0]["config_path"])
+                config = json.loads(path.read_text(encoding="utf-8"))
+                config["body_params"]["fixed"].append("new_param")
+                path.write_text(json.dumps(config), encoding="utf-8")
+                return summary
+
+            coordinator.export_configs_fn = export_fixed
+            coordinator.run()
+            child = coordinator.state["versions"][1]
+            self.assertTrue(child["replay_result"]["passed"] is False)
+            self.assertEqual(child["terminal_reason"], "NO_NEW_FUZZABLE_TARGET")
+            self.assertEqual(log.count("worker_start"), 1)
+            self.assertNotIn("worker_stop", log[:log.index("pause_released")])
+
+    def test_nested_selector_targets_and_missing_config_field_block_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            parent, child = coordinator.state["versions"]
+            nested = Path(tmp) / "nested.json"
+            nested.write_text(json.dumps({"body_params": {
+                "data": [{"name": "cfx_settings[alert_emails]", "value": "fuzz"},
+                         {"name": "cfx_settings[mode]", "value": "x"}],
+                "fixed": ["cfx_settings\\[mode\\]"], "fuzz": ["cfx_settings\\[alert_emails\\]"],
+            }}), encoding="utf-8")
+            child = {**child, "config_path": str(nested)}
+            replay = {"verification_policy": "parameter_replay_v1",
+                      "verified_parameters": [{"bucket": "body_params", "name": "cfx_settings"}]}
+            descriptor, blocked = coordinator._priority_seed(parent, child, replay)
+            self.assertIsNone(blocked)
+            self.assertEqual(descriptor["targets"], [["body_params", "cfx_settings[alert_emails]"]])
+            replay["verified_parameters"] = [{"bucket": "body_params", "name": "other"}]
+            self.assertEqual(coordinator._priority_seed(parent, child, replay), (None, "VERIFIED_FIELD_NOT_IN_CONFIG"))
+            # A nested selector the parent config already fuzzes is not new: no target, no handoff.
+            parent_path = Path(tmp) / "parent.json"
+            parent_path.write_text(nested.read_text(encoding="utf-8"), encoding="utf-8")
+            replay["verified_parameters"] = [{"bucket": "body_params", "name": "cfx_settings"}]
+            self.assertEqual(coordinator._priority_seed({**parent, "config_path": str(parent_path)}, child, replay),
+                             (None, "NO_NEW_FUZZABLE_TARGET"))
+
+    def test_bootstrap_discovery_keeps_callback_baseline_policy(self):
+        for origin, policy in (("v0_gate", "callback_baseline_v1"), ("worker_poll", "parameter_replay_v1")):
+            with self.subTest(origin=origin), tempfile.TemporaryDirectory() as tmp:
+                coordinator, parent, evidence, convergence = self.make_probe_context(
+                    Path(tmp), [], names=("a",), accepted=("a",),
+                )
+                child = coordinator._run_pending_probe(
+                    parent=parent, evidence={**evidence, "evidence_origin": origin},
+                    raw_report=coordinator._reports["v0"], convergence=convergence,
+                    probe=convergence["pending_probes"][0], seed=parent["seed_item"], deadline=None,
+                )
+                self.assertEqual(child["replay_result"]["verification_policy"], policy)
+                started = worker_env(coordinator.state["workers"][-1])
+                self.assertEqual("HOOKPHUZZ_PRIORITY_SEED" in started, origin == "worker_poll")
+
+    def test_resume_gate_keeps_parameter_replay_policy_and_handoff_proof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            sender = coordinator.probe_sender
+
+            def server_error(container, **kwargs):
+                result = sender(container, **kwargs)
+                if kwargs["run_id"].endswith("-replay") and result.get("request"):
+                    result["response_status"] = 500
+                    result["request"]["response"]["status_code"] = 500
+                return result
+
+            coordinator.probe_sender = server_error
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            child = coordinator.state["versions"][1]
+            handoff_proof = (child["replay_config_path"], child["replay_config_hash"])
+            self.assertTrue(child["replay_result"]["passed"])
+            # Reactivate v1 the way _load_checkpoint does, against a live 500 response.
+            coordinator.resume = True
+            coordinator.state["terminal_status"] = None
+            child["worker_run_id"] = "run-v1-resume-1"
+            child.setdefault("readiness_history", []).append(None)
+            body = {"action": "fixture", "seed": "base", "new_param": "fuzz"}
+
+            def gate(rows, **kwargs):
+                run_id = kwargs["legacy_run_id"]
+                return {"legacy_run_id": run_id, "runs": [{
+                    **rows[0], "callback_reached": True, "validation_status": "callback_reached",
+                    "process_status": "replaying", "matched_artifact": "resume-gate.json",
+                    "zend_artifact": "resume-gate.json",
+                    "request_payload": {
+                        "request_id": "resume-gate", "legacy_run_id": run_id, "target_plugin": "fixture",
+                        "hook_name": child["hook_name"], "callback_id": child["callback_id"],
+                        "auth_context": child["auth_context"], "http_method": "POST",
+                        "response": {"status_code": 500}, "request_params": {"body_params": body},
+                    },
+                    "zend_payload": {
+                        "request_id": "resume-gate", "run_id": run_id, "request_method": "POST",
+                        "events": [{"source": "POST", "path": ["new_param"], "operation": "read",
+                                    "callback_context": {"attributed": True, "root_callback": "fixture_callback",
+                                                         "depth": 0}}],
+                    },
+                }]}
+
+            coordinator.replay_runner = gate
+            config = json.loads(Path(child["replay_config_path"]).read_text(encoding="utf-8"))
+            self.assertTrue(coordinator._gate_v0(child, config, deadline=coordinator.clock() + 100),
+                            child.get("readiness"))
+            self.assertEqual(child["readiness"]["verification_policy"], "parameter_replay_v1")
+            # The reactivation replay is stored apart; the handoff proof the exporter rechecks is intact.
+            self.assertEqual((child["replay_config_path"], child["replay_config_hash"]), handoff_proof)
+            self.assertNotEqual(child["readiness"]["config_path"], handoff_proof[0])
+
+    def test_priority_energy_mode_is_fixed_in_batch_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator = self.make_coordinator(root, [])
+            registry = root / "registry.json"
+            registry.write_text(json.dumps(coordinator.registry), encoding="utf-8")
+            args = SimpleNamespace(suggested_seeds=str(coordinator.suggested_seeds), bootstrap_config="",
+                config_root=str(root / "configs"), output_root=str(root / "output"), plugin_slug="fixture",
+                legacy_run_id="campaign", max_seconds=10, max_versions=3, max_candidates=2,
+                campaign_seconds=100, callback_registry=str(registry), service="fuzzer-wordpress-plugin")
+            modes: list[str] = []
+
+            class FakeCoordinator:
+                def __init__(self, **kwargs):
+                    modes.append(kwargs["priority_energy_mode"])
+                    self.state_path = root / "candidate-state.json"
+                    self.state = {"legacy_run_id": kwargs["legacy_run_id"], "plugin_slug": "fixture",
+                                  "terminal_status": "PARTIAL", "terminal_reason": "PENDING_RUNTIME_VERIFICATION",
+                                  "versions": [], "candidate_queue": []}
+
+                def run(self):
+                    self.state_path.write_text(json.dumps(self.state), encoding="utf-8")
+                    return 0
+
+            batch_path = root / "output/online-linked/campaign/batch-state.json"
+            with patch("online_linked.coordinator.OnlineLinkedCoordinator", FakeCoordinator):
+                with patch.dict(os.environ, {"HOOKPHUZZ_PRIORITY_ENERGY_MODE": "bogus"}):
+                    with self.assertRaisesRegex(ValueError, "HOOKPHUZZ_PRIORITY_ENERGY_MODE"):
+                        run_online_linked(args)
+                with patch.dict(os.environ, {"HOOKPHUZZ_PRIORITY_ENERGY_MODE": "carryover"}):
+                    run_online_linked(args)
+                saved = json.loads(batch_path.read_text())
+                self.assertEqual(saved["priority_energy_mode"], "carryover")
+                args.resume = True
+                legacy = copy.deepcopy(saved)
+                legacy.pop("priority_energy_mode")
+                for checkpoint, env_mode in ((saved, "seed-plus-bonus"), (legacy, "carryover")):
+                    batch_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+                    with patch.dict(os.environ, {"HOOKPHUZZ_PRIORITY_ENERGY_MODE": env_mode}), \
+                            patch("online_linked.coordinator.time.time", return_value=saved["budget"]["saved_at"]):
+                        run_online_linked(args)
+            # Resume keeps the saved mode; a checkpoint without one uses the default.
+            self.assertEqual(modes, ["carryover", "carryover", "seed-plus-bonus"])
+
+    def test_resume_releases_pause_when_worker_inspection_fails(self):
+        # An inspect error is not proof the worker is gone: still send the token-guarded release.
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, replay_passes=False)
+            run_command, failed = coordinator.run_command, []
+
+            def flaky(command, **kwargs):
+                if command[:2] == ["docker", "inspect"] and kwargs.get("timeout") == 10.0 and not failed:
+                    failed.append(command)
+                    return subprocess.CompletedProcess(command, 1, "", "daemon busy")
+                return run_command(command, **kwargs)
+
+            coordinator.run_command = flaky
+            coordinator.run()
+            self.assertTrue(failed)
+            self.assertIn("pause_released", log)
+
+    def test_pause_state_does_not_leak_when_pause_request_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            record = coordinator._record_event
+
+            def failing(event, **kwargs):
+                if event.get("kind") == "WORKER_PAUSE" and event.get("status") == "REQUESTED":
+                    raise OSError("disk full")
+                return record(event, **kwargs)
+
+            coordinator._record_event = failing
+            coordinator.run()
+            self.assertIsNone(coordinator._pause)
+
+    def test_late_pause_ack_defers_and_retains_discovery(self):
+        # The ACK wait spends the candidate budget; a late ACK must keep the batch, not drop it.
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log)
+            coordinator._sender_seconds = 0.5
+            run_command = coordinator.run_command
+
+            def slow_ack(command, **kwargs):
+                # The ACK is read just after it lands, with less than the reserve left.
+                if command[:2] == ["docker", "exec"] and command[6:7] == ["ack"]:
+                    coordinator.clock.now = coordinator._deadline - 0.6
+                return run_command(command, **kwargs)
+
+            coordinator.run_command = slow_ack
+            coordinator.run()
+            self.assertFalse(any(entry.startswith("sender_timeout:run-v1-replay") for entry in log))
+            deferred = [e for e in coordinator.state["events"] if e.get("kind") == "PARAMETER_DISCOVERY"
+                        and e.get("status") == "DEFERRED"]
+            self.assertEqual([e["reason"] for e in deferred], ["INSUFFICIENT_VERIFICATION_BUDGET"])
+            self.assertTrue(coordinator.state["pending_runtime_candidates"])
+            self.assertIn("pause_released", log)
+
+    def test_descendant_failing_batch_recheck_keeps_verified_ancestor(self):
+        # v2 proves cn_nonce but not cn_param in its own replay: hand off v1, which passed.
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, log, sends = self._guard_chain_campaign(Path(tmp), v2_replay_unread=("cn_param",))
+            versions = {version["version"]: version for version in coordinator.state["versions"]}
+            self.assertEqual(versions["v2"]["terminal_reason"], "PARAMETER_REPLAY_NOT_VERIFIED")
+            self.assertEqual(coordinator._active_version, "v1")
+            self.assertEqual(versions["v1"]["worker_status"], "started")
+
+    def test_runtime_parameter_triggers_handoff_without_new_coverage(self):
+        # The coordinator never asks PHUZZ for new paths: one admitted Zend field
+        # is enough, while a trace with only known fields must not pause anyone.
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log)
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            accepted = [event for event in coordinator.state["events"]
+                        if event.get("kind") == "PARAMETER_DISCOVERY" and event.get("status") == "ACCEPTED"]
+            self.assertEqual(len(accepted), 1)
+            self.assertEqual(log.count("pause_requested"), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False)
+            coordinator.run()
+            self.assertNotIn("pause_requested", log)
+            self.assertEqual(log.count("worker_start"), 1)
+
+    def test_handoff_waits_for_matching_pause_ack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log)
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            baseline = next(i for i, entry in enumerate(log) if entry.startswith("sender_timeout:run-v1-replay"))
+            self.assertLess(log.index("pause_requested"), log.index("pause_ack"))
+            self.assertLess(log.index("pause_ack"), baseline)
+            self.assertLess(baseline, log.index("worker_stop"))
+            self.assertEqual(log.count("worker_start"), 2)
+            snapshot = coordinator.state["versions"][0]["pause_ack"]
+            self.assertEqual((snapshot["allocated_energy"], snapshot["attempts_used"]), (20, 9))
+            self.assertIn("HOOKPHUZZ_HANDOFF_KEY=" + coordinator.state["versions"][0]["handoff_key"],
+                          coordinator.state["workers"][0]["command"])
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            stale = lambda request: {**request, "token": "stale", "round_id": 1, "allocated_energy": 20, "attempts_used": 9}
+            coordinator = self.make_coordinator(Path(tmp), log, pause_ack=stale)
+            coordinator.run()
+            self.assertFalse(any(entry.startswith("sender_timeout:run-v1-replay") for entry in log))
+            self.assertEqual(log.count("worker_start"), 1)
+            self.assertNotIn("worker_stop", log[:log.index("pause_released")])
+            pause = [event for event in coordinator.state["events"] if event.get("kind") == "WORKER_PAUSE"]
+            self.assertIn(("REJECTED", "PAUSE_ACK_TIMEOUT"), [(e["status"], e["reason"]) for e in pause])
+
+    def test_replay_rejection_resumes_paused_parent_and_keeps_polling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, replay_passes=False)
+            coordinator.run()
+            child = coordinator.state["versions"][1]
+            self.assertEqual(child["status"], "replay_failed")
+            self.assertNotEqual(coordinator.state["terminal_reason"], "CHILD_REPLAY_FAILED")
+            self.assertEqual(log.count("worker_start"), 1)
+            released = log.index("pause_released")
+            self.assertLess(log.index("run_generated_configs"), released)
+            self.assertNotIn("worker_stop", log[:released])
+            # Back to polling the same parent instead of a terminal state.
+            self.assertIn("runtime_batch_reader", log[released:])
 
     def test_online_max_versions_includes_v0(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5787,8 +6282,12 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                             "hook_name": rows[0]["hook_name"], "callback_id": rows[0]["callback_id"],
                             "auth_context": next(v["auth_context"] for v in coordinator.state["versions"] if v.get("worker_run_id") == run_id),
                             "response": {"status_code": 200},
-                            "request_params": {"body_params": {"action": "fixture", "seed": "base"}}},
-                        "zend_payload": {"request_id": "fresh-gate", "run_id": run_id}}]}
+                            # v1's replay config sends its proven field a; the trace reads it again.
+                            "request_params": {"body_params": {"action": "fixture", "seed": "base", "a": "probe-a"}}},
+                        "zend_payload": {"request_id": "fresh-gate", "run_id": run_id, "events": [{
+                            "source": "POST", "path": ["a"], "operation": "read",
+                            "callback_context": {"attributed": True, "root_callback": "fixture_callback", "depth": 0},
+                        }]}}]}
                 return old_replay(rows, **kwargs)
             coordinator.replay_runner = replay
             old_gate = coordinator._gate_v0
@@ -5926,6 +6425,17 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 zend_names={"1788671490-f70d334e-44a4-46f8-85e6-95b571434eec.json"},
             )
             coordinator.export_configs_fn = export_seed_configs
+            materialize = coordinator.materialize_fn
+
+            def materialize_fuzzable(*args, **kwargs):
+                # As the real materializer: a verified new field is declared fuzzable, not only given a value.
+                report = materialize(*args, **kwargs)
+                seed = report["suggested_seeds"][0]["seed"]
+                seed["fuzzable_params"] = sorted({*seed.get("fuzzable_params", []),
+                                                  *(str(p["name"]) for p in kwargs.get("known_parameters") or [])})
+                return report
+
+            coordinator.materialize_fn = materialize_fuzzable
             replay_runner = coordinator.replay_runner
 
             def replay_with_existing_config(rows, **kwargs):

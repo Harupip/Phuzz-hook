@@ -9,6 +9,120 @@ from pathlib import Path
 from filesystem_paths import filesystem_path
 
 from hook_energy.seed_generation.online_common import config_hash
+from zend_discovery.engine import resolve_request_transport, runtime_parameter_is_accepted
+
+PARAMETER_REPLAY_POLICY = "parameter_replay_v1"
+_BUCKET_TRANSPORT = {"query_params": "GET", "body_params": "POST", "cookies": "COOKIE"}
+_TRANSPORT_BUCKET = {source: bucket for bucket, source in _BUCKET_TRANSPORT.items()}
+
+
+def config_name_is_fuzzable(section: dict, name: str) -> bool:
+    if not name:
+        return False
+    fixed = section.get("fixed", [])
+    fuzz = section.get("fuzz", [])
+    if not isinstance(fixed, list) or not isinstance(fuzz, list):
+        return False
+    is_fixed = any(re.match(str(selector), name) for selector in fixed)
+    is_fuzzable = any(re.match(str(selector), name) for selector in fuzz)
+    return is_fuzzable and not is_fixed
+
+
+def config_fields(path: Path, *, fuzzable_only: bool = True) -> set:
+    """(bucket, name) of a config's data rows; by default only the fuzzable ones."""
+    config = json.loads(filesystem_path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(config, dict):
+        raise ValueError("Expected a config object")
+    fields = set()
+    for bucket in ("query_params", "body_params", "headers", "cookies"):
+        section = config.get(bucket, {})
+        for row in section.get("data", []):
+            name = str(row.get("name") or "")
+            if bucket == "headers" and name.lower() in {"host", "cookie"}:
+                continue
+            if name and (not fuzzable_only or config_name_is_fuzzable(section, name)):
+                fields.add((bucket, name))
+    return fields
+
+
+def config_fuzzable_fields(path: Path) -> set:
+    return config_fields(path)
+
+
+def callback_name(value) -> str:
+    return re.sub(r"\s*(?:->|::)\s*", "::", str(value or "").strip())
+
+
+def handoff_new_fields(child_known: list, parent_known: list, parent_fields: set, request: dict) -> list:
+    """Fields a handoff adds over the running parent: identity plus config bucket.
+
+    Shared by the coordinator (to build ``verified_parameters``) and the exporter
+    (to require the whole batch), so both use one definition of "new".
+    """
+    def key(parameter):
+        return (str(parameter.get("name") or ""), str(parameter.get("source") or "").upper(),
+                str(parameter.get("location") or ""))
+
+    request = request if isinstance(request, dict) else {}
+    params = request.get("request_params") if isinstance(request.get("request_params"), dict) else {}
+    headers = params.get("headers") if isinstance(params.get("headers"), dict) else {}
+    method = str(request.get("http_method") or request.get("method") or "").upper()
+    known = {key(p) for p in parent_known or [] if isinstance(p, dict)}
+    fields = {}
+    for parameter in child_known or []:
+        if not isinstance(parameter, dict) or key(parameter) in known:
+            continue
+        name, source, location = key(parameter)
+        transport = source
+        if source == "REQUEST":
+            resolved = resolve_request_transport(name, request_method=method, request_params=params, headers=headers)
+            transport = resolved[0] if resolved else ""
+        bucket = _TRANSPORT_BUCKET.get(transport, "")
+        if (bucket, name) in parent_fields:
+            continue
+        fields.setdefault((bucket, name), {"bucket": bucket, "name": name, "source": source, "location": location})
+    return list(fields.values())
+
+
+def parameter_replay_failures(fields: list, request: dict, zend: dict) -> list:
+    """Return the ``verified_parameters`` rows that one replay does not prove.
+
+    Each field needs an attributed Zend read/guard of exactly its transport (or a
+    $_REQUEST read resolving to it) under its root callback, and its key in that
+    request bucket. No events never counts as proof.
+    """
+    events = zend.get("events") if isinstance(zend, dict) else None
+    request = request if isinstance(request, dict) else {}
+    params = request.get("request_params") if isinstance(request.get("request_params"), dict) else {}
+    headers = params.get("headers") if isinstance(params.get("headers"), dict) else {}
+    method = str(request.get("http_method") or request.get("method") or "").upper()
+    failures = []
+    for field in fields:
+        name = str(field.get("name") or "") if isinstance(field, dict) else ""
+        transport = _BUCKET_TRANSPORT.get(str(field.get("bucket") or "")) if name else None
+        callback = str(field.get("canonical_callback") or "") if name else ""
+        proven = False
+        for source in (transport, "REQUEST") if isinstance(events, list) and events and transport and callback else ():
+            if source == "REQUEST" and (resolve_request_transport(
+                    name, request_method=method, request_params=params, headers=headers) or ("",))[0] != transport:
+                continue
+            operations = {
+                str(event.get("operation") or "").strip().lower() for event in events
+                if isinstance(event, dict) and str(event.get("source") or "").upper() == source
+                and event.get("path") == [name]
+                and isinstance(event.get("callback_context"), dict)
+                and event["callback_context"].get("attributed") is True
+                and str(event["callback_context"].get("root_callback") or "") == callback
+            }
+            parameter = {"name": name, "source": source, "path": [name], "helper_depth": 0, "observed_count": 1}
+            if runtime_parameter_is_accepted(parameter, request, zend, canonical_callback=callback,
+                                             request_method=method, operations=operations,
+                                             runtime_cookie_probes=True):
+                proven = True
+                break
+        if not proven:
+            failures.append(field)
+    return failures
 
 
 def export_online_linked_batch(batch_state_path: Path, destination: Path | None = None) -> int:
@@ -60,7 +174,7 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
         verified_versions = []
         for version in versions:
             try:
-                content = _verified_config(version)
+                content = _verified_config(version, {v["version"]: v for v in versions})
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 skipped = {
                     "version": version["version"], "reason": str(exc),
@@ -118,7 +232,7 @@ def export_online_linked_batch(batch_state_path: Path, destination: Path | None 
                    "source_config_path": version["config_path"], "config_hash": version["config_hash"],
                    "equivalent_versions": [], "superseded_versions": []}
             gate = version.get("readiness" if version["version"] == "v0" else "replay_result") or {}
-            if gate.get("verification_policy") == "callback_baseline_v1":
+            if gate.get("verification_policy") in {"callback_baseline_v1", PARAMETER_REPLAY_POLICY}:
                 row.update(verification_policy=gate["verification_policy"], baseline_evidence=gate["baseline_evidence"])
             exported[request_key] = row
             representatives.append((semantic, version, row))
@@ -305,8 +419,8 @@ def _discovery_summary(state: dict, selected_versions: list[str]) -> dict:
             "pending_parameters": pending}
 
 
-def _verified_config(version: dict) -> bytes:
-    content, config = _verified_base(version)
+def _verified_config(version: dict, versions: dict | None = None) -> bytes:
+    content, config = _verified_base(version, versions or {})
     if (version.get("config_type") != "fuzzing_ready" or config.get("config_type") != "fuzzing_ready"
             or version.get("probe_variant") is True
             or (config.get("metadata") or {}).get("probe_variant") is True):
@@ -314,7 +428,7 @@ def _verified_config(version: dict) -> bytes:
     return content
 
 
-def _verified_base(version: dict) -> tuple[bytes, dict]:
+def _verified_base(version: dict, versions: dict | None = None) -> tuple[bytes, dict]:
     gate = version.get("readiness" if version["version"] == "v0" else "replay_result") or {}
     if gate.get("passed") is not True:
         raise ValueError("GATE_NOT_VERIFIED")
@@ -333,6 +447,25 @@ def _verified_base(version: dict) -> tuple[bytes, dict]:
     policy = gate.get("verification_policy")
     if policy == "callback_baseline_v1":
         _verify_baseline_gate(version, gate, config)
+    elif policy == PARAMETER_REPLAY_POLICY:
+        # HTTP status is diagnostic here; the field proof replaces the 2xx rule.
+        _verify_baseline_gate(version, gate, config, require_2xx=False)
+        fields = gate.get("verified_parameters")
+        row = gate["runner"]["runs"][0]
+        if not isinstance(fields, list) or not fields or parameter_replay_failures(
+                fields, row.get("request_payload") or {}, row.get("zend_payload") or {}):
+            raise ValueError("PARAMETER_REPLAY_NOT_VERIFIED")
+        # The proof must name this version's callback, not just agree with its own trace.
+        expected = callback_name(version.get("canonical_callback"))
+        if not expected or any(callback_name(f.get("canonical_callback")) != expected for f in fields):
+            raise ValueError("PARAMETER_REPLAY_CALLBACK_MISMATCH")
+        # ... and cover every field this version adds over its parent.
+        parent = (versions or {}).get(version.get("parent_version")) or {}
+        parent_fields = config_fuzzable_fields(Path(version["parent_config"])) if version.get("parent_config") else set()
+        required = handoff_new_fields(version.get("known_parameters") or [], parent.get("known_parameters") or [],
+                                      parent_fields, row.get("request_payload") or {})
+        if not {(f["bucket"], f["name"]) for f in required} <= {(f.get("bucket"), f.get("name")) for f in fields}:
+            raise ValueError("PARAMETER_REPLAY_BATCH_INCOMPLETE")
     elif policy is None:
         # Historical records retain their original eligibility contract.
         pass2 = gate.get("pass2_verification") or {}
@@ -344,7 +477,7 @@ def _verified_base(version: dict) -> tuple[bytes, dict]:
     return content, config
 
 
-def _verify_baseline_gate(version: dict, gate: dict, config: dict) -> None:
+def _verify_baseline_gate(version: dict, gate: dict, config: dict, *, require_2xx: bool = True) -> None:
     proof = gate.get("baseline_evidence")
     fields = {"request_id", "run_id", "plugin_slug", "callback_id", "http_method", "auth_context", "seed_variant_id"}
     if (not isinstance(proof, dict) or not fields <= proof.keys()
@@ -400,7 +533,7 @@ def _verify_baseline_gate(version: dict, gate: dict, config: dict) -> None:
     if request.get("target_plugin") != proof["plugin_slug"] or str(request.get("http_method") or request.get("method") or "").upper() != proof["http_method"]:
         raise ValueError("BASELINE_REQUEST_MISMATCH")
     response = request.get("response")
-    if not isinstance(response, dict) or not 200 <= int(response.get("status_code", 0)) < 300:
+    if require_2xx and (not isinstance(response, dict) or not 200 <= int(response.get("status_code", 0)) < 300):
         raise ValueError("BASELINE_HTTP_NOT_VERIFIED")
     replay_path = Path(version["replay_config_path"])
     if (gate.get("config_path") != str(replay_path) or gate.get("config_hash") != version.get("replay_config_hash")

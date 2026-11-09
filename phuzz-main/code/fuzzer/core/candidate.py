@@ -6,6 +6,18 @@ from pathlib import Path
 from uuid import uuid4
 from .utils import fuzz_open
 
+SYNC_ROOT = "/sync-tmpfs"
+
+
+def sync_dir():
+    """Online-linked workers sync per config, so an older selector never loads these files."""
+    namespace = os.environ.get("HOOKPHUZZ_SYNC_NAMESPACE", "")
+    if not namespace:
+        return SYNC_ROOT
+    if namespace in {".", ".."} or not all(ch.isalnum() or ch in "_.-" for ch in namespace):
+        raise ValueError("HOOKPHUZZ_SYNC_NAMESPACE is invalid")
+    return os.path.join(SYNC_ROOT, namespace)
+
 
 class Candidate:
     def __init__(self,  parent=None, score=0, priority=0, http_target="", http_method="GET", fixed_params={}, fuzz_params={}, fuzz_weights={}, fuzzer_id=-1, is_initial_candidate=False, mutated_param_type=None, mutated_param_name=None, mutation_source="normal", cmplog_hint=None):
@@ -163,9 +175,9 @@ class Candidate:
             h = self.get_params_hash()
 
         if is_interesting:
-            return os.path.join("/sync-tmpfs", "interesting_" + h + ".json")
+            return os.path.join(sync_dir(), "interesting_" + h + ".json")
         else:
-            return os.path.join("/sync-tmpfs", h + ".json")
+            return os.path.join(sync_dir(), h + ".json")
 
 
     def touch_sync_file(self, is_interesting=False):
@@ -174,6 +186,7 @@ class Candidate:
 
     def write_sync_file(self):
         sync_path = self.get_sync_file()
+        os.makedirs(os.path.dirname(sync_path), exist_ok=True)
         temp_path = f"{sync_path}.{uuid4().hex}.tmp"
         try:
             with fuzz_open(temp_path, 'w') as f:

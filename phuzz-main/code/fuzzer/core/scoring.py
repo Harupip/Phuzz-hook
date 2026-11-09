@@ -157,6 +157,13 @@ DEFAULT_HOOK_MIN_ENERGY_SCALE = _env_int("FUZZER_HOOK_MIN_ENERGY_SCALE", 4)
 #         return energy
 
 
+def phuzz_base_energy(candidate, score):
+    """Original PHUZZ energy for a scored candidate; reads only, whatever scoring mode runs."""
+    if candidate.parent is not None:
+        return max(1, candidate.parent.number_of_new_paths + abs(candidate.parent.score - score))
+    return max(1, len(candidate.new_paths))
+
+
 class PhuzzScoringFormula(ScoringFormula):
     def calculate_score(self, candidate):
         # Innermost PHUZZ score calculation. `Fuzzer.calculate_score()` delegates here.
@@ -196,10 +203,7 @@ class PhuzzScoringFormula(ScoringFormula):
         if current_score is None or (current_score == 0 and (candidate.paths or candidate.new_paths)):
             current_score = self.calculate_score(candidate)
 
-        if candidate.parent is not None:
-            energy = max(1, candidate.parent.number_of_new_paths + abs(candidate.parent.score - current_score))
-        else:
-            energy = max(1, len(candidate.new_paths))
+        energy = phuzz_base_energy(candidate, current_score)
         # Plain PHUZZ mode has no hook feedback, so base/final stay identical here.
         candidate.base_energy = int(energy)
         candidate.final_energy = int(energy)

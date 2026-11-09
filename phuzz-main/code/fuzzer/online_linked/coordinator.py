@@ -11,6 +11,8 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -38,7 +40,12 @@ from hook_energy.seed_generation.online_common import (
     validate_v0_config,
 )
 from online_linked.evidence import RuntimeBatchTimeout, read_runtime_batch
-from online_linked.export import export_online_linked_batch
+from core.online_handoff import DEFAULT_PRIORITY_ENERGY_MODE, priority_energy_mode as _priority_energy_mode
+from online_linked.export import (
+    PARAMETER_REPLAY_POLICY, config_fields as _config_fields, config_fuzzable_fields as _config_fuzzable_fields,
+    config_name_is_fuzzable as _config_name_is_fuzzable, export_online_linked_batch, handoff_new_fields,
+    parameter_replay_failures,
+)
 from hook_energy.seed_generation.zend_runtime.bridge_cli import (
     converge_iteration,
     list_convergence_targets,
@@ -54,7 +61,10 @@ from seed_generation.config.config_exporter import (
 from seed_generation.convergence.convergence import materialize_convergence_seeds
 from discovery.entrypoints.entrypoints import seed_template_for_callback
 from discovery.entrypoints.method_resolution import resolve_http_methods
-from zend_discovery.engine import candidate_from_seed_item, canonical_identity_id, prepare_callback_registry, runtime_parameter_is_accepted
+from zend_discovery.engine import (
+    candidate_from_seed_item, canonical_identity_id, prepare_callback_registry, resolve_request_transport,
+    runtime_parameter_is_accepted,
+)
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
@@ -95,34 +105,6 @@ def _parameter_key(parameter: Any) -> tuple[str, str, str]:
         str(parameter.get("source") or "").upper(),
         str(parameter.get("location") or ""),
     )
-
-
-def _config_name_is_fuzzable(section: Mapping[str, Any], name: str) -> bool:
-    if not name:
-        return False
-    fixed = section.get("fixed", [])
-    fuzz = section.get("fuzz", [])
-    if not isinstance(fixed, list) or not isinstance(fuzz, list):
-        return False
-    is_fixed = any(re.match(str(selector), name) for selector in fixed)
-    is_fuzzable = any(re.match(str(selector), name) for selector in fuzz)
-    return is_fuzzable and not is_fixed
-
-
-def _config_fuzzable_fields(path: Path) -> set[tuple[str, str]]:
-    config = json.loads(filesystem_path(path).read_text(encoding="utf-8-sig"))
-    if not isinstance(config, Mapping):
-        raise ValueError("Expected a config object")
-    fields = set()
-    for bucket in ("query_params", "body_params", "headers", "cookies"):
-        section = config.get(bucket, {})
-        for row in section.get("data", []):
-            name = str(row.get("name") or "")
-            if bucket == "headers" and name.lower() in {"host", "cookie"}:
-                continue
-            if _config_name_is_fuzzable(section, name):
-                fields.add((bucket, name))
-    return fields
 
 
 def _replace_fuzzable_values_with_placeholder(config: dict[str, Any]) -> None:
@@ -207,6 +189,7 @@ class OnlineLinkedCoordinator:
         progress_callback: Callable[[str, str], float | None] | None = None,
         registry_checkpoint_callback: Callable[[Mapping[str, Any]], None] | None = None,
         resume: bool = False,
+        priority_energy_mode: str = DEFAULT_PRIORITY_ENERGY_MODE,
     ) -> None:
         if type(max_seconds) is not int or type(max_versions) is not int:
             raise ValueError("initial candidate budgets must be positive integers")
@@ -228,11 +211,15 @@ class OnlineLinkedCoordinator:
         # Set while a passed AJAX replay's guards are probed: children are only verified.
         self._replay_discovery_active = False
         self._replay_evidence: dict[str, dict[str, Any]] = {}
+        # The acknowledged pause of the running worker during one handoff.
+        self._pause: dict[str, str] | None = None
         self.max_versions = max_versions
         self.hard_seconds = hard_seconds
         self.hard_versions = hard_versions
         self.progress_callback = progress_callback
         self.registry_checkpoint_callback = registry_checkpoint_callback
+        # Fixed by the batch checkpoint; the worker of each verified handoff receives it.
+        self.priority_energy_mode = _priority_energy_mode(priority_energy_mode)
         self._deadline: float | None = None
         self._hard_deadline: float | None = None
         self._progress_keys: set[tuple[str, str]] = set()
@@ -288,6 +275,7 @@ class OnlineLinkedCoordinator:
             "hard_versions": self.hard_versions,
             "budget_progress": [],
             "runtime_cookie_probes": self.runtime_cookie_probes,
+            "priority_energy_mode": self.priority_energy_mode,
             "campaign_deadline": self.campaign_deadline,
             "campaign_status": "running" if self.campaign_deadline is not None else None,
             "versions": [],
@@ -669,8 +657,13 @@ class OnlineLinkedCoordinator:
         if reactivation:
             gate_name += f"-activation-{len(version.get('readiness_history', []))}"
         path = self._write_config(gate_name, replay, replay=True)
-        version["replay_config_path"] = str(path)
-        version["replay_config_hash"] = config_hash(replay)
+        # A child's handoff replay is the proof the exporter rechecks: store reactivations apart.
+        child_proof = version.get("replay_result") if str(version.get("version")) != "v0" else None
+        child_proof = child_proof if isinstance(child_proof, Mapping) else None
+        if child_proof is None:
+            version["replay_config_path"] = str(path)
+            version["replay_config_hash"] = config_hash(replay)
+        parameter_policy = bool(child_proof) and child_proof.get("verification_policy") == PARAMETER_REPLAY_POLICY
         seed = version["seed_item"].get("seed", {})
         row = {
             "config_slug": path.relative_to(self.config_root).with_suffix("").as_posix(),
@@ -747,7 +740,17 @@ class OnlineLinkedCoordinator:
             }
             response = gate_evidence["request"].get("response")
             status = response.get("status_code") if isinstance(response, Mapping) else None
-            if version["config_type"] == "fuzzing_ready":
+            if parameter_policy:
+                # Same policy as the handoff that admitted this config: status is diagnostic.
+                fields = list(child_proof.get("verified_parameters") or [])
+                missing = parameter_replay_failures(fields, gate_evidence["request"], gate_evidence["zend"])
+                readiness.update(verification_policy=PARAMETER_REPLAY_POLICY, verified_parameters=fields,
+                                 response_status=status)
+                if not fields or missing:
+                    readiness.update(reason="PARAMETER_REPLAY_NOT_VERIFIED", unverified_parameters=missing)
+                    self.state.update(terminal_status="PARTIAL", terminal_reason="PARAMETER_REPLAY_NOT_VERIFIED")
+                    return False
+            elif version["config_type"] == "fuzzing_ready":
                 try:
                     guard_unknown = not 200 <= int(status) < 300
                 except (TypeError, ValueError):
@@ -1449,17 +1452,55 @@ class OnlineLinkedCoordinator:
             proposed_parameters = [*carried, *proposed_parameters]
             discovery["carried_parameters"] = [self._safe_parameter_identity(parameter) for parameter in carried]
         discovery = self._record_event(discovery)
+        # A descendant verified inside this handoff runs under the outer pause.
+        owns_pause = self._pause is None
+        defer_reason = ""
         # Reserve one baseline send and one sender-sized handoff allowance.
         if deadline is not None and deadline - self.clock() < 2 * self._sender_seconds:
+            defer_reason = "INSUFFICIENT_VERIFICATION_BUDGET"
+        elif owns_pause and not self._pause_parent(parent, deadline, request_id=str(discovery.get("request_id") or "")):
+            defer_reason = "PARENT_PAUSE_NOT_ACKNOWLEDGED"
+        elif deadline is not None and deadline - self.clock() < 2 * self._sender_seconds:
+            # The ACK wait spent the reserve: resume the parent and keep the batch.
+            defer_reason = "INSUFFICIENT_VERIFICATION_BUDGET"
+            if owns_pause:
+                self._resume_parent()
+        if defer_reason:
             self._retain_pending_runtime_candidates([
                 {"parameters": [parameter], "evidence": (
                     evidence_by_parameter.get(_parameter_key(parameter), evidence)
                     if isinstance(evidence_by_parameter, Mapping) else evidence
                 )} for parameter in new_parameters
             ], parent)
-            self._record_event({**discovery, "event_id": "", "status": "DEFERRED",
-                                "reason": "INSUFFICIENT_VERIFICATION_BUDGET"})
+            self._record_event({**discovery, "event_id": "", "status": "DEFERRED", "reason": defer_reason})
             return None
+        try:
+            return self._build_and_hand_off_child(
+                parent=parent, evidence=evidence, raw_report=raw_report, result=result, seed=seed,
+                deadline=deadline, discovery=discovery, new_parameters=new_parameters,
+                proposed_parameters=proposed_parameters, evidence_by_parameter=evidence_by_parameter,
+                transition_report=transition_report,
+            )
+        finally:
+            if owns_pause:
+                self._resume_parent()
+
+    def _build_and_hand_off_child(
+        self,
+        *,
+        parent: dict[str, Any],
+        evidence: Mapping[str, Any],
+        raw_report: Mapping[str, Any],
+        result: Mapping[str, Any],
+        seed: Mapping[str, Any],
+        deadline: float | None,
+        discovery: Mapping[str, Any],
+        new_parameters: list[Any],
+        proposed_parameters: list[Any],
+        evidence_by_parameter: Any,
+        transition_report: Any,
+    ) -> dict[str, Any] | None:
+        """Materialize, export and replay one child while the parent is paused."""
         materialize_candidate_key = str(result.get("candidate_key") or self._target_key).split("::", 1)[0]
         try:
             materialized = self.materialize_fn(
@@ -1530,6 +1571,12 @@ class OnlineLinkedCoordinator:
                 config_generation_seconds=round(max(0.0, self.clock() - config_generation_started_at), 3),
             )
             child["known_parameters"] = proposed_parameters
+            child["discovery_payload_hash"] = _request_payload_hash(evidence.get("request"))
+            # parameter_replay_v1 covers discovery while a worker fuzzes; descendants keep their batch's origin.
+            child["evidence_origin"] = str(
+                (parent.get("evidence_origin") if self._replay_discovery_active
+                 else result.get("evidence_origin") or evidence.get("evidence_origin")) or "worker_poll"
+            )
             if self._replay_discovery_active:
                 child["discovery_origin"] = "replay_guard"
             self._reports[next_version] = copy.deepcopy(materialized)
@@ -1908,6 +1955,27 @@ class OnlineLinkedCoordinator:
             return False
         return True
 
+    def _parameter_replay_fields(
+        self, parent: Mapping[str, Any], child: Mapping[str, Any], baseline: Mapping[str, Any] | None,
+    ) -> list[dict[str, str]]:
+        """Fields ``child`` adds over the running ``parent``: config bucket, name and Zend identity."""
+        request = baseline.get("request") if isinstance(baseline, Mapping) else None
+        request = dict(request) if isinstance(request, Mapping) else {}
+        request.setdefault("http_method", str(child.get("resolved_method") or ""))
+        try:
+            parent_fields = _config_fuzzable_fields(Path(str(parent["config_path"])))
+        except (KeyError, OSError, ValueError, re.error):
+            parent_fields = set()
+        callback = self._expected_callback(child)
+        return [
+            {**row, "canonical_callback": callback}
+            for row in handoff_new_fields(
+                [dict(p) for p in child.get("known_parameters") or [] if isinstance(p, Mapping)],
+                [dict(p) for p in parent.get("known_parameters") or [] if isinstance(p, Mapping)],
+                parent_fields, request,
+            )
+        ]
+
     def _baseline_evidence(self, evidence: Mapping[str, Any], version: Mapping[str, Any]) -> dict[str, str]:
         request = evidence["request"]
         return {
@@ -2225,6 +2293,7 @@ class OnlineLinkedCoordinator:
                     if isinstance(parameter, Mapping) and parameter.get("fuzzable") is True
                 ]
             final_result["_pending_group_dispatch"] = True
+            final_result["evidence_origin"] = str(evidence.get("evidence_origin") or "worker_poll")
             if group.get("combined") or convergence.get("_coherent_only") is True:
                 # A probe's missing reads describe that individual request,
                 # not the combined proposal which has yet to be sent.
@@ -2986,11 +3055,29 @@ class OnlineLinkedCoordinator:
         artifact_status = response.get("status_code") if isinstance(response, Mapping) else None
         if response_status is None and isinstance(response, Mapping):
             response_status = artifact_status
-        try:
-            non_success_response = (bool(sender_result.get("error")) or not 200 <= int(response_status) <= 299
-                                    or int(artifact_status) != int(response_status))
-        except (TypeError, ValueError):
-            non_success_response = True
+        verified_parameters = (
+            self._parameter_replay_fields(parent, child, baseline)
+            if child.get("evidence_origin", "worker_poll") == "worker_poll" else []
+        )
+        parameter_failures: list[dict[str, str]] = []
+        if verified_parameters:
+            # parameter_replay_v1: the HTTP status is diagnostic; the batch's Zend proof decides.
+            transport_failed = bool(sender_result.get("error")) or (
+                response_status is not None and artifact_status is not None
+                and str(artifact_status) != str(response_status)
+            )
+            parameter_failures = (
+                parameter_replay_failures(verified_parameters, baseline["request"], baseline["zend"])
+                if baseline is not None else list(verified_parameters)
+            )
+            replay_passed = replay_passed and not transport_failed and not parameter_failures
+            non_success_response = False
+        else:
+            try:
+                non_success_response = (bool(sender_result.get("error")) or not 200 <= int(response_status) <= 299
+                                        or int(artifact_status) != int(response_status))
+            except (TypeError, ValueError):
+                non_success_response = True
         replay_result = {
             "passed": replay_passed and not non_success_response,
             "guard_status": "unknown",
@@ -2998,8 +3085,15 @@ class OnlineLinkedCoordinator:
             "config_path": str(replay_path),
             "config_hash": self.config_hash(replay_path),
             "runner": replay_report,
-            "verification_policy": "callback_baseline_v1",
+            "verification_policy": PARAMETER_REPLAY_POLICY if verified_parameters else "callback_baseline_v1",
+            "response_status": response_status,
         }
+        if verified_parameters:
+            replay_result["verified_parameters"] = verified_parameters
+            if parameter_failures:
+                replay_result["unverified_parameters"] = parameter_failures
+            if transport_failed:
+                replay_result["transport_error"] = True
         if replay_result["passed"]:
             replay_result["baseline_evidence"] = self._baseline_evidence(baseline, child)
         replay_result["timing"] = dict(sender_result.get("timing") or {})
@@ -3041,6 +3135,7 @@ class OnlineLinkedCoordinator:
             if _is_ajax(child):
                 target = self._discover_replay_guards(
                     child, {**baseline, "evidence_origin": "child_replay"}, deadline=deadline,
+                    running_parent=parent,
                 )
                 if self.state.get("terminal_status") in {"NOT_VERIFIED", "VULN_FOUND"} or not self._active_container:
                     child["worker_status"] = "not_started_parent_exited"
@@ -3062,17 +3157,14 @@ class OnlineLinkedCoordinator:
                 self._write_state()
                 return False
             handoff_started_at = self.clock()
-            parameter_bonus = 0
-            try:
-                parameter_bonus = len(
-                    _config_fuzzable_fields(Path(child["config_path"]))
-                    - _config_fuzzable_fields(Path(parent["config_path"]))
-                )
-            except (OSError, ValueError, re.error) as exc:
-                self._record_event({
-                    "kind": "PARAMETER_ENERGY_BONUS", "status": "SKIPPED",
-                    "version": version_name, "reason": "CONFIG_FIELDS_UNAVAILABLE", "detail": str(exc),
-                })
+            priority_seed, blocked = self._priority_seed(parent, child, replay_result)
+            if blocked:
+                # The config would drop a field the replay proved: keep the parent instead.
+                replay_result["passed"] = False
+                child.update(status="replay_failed", worker_status="not_started_replay_failed", terminal_reason=blocked)
+                record_replay_event("REJECTED", blocked)
+                self._write_state()
+                return False
             if not self._stop_worker(parent, "HANDOFF_TO_" + str(child["version"])):
                 child["worker_status"] = "not_started_parent_stop_failed"
                 child["terminal_reason"] = "WORKER_STOP_FAILED"
@@ -3080,14 +3172,17 @@ class OnlineLinkedCoordinator:
                 record_replay_event("PASS", "WORKER_STOP_FAILED")
                 self._write_state()
                 return False
-            if self._start_worker(child, deadline=deadline, parameter_bonus=parameter_bonus):
+            if self._start_worker(child, deadline=deadline, priority_seed=priority_seed):
                 self._active_version = str(child["version"])
                 if child.get("resolved_method") != parent.get("resolved_method"):
                     candidate = candidate_from_seed_item(merged_report["suggested_seeds"][0], plugin_slug=self.plugin_slug)
                     variant = str(merged_report["suggested_seeds"][0]["seed"].get("seed_variant_id") or "")
                     self._target_key = canonical_identity_id(candidate) + (f"::{variant}" if variant else "")
                 replay_result["timing"]["handoff"] = round(self.clock() - handoff_started_at, 3)
-                record_replay_event("PASS", "CALLBACK_BASELINE_VERIFIED")
+                record_replay_event("PASS", (
+                    "PARAMETER_REPLAY_VERIFIED" if replay_result["verification_policy"] == PARAMETER_REPLAY_POLICY
+                    else "CALLBACK_BASELINE_VERIFIED"
+                ))
                 self._write_state()
                 return True
             replay_result["timing"]["handoff"] = round(self.clock() - handoff_started_at, 3)
@@ -3117,9 +3212,14 @@ class OnlineLinkedCoordinator:
                 child["terminal_reason"] = "REPLAY_PROCESS_FAILED"
             elif replay_row.get("validation_status") != "callback_reached":
                 child["terminal_reason"] = str(replay_row.get("validation_reason") or "CALLBACK_NOT_REACHED")
+            elif replay_result.get("transport_error"):
+                child["terminal_reason"] = "REPLAY_TRANSPORT_NOT_VERIFIED"
+            elif replay_result.get("unverified_parameters"):
+                child["terminal_reason"] = "PARAMETER_REPLAY_NOT_VERIFIED"
             else:
                 child["terminal_reason"] = "CALLBACK_BASELINE_NOT_VERIFIED"
-            if not self._replay_discovery_active:
+            # A paused parent resumes its round (or fails loudly in _resume_parent).
+            if not self._replay_discovery_active and self._pause is None:
                 self._failure = True
                 self.state["terminal_status"] = "NOT_VERIFIED"
                 self.state["terminal_reason"] = "CHILD_REPLAY_FAILED"
@@ -3136,6 +3236,7 @@ class OnlineLinkedCoordinator:
 
     def _discover_replay_guards(
         self, child: dict[str, Any], evidence: Mapping[str, Any], *, deadline: float | None,
+        running_parent: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Probe guards that a passed AJAX replay hit on fields it never sent.
 
@@ -3221,6 +3322,8 @@ class OnlineLinkedCoordinator:
                 or (next_child.get("replay_result") or {}).get("passed") is not True
             ):
                 break
+            if running_parent is not None and not self._descendant_proves_batch(running_parent, next_child):
+                break  # keep the verified ancestor as the handoff target
             current["worker_status"] = "not_started_superseded"
             current["terminal_reason"] = f"SUPERSEDED_BY_{next_child['version']}"
             covered = {
@@ -3249,6 +3352,30 @@ class OnlineLinkedCoordinator:
             })
             current, evidence = next_child, next_evidence
         return current
+
+    def _descendant_proves_batch(self, running_parent: Mapping[str, Any], descendant: dict[str, Any]) -> bool:
+        """The worker gets the last descendant: its own replay must prove every field new over the parent."""
+        replay_result = descendant["replay_result"]
+        if descendant.get("evidence_origin", "worker_poll") != "worker_poll":
+            return True
+        rows = (replay_result.get("runner") or {}).get("runs") or [{}]
+        proof = {"request": rows[0].get("request_payload") or {}, "zend": rows[0].get("zend_payload") or {}}
+        batch = self._parameter_replay_fields(running_parent, descendant, proof)
+        if not batch:
+            return True
+        replay_result.update(verification_policy=PARAMETER_REPLAY_POLICY, verified_parameters=batch)
+        missing = parameter_replay_failures(batch, proof["request"], proof["zend"])
+        if not missing:
+            return True
+        replay_result.update(passed=False, unverified_parameters=missing)
+        descendant.update(status="replay_failed", worker_status="not_started_replay_failed",
+                          terminal_reason="PARAMETER_REPLAY_NOT_VERIFIED")
+        self._record_event({
+            "kind": "CHILD_REPLAY", "status": "REJECTED", "reason": "PARAMETER_REPLAY_NOT_VERIFIED",
+            "hook_name": descendant.get("hook_name"), "version": descendant.get("version"),
+            "probe_id": None, "parameter": None, "timing": dict(replay_result.get("timing") or {}),
+        })
+        return False
 
     def _select_v0(self) -> tuple[Mapping[str, Any], dict[str, Any], str] | None:
         payload = json.loads(filesystem_path(self.suggested_seeds).read_text(encoding="utf-8-sig"))
@@ -3346,7 +3473,8 @@ class OnlineLinkedCoordinator:
         return record
 
     def _start_worker(
-        self, version: dict[str, Any], *, deadline: float | None = None, parameter_bonus: int = 0,
+        self, version: dict[str, Any], *, deadline: float | None = None,
+        priority_seed: Mapping[str, Any] | None = None,
     ) -> bool:
         if self._active_container:
             return False
@@ -3362,6 +3490,8 @@ class OnlineLinkedCoordinator:
         container_name = f"hookphuzz-online-linked-{safe_run}-{version_name}"
         worker_run_id = str(version.get("worker_run_id") or f"{self.legacy_run_id}-{version_name}")
         version["worker_run_id"] = worker_run_id
+        handoff_key = f"{version_name}-{uuid.uuid4().hex}"
+        version["handoff_key"] = handoff_key
         command = [
             "docker", "compose", "run", "-d", "--no-deps", "--name", container_name,
             "-e", f"FUZZER_CONFIG={runtime_slug}",
@@ -3369,9 +3499,15 @@ class OnlineLinkedCoordinator:
             "-e", f"HOOKPHUZZ_LEGACY_RUN_ID={worker_run_id}",
             "-e", f"HOOKPHUZZ_FINDING_ARTIFACT=/shared-tmpfs/fuzzer-findings/{worker_run_id}.json",
             "-e", "HOOKPHUZZ_CMPLOG=1",
+            "-e", f"HOOKPHUZZ_HANDOFF_KEY={handoff_key}",
+            # Immutable config → own candidate sync folder; older selectors never load these files.
+            "-e", f"HOOKPHUZZ_SYNC_NAMESPACE={str(version.get('config_hash') or '')[:16] or version_name}",
         ]
-        if parameter_bonus:
-            command.extend(["-e", f"HOOKPHUZZ_NEW_PARAMETER_ENERGY_BONUS={parameter_bonus}"])
+        # The priority round belongs to the first activation of a verified config only.
+        grant = priority_seed is not None and not version.get("priority_seed")
+        if grant:
+            command.extend(["-e", "HOOKPHUZZ_PRIORITY_SEED=" + json.dumps(dict(priority_seed), sort_keys=True,
+                                                                            separators=(",", ":"))])
         command.append(self.service)
         try:
             timeout = 30 if deadline is None else min(30, max(0.0, deadline - self.clock()))
@@ -3390,6 +3526,8 @@ class OnlineLinkedCoordinator:
             return False
         version["worker_status"] = "started"
         version["status"] = "replaying" if version.get("config_type") == "replay_only" else "fuzzing"
+        if grant:
+            version["priority_seed"] = dict(priority_seed)
         self._active_container = container_name
         self._worker_started_at[version_name] = self.clock()
         self.state["workers"].append({
@@ -3439,6 +3577,164 @@ class OnlineLinkedCoordinator:
             if timeout is not None:
                 raise ParentInspectionError("PARENT_INSPECT_FAILED") from exc
             return None
+
+    def _priority_seed(
+        self, parent: Mapping[str, Any], child: Mapping[str, Any], replay_result: Mapping[str, Any],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Reference the verified replay seed and its fuzzable new fields; never request values.
+
+        Returns (descriptor, block_reason); a block reason stops the handoff.
+        """
+        if replay_result.get("verification_policy") != PARAMETER_REPLAY_POLICY:
+            return None, None
+        event = {"kind": "PRIORITY_SEED", "version": child.get("version")}
+        verified = {
+            (str(row.get("bucket") or ""), str(row.get("name") or ""))
+            for row in replay_result.get("verified_parameters") or [] if isinstance(row, Mapping)
+        }
+
+        def covers(field: tuple[str, str], proven: tuple[str, str]) -> bool:
+            # Zend proves the top-level key; the materializer may fuzz nested selectors under it.
+            return field[0] == proven[0] and (field[1] == proven[1] or field[1].split("[", 1)[0] == proven[1])
+
+        try:
+            child_path = Path(str(child["config_path"]))
+            all_fields = _config_fields(child_path, fuzzable_only=False)
+            # Only fields the running parent could not fuzz are new (nested selectors included).
+            fuzzable = _config_fuzzable_fields(child_path) - _config_fuzzable_fields(Path(str(parent["config_path"])))
+            replay_slug = Path(str(child["replay_config_path"])).relative_to(self.config_root).with_suffix("").as_posix()
+        except (KeyError, OSError, ValueError, re.error) as exc:
+            self._record_event({**event, "status": "REJECTED", "reason": "CONFIG_FIELDS_UNAVAILABLE", "detail": str(exc)})
+            return None, "CONFIG_FIELDS_UNAVAILABLE"
+        missing = sorted(p for p in verified if not any(covers(f, p) for f in all_fields))
+        if missing:
+            self._record_event({**event, "status": "REJECTED", "reason": "VERIFIED_FIELD_NOT_IN_CONFIG",
+                                "fields": [list(field) for field in missing]})
+            return None, "VERIFIED_FIELD_NOT_IN_CONFIG"
+        # A verified field the updated config keeps fixed gets no priority attempts.
+        targets = sorted(f for f in fuzzable if any(covers(f, p) for p in verified))
+        if not targets:
+            # The plan switches config only for a new fuzzable param: keep the parent.
+            self._record_event({**event, "status": "REJECTED", "reason": "NO_NEW_FUZZABLE_TARGET"})
+            return None, "NO_NEW_FUZZABLE_TARGET"
+        ack = parent.get("pause_ack") if isinstance(parent.get("pause_ack"), Mapping) else {}
+        descriptor = {
+            "replay_slug": replay_slug,
+            "replay_hash": str(child.get("replay_config_hash") or ""),
+            "targets": [list(target) for target in targets],
+            "mode": self.priority_energy_mode,
+            "allocated_energy": ack["allocated_energy"] if type(ack.get("allocated_energy")) is int else 0,
+            "attempts_used": ack["attempts_used"] if type(ack.get("attempts_used")) is int else 0,
+        }
+        attempt = next((row for row in reversed(self.state.get("attempts", []))
+                        if row.get("version") == child.get("version")), {})
+        # The old worker's PHUZZ energy counts only for the very request this seed replays:
+        # same request ID and the same sent input (a probe or the replay may have changed it).
+        rows = (replay_result.get("runner") or {}).get("runs") or [{}]
+        seed_payload = _request_payload_hash(rows[0].get("request_payload"))
+        if (type(ack.get("seed_phuzz_energy")) is int and ack.get("request_id")
+                and ack.get("request_id") == attempt.get("request_id")
+                and seed_payload and seed_payload == child.get("discovery_payload_hash")):
+            descriptor["seed_phuzz_energy"] = ack["seed_phuzz_energy"]
+        self._record_event({
+            **event, "status": "GRANTED", "reason": "PARAMETER_REPLAY_VERIFIED", "mode": descriptor["mode"],
+            "discovery_request_id": attempt.get("request_id"), "pause_round_id": ack.get("round_id"),
+            "allocated_energy": descriptor["allocated_energy"], "attempts_used": descriptor["attempts_used"],
+            "targets": descriptor["targets"], "seed_phuzz_energy": descriptor.get("seed_phuzz_energy"),
+        })
+        return descriptor, None
+
+    def _handoff_command(self, *args: str, deadline: float | None) -> dict[str, Any] | None:
+        """Run one pause-protocol operation inside the active worker container."""
+        timeout = 10.0 if deadline is None else min(10.0, max(0.0, deadline - self.clock()))
+        if timeout <= 0 or not self._active_container:
+            return None
+        try:
+            result = self.run_command(
+                ["docker", "exec", self._active_container, "python", "-m", "core.online_handoff", *args],
+                timeout=timeout, check=False, capture_output=True, text=True,
+            )
+            payload = json.loads(str(getattr(result, "stdout", "") or "null"))
+        except Exception:
+            return None
+        if int(getattr(result, "returncode", 1)) != 0:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _pause_parent(self, parent: Mapping[str, Any], deadline: float | None, *, request_id: str = "") -> bool:
+        """Ask the running worker to stop between requests and wait for its matching ACK."""
+        key = str(parent.get("handoff_key") or "")
+        run_id = str(parent.get("worker_run_id") or "")
+        event = {"kind": "WORKER_PAUSE", "version": parent.get("version"), "worker_run_id": run_id}
+        if not key or not self._active_container:
+            self._record_event({**event, "status": "REJECTED", "reason": "PAUSE_UNAVAILABLE"})
+            return False
+        token = uuid.uuid4().hex
+        self._pause = {"container": self._active_container, "key": key, "token": token}
+        try:
+            return self._await_pause_ack(parent, event, key, token, run_id, deadline, request_id)
+        except BaseException:
+            self._resume_parent()
+            raise
+
+    def _await_pause_ack(
+        self, parent: Mapping[str, Any], event: Mapping[str, Any], key: str, token: str, run_id: str,
+        deadline: float | None, request_id: str = "",
+    ) -> bool:
+        self._record_event({**event, "status": "REQUESTED", "reason": "PARAMETER_HANDOFF"})
+        wait_until = (deadline - 2 * self._sender_seconds if deadline is not None
+                      else self.clock() + self.max_seconds)
+        reason = "PAUSE_REQUEST_FAILED"
+        if self._handoff_command("request", key, token, run_id, *([request_id] if request_id else []),
+                                 deadline=wait_until) is not None:
+            reason = "PAUSE_ACK_TIMEOUT"
+            while self.clock() < wait_until:
+                ack = self._handoff_command("ack", key, deadline=wait_until)
+                if ack and ack.get("token") == token and ack.get("worker_run_id") == run_id:
+                    snapshot = {name: ack.get(name) for name in (
+                        "round_id", "allocated_energy", "attempts_used", "request_id", "seed_phuzz_energy")}
+                    record = self._version(str(parent.get("version"))) or {}
+                    record["pause_ack"] = {**snapshot, "token": token, "acked_at": self.clock()}
+                    self._record_event({**event, "status": "ACKNOWLEDGED", "reason": "PAUSE_ACK", **snapshot})
+                    return True
+                try:
+                    exit_code = self._worker_exit_code(timeout=min(10.0, max(0.0, wait_until - self.clock())))
+                except (ParentInspectionTimeout, ParentInspectionError):
+                    exit_code = None
+                if exit_code is not None:
+                    reason = "PAUSE_WORKER_EXITED"
+                    break
+                self.sleeper(min(0.2, max(0.0, wait_until - self.clock())))
+        self._record_event({**event, "status": "REJECTED", "reason": reason})
+        self._resume_parent()
+        return False
+
+    def _resume_parent(self) -> bool:
+        """Release the pause only for the same worker container while it still runs."""
+        pause, self._pause = self._pause, None
+        if pause is None or self._active_container != pause["container"]:
+            return True
+        try:
+            running = self._worker_exit_code(timeout=10.0) is None
+        except (ParentInspectionTimeout, ParentInspectionError):
+            running = True  # unknown: the token-guarded release is harmless if the container is gone
+        response = self._handoff_command("release", pause["key"], pause["token"], deadline=None) if running else None
+        # {"released": false}: no request with this token is pending, so nothing is paused.
+        released = response is not None
+        version = self._version(self._active_version) or {}
+        if released:
+            reason = "PAUSE_RELEASED" if response.get("released") is True else "PAUSE_NOT_PENDING"
+        else:
+            reason = "PAUSE_RELEASE_FAILED" if running else "PAUSED_WORKER_NOT_RUNNING"
+        self._record_event({
+            "kind": "WORKER_PAUSE", "status": "RELEASED" if released else "REJECTED", "reason": reason,
+            "version": version.get("version"), "worker_run_id": version.get("worker_run_id"),
+        })
+        if not released and running and self.state.get("terminal_status") is None:
+            self._failure = True
+            self.state.update(terminal_status="NOT_VERIFIED", terminal_reason="PAUSE_RELEASE_FAILED")
+            self._write_state()
+        return released
 
     def _stop_active_worker(self, reason: str) -> None:
         version = self._version(self._active_version)
@@ -3845,6 +4141,39 @@ def _is_ajax(parent: Mapping[str, Any]) -> bool:
     )
 
 
+# Only the fuzzer's own per-request tracking headers are ignored; application headers such as
+# User-Agent or Accept can select a WordPress branch (wp_is_mobile()), so they are compared.
+_UNCOMPARED_HEADER_PREFIXES = ("x-fuzzer-", "x-hookphuzz-")
+
+
+def _request_payload_hash(request: Any) -> str:
+    """Hash of everything a request sent that can select a branch; "" when that is not known.
+
+    Method, route, query, form/JSON body, cookies and every header except the fuzzer's tracking ones.
+    "" never matches, so an incomplete artifact makes the worker re-score the seed.
+    """
+    if not isinstance(request, Mapping) or not isinstance(request.get("request_params"), Mapping):
+        return ""
+    params = request["request_params"]
+    method = str(request.get("http_method") or request.get("method") or "").upper()
+    target = str(request.get("http_target") or "")
+    if not method or not target:
+        return ""
+    headers = params.get("headers") if isinstance(params.get("headers"), Mapping) else {}
+    cookies = params.get("cookies")
+    return config_hash({
+        "method": method,
+        "route": urllib.parse.urlsplit(target).path,
+        "endpoint": request.get("endpoint"),
+        **{name: params.get(name) or {} for name in ("query_params", "body_params", "json_params")},
+        "cookies": cookies if isinstance(cookies, (Mapping, list)) else {},
+        "headers": {
+            str(key).lower(): value for key, value in headers.items()
+            if not str(key).lower().startswith(_UNCOMPARED_HEADER_PREFIXES)
+        },
+    })
+
+
 def _canonical_callback_name(value: Any) -> str:
     return re.sub(r"\s*(?:->|::)\s*", "::", str(value or "").strip())
 
@@ -4083,6 +4412,8 @@ def run_online_linked(args: argparse.Namespace) -> int:
         "non_http_skipped": [],
         "expansion_events": [],
         "resume_context": context,
+        "priority_energy_mode": DEFAULT_PRIORITY_ENERGY_MODE if resume else _priority_energy_mode(
+            os.environ.get("HOOKPHUZZ_PRIORITY_ENERGY_MODE")),
     }
     skipped = False
     queue: list[tuple[int, Mapping[str, Any], str]] = []
@@ -4136,6 +4467,8 @@ def run_online_linked(args: argparse.Namespace) -> int:
         queued_ids = set(saved["queued_ids"])
         queued_context_keys = set(saved["queued_context_keys"])
         batch_state.update(campaign_status="running", terminal_reason=None)
+        # The saved mode wins; a checkpoint from before the option uses the default.
+        batch_state["priority_energy_mode"] = _priority_energy_mode(saved.get("priority_energy_mode"))
         skipped = any(row.get("terminal_status") == "NOT_VERIFIED" for row in saved["candidates"])
 
     def checkpoint(registry: Mapping[str, Any] | None = None) -> None:
@@ -4267,6 +4600,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 progress_callback=lambda kind, key, identity=candidate_record["identity"]:
                     credit_progress(kind, key if kind == "runtime_callback" else identity + ":" + key),
                 registry_checkpoint_callback=checkpoint,
+                priority_energy_mode=batch_state["priority_energy_mode"],
             )
             candidate_record["state_path"] = str(coordinator.state_path)
             checkpoint()
