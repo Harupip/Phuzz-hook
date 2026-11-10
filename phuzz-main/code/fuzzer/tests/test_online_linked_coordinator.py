@@ -3540,6 +3540,51 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 self.assertEqual([item for item in coordinator.state["probe_attempts"] if item["candidate"]["name"] == "a"], [first_attempts[0]])
                 self.assertIn("probe:b", log)
 
+    def test_probe_artifact_failure_keeps_stage(self):
+        """The stage tells operators whether the write or the correlation step failed.
+        ReplayArtifactError subclasses RuntimeError, so reordering the except branches
+        would silently report every write failure as id_correlation. A save that succeeds
+        but leaves artifacts from another run must also be reported, not raised: the
+        correlation check runs inside the same guarded step as the write."""
+        from online_linked.coordination.errors import ReplayArtifactError
+
+        def save_from_other_run(row, request_dir, zend_dir):
+            name = str(row["matched_artifact"])
+            request_dir.mkdir(parents=True, exist_ok=True)
+            zend_dir.mkdir(parents=True, exist_ok=True)
+            stem = Path(name).stem
+            (request_dir / name).write_text(json.dumps(
+                {"request_id": stem, "legacy_run_id": row["legacy_run_id"]}), encoding="utf-8")
+            (zend_dir / name).write_text(json.dumps(
+                {"request_id": stem, "run_id": "another-run"}), encoding="utf-8")
+
+        cases = (
+            ("write", ReplayArtifactError("request_write", "boom"), "request_write"),
+            ("runtime", RuntimeError("boom"), "id_correlation"),
+            ("mismatched_run", None, "id_correlation"),
+        )
+        for case, error, stage in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                log: list[str] = []
+                coordinator, parent, evidence, convergence = self.make_probe_context(
+                    Path(tmp), log, names=("a",), accepted=("a",),
+                )
+
+                def failing_save(row, request_dir, zend_dir, error=error):
+                    raise error
+
+                coordinator._save_replay_artifacts = save_from_other_run if error is None else failing_save
+                outcome = coordinator._run_pending_probe_once(
+                    parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                    convergence=convergence, probe=convergence["pending_probes"][0],
+                    seed=parent["seed_item"], deadline=None,
+                )
+
+                self.assertIsNone(outcome)
+                event = coordinator.state["events"][-1]
+                self.assertEqual((event["status"], event["reason"], event["artifact_stage"]),
+                                 ("REJECTED", "PROBE_ARTIFACT_CORRELATION_FAILED", stage))
+
     def test_probe_dedupe_retries_changed_inputs_not_request_ids_or_key_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             log: list[str] = []
@@ -4324,6 +4369,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             '["v2","run-v2","cb1","wp_ajax_x","ajax","n","POST","form","cb1","fixture","Plugin::handle","POST",'
             '"f0a7440e2b4b1053c7b9aa938ec69adf3a67846ee206504f2bd7f42563690cb1"]',
         )
+        # Probe and handoff request IDs are matched against worker artifacts; value captured after wave 2.
+        from online_linked.coordinator import _request_id
+        self.assertEqual(_request_id("run-v1-probe-p1"), "r-d97f3ba0aeffe293249595c2")
 
     def test_resume_reports_first_incompatible_field(self):
         """Users read the first resume error to learn why a run cannot continue, so the check

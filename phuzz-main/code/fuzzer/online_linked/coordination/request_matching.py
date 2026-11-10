@@ -56,6 +56,10 @@ def _replace_fuzzable_values_with_placeholder(config: dict[str, Any]) -> None:
                 row["value"] = "fuzz"
 
 
+def _request_id(run_id: str) -> str:
+    return "r-" + hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:24]
+
+
 def _method_parameter_key(parameter: Mapping[str, Any], method: str = "") -> tuple[str, tuple[str, str, str]]:
     return (str(method or parameter.get("request_method") or "").upper(), _parameter_key(parameter))
 

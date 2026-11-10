@@ -43,18 +43,33 @@ from online_linked.coordination.candidate_identity import (
 from online_linked.coordination.checkpoint import validate_resume_checkpoint
 from online_linked.coordination.errors import OnlineLinkedError, ReplayArtifactError
 from online_linked.coordination.replay_artifacts import save_replay_artifacts
+from online_linked.coordination.probe_config import (
+    load_correlated_probe_artifacts,
+    probe_paths,
+    probe_request_row,
+    probe_runtime_metadata,
+    select_probe_item,
+)
+from online_linked.coordination.probe_proposals import (
+    add_accepted_records,
+    drop_queue_row,
+    group_accepted_records,
+    probe_proposals,
+    proposal_result,
+)
 from online_linked.coordination.probe_results import (
     ajax_branch_continuation,
     match_probe_parameters,
     replay_verdict,
+    sender_runner_row,
 )
 from online_linked.coordination.replay_request import restore_request_values
 from online_linked.coordination.request_matching import (
-    _coherent_evidence_key,
     _is_ajax,
     _method_parameter_key,
     _parameter_key,
     _replace_fuzzable_values_with_placeholder,
+    _request_id,
     _request_payload_hash,
     _runtime_candidate_key,
     _safe_parameter_identity,
@@ -120,10 +135,6 @@ def _budget_pair(name: str, initial: int, hard: int | None, default: int,
     if hard < initial:
         raise ValueError(f"hard {name} cap must cover initial budget")
     return initial, hard
-
-
-def _request_id(run_id: str) -> str:
-    return "r-" + hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:24]
 
 
 class OnlineLinkedCoordinator:
@@ -558,31 +569,7 @@ class OnlineLinkedCoordinator:
 
     @staticmethod
     def _sender_runner_row(base: Mapping[str, Any], result: Mapping[str, Any], run_id: str) -> dict[str, Any]:
-        reached = result.get("status") == "callback_reached" or result.get("callback_reached") is True
-        status = "stopped_on_callback" if reached else (
-            "window_elapsed" if result.get("status") == "timeout" else "failed"
-        )
-        row = {
-            **dict(base),
-            "legacy_run_id": run_id,
-            "process_status": status,
-            "callback_reached": reached,
-            "validation_status": result.get("validation_status") or (
-                "callback_reached" if reached else "registered_not_executed"
-            ),
-            "validation_reason": result.get("validation_reason") or result.get("error") or "",
-            "response_status": result.get("response_status"),
-            "response_location": result.get("response_location"),
-            "http_error": result.get("error"),
-            "diagnostics": result.get("diagnostics"),
-            "matched_artifact": result.get("request_name"),
-            "request_artifacts": [result["request_name"]] if result.get("request_name") else [],
-            "zend_artifact": result.get("zend_name"),
-            "request_payload": result.get("request"),
-            "zend_payload": result.get("zend"),
-            "timing": dict(result.get("timing") or {}),
-        }
-        return row
+        return sender_runner_row(base, result, run_id)
 
     def _candidate_deadline(self) -> float:
         if self._deadline is None:
@@ -1810,19 +1797,9 @@ class OnlineLinkedCoordinator:
             self._inherit_callback_identity(item, parent) for item in convergence.get("new_parameters", [])
             if isinstance(item, Mapping)
         ] if isinstance(convergence.get("new_parameters"), list) else []
-        # Keyed by method too: a proof in one method context never covers another.
         accepted_keys: set[tuple[str, tuple[str, str, str]]] = set()
         accepted_records: list[dict[str, Any]] = []
-        for parameter in accepted:
-            key = _method_parameter_key(parameter)
-            if key in accepted_keys:
-                continue
-            accepted_keys.add(key)
-            accepted_records.append({
-                "parameter": dict(parameter),
-                "evidence": evidence,
-                "result": convergence,
-            })
+        add_accepted_records(accepted_records, accepted_keys, accepted, evidence, convergence)
         deferred: list[dict[str, Any]] = []
         if accepted and probe_deadline is not None:
             deferred = [dict(item["candidate"]) for item in queue]
@@ -1845,9 +1822,10 @@ class OnlineLinkedCoordinator:
                 candidate, str(candidate.get("probe_method") or parent.get("resolved_method") or ""),
             ) in accepted_keys:
                 # A saved per-field probe whose field an earlier trace already proved.
-                self.state["pending_probe_queue"] = [row for row in self.state.get("pending_probe_queue", [])
-                    if not (row.get("parent_version") == parent["version"] and
-                            row.get("candidate") == candidate and row.get("evidence") == candidate_evidence)]
+                self.state["pending_probe_queue"] = drop_queue_row(
+                    self.state.get("pending_probe_queue", []), parent_version=parent["version"],
+                    candidate=candidate, evidence=candidate_evidence,
+                )
                 self._record_event({
                     "kind": "PARAMETER_PROBE", "status": "SKIPPED", "reason": "ADMITTED_FROM_TRACE",
                     "version": parent["version"], "request_id": candidate.get("request_id"),
@@ -1862,9 +1840,10 @@ class OnlineLinkedCoordinator:
             if deadline is not None and isinstance(outcome, Mapping) and outcome.get("status") == "accepted":
                 deadline = max(deadline, self._candidate_deadline())
                 probe_deadline = max(probe_deadline, deadline - 2 * self._sender_seconds)
-            self.state["pending_probe_queue"] = [row for row in self.state.get("pending_probe_queue", [])
-                if not (row.get("parent_version") == parent["version"] and
-                        row.get("candidate") == candidate and row.get("evidence") == candidate_evidence)]
+            self.state["pending_probe_queue"] = drop_queue_row(
+                self.state.get("pending_probe_queue", []), parent_version=parent["version"],
+                candidate=candidate, evidence=candidate_evidence,
+            )
             self._write_state()
             if not isinstance(outcome, Mapping) or outcome.get("status") != "accepted":
                 if isinstance(outcome, Mapping) and outcome.get("status") == "pending":
@@ -1894,18 +1873,10 @@ class OnlineLinkedCoordinator:
             trace_parameters = outcome.get("parameters")
             if not isinstance(trace_parameters, list) or not trace_parameters:
                 trace_parameters = [parameter]
-            for trace_parameter in trace_parameters:
-                if not isinstance(trace_parameter, Mapping):
-                    continue
-                parameter_key = _method_parameter_key(trace_parameter)
-                if parameter_key in accepted_keys:
-                    continue
-                accepted_keys.add(parameter_key)
-                accepted_records.append({
-                    "parameter": dict(trace_parameter),
-                    "evidence": probe_evidence,
-                    "result": outcome.get("result") if isinstance(outcome.get("result"), Mapping) else {},
-                })
+            add_accepted_records(
+                accepted_records, accepted_keys, trace_parameters, probe_evidence,
+                outcome.get("result") if isinstance(outcome.get("result"), Mapping) else {},
+            )
             probe_result = outcome.get("result")
             next_probes = probe_result.get("pending_probes") if isinstance(probe_result, Mapping) else None
             if isinstance(next_probes, list):
@@ -1930,38 +1901,9 @@ class OnlineLinkedCoordinator:
         if not accepted_records:
             return None
 
-        groups: dict[tuple[str, str, str], dict[str, Any]] = {}
-        for record in accepted_records:
-            group_key = _coherent_evidence_key(record["evidence"])
-            group = groups.setdefault(group_key, {
-                "parameters": [], "evidence": record["evidence"], "result": record["result"],
-            })
-            group["parameters"].append(record["parameter"])
-            group["result"] = record["result"]
-        ordered_groups = sorted(
-            groups.values(),
-            key=lambda group: sorted(_parameter_key(p) for p in group["parameters"]),
-            reverse=True,
-        )
+        ordered_groups = group_accepted_records(accepted_records)
         self._retain_pending_runtime_candidates(ordered_groups, parent)
-
-        # Separate reads justify trying a combined request, never publishing a
-        # union directly. Admission checks each original evidence pair, then the
-        # a single correlated callback baseline must pass before handoff.
-        proposals = list(ordered_groups)
-        if len(ordered_groups) > 1:
-            proposals.insert(0, {
-                "parameters": sorted(
-                    (record["parameter"] for record in accepted_records), key=_parameter_key,
-                ),
-                "evidence": ordered_groups[0]["evidence"],
-                "result": ordered_groups[0]["result"],
-                "parameter_evidence": {
-                    _parameter_key(record["parameter"]): record["evidence"]
-                    for record in accepted_records
-                },
-                "combined": True,
-            })
+        proposals = probe_proposals(ordered_groups, accepted_records)
 
         existing = parent.get("known_parameters", [])
         existing = [dict(item) for item in existing if isinstance(item, Mapping)] if isinstance(existing, list) else []
@@ -1971,37 +1913,13 @@ class OnlineLinkedCoordinator:
             # recoverable and are tried as separate coherent proposals.
             if not group.get("combined"):
                 self._discard_pending_runtime_candidates([group])
-            chosen_parameters = [dict(item) for item in group["parameters"]]
-            chosen_evidence = group["evidence"]
-            final_result = dict(group["result"])
-            final_result["new_parameters"] = chosen_parameters
-            inherited = [] if convergence.get("_coherent_only") is True and not group.get("combined") else existing
-            final_result["known_parameters"] = list({
-                _parameter_key(p): p for p in sorted(inherited + chosen_parameters, key=_parameter_key)
-            }.values())
-            final_result.pop("pending_probes", None)
-            final_result["deferred_probes"] = deferred
-            final_result["parameter_evidence"] = group.get("parameter_evidence") or {
-                _parameter_key(parameter): chosen_evidence for parameter in chosen_parameters
-            }
-            final_result["base_evidence"] = chosen_evidence
-            final_result["candidate_key"] = str(convergence.get("candidate_key") or self._target_key)
-            if isinstance(group["result"].get("method_transition_report"), Mapping):
-                final_result["method_transition_report"] = group["result"]["method_transition_report"]
-                final_result["candidate_key"] = group["result"]["candidate_key"]
-                final_result["known_parameters"] = [
-                    dict(parameter) for parameter in group["result"].get("observed_parameters", [])
-                    if isinstance(parameter, Mapping) and parameter.get("fuzzable") is True
-                ]
-            final_result["_pending_group_dispatch"] = True
-            final_result["evidence_origin"] = str(evidence.get("evidence_origin") or "worker_poll")
-            if group.get("combined") or convergence.get("_coherent_only") is True:
-                # A probe's missing reads describe that individual request,
-                # not the combined proposal which has yet to be sent.
-                final_result["status"] = "CONTINUE"
-                final_result["missing_parameters"] = []
+            final_result = proposal_result(
+                group, convergence=convergence, existing=existing, deferred=deferred,
+                evidence_origin=str(evidence.get("evidence_origin") or "worker_poll"),
+                target_key=self._target_key,
+            )
             child = self._handle_convergence_result(
-                parent=parent, evidence=chosen_evidence, raw_report=raw_report,
+                parent=parent, evidence=group["evidence"], raw_report=raw_report,
                 result=final_result, seed=seed, deadline=deadline,
             )
             if child is not None:
@@ -2041,18 +1959,7 @@ class OnlineLinkedCoordinator:
                 "candidate": dict(probe),
             })
             return None
-        merged_probe_report = convergence.get("merged_suggested_seeds")
-        probe_items = merged_probe_report.get("suggested_seeds", []) if isinstance(merged_probe_report, Mapping) else []
-        if not isinstance(probe_items, list):
-            probe_items = []
-        variant = str(probe.get("seed_variant_id") or "")
-        probe_item = next(
-            (item for item in probe_items if isinstance(item, Mapping)
-             and str((item.get("seed") or {}).get("seed_variant_id") or "") == variant),
-            None,
-        )
-        if probe_item is None and len(probe_items) == 1 and isinstance(probe_items[0], Mapping):
-            probe_item = probe_items[0]
+        probe_item = select_probe_item(convergence, probe)
         if probe_item is None:
             return self._finish_probe_failure(parent, evidence, None, "PROBE_CONFIG_MISSING", deadline)
         if deadline is not None and self.clock() >= deadline:
@@ -2071,9 +1978,11 @@ class OnlineLinkedCoordinator:
             worker_started_at = self._worker_started_at.get(str(parent["version"]))
             if worker_started_at is not None:
                 first_probe_delay = max(0.0, self.clock() - worker_started_at)
-        probe_root = self.run_dir / "versions" / str(parent["version"]) / "probe" / probe_id
-        generated_dir = self.config_dir / "versions" / str(parent["version"]) / "probe" / probe_id / "exported"
-        generated_summary_path = probe_root / "generated_config_summary.json"
+        paths = probe_paths(run_dir=self.run_dir, config_dir=self.config_dir,
+                            version=str(parent["version"]), probe_id=probe_id)
+        probe_root = paths.root
+        generated_dir = paths.generated_dir
+        generated_summary_path = paths.generated_summary
         attempt: dict[str, Any] = {
             "probe_id": probe_id, "parent_version": parent["version"],
             "request_id": evidence.get("request_id"), "status": "exporting",
@@ -2113,22 +2022,13 @@ class OnlineLinkedCoordinator:
             probe_metadata = probe_config.setdefault("metadata", {})
             if not isinstance(probe_metadata, dict):
                 raise OnlineLinkedError("PROBE_CONFIG_METADATA_INVALID")
-            probe_metadata["zend_runtime_probe"] = {
-                "parameter": str(probe.get("name") or ""),
-                "source": str(probe.get("source") or "").upper(),
-                "location": str(probe.get("location") or ""),
-                "helper_depth": probe.get("helper_depth"),
-                "value_origin": "generated_probe",
-                "candidate_value_redacted": True,
-                "candidate_request_id": probe.get("request_id"),
-                "candidate_run_id": probe.get("run_id"),
-            }
+            probe_metadata["zend_runtime_probe"] = probe_runtime_metadata(probe)
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_CONFIG_INVALID", deadline, detail=str(exc))
-        probe_config_path = self.config_dir / "versions" / str(parent["version"]) / "probe" / probe_id / f"{probe_id}-config.json"
-        probe_mirror_path = probe_root / f"{probe_id}-config.json"
-        replay_path = self.config_dir / "versions" / str(parent["version"]) / "probe" / probe_id / f"{probe_id}-replay.json"
-        replay_mirror_path = probe_root / f"{probe_id}-replay.json"
+        probe_config_path = paths.config
+        probe_mirror_path = paths.config_mirror
+        replay_path = paths.replay
+        replay_mirror_path = paths.replay_mirror
         try:
             _write_exclusive_json(probe_config_path, probe_config)
             _write_exclusive_json(probe_mirror_path, probe_config)
@@ -2148,19 +2048,9 @@ class OnlineLinkedCoordinator:
             "remaining_budget_seconds": attempt.get("remaining_budget_seconds"),
             "first_probe_delay_seconds": attempt.get("first_probe_delay_seconds"),
         })
-        probe_seed = probe_item.get("seed") if isinstance(probe_item.get("seed"), Mapping) else {}
-        probe_parent = parent
-        method_transition = probe_seed.get("method_transition") == {"from": "GET", "to": "POST"}
-        if method_transition:
-            probe_parent = {**parent, "resolved_method": "POST"}
-        probe_row = {
-            "config_slug": replay_path.relative_to(self.config_root).with_suffix("").as_posix(),
-            "hook_name": str(probe_item.get("hook_name") or parent["hook_name"]),
-            "callback_id": str(probe_item.get("callback_id") or parent["callback_id"]),
-            "entrypoint_type": str(probe_item.get("entrypoint_type") or parent["entrypoint_type"]),
-            "resolved_method": str(probe_seed.get("resolved_method") or probe_seed.get("method") or parent["resolved_method"]),
-            "seed_variant_id": str(probe_seed.get("seed_variant_id") or ""),
-        }
+        probe_row, probe_parent, method_transition = probe_request_row(
+            probe_item, parent, replay_path=replay_path, config_root=self.config_root,
+        )
         timeout = deadline - self.clock() if deadline is not None else self.max_seconds
         if timeout <= 0:
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_BUDGET_EXPIRED", deadline)
@@ -2242,21 +2132,9 @@ class OnlineLinkedCoordinator:
         try:
             self._save_replay_artifacts(replay_row, request_dir, zend_dir)
             artifact_name = str(replay_row.get("matched_artifact") or "")
-            request_path = request_dir / artifact_name
-            zend_paths = [path for path in filesystem_path(zend_dir).glob("*.json") if path.stem == request_path.stem]
-            if Path(artifact_name).name != artifact_name or not filesystem_path(request_path).is_file() or len(zend_paths) != 1:
-                raise OnlineLinkedError("PROBE_ARTIFACT_CORRELATION_FAILED")
-            probe_request = json.loads(filesystem_path(request_path).read_text(encoding="utf-8-sig"))
-            probe_zend = json.loads(filesystem_path(zend_paths[0]).read_text(encoding="utf-8-sig"))
-            if (
-                not isinstance(probe_request, Mapping)
-                or not isinstance(probe_zend, Mapping)
-                or str(probe_request.get("request_id") or "") != request_path.stem
-                or str(probe_zend.get("request_id") or "") != request_path.stem
-                or str(probe_request.get("legacy_run_id") or probe_request.get("run_id") or "") != probe_run_id
-                or str(probe_zend.get("run_id") or probe_zend.get("legacy_run_id") or "") != probe_run_id
-            ):
-                raise OnlineLinkedError("PROBE_ARTIFACT_CORRELATION_FAILED")
+            request_path, probe_request, zend_path, probe_zend = load_correlated_probe_artifacts(
+                request_dir, zend_dir, artifact_name, probe_run_id,
+            )
         except ReplayArtifactError as exc:
             return self._finish_probe_failure(
                 parent, evidence, attempt, "PROBE_ARTIFACT_CORRELATION_FAILED", deadline,
@@ -2271,7 +2149,7 @@ class OnlineLinkedCoordinator:
         probe_evidence = {
             "version": parent["version"], "worker_run_id": probe_run_id,
             "request_name": artifact_name, "request_id": request_path.stem,
-            "request": dict(probe_request), "zend_name": zend_paths[0].name, "zend": dict(probe_zend),
+            "request": dict(probe_request), "zend_name": zend_path.name, "zend": dict(probe_zend),
         }
         try:
             probe_result = self.converge_fn(

@@ -140,3 +140,32 @@ def replay_verdict(
         parameter_failures=parameter_failures,
         transport_failed=transport_failed,
     )
+
+
+def sender_runner_row(base: Mapping[str, Any], result: Mapping[str, Any], run_id: str) -> dict[str, Any]:
+    """Shape a light-sender result as the replay runner row the converge step reads."""
+    reached = result.get("status") == "callback_reached" or result.get("callback_reached") is True
+    status = "stopped_on_callback" if reached else (
+        "window_elapsed" if result.get("status") == "timeout" else "failed"
+    )
+    row = {
+        **dict(base),
+        "legacy_run_id": run_id,
+        "process_status": status,
+        "callback_reached": reached,
+        "validation_status": result.get("validation_status") or (
+            "callback_reached" if reached else "registered_not_executed"
+        ),
+        "validation_reason": result.get("validation_reason") or result.get("error") or "",
+        "response_status": result.get("response_status"),
+        "response_location": result.get("response_location"),
+        "http_error": result.get("error"),
+        "diagnostics": result.get("diagnostics"),
+        "matched_artifact": result.get("request_name"),
+        "request_artifacts": [result["request_name"]] if result.get("request_name") else [],
+        "zend_artifact": result.get("zend_name"),
+        "request_payload": result.get("request"),
+        "zend_payload": result.get("zend"),
+        "timing": dict(result.get("timing") or {}),
+    }
+    return row
