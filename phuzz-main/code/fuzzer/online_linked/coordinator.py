@@ -9,7 +9,6 @@ import re
 import subprocess
 import sys
 import time
-import urllib.parse
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -40,11 +39,35 @@ from online_linked.coordination.candidate_identity import (
     _CANDIDATE_CONTEXT_KEY_VERSION,
     _candidate_context_key,
     _candidate_identity,
-    _canonical_callback_name,
 )
+from online_linked.coordination.checkpoint import validate_resume_checkpoint
 from online_linked.coordination.errors import OnlineLinkedError, ReplayArtifactError
 from online_linked.coordination.replay_artifacts import save_replay_artifacts
+from online_linked.coordination.probe_results import (
+    ajax_branch_continuation,
+    match_probe_parameters,
+    replay_verdict,
+)
 from online_linked.coordination.replay_request import restore_request_values
+from online_linked.coordination.request_matching import (
+    _coherent_evidence_key,
+    _is_ajax,
+    _method_parameter_key,
+    _parameter_key,
+    _replace_fuzzable_values_with_placeholder,
+    _request_payload_hash,
+    _runtime_candidate_key,
+    _safe_parameter_identity,
+    admission_complete,
+    baseline_evidence,
+    baseline_identity_complete,
+    config_request_key,
+    inherit_callback_identity,
+    parameter_replay_fields,
+    probe_admission_complete,
+    probe_context_key,
+    published_config_with_same_request,
+)
 from online_linked.coordination.worker import (
     CommandRunner,
     handoff_command,
@@ -56,7 +79,6 @@ from online_linked.evidence import RuntimeBatchTimeout, correlate_runtime_pair, 
 from core.online_handoff import DEFAULT_PRIORITY_ENERGY_MODE, priority_energy_mode as _priority_energy_mode
 from online_linked.export import (
     PARAMETER_REPLAY_POLICY, config_fields as _config_fields, config_fuzzable_fields as _config_fuzzable_fields,
-    config_name_is_fuzzable as _config_name_is_fuzzable, handoff_new_fields,
     parameter_replay_failures,
 )
 from hook_energy.seed_generation.zend_runtime.bridge_cli import (
@@ -73,8 +95,7 @@ from seed_generation.convergence.convergence import materialize_convergence_seed
 from discovery.entrypoints.entrypoints import seed_template_for_callback
 from discovery.entrypoints.method_resolution import resolve_http_methods
 from zend_discovery.engine import (
-    candidate_from_seed_item, canonical_identity_id, prepare_callback_registry, resolve_request_transport,
-    runtime_parameter_is_accepted,
+    candidate_from_seed_item, canonical_identity_id, resolve_request_transport,
 )
 ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
@@ -99,42 +120,6 @@ def _budget_pair(name: str, initial: int, hard: int | None, default: int,
     if hard < initial:
         raise ValueError(f"hard {name} cap must cover initial budget")
     return initial, hard
-
-
-def _request_id(run_id: str) -> str:
-    # Request IDs become artifact filenames; keep full run identity in the payload.
-    return hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:32]
-
-
-def _parameter_key(parameter: Any) -> tuple[str, str, str]:
-    if not isinstance(parameter, Mapping):
-        return "", "", ""
-    return (
-        str(parameter.get("name") or ""),
-        str(parameter.get("source") or "").upper(),
-        str(parameter.get("location") or ""),
-    )
-
-
-def _replace_fuzzable_values_with_placeholder(config: dict[str, Any]) -> None:
-    """Use PHUZZ's fuzz sentinel in the published fuzzing config only."""
-    for section_name in ("query_params", "body_params", "headers", "cookies"):
-        section = config.get(section_name)
-        if not isinstance(section, Mapping):
-            continue
-        data = section.get("data")
-        fixed = section.get("fixed", [])
-        fuzz = section.get("fuzz", [])
-        if not isinstance(data, list) or not isinstance(fixed, list) or not isinstance(fuzz, list):
-            continue
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            name = str(row.get("name") or "")
-            if not name:
-                continue
-            if _config_name_is_fuzzable(section, name):
-                row["value"] = "fuzz"
 
 
 def _request_id(run_id: str) -> str:
@@ -1234,30 +1219,7 @@ class OnlineLinkedCoordinator:
             self._reconcile_pending_runtime_candidates(parent, evidence, result)
         branch_failure = result.get("status") == "REPLAY_FAILED" or bool(result.get("missing_parameters"))
         if branch_failure and not result.get("runtime_block_reason") and _is_ajax(parent):
-            # AJAX keeps the accumulated set: a known field this request did not
-            # touch only describes its path (also for results saved before).
-            observed = list({
-                _parameter_key(parameter): dict(parameter)
-                for parameter in [*(result.get("observed_parameters") or []), *(result.get("new_parameters") or [])]
-                if isinstance(parameter, Mapping) and parameter.get("fuzzable") is True
-            }.values())
-            base = [
-                dict(parameter) for parameter in (result.get("known_parameters") or parent.get("known_parameters") or [])
-                if isinstance(parameter, Mapping)
-            ]
-            base_keys = {_parameter_key(parameter) for parameter in base}
-            new = [
-                dict(parameter) for parameter in (result.get("new_parameters") or [])
-                if isinstance(parameter, Mapping) and parameter.get("fuzzable") is True
-            ] or [parameter for parameter in observed if _parameter_key(parameter) not in base_keys]
-            result = {
-                **result,
-                "status": "CONTINUE",
-                "new_parameters": new,
-                "known_parameters": list({_parameter_key(p): p for p in [*base, *observed]}.values()),
-                "unobserved_known_parameters": list(result.get("missing_parameters") or []),
-                "missing_parameters": [],
-            }
+            result = ajax_branch_continuation(result, parent)
             branch_failure = False
         if branch_failure or result.get("runtime_block_reason"):
             self._record_event({
@@ -1370,7 +1332,7 @@ class OnlineLinkedCoordinator:
                 self._record_event({
                     "kind": "REPLAY_GUARD_DISCOVERY", "status": "DEFERRED", "reason": reason,
                     "version": parent["version"], "request_id": evidence.get("request_id"),
-                    "parameters": [self._safe_parameter_identity(p) for p in new_parameters if isinstance(p, Mapping)],
+                    "parameters": [_safe_parameter_identity(p) for p in new_parameters if isinstance(p, Mapping)],
                 })
             else:
                 self.state.update(terminal_status="PARTIAL", terminal_reason=reason)
@@ -1391,7 +1353,7 @@ class OnlineLinkedCoordinator:
         }
         if result.get("unobserved_known_parameters"):
             discovery["unobserved_known_parameters"] = [
-                self._safe_parameter_identity(parameter) for parameter in result["unobserved_known_parameters"]
+                _safe_parameter_identity(parameter) for parameter in result["unobserved_known_parameters"]
                 if isinstance(parameter, Mapping)
             ]
         proposed_parameters = [
@@ -1402,7 +1364,7 @@ class OnlineLinkedCoordinator:
         carried = self._failed_batch_parameters(admission_parent, proposed_parameters) if _is_ajax(parent) else []
         if carried:
             proposed_parameters = [*carried, *proposed_parameters]
-            discovery["carried_parameters"] = [self._safe_parameter_identity(parameter) for parameter in carried]
+            discovery["carried_parameters"] = [_safe_parameter_identity(parameter) for parameter in carried]
         discovery = self._record_event(discovery)
         # A descendant verified inside this handoff runs under the outer pause.
         owns_pause = self._pause is None
@@ -1584,24 +1546,6 @@ class OnlineLinkedCoordinator:
                     carried.append(dict(parameter))
         return carried
 
-    @staticmethod
-    def _safe_parameter_identity(parameter: Mapping[str, Any]) -> dict[str, str]:
-        return {
-            "name": str(parameter.get("name") or ""),
-            "source": str(parameter.get("source") or "").upper(),
-            "location": str(parameter.get("location") or "").lower(),
-        }
-
-    @classmethod
-    def _coherent_evidence_key(cls, evidence: Mapping[str, Any]) -> tuple[str, str, str]:
-        request = evidence.get("request")
-        request_params = request.get("request_params") if isinstance(request, Mapping) else {}
-        return (
-            str(evidence.get("request_id") or ""),
-            str(evidence.get("worker_run_id") or evidence.get("run_id") or ""),
-            cls._request_context_key(request_params) if isinstance(request_params, Mapping) else "",
-        )
-
     def _retain_pending_runtime_candidates(
         self, groups: Sequence[Mapping[str, Any]], parent: Mapping[str, Any],
     ) -> None:
@@ -1626,7 +1570,7 @@ class OnlineLinkedCoordinator:
             for parameter in group.get("parameters", []):
                 if not isinstance(parameter, Mapping):
                     continue
-                row = dict(self._safe_parameter_identity(parameter))
+                row = dict(_safe_parameter_identity(parameter))
                 row.update({
                     "parameter": copy.deepcopy(dict(parameter)),
                     "evidence": copy.deepcopy(dict(evidence)),
@@ -1662,7 +1606,7 @@ class OnlineLinkedCoordinator:
             for parameter in group.get("parameters", []):
                 if not isinstance(parameter, Mapping):
                     continue
-                identity = self._safe_parameter_identity(parameter)
+                identity = _safe_parameter_identity(parameter)
                 discard.add((
                     identity["name"], identity["source"], identity["location"], request_id, run_id,
                 ))
@@ -1680,14 +1624,6 @@ class OnlineLinkedCoordinator:
         ]
         self._write_state()
 
-    @staticmethod
-    def _runtime_candidate_key(candidate: Mapping[str, Any]) -> tuple[str, str, str]:
-        return (
-            str(candidate.get("name") or ""),
-            str(candidate.get("source") or "").upper(),
-            str(candidate.get("location") or "").lower(),
-        )
-
     def _reconcile_pending_runtime_candidates(
         self,
         parent: Mapping[str, Any],
@@ -1701,11 +1637,11 @@ class OnlineLinkedCoordinator:
                 fresh_candidates.extend(item for item in values if isinstance(item, Mapping))
         if self.resume and not result.get("runtime_block_reason"):
             fresh_keys = {
-                self._runtime_candidate_key(candidate) for candidate in fresh_candidates
+                _runtime_candidate_key(candidate) for candidate in fresh_candidates
                 if self._admission_complete({**dict(candidate), "evidence_kind": "fresh_proposal"}, evidence, parent)
             }
             self.state["pending_probe_queue"] = [row for row in self.state.get("pending_probe_queue", [])
-                if self._runtime_candidate_key(row["candidate"]) not in fresh_keys]
+                if _runtime_candidate_key(row["candidate"]) not in fresh_keys]
         pending = self.state.get("pending_runtime_candidates")
         if not isinstance(pending, list) or not pending:
             return
@@ -1727,10 +1663,10 @@ class OnlineLinkedCoordinator:
             if same_context:
                 remaining.append(item)
                 continue
-            key = self._runtime_candidate_key(item)
+            key = _runtime_candidate_key(item)
             matched = next(
                 (candidate for candidate in fresh_candidates
-                 if self._runtime_candidate_key(candidate) == key),
+                 if _runtime_candidate_key(candidate) == key),
                 None,
             )
             if self.resume and matched is None:
@@ -1757,219 +1693,32 @@ class OnlineLinkedCoordinator:
 
     @staticmethod
     def _config_request_key(config: Mapping[str, Any]) -> str:
-        semantic: dict[str, Any] = {
-            key: copy.deepcopy(config.get(key))
-            for key in ("target", "methods", "entrypoint_type")
-        }
-        for section_name in ("query_params", "body_params", "json_params", "headers", "cookies"):
-            section = config.get(section_name)
-            if not isinstance(section, Mapping):
-                continue
-            data = copy.deepcopy(section.get("data"))
-            if isinstance(data, list):
-                for row in data:
-                    if (
-                        section_name != "json_params"
-                        and isinstance(row, Mapping)
-                        and _config_name_is_fuzzable(section, str(row.get("name") or ""))
-                    ):
-                        row["value"] = "<fuzzable>"
-            elif isinstance(data, Mapping):
-                for name in data:
-                    if section_name != "json_params" and _config_name_is_fuzzable(section, str(name)):
-                        data[name] = "<fuzzable>"
-            semantic[section_name] = {"data": data}
-        return json.dumps(semantic, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+        return config_request_key(config)
 
     def _published_config_with_same_request(
-        self,
-        config: Mapping[str, Any],
-        proposed_parameters: Sequence[Mapping[str, Any]] | None,
+        self, config: Mapping[str, Any], proposed_parameters: Sequence[Mapping[str, Any]] | None,
     ) -> dict[str, Any] | None:
-        candidate_key = self._config_request_key(config)
-        candidate_parameters = None
-        if proposed_parameters is not None:
-            candidate_parameters = {
-                tuple(self._safe_parameter_identity(parameter).values())
-                for parameter in proposed_parameters
-                if isinstance(parameter, Mapping)
-            }
-        for version in self.state.get("versions", []):
-            if not isinstance(version, Mapping):
-                continue
-            if candidate_parameters is not None:
-                published_parameters = {
-                    tuple(self._safe_parameter_identity(parameter).values())
-                    for parameter in version.get("known_parameters", [])
-                    if isinstance(parameter, Mapping)
-                }
-                if published_parameters != candidate_parameters:
-                    continue
-            try:
-                # The published config is the normalized proposal. Replay
-                # payloads contain per-request fuzz mutations and are not
-                # semantic progress by themselves.
-                published_path = version["config_path"]
-                published = json.loads(filesystem_path(Path(str(published_path))).read_text(encoding="utf-8-sig"))
-            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-                continue
-            if self._config_request_key(published) == candidate_key:
-                return dict(version)
-        return None
+        return published_config_with_same_request(config, proposed_parameters, versions=self.state.get("versions", []))
 
-
-    @staticmethod
-    def _request_context_key(request_params: Mapping[str, Any]) -> str:
-        encoded = json.dumps(
-            request_params, sort_keys=True, separators=(",", ":"),
-            ensure_ascii=False, default=str,
-        )
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _request_auth_context(request: Mapping[str, Any]) -> str:
-        value = request.get("auth_context")
-        if value is None and isinstance(request.get("metadata"), Mapping):
-            value = request["metadata"].get("auth_context")
-        params = request.get("request_params")
-        headers = params.get("headers") if isinstance(params, Mapping) else None
-        if value is None and isinstance(headers, Mapping):
-            value = next(
-                (item for key, item in headers.items()
-                 if str(key).lower() == "x-hookphuzz-auth-context"),
-                None,
-            )
-        return str(value or "").strip()
-
-    @staticmethod
-    def _request_callback_matches(request: Mapping[str, Any], parent: Mapping[str, Any]) -> bool:
-        expected_hook = str(parent.get("hook_name") or "")
-        expected_callback = str(parent.get("callback_id") or "")
-        explicit_hook = str(request.get("hook_name") or "").strip()
-        explicit_callback = str(request.get("callback_id") or "").strip()
-        if explicit_hook and explicit_hook != expected_hook:
-            return False
-        if explicit_callback and explicit_callback != expected_callback:
-            return False
-        if explicit_hook and explicit_callback:
-            return True
-        coverage = request.get("hook_coverage")
-        if not isinstance(coverage, Mapping):
-            return False
-        for bucket in ("executed_callbacks",):
-            entries = coverage.get(bucket)
-            if not isinstance(entries, Mapping):
-                continue
-            for key, raw in entries.items():
-                if not isinstance(raw, Mapping):
-                    continue
-                callback_ids = {str(key)}
-                if raw.get("callback_id"):
-                    callback_ids.add(str(raw["callback_id"]))
-                hooks = {
-                    str(raw.get(field) or "")
-                    for field in ("hook_name", "fired_hook")
-                    if raw.get(field)
-                }
-                if expected_callback in callback_ids and expected_hook in hooks:
-                    return True
-        return False
 
     def _baseline_identity_complete(
-        self,
-        request: Mapping[str, Any],
-        zend: Mapping[str, Any],
-        parent: Mapping[str, Any],
+        self, request: Mapping[str, Any], zend: Mapping[str, Any], parent: Mapping[str, Any],
     ) -> bool:
-        request_id = str(request.get("request_id") or "").strip()
-        if not request_id or zend.get("request_id") != request_id:
-            return False
-        expected_run = str(parent.get("worker_run_id") or "")
-        if not expected_run:
-            return False
-        for payload in (request, zend):
-            run_ids = [str(payload[key]) for key in ("run_id", "legacy_run_id") if payload.get(key)]
-            if not run_ids or any(value != expected_run for value in run_ids):
-                return False
-            if payload.get("seed_variant_id") is not None and str(payload["seed_variant_id"]) != str(parent.get("seed_variant_id") or ""):
-                return False
-        if str(request.get("target_plugin") or "").strip() != self.plugin_slug:
-            return False
-        if not self._request_callback_matches(request, parent):
-            return False
-        expected_auth = str(parent.get("auth_context") or "").strip()
-        if expected_auth and self._request_auth_context(request) != expected_auth:
-            return False
-        expected_method = str(parent.get("resolved_method") or "").upper()
-        request_method = str(request.get("http_method") or request.get("method") or "").upper()
-        zend_method = str(zend.get("request_method") or zend.get("method") or "").upper()
-        if request_method != expected_method or (zend_method and zend_method != expected_method):
-            return False
-        return True
+        return baseline_identity_complete(request, zend, parent, plugin_slug=self.plugin_slug)
 
     def _parameter_replay_fields(
         self, parent: Mapping[str, Any], child: Mapping[str, Any], baseline: Mapping[str, Any] | None,
     ) -> list[dict[str, str]]:
-        """Fields ``child`` adds over the running ``parent``: config bucket, name and Zend identity."""
-        request = baseline.get("request") if isinstance(baseline, Mapping) else None
-        request = dict(request) if isinstance(request, Mapping) else {}
-        request.setdefault("http_method", str(child.get("resolved_method") or ""))
-        try:
-            parent_fields = _config_fuzzable_fields(Path(str(parent["config_path"])))
-        except (KeyError, OSError, ValueError, re.error):
-            parent_fields = set()
-        callback = self._expected_callback(child)
-        return [
-            {**row, "canonical_callback": callback}
-            for row in handoff_new_fields(
-                [dict(p) for p in child.get("known_parameters") or [] if isinstance(p, Mapping)],
-                [dict(p) for p in parent.get("known_parameters") or [] if isinstance(p, Mapping)],
-                parent_fields, request,
-            )
-        ]
+        return parameter_replay_fields(parent, child, baseline, plugin_slug=self.plugin_slug, registry=self.registry)
 
     def _baseline_evidence(self, evidence: Mapping[str, Any], version: Mapping[str, Any]) -> dict[str, str]:
-        request = evidence["request"]
-        return {
-            "request_id": str(evidence["request_id"]),
-            "run_id": str(evidence["worker_run_id"]),
-            "plugin_slug": self.plugin_slug,
-            "callback_id": str(version["callback_id"]),
-            "http_method": str(request.get("http_method") or request.get("method") or "").upper(),
-            "auth_context": self._request_auth_context(request),
-            "seed_variant_id": str(version.get("seed_variant_id") or ""),
-        }
+        return baseline_evidence(evidence, version, plugin_slug=self.plugin_slug)
 
 
     def _probe_context_key(
         self, parent: Mapping[str, Any], probe: Mapping[str, Any], evidence: Mapping[str, Any],
     ) -> str:
-        request = evidence.get("request")
-        params = request.get("request_params") if isinstance(request, Mapping) else None
-        params = params if isinstance(params, Mapping) else {}
-        # Ignore request IDs and metadata; preserve input types and array order.
-        inputs = {
-            bucket: params.get(bucket, {})
-            for bucket in ("query_params", "body_params", "json_params", "cookies")
-        }
-        input_hash = hashlib.sha256(
-            json.dumps(inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
-        return json.dumps([
-            str(parent.get("version") or ""),
-            str(parent.get("worker_run_id") or ""),
-            str(parent.get("callback_id") or ""),
-            str(parent.get("hook_name") or ""),
-            str(parent.get("entrypoint_type") or ""),
-            str(probe.get("name") or ""),
-            str(probe.get("source") or "").upper(),
-            str(probe.get("location") or ""),
-            str(probe.get("callback_id") or parent.get("callback_id") or ""),
-            str(probe.get("plugin_slug") or self.plugin_slug),
-            str(probe.get("canonical_callback") or parent.get("canonical_callback") or ""),
-            str(probe.get("request_method") or parent.get("resolved_method") or "").upper(),
-            input_hash,
-        ], separators=(",", ":"))
+        return probe_context_key(parent, probe, evidence, plugin_slug=self.plugin_slug)
 
     def _recover_parent_after_failure(self, parent: Mapping[str, Any], deadline: float | None) -> bool:
         if self._active_container:
@@ -2183,7 +1932,7 @@ class OnlineLinkedCoordinator:
 
         groups: dict[tuple[str, str, str], dict[str, Any]] = {}
         for record in accepted_records:
-            group_key = self._coherent_evidence_key(record["evidence"])
+            group_key = _coherent_evidence_key(record["evidence"])
             group = groups.setdefault(group_key, {
                 "parameters": [], "evidence": record["evidence"], "result": record["result"],
             })
@@ -2551,31 +2300,9 @@ class OnlineLinkedCoordinator:
             all_probe_parameters.extend(observed_parameters)
         if not all_probe_parameters:
             return self._finish_probe_failure(parent, evidence, attempt, "PROBE_NO_CORRELATED_READ", deadline)
-        target_key = _parameter_key(probe)
-        matching = [
-            parameter for parameter in all_probe_parameters
-            if isinstance(parameter, Mapping)
-            # A method probe proves POST only through a POST field, never GET reads.
-            and (_parameter_key(parameter) == target_key if probe.get("method_probe") is not True
-                 else str(parameter.get("source") or "").upper() == "POST")
-            and parameter.get("fuzzable") is True
-        ]
-        # The probe's target decides success; once it holds, every other
-        # admitted access in the same AJAX trace joins the same proposal.
-        trace_parameters = list({
-            _parameter_key(parameter): parameter for parameter in all_probe_parameters
-            if isinstance(parameter, Mapping) and parameter.get("fuzzable") is True
-        }.values()) if matching and _is_ajax(parent) else matching
-        pending_matching = [
-            parameter for parameter in all_probe_parameters
-            if isinstance(parameter, Mapping)
-            and (probe.get("method_probe") is True or _parameter_key(parameter) == target_key)
-            and parameter.get("fuzzable") is not True
-        ]
-        unexpected = [
-            dict(parameter) for parameter in probe_parameters
-            if isinstance(parameter, Mapping) and _parameter_key(parameter) != target_key
-        ] if isinstance(probe_parameters, list) else []
+        match = match_probe_parameters(probe, probe_parameters, all_probe_parameters, ajax=_is_ajax(parent))
+        matching, trace_parameters = match.matching, match.trace_parameters
+        pending_matching, unexpected = match.pending_matching, match.unexpected
         if not matching and pending_matching:
             parameter = self._inherit_callback_identity(pending_matching[0], parent)
             return self._finish_probe_pending(
@@ -2852,45 +2579,19 @@ class OnlineLinkedCoordinator:
         except (OSError, RuntimeError, ValueError):
             baseline = None
         deadline_expired = deadline is not None and self.clock() >= deadline
-        replay_passed = bool(
-            isinstance(replay_row, Mapping)
-            and not deadline_expired
-            and not artifact_error
-            and replay_row.get("validation_status") == "callback_reached"
-            and replay_row.get("process_status") not in {"failed", "runner_error", "window_elapsed"}
-            and baseline is not None
-        )
-        request_payload = replay_row.get("request_payload")
-        response = request_payload.get("response") if isinstance(request_payload, Mapping) else None
-        response_status = sender_result.get("response_status")
-        artifact_status = response.get("status_code") if isinstance(response, Mapping) else None
-        if response_status is None and isinstance(response, Mapping):
-            response_status = artifact_status
         verified_parameters = (
             self._parameter_replay_fields(parent, child, baseline)
             if child.get("evidence_origin", "worker_poll") == "worker_poll" else []
         )
-        parameter_failures: list[dict[str, str]] = []
-        if verified_parameters:
-            # parameter_replay_v1: the HTTP status is diagnostic; the batch's Zend proof decides.
-            transport_failed = bool(sender_result.get("error")) or (
-                response_status is not None and artifact_status is not None
-                and str(artifact_status) != str(response_status)
-            )
-            parameter_failures = (
-                parameter_replay_failures(verified_parameters, baseline["request"], baseline["zend"])
-                if baseline is not None else list(verified_parameters)
-            )
-            replay_passed = replay_passed and not transport_failed and not parameter_failures
-            non_success_response = False
-        else:
-            try:
-                non_success_response = (bool(sender_result.get("error")) or not 200 <= int(response_status) <= 299
-                                        or int(artifact_status) != int(response_status))
-            except (TypeError, ValueError):
-                non_success_response = True
+        verdict = replay_verdict(
+            replay_row=replay_row, sender_result=sender_result, baseline=baseline,
+            verified_parameters=verified_parameters, deadline_expired=deadline_expired, artifact_error=artifact_error,
+        )
+        replay_passed, non_success_response = verdict.callback_passed, verdict.non_success_response
+        response_status, parameter_failures = verdict.response_status, verdict.parameter_failures
+        transport_failed = verdict.transport_failed
         replay_result = {
-            "passed": replay_passed and not non_success_response,
+            "passed": verdict.passed,
             "guard_status": "unknown",
             "budget_expired": deadline_expired,
             "config_path": str(replay_path),
@@ -3112,7 +2813,7 @@ class OnlineLinkedCoordinator:
                 "kind": "REPLAY_GUARD_DISCOVERY", "status": "PENDING", "reason": "UNSENT_GUARD",
                 "version": version_name, "worker_run_id": replay_run_id,
                 "request_id": evidence.get("request_id"),
-                "parameters": [self._safe_parameter_identity(row) for row in probes],
+                "parameters": [_safe_parameter_identity(row) for row in probes],
             })
             convergence = {
                 **result, "new_parameters": [], "pending_probes": probes,
@@ -3592,22 +3293,8 @@ class OnlineLinkedCoordinator:
 
     def _load_checkpoint(self) -> tuple[dict[str, Any], dict[str, Any]]:
         saved = json.loads(self.state_path.read_text(encoding="utf-8-sig"))
-        if saved.get("budget_policy") != "progress_idle_v1":
-            raise ValueError("resume budget policy incompatible; create a new run")
+        validate_resume_checkpoint(saved, expected=self.state)
         checkpoint = saved.get("checkpoint", {})
-        if (saved.get("context_key_version") != _CANDIDATE_CONTEXT_KEY_VERSION
-                or checkpoint.get("context_key_version") != _CANDIDATE_CONTEXT_KEY_VERSION):
-            raise ValueError("resume candidate context-key version missing or unsupported")
-        if not isinstance(saved.get("queued_candidate_context_keys"), list):
-            raise ValueError("resume candidate context-key checkpoint is missing")
-        if saved.get("terminal_status") not in {None, "PARTIAL"}:
-            raise ValueError("resume requires a PARTIAL candidate")
-        for field in ("plugin_slug", "legacy_run_id", "max_seconds", "hard_seconds", "hard_versions",
-                      "runtime_cookie_probes"):
-            if saved.get(field) != self.state[field]:
-                raise ValueError(f"resume candidate context changed: {field}")
-        if saved.get("initial_max_versions") != self.state["initial_max_versions"]:
-            raise ValueError("resume initial version budget changed")
         if checkpoint.get("input_hash") != hashlib.sha256(self.suggested_seeds.read_bytes()).hexdigest():
             raise ValueError("resume candidate input changed")
         budget = saved["budget"]
@@ -3670,159 +3357,20 @@ class OnlineLinkedCoordinator:
         return config_hash(json.loads(filesystem_path(Path(path)).read_text(encoding="utf-8")))
 
     def _admission_complete(self, parameter: Any, evidence: Mapping[str, Any], parent: Mapping[str, Any]) -> bool:
-        if not isinstance(parameter, Mapping):
-            return False
-        required = (
-            parameter.get("name"),
-            parameter.get("source"),
-            parameter.get("location"),
-            parameter.get("evidence_kind"),
-            parameter.get("request_id"),
-            parameter.get("run_id"),
-            parameter.get("plugin_slug"),
-            parameter.get("canonical_callback"),
-            parameter.get("request_method"),
-        )
-        evidence_run_id = str(
-            evidence.get("worker_run_id")
-            or evidence.get("run_id")
-            or parent.get("worker_run_id")
-            or ""
-        )
-        expected_callback = self._expected_callback(parent)
-        parent_callback_id = str(parent.get("callback_id") or "")
-        parameter_callback_id = str(parameter.get("callback_id") or "")
-        request = evidence.get("request")
-        if isinstance(request, Mapping):
-            request_callback_id = str(request.get("callback_id") or "")
-            request_hook_name = str(request.get("hook_name") or "")
-            request_auth_context = str(request.get("auth_context") or "")
-            request_metadata = request.get("metadata")
-            if isinstance(request_metadata, Mapping):
-                request_auth_context = request_auth_context or str(request_metadata.get("auth_context") or "")
-            if (
-                (request_callback_id and request_callback_id != parent_callback_id)
-                or (request_hook_name and request_hook_name != str(parent.get("hook_name") or ""))
-                or (request_auth_context and request_auth_context != str(parent.get("auth_context") or ""))
-            ):
-                return False
-        return (
-            all(str(value or "").strip() for value in required)
-            and str(parameter.get("request_id")) == str(evidence.get("request_id"))
-            and str(parameter.get("run_id")) == evidence_run_id
-            and str(parameter.get("plugin_slug")) == self.plugin_slug
-            and str(parameter.get("request_method")).upper() == str(parent.get("resolved_method") or "").upper()
-            and (not parent_callback_id or parameter_callback_id == parent_callback_id)
-            and _canonical_callback_name(parameter.get("canonical_callback"))
-            == _canonical_callback_name(expected_callback)
-        )
-
-    def _expected_callback(self, parent: Mapping[str, Any]) -> str:
-        callback_map = self.registry.get("callback_map")
-        if not isinstance(callback_map, Mapping):
-            callback_map = prepare_callback_registry(self.registry, self.plugin_slug).get("callback_map", {})
-        expected = callback_map.get(str(parent.get("callback_id") or ""))
-        return str(expected or parent.get("canonical_callback") or "")
+        return admission_complete(parameter, evidence, parent, plugin_slug=self.plugin_slug, registry=self.registry)
 
     def _inherit_callback_identity(
         self, parameter: Mapping[str, Any], parent: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """Fill legacy parameter rows with the already-verified parent identity."""
-        normalized = dict(parameter)
-        parent_callback_id = str(parent.get("callback_id") or "")
-        if parent_callback_id and not str(normalized.get("callback_id") or ""):
-            expected = _canonical_callback_name(self._expected_callback(parent))
-            actual = _canonical_callback_name(normalized.get("canonical_callback"))
-            if expected and actual == expected:
-                normalized["callback_id"] = parent_callback_id
-        return normalized
+        return inherit_callback_identity(parameter, parent, plugin_slug=self.plugin_slug, registry=self.registry)
 
     def _probe_admission_complete(
         self, parameter: Mapping[str, Any], evidence: Mapping[str, Any], parent: Mapping[str, Any],
     ) -> bool:
-        if not self._admission_complete(parameter, evidence, parent):
-            return False
-        request = evidence.get("request")
-        zend = evidence.get("zend")
-        source = str(parameter.get("source") or "").upper()
-        location = str(parameter.get("location") or "").lower()
-        request_method = str(parent.get("resolved_method") or "").upper()
-        access_forms = parameter.get("access_forms")
-        operations = {
-            str(value).strip().lower()
-            for value in access_forms
-            if str(value).strip()
-        } if isinstance(access_forms, list) else None
-        artifact_method = str(
-            (request.get("http_method") if isinstance(request, Mapping) else "")
-            or (request.get("method") if isinstance(request, Mapping) else "")
-            or (zend.get("request_method") if isinstance(zend, Mapping) else "")
-            or (zend.get("method") if isinstance(zend, Mapping) else "")
-            or request_method
-        ).upper()
-        return (
-            isinstance(request, Mapping)
-            and isinstance(zend, Mapping)
-            and request.get("target_plugin") == self.plugin_slug
-            and (source, location) in ({("GET", "query"), ("POST", "form")} | (
-                {("COOKIE", "cookie")} if self.runtime_cookie_probes else set()
-            ))
-            and artifact_method == request_method
-            and runtime_parameter_is_accepted(
-                parameter,
-                request,
-                zend,
-                canonical_callback=_canonical_callback_name(self._expected_callback(parent)),
-                request_method=str(parent.get("resolved_method") or ""),
-                operations=operations,
-                runtime_cookie_probes=self.runtime_cookie_probes,
-                accept_absent_key=_is_ajax(parent),
-            )
+        return probe_admission_complete(
+            parameter, evidence, parent, plugin_slug=self.plugin_slug, registry=self.registry,
+            runtime_cookie_probes=self.runtime_cookie_probes, ajax=_is_ajax(parent),
         )
-
-
-def _method_parameter_key(parameter: Mapping[str, Any], method: str = "") -> tuple[str, tuple[str, str, str]]:
-    return (str(method or parameter.get("request_method") or "").upper(), _parameter_key(parameter))
-
-
-def _is_ajax(parent: Mapping[str, Any]) -> bool:
-    return (
-        str(parent.get("entrypoint_type") or "").startswith("ajax")
-        or str(parent.get("hook_name") or "").startswith("wp_ajax_")
-    )
-
-
-# Only the fuzzer's own per-request tracking headers are ignored; application headers such as
-# User-Agent or Accept can select a WordPress branch (wp_is_mobile()), so they are compared.
-_UNCOMPARED_HEADER_PREFIXES = ("x-fuzzer-", "x-hookphuzz-")
-
-
-def _request_payload_hash(request: Any) -> str:
-    """Hash of everything a request sent that can select a branch; "" when that is not known.
-
-    Method, route, query, form/JSON body, cookies and every header except the fuzzer's tracking ones.
-    "" never matches, so an incomplete artifact makes the worker re-score the seed.
-    """
-    if not isinstance(request, Mapping) or not isinstance(request.get("request_params"), Mapping):
-        return ""
-    params = request["request_params"]
-    method = str(request.get("http_method") or request.get("method") or "").upper()
-    target = str(request.get("http_target") or "")
-    if not method or not target:
-        return ""
-    headers = params.get("headers") if isinstance(params.get("headers"), Mapping) else {}
-    cookies = params.get("cookies")
-    return config_hash({
-        "method": method,
-        "route": urllib.parse.urlsplit(target).path,
-        "endpoint": request.get("endpoint"),
-        **{name: params.get(name) or {} for name in ("query_params", "body_params", "json_params")},
-        "cookies": cookies if isinstance(cookies, (Mapping, list)) else {},
-        "headers": {
-            str(key).lower(): value for key, value in headers.items()
-            if not str(key).lower().startswith(_UNCOMPARED_HEADER_PREFIXES)
-        },
-    })
 
 
 if __name__ == "__main__":

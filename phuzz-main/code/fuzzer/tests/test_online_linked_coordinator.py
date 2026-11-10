@@ -4269,6 +4269,83 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             OnlineLinkedCoordinator._config_request_key(config(query=True)),
         )
 
+    def test_request_matching_keys_are_stable(self):
+        """Published-config dedupe, priority-seed reuse and probe dedupe compare these keys
+        against values stored in earlier checkpoints, so moving code must not change them."""
+        from online_linked.coordination.request_matching import _coherent_evidence_key, probe_context_key
+        from online_linked.coordinator import _parameter_key, _request_payload_hash
+
+        config = {
+            "target": "http://web/wp-admin/admin-ajax.php",
+            "methods": ["POST"],
+            "body_params": {
+                "data": [{"name": "nonce", "value": "valid-a"}, {"name": "fuzz_token", "value": "one"}],
+                "fixed": ["nonce"],
+                "fuzz": ["nonce", "fuzz_.*"],
+                "weight": 1,
+            },
+        }
+        self.assertEqual(
+            OnlineLinkedCoordinator._config_request_key(config),
+            '{"body_params":{"data":[{"name":"nonce","value":"valid-a"},'
+            '{"name":"fuzz_token","value":"<fuzzable>"}]},"entrypoint_type":null,'
+            '"methods":["POST"],"target":"http://web/wp-admin/admin-ajax.php"}',
+        )
+        request = {
+            "http_method": "post",
+            "http_target": "http://web/wp-admin/admin-ajax.php?action=x",
+            "endpoint": "admin-ajax",
+            "request_params": {
+                "query_params": {"action": "x"},
+                "body_params": {"nonce": "a"},
+                "cookies": {"c": "1"},
+                "headers": {"User-Agent": "UA", "X-Fuzzer-Id": "9"},
+            },
+        }
+        self.assertEqual(
+            _request_payload_hash(request),
+            "e6636f58129fb96e9ccb7ac95ed1f23e34d26fd056e650de7d7003d0c03a0b83",
+        )
+        self.assertEqual(
+            _coherent_evidence_key({"request_id": "r1", "run_id": "w1", "request": request}),
+            ("r1", "w1", "7400a83139b97a74252c7b291cd13aa949ca18412226ea69583499ffa0ce4a85"),
+        )
+        self.assertEqual(_parameter_key({"name": "n", "source": "post", "location": "form"}), ("n", "POST", "form"))
+        # Stored in checkpoints to skip probes already tried; value captured at 87da6907.
+        parent = {"version": "v2", "worker_run_id": "run-v2", "callback_id": "cb1", "hook_name": "wp_ajax_x",
+                  "entrypoint_type": "ajax", "canonical_callback": "Plugin::handle", "resolved_method": "post"}
+        probe_evidence = {"request": {"request_params": {
+            "query_params": {"action": "x"}, "body_params": {"n": [1, "a"]},
+            "cookies": {"c": "1"}, "headers": {"X-Ignored": "1"},
+        }}}
+        self.assertEqual(
+            probe_context_key(parent, {"name": "n", "source": "post", "location": "form"}, probe_evidence,
+                              plugin_slug="fixture"),
+            '["v2","run-v2","cb1","wp_ajax_x","ajax","n","POST","form","cb1","fixture","Plugin::handle","POST",'
+            '"f0a7440e2b4b1053c7b9aa938ec69adf3a67846ee206504f2bd7f42563690cb1"]',
+        )
+
+    def test_resume_reports_first_incompatible_field(self):
+        """Users read the first resume error to learn why a run cannot continue, so the check
+        order is part of the contract: budget policy is reported before candidate context."""
+        from online_linked.coordination.checkpoint import validate_resume_checkpoint
+
+        expected = {
+            "plugin_slug": "fixture", "legacy_run_id": "run", "max_seconds": 60, "hard_seconds": 120,
+            "hard_versions": 4, "runtime_cookie_probes": False, "initial_max_versions": 2,
+        }
+        saved = {
+            **expected, "budget_policy": "progress_idle_v1", "context_key_version": 1,
+            "queued_candidate_context_keys": [], "terminal_status": "PARTIAL",
+            "checkpoint": {"context_key_version": 1},
+        }
+        validate_resume_checkpoint(saved, expected=expected)
+        with self.assertRaisesRegex(ValueError, "^resume budget policy incompatible"):
+            validate_resume_checkpoint(
+                {**saved, "budget_policy": "old", "plugin_slug": "other"}, expected=expected)
+        with self.assertRaisesRegex(ValueError, "^resume candidate context changed: plugin_slug$"):
+            validate_resume_checkpoint({**saved, "plugin_slug": "other"}, expected=expected)
+
     def test_replay_failed_branch_still_services_independent_pending_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, parent, evidence, convergence = self.make_probe_context(
