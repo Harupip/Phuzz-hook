@@ -42,8 +42,15 @@ from online_linked.coordination.errors import OnlineLinkedError, ReplayArtifactE
 from online_linked.coordination.evidence_runner import EvidenceRunner
 from online_linked.coordination.gate_replay import load_gate_evidence
 from online_linked.coordination.gate_runner import GateRunner
+from online_linked.coordination.handoff_replay import handoff_replay_row, replay_failure_reason
 from online_linked.coordination.replay_artifacts import save_replay_artifacts
 from online_linked.coordination.pending_candidates import failed_batch_parameters
+from online_linked.coordination.priority_descriptor import (
+    missing_verified_fields,
+    priority_descriptor,
+    priority_targets,
+    verified_fields,
+)
 from online_linked.coordination.probe_runner import ProbeRunner
 from online_linked.coordination.probe_results import (
     ajax_branch_continuation,
@@ -73,7 +80,9 @@ from online_linked.coordination.request_matching import (
 from online_linked.coordination.worker import (
     CommandRunner,
     handoff_command,
+    matching_pause_ack,
     remove_container,
+    worker_container_name,
     worker_exit_code,
     worker_start_command,
 )
@@ -1039,14 +1048,7 @@ class OnlineLinkedCoordinator:
         replay_dir = self.run_dir / "versions" / version_name / "replay"
         request_dir = replay_dir / "request"
         zend_dir = replay_dir / "zend"
-        row = {
-            "config_slug": replay_path.relative_to(self.config_root).with_suffix("").as_posix(),
-            "hook_name": child["hook_name"],
-            "callback_id": child["callback_id"],
-            "entrypoint_type": child["entrypoint_type"],
-            "resolved_method": child["resolved_method"],
-            "seed_variant_id": child.get("seed_variant_id", ""),
-        }
+        row = handoff_replay_row(child, replay_path, config_root=self.config_root)
         timeout = deadline - self.clock() if deadline is not None else self.max_seconds
         if timeout <= 0:
             child["worker_status"] = "not_started_budget_expired"
@@ -1287,18 +1289,10 @@ class OnlineLinkedCoordinator:
                 record_replay_event("DEFERRED", "CANDIDATE_BUDGET_EXPIRED")
                 self._write_state()
                 return False
-            if artifact_error:
-                child["terminal_reason"] = "REPLAY_ARTIFACT_SAVE_FAILED"
-            elif replay_report.get("error") or replay_row.get("process_status") in {"failed", "runner_error"}:
-                child["terminal_reason"] = "REPLAY_PROCESS_FAILED"
-            elif replay_row.get("validation_status") != "callback_reached":
-                child["terminal_reason"] = str(replay_row.get("validation_reason") or "CALLBACK_NOT_REACHED")
-            elif replay_result.get("transport_error"):
-                child["terminal_reason"] = "REPLAY_TRANSPORT_NOT_VERIFIED"
-            elif replay_result.get("unverified_parameters"):
-                child["terminal_reason"] = "PARAMETER_REPLAY_NOT_VERIFIED"
-            else:
-                child["terminal_reason"] = "CALLBACK_BASELINE_NOT_VERIFIED"
+            child["terminal_reason"] = replay_failure_reason(
+                artifact_error=artifact_error, replay_report=replay_report, replay_row=replay_row,
+                replay_result=replay_result,
+            )
             # A paused parent resumes its round (or fails loudly in _resume_parent).
             if not self._replay_discovery_active and self._pause is None:
                 self._failure = True
@@ -1359,8 +1353,7 @@ class OnlineLinkedCoordinator:
         version_name = str(version["version"])
         config_path = Path(str(version["config_path"]))
         runtime_slug = config_path.relative_to(self.config_root).with_suffix("").as_posix()
-        safe_run = re.sub(r"[^A-Za-z0-9_.-]+", "-", self.legacy_run_id).strip("-") or "online-linked"
-        container_name = f"hookphuzz-online-linked-{safe_run}-{version_name}"
+        container_name = worker_container_name(self.legacy_run_id, version_name)
         worker_run_id = str(version.get("worker_run_id") or f"{self.legacy_run_id}-{version_name}")
         version["worker_run_id"] = worker_run_id
         handoff_key = f"{version_name}-{uuid.uuid4().hex}"
@@ -1415,14 +1408,7 @@ class OnlineLinkedCoordinator:
         if replay_result.get("verification_policy") != PARAMETER_REPLAY_POLICY:
             return None, None
         event = {"kind": "PRIORITY_SEED", "version": child.get("version")}
-        verified = {
-            (str(row.get("bucket") or ""), str(row.get("name") or ""))
-            for row in replay_result.get("verified_parameters") or [] if isinstance(row, Mapping)
-        }
-
-        def covers(field: tuple[str, str], proven: tuple[str, str]) -> bool:
-            # Zend proves the top-level key; the materializer may fuzz nested selectors under it.
-            return field[0] == proven[0] and (field[1] == proven[1] or field[1].split("[", 1)[0] == proven[1])
+        verified = verified_fields(replay_result)
 
         try:
             child_path = Path(str(child["config_path"]))
@@ -1433,36 +1419,24 @@ class OnlineLinkedCoordinator:
         except (KeyError, OSError, ValueError, re.error) as exc:
             self._record_event({**event, "status": "REJECTED", "reason": "CONFIG_FIELDS_UNAVAILABLE", "detail": str(exc)})
             return None, "CONFIG_FIELDS_UNAVAILABLE"
-        missing = sorted(p for p in verified if not any(covers(f, p) for f in all_fields))
+        missing = missing_verified_fields(verified, all_fields)
         if missing:
             self._record_event({**event, "status": "REJECTED", "reason": "VERIFIED_FIELD_NOT_IN_CONFIG",
                                 "fields": [list(field) for field in missing]})
             return None, "VERIFIED_FIELD_NOT_IN_CONFIG"
         # A verified field the updated config keeps fixed gets no priority attempts.
-        targets = sorted(f for f in fuzzable if any(covers(f, p) for p in verified))
+        targets = priority_targets(verified, fuzzable)
         if not targets:
             # The plan switches config only for a new fuzzable param: keep the parent.
             self._record_event({**event, "status": "REJECTED", "reason": "NO_NEW_FUZZABLE_TARGET"})
             return None, "NO_NEW_FUZZABLE_TARGET"
         ack = parent.get("pause_ack") if isinstance(parent.get("pause_ack"), Mapping) else {}
-        descriptor = {
-            "replay_slug": replay_slug,
-            "replay_hash": str(child.get("replay_config_hash") or ""),
-            "targets": [list(target) for target in targets],
-            "mode": self.priority_energy_mode,
-            "allocated_energy": ack["allocated_energy"] if type(ack.get("allocated_energy")) is int else 0,
-            "attempts_used": ack["attempts_used"] if type(ack.get("attempts_used")) is int else 0,
-        }
         attempt = next((row for row in reversed(self.state.get("attempts", []))
                         if row.get("version") == child.get("version")), {})
-        # The old worker's PHUZZ energy counts only for the very request this seed replays:
-        # same request ID and the same sent input (a probe or the replay may have changed it).
-        rows = (replay_result.get("runner") or {}).get("runs") or [{}]
-        seed_payload = _request_payload_hash(rows[0].get("request_payload"))
-        if (type(ack.get("seed_phuzz_energy")) is int and ack.get("request_id")
-                and ack.get("request_id") == attempt.get("request_id")
-                and seed_payload and seed_payload == child.get("discovery_payload_hash")):
-            descriptor["seed_phuzz_energy"] = ack["seed_phuzz_energy"]
+        descriptor = priority_descriptor(
+            replay_slug=replay_slug, child=child, targets=targets, mode=self.priority_energy_mode,
+            ack=ack, attempt=attempt, replay_result=replay_result,
+        )
         self._record_event({
             **event, "status": "GRANTED", "reason": "PARAMETER_REPLAY_VERIFIED", "mode": descriptor["mode"],
             "discovery_request_id": attempt.get("request_id"), "pause_round_id": ack.get("round_id"),
@@ -1505,9 +1479,8 @@ class OnlineLinkedCoordinator:
             reason = "PAUSE_ACK_TIMEOUT"
             while self.clock() < wait_until:
                 ack = self._handoff_command("ack", key, deadline=wait_until)
-                if ack and ack.get("token") == token and ack.get("worker_run_id") == run_id:
-                    snapshot = {name: ack.get(name) for name in (
-                        "round_id", "allocated_energy", "attempts_used", "request_id", "seed_phuzz_energy")}
+                snapshot = matching_pause_ack(ack, token=token, run_id=run_id)
+                if snapshot is not None:
                     record = self._version(str(parent.get("version"))) or {}
                     record["pause_ack"] = {**snapshot, "token": token, "acked_at": self.clock()}
                     self._record_event({**event, "status": "ACKNOWLEDGED", "reason": "PAUSE_ACK", **snapshot})

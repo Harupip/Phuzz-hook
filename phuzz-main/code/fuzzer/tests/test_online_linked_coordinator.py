@@ -583,6 +583,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
     def _guard_chain_campaign(
         self, root: Path, *, guards=("cn_param", "cn_nonce"), nonce_callback="fixture_callback",
         probe_status=200, deadline=None, send_cost=0.0, version_cap=None, v2_replay_unread=(),
+        send_cost_by_run_id=None,
     ):
         """Cookie Notice shape: PHP evaluates isset(action, cn_param, cn_nonce) left to right
         and stops at the first absent field, so each request reveals one more guard."""
@@ -660,7 +661,7 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     body = dict(parse_qsl(raw_body))
                     status = probe_status if "cn_nonce" in body else 200
                     sends.append({"run_id": run_id, "query": query, "body": body, "status": status})
-                    coordinator.clock.now += send_cost
+                    coordinator.clock.now += (send_cost_by_run_id or {}).get(run_id, send_cost)
                     log.append(f"send:{run_id}")
                     request, zend = php(request_id, run_id, prepared.method, query, body,
                                         str(kwargs["expected"].get("auth_context") or ""), status)
@@ -6338,6 +6339,162 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             coordinator.run()
             self.assertNotIn("pause_requested", log)
             self.assertEqual(log.count("worker_start"), 1)
+
+    def _trace_docker(self, coordinator, *, fail=None) -> list[tuple]:
+        trace = []
+        run_command = coordinator.run_command
+        starts = 0
+
+        def traced(command, **kwargs):
+            nonlocal starts
+            if command[:2] == ["docker", "exec"] and command[3:6] == ["python", "-m", "core.online_handoff"]:
+                trace.append(("exec", command[6], command[2], *command[7:9]))
+            elif command[:3] == ["docker", "rm", "-f"]:
+                trace.append(("rm", command[3]))
+                if fail == "rm":
+                    return subprocess.CompletedProcess(command, 1, "", "boom")
+            elif command[:3] == ["docker", "compose", "run"]:
+                trace.append(("run", command[command.index("--name") + 1]))
+                starts += 1
+                if fail == "child_run" and starts == 2:
+                    return subprocess.CompletedProcess(command, 1, "", "start boom")
+            return run_command(command, **kwargs)
+
+        coordinator.run_command = traced
+        return trace
+
+    def test_handoff_docker_order_pause_ack_stop_then_start(self):
+        """Start only after removing the parent, and release only if the parent survives."""
+        for failure in (None, "rm", "child_run"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                coordinator = self.make_coordinator(Path(tmp), [])
+                trace = self._trace_docker(coordinator, fail=failure)
+                coordinator.run()
+                parent = coordinator.state["workers"][0]["container_name"]
+                child_start = ("run", "hookphuzz-online-linked-run-v1")
+                request = next(row for row in trace if row[:2] == ("exec", "request"))
+                key, token = request[3:]
+                ack = ("exec", "ack", parent, key)
+                release = ("exec", "release", parent, key, token)
+                releases = [row for row in trace if row[:2] == ("exec", "release")]
+                last = release if failure == "rm" else child_start
+                start = trace.index(request)
+                self.assertEqual(trace[start:start + 4], [("exec", "request", parent, key, token),
+                                                           ack, ("rm", parent), last])
+                self.assertIsNone(coordinator._pause)
+                if failure == "rm":
+                    self.assertNotIn(child_start, trace)
+                    self.assertEqual(coordinator.state["versions"][1]["worker_status"],
+                                     "not_started_parent_stop_failed")
+                    self.assertEqual(coordinator.state["terminal_reason"], "WORKER_STOP_FAILED")
+                else:
+                    self.assertEqual(releases, [])
+                    if failure == "child_run":
+                        self.assertEqual(coordinator.state["terminal_reason"], "CHILD_WORKER_START_FAILED")
+                    else:
+                        pause_statuses = [e["status"] for e in coordinator.state["events"]
+                                          if e["kind"] == "WORKER_PAUSE"]
+                        self.assertEqual(pause_statuses, ["REQUESTED", "ACKNOWLEDGED"])
+
+    def test_pause_ack_with_foreign_run_id_is_ignored_and_released(self):
+        """An ACK from another run must not authorize replay, even with the correct token."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = []
+            coordinator = self.make_coordinator(
+                Path(tmp), log, pause_ack=lambda r: {**r, "worker_run_id": "other-run", "round_id": 1,
+                                                     "allocated_energy": 20, "attempts_used": 9},
+            )
+            trace = self._trace_docker(coordinator)
+            coordinator.run()
+            self.assertFalse(any(entry.startswith("sender_timeout:run-v1-replay") for entry in log))
+            self.assertEqual(log.count("worker_start"), 1)
+            self.assertNotIn("pause_ack", coordinator.state["versions"][0])
+            pause = [(e["status"], e["reason"]) for e in coordinator.state["events"] if e["kind"] == "WORKER_PAUSE"]
+            self.assertLess(pause.index(("REJECTED", "PAUSE_ACK_TIMEOUT")), pause.index(("RELEASED", "PAUSE_RELEASED")))
+            _, _, parent, key, token = next(row for row in trace if row[:2] == ("exec", "request"))
+            self.assertIn(("exec", "release", parent, key, token), trace)
+            self.assertIsNone(coordinator._pause)
+
+    def test_rejected_handoff_releases_same_pause_token(self):
+        """Replay or priority rejection must release the exact paused parent before polling again."""
+        for fixed in (False, True):
+            with self.subTest(fixed=fixed), tempfile.TemporaryDirectory() as tmp:
+                coordinator = self.make_coordinator(Path(tmp), [], replay_passes=fixed)
+                if fixed:
+                    export = coordinator.export_configs_fn
+
+                    def export_fixed(report, **kwargs):
+                        summary = export(report, **kwargs)
+                        path = Path(summary["generated"][0]["config_path"])
+                        config = json.loads(path.read_text(encoding="utf-8"))
+                        config["body_params"]["fixed"].append("new_param")
+                        path.write_text(json.dumps(config), encoding="utf-8")
+                        return summary
+
+                    coordinator.export_configs_fn = export_fixed
+                trace = self._trace_docker(coordinator)
+                coordinator.run()
+                events = [(e["kind"], e["status"], e["reason"]) for e in coordinator.state["events"]]
+                self.assertEqual([e[1:] for e in events if e[0] == "WORKER_PAUSE"][:3], [
+                    ("REQUESTED", "PARAMETER_HANDOFF"), ("ACKNOWLEDGED", "PAUSE_ACK"), ("RELEASED", "PAUSE_RELEASED"),
+                ])
+                _, _, parent, key, token = next(row for row in trace if row[:2] == ("exec", "request"))
+                release = next(row for row in trace if row[:2] == ("exec", "release"))
+                self.assertEqual(release, ("exec", "release", parent, key, token))
+                self.assertNotIn(("rm", parent), trace[:trace.index(release)])
+                self.assertIsNone(coordinator._pause)
+                released = events.index(("WORKER_PAUSE", "RELEASED", "PAUSE_RELEASED"))
+                if fixed:
+                    reason = "NO_NEW_FUZZABLE_TARGET"
+                    priority = events.index(("PRIORITY_SEED", "REJECTED", reason))
+                    rejected = events.index(("CHILD_REPLAY", "REJECTED", reason))
+                    self.assertLess(priority, rejected)
+                else:
+                    rejected = next(i for i, e in enumerate(events) if e[:2] == ("CHILD_REPLAY", "REJECTED"))
+                    self.assertNotEqual(coordinator.state["terminal_reason"], "CHILD_REPLAY_FAILED")
+                self.assertLess(rejected, released)
+
+    def test_priority_seed_is_recorded_once_and_never_overwritten(self):
+        """A restart must retain the descriptor of the first verified activation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            self.assertEqual(coordinator.run(), 0)
+            child = coordinator.state["versions"][1]
+            descriptor = json.loads(worker_env(coordinator.state["workers"][-1])["HOOKPHUZZ_PRIORITY_SEED"])
+            keys = ["replay_slug", "replay_hash", "targets", "mode", "allocated_energy", "attempts_used"]
+            self.assertEqual(child["priority_seed"], descriptor)
+            self.assertEqual(list(child["priority_seed"]), keys)
+            saved = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(list(saved["versions"][1]["priority_seed"]), keys)
+
+            def grants():
+                return sum(e["kind"] == "PRIORITY_SEED" and e["status"] == "GRANTED"
+                           for e in coordinator.state["events"])
+
+            self.assertEqual(grants(), 1)
+            self.assertTrue(coordinator._stop_worker(child, "TEST_RESTART"))
+            replacement = {**descriptor, "targets": [["body_params", "other"]]}
+            self.assertTrue(coordinator._start_worker(child, priority_seed=replacement))
+            self.assertEqual(child["priority_seed"], descriptor)
+            self.assertNotIn("HOOKPHUZZ_PRIORITY_SEED", worker_env(coordinator.state["workers"][-1]))
+            self.assertEqual(grants(), 1)
+
+    def test_guard_target_handoff_event_describes_started_version(self):
+        """The event must use the activated descendant's version and distinct replay timing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, _, _ = self._guard_chain_campaign(
+                Path(tmp), probe_status=403, send_cost_by_run_id={"run-v1-replay": 0.25, "run-v2-replay": 0.5},
+            )
+            versions = {v["version"]: v for v in coordinator.state["versions"]}
+            v1_timing = versions["v1"]["replay_result"]["timing"]
+            v2_timing = versions["v2"]["replay_result"]["timing"]
+            self.assertEqual([v1_timing["total"], v2_timing["total"]], [0.25, 0.5])
+            events = [e for e in coordinator.state["events"] if e["kind"] == "CHILD_REPLAY" and e["status"] == "PASS"
+                      and e["reason"] in {"PARAMETER_REPLAY_VERIFIED", "CALLBACK_BASELINE_VERIFIED"}]
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["version"], "v2")
+            self.assertEqual(events[0]["timing"], v2_timing)
+            self.assertIn("handoff", v2_timing)
 
     def test_handoff_waits_for_matching_pause_ack(self):
         with tempfile.TemporaryDirectory() as tmp:

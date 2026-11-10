@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -10,6 +11,20 @@ from typing import Any
 from online_linked.probe_sender import ParentInspectionError, ParentInspectionTimeout
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def worker_container_name(legacy_run_id: str, version_name: str) -> str:
+    safe_run = re.sub(r"[^A-Za-z0-9_.-]+", "-", legacy_run_id).strip("-") or "online-linked"
+    return f"hookphuzz-online-linked-{safe_run}-{version_name}"
+
+
+def matching_pause_ack(
+    ack: Mapping[str, Any] | None, *, token: str, run_id: str,
+) -> dict[str, Any] | None:
+    if not ack or ack.get("token") != token or ack.get("worker_run_id") != run_id:
+        return None
+    return {name: ack.get(name) for name in (
+        "round_id", "allocated_energy", "attempts_used", "request_id", "seed_phuzz_energy")}
 
 
 def worker_start_command(
