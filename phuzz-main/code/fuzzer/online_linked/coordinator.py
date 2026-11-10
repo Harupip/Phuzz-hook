@@ -28,28 +28,20 @@ from online_linked.probe_sender import (
     run_in_container,
 )
 from hook_energy.seed_generation.online_common import (
-    select_v0,
     _load_zend_artifact,
     _write_exclusive_json,
     _write_json,
     config_hash,
-    validate_v0_config,
 )
 from online_linked.coordination.candidate_identity import (
     _CANDIDATE_CONTEXT_KEY_VERSION,
-    _candidate_context_key,
     _candidate_identity,
 )
 from online_linked.coordination.checkpoint import validate_resume_checkpoint
 from online_linked.coordination.errors import OnlineLinkedError, ReplayArtifactError
 from online_linked.coordination.evidence_runner import EvidenceRunner
-from online_linked.coordination.gate_replay import (
-    gate_replay_name,
-    gate_replay_row,
-    guard_replay_summary,
-    load_gate_evidence,
-    unsent_guard_probes,
-)
+from online_linked.coordination.gate_replay import load_gate_evidence
+from online_linked.coordination.gate_runner import GateRunner
 from online_linked.coordination.replay_artifacts import save_replay_artifacts
 from online_linked.coordination.pending_candidates import failed_batch_parameters
 from online_linked.coordination.probe_runner import ProbeRunner
@@ -89,14 +81,12 @@ from online_linked.evidence import read_runtime_batch
 from core.online_handoff import DEFAULT_PRIORITY_ENERGY_MODE, priority_energy_mode as _priority_energy_mode
 from online_linked.export import (
     PARAMETER_REPLAY_POLICY, config_fields as _config_fields, config_fuzzable_fields as _config_fuzzable_fields,
-    parameter_replay_failures,
 )
 from hook_energy.seed_generation.zend_runtime.bridge_cli import (
     converge_iteration,
     list_convergence_targets,
 )
 from seed_generation.config.config_exporter import (
-    SeedConfigSkip,
     _force_replay_only,
     build_config_for_seed_item,
     export_seed_configs,
@@ -417,6 +407,11 @@ class OnlineLinkedCoordinator:
         # Built per use, like _probes.
         return EvidenceRunner(self)
 
+    @property
+    def _gate_runner(self) -> GateRunner:
+        # Built per use, like _probes.
+        return GateRunner(self)
+
     def _drain_pending_probes(self) -> None:
         self._probes.drain_pending_probes()
 
@@ -530,122 +525,7 @@ class OnlineLinkedCoordinator:
             self.state["campaign_stop_reason"] = "CAMPAIGN_BUDGET_EXPIRED"
 
     def _gate_v0(self, version: dict[str, Any], config: Mapping[str, Any], *, deadline: float) -> bool:
-        """Require a correlated replay before starting any v0 worker."""
-        if deadline - self.clock() < 1:
-            version["terminal_reason"] = "BUDGET_EXPIRED"
-            return False
-        replay = copy.deepcopy(dict(config))
-        self.force_replay_only_fn(replay)
-        gate_name, reactivation = gate_replay_name(
-            version, resume=self.resume, resume_count=self.state.get("resume_count", 0),
-        )
-        path = self._write_config(gate_name, replay, replay=True)
-        # A child's handoff replay is the proof the exporter rechecks: store reactivations apart.
-        child_proof = version.get("replay_result") if str(version.get("version")) != "v0" else None
-        child_proof = child_proof if isinstance(child_proof, Mapping) else None
-        if child_proof is None:
-            version["replay_config_path"] = str(path)
-            version["replay_config_hash"] = config_hash(replay)
-        parameter_policy = bool(child_proof) and child_proof.get("verification_policy") == PARAMETER_REPLAY_POLICY
-        row = gate_replay_row(version, path, config_root=self.config_root)
-        reason = "V0_CALLBACK_NOT_REACHED"
-        readiness: dict[str, Any] = {
-            "passed": False, "verification_policy": "callback_baseline_v1",
-            "config_path": str(path), "config_hash": config_hash(replay),
-        }
-        version["readiness"] = readiness
-        try:
-            if not self.registry.get("callback_map", {}).get(version["callback_id"]):
-                raise OnlineLinkedError("V0_REGISTRY_MISSING")
-            timeout = min(30, int(deadline - self.clock()))
-            if timeout < 1:
-                raise OnlineLinkedError("BUDGET_EXPIRED")
-            report = self.replay_runner(
-                [row], timeout_seconds=timeout, service=self.service,
-                legacy_run_id=version["worker_run_id"], run_command=self.run_command,
-                list_artifacts=self.list_artifacts, load_artifact=self.load_artifact,
-                list_zend_artifacts=self.list_zend_artifacts, poll_interval_seconds=0, fuzzer_node_id=100,
-                stop_on_callback=True,
-            )
-            readiness["runner"] = report
-            rows = report.get("runs", [])
-            result_row = rows[0] if len(rows) == 1 else {}
-            if result_row.get("process_status") == "vuln_found":
-                self.state.update(terminal_status="VULN_FOUND", terminal_reason="VULN_FOUND")
-                return False
-            if result_row.get("callback_reached") is not True or result_row.get("validation_status") != "callback_reached":
-                raise OnlineLinkedError(reason)
-            if result_row.get("process_status") in {"failed", "runner_error"}:
-                raise OnlineLinkedError("V0_REPLAY_PROCESS_FAILED")
-            probe_dir = gate_name + "-probe" if reactivation else "probe"
-            request_dir = self.run_dir / "versions" / str(version["version"]) / probe_dir / "request"
-            zend_dir = request_dir.parent / "zend"
-            self._save_replay_artifacts(
-                {**result_row, "_strict_correlation": False}, request_dir, zend_dir,
-            )
-            reason = "V0_PROVENANCE_NOT_VERIFIED"
-            observation = self.converge_fn(
-                raw_report=self._reports[str(version["version"])], pass_run_summary=report,
-                pass_artifacts_dir=request_dir, zend_events_dir=zend_dir, registry=self.registry,
-                plugin_slug=self.plugin_slug, legacy_run_id=version["worker_run_id"],
-                known_state={"known_parameters": version.get("known_parameters", [])}, candidate_key=self._target_key,
-                runtime_cookie_probes=self.runtime_cookie_probes,
-            )
-            readiness["convergence"] = observation
-            if observation.get("runtime_block_reason") or (observation.get("status") == "REPLAY_FAILED" and not observation.get("missing_parameters")):
-                reason = str(observation.get("runtime_block_reason") or "V0_PROVENANCE_NOT_VERIFIED")
-                self._record_event({"kind": "V0_READINESS", "status": "REJECTED", "reason": reason,
-                                    "missing_parameters": observation.get("missing_parameters", [])})
-                raise OnlineLinkedError(reason)
-            if version["config_type"] != "fuzzing_ready":
-                readiness["probe_only"] = True
-            gate_evidence = load_gate_evidence(
-                version, result_row, request_dir, zend_dir, observation,
-                plugin_slug=self.plugin_slug,
-            )
-            if gate_evidence is None or not self._baseline_identity_complete(
-                gate_evidence["request"], gate_evidence["zend"], version,
-            ):
-                raise OnlineLinkedError("V0_PROVENANCE_NOT_VERIFIED")
-            self._gate_evidence = gate_evidence
-            self._gate_convergence = copy.deepcopy(dict(observation))
-            version["gate_evidence"] = {
-                "origin": "v0_gate",
-                "request_id": gate_evidence["request_id"],
-                "request_name": gate_evidence["request_name"],
-                "zend_name": gate_evidence["zend_name"],
-                "consumed": False,
-            }
-            response = gate_evidence["request"].get("response")
-            status = response.get("status_code") if isinstance(response, Mapping) else None
-            if parameter_policy:
-                # Same policy as the handoff that admitted this config: status is diagnostic.
-                fields = list(child_proof.get("verified_parameters") or [])
-                missing = parameter_replay_failures(fields, gate_evidence["request"], gate_evidence["zend"])
-                readiness.update(verification_policy=PARAMETER_REPLAY_POLICY, verified_parameters=fields,
-                                 response_status=status)
-                if not fields or missing:
-                    readiness.update(reason="PARAMETER_REPLAY_NOT_VERIFIED", unverified_parameters=missing)
-                    self.state.update(terminal_status="PARTIAL", terminal_reason="PARAMETER_REPLAY_NOT_VERIFIED")
-                    return False
-            elif version["config_type"] == "fuzzing_ready":
-                try:
-                    guard_unknown = not 200 <= int(status) < 300
-                except (TypeError, ValueError):
-                    guard_unknown = True
-                if guard_unknown:
-                    readiness.update(guard_status="unknown", reason="GUARD_SATISFACTION_UNKNOWN")
-                    self.state.update(terminal_status="PARTIAL", terminal_reason="GUARD_SATISFACTION_UNKNOWN")
-                    return False
-            if self.clock() >= deadline:
-                raise OnlineLinkedError("BUDGET_EXPIRED")
-            readiness["baseline_evidence"] = self._baseline_evidence(gate_evidence, version)
-            readiness["passed"] = True
-            return True
-        except (OSError, RuntimeError, ValueError) as exc:
-            readiness.update(reason=str(exc), passed=False)
-            self.state.update(terminal_status="NOT_VERIFIED", terminal_reason=str(exc) if isinstance(exc, OnlineLinkedError) else reason)
-            return False
+        return self._gate_runner.gate_v0(version, config, deadline=deadline)
 
     def read_new_runtime_evidence(self, *, deadline: float | None = None) -> list[dict[str, Any]]:
         return self._evidence_runner.read_new_runtime_evidence(deadline=deadline)
@@ -1439,181 +1319,12 @@ class OnlineLinkedCoordinator:
         self, child: dict[str, Any], evidence: Mapping[str, Any], *, deadline: float | None,
         running_parent: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Probe guards that a passed AJAX replay hit on fields it never sent.
-
-        The running parent sends each probe and child baseline. A descendant replaces
-        ``child`` only after its own callback baseline passes; every round adds one
-        version, so the loop is bounded by the version and probe caps.
-        """
-        current = child
-        while not (deadline is not None and self.clock() >= deadline):
-            if self.state.get("terminal_status") or not self._active_container:
-                break
-            version_name = str(current["version"])
-            raw_report = self._reports.get(version_name)
-            if raw_report is None or not current.get("replay_config_path"):
-                break
-            replay_run_id = str(evidence["worker_run_id"])
-            replay_dir = self.run_dir / "versions" / version_name / "replay"
-            try:
-                result = self.converge_fn(
-                    raw_report=raw_report,
-                    pass_run_summary=guard_replay_summary(
-                        current, evidence, config_root=self.config_root, replay_run_id=replay_run_id,
-                    ),
-                    pass_artifacts_dir=replay_dir / "request",
-                    zend_events_dir=replay_dir / "zend",
-                    registry=self.registry,
-                    plugin_slug=self.plugin_slug,
-                    legacy_run_id=replay_run_id,
-                    known_state={"known_parameters": current.get("known_parameters", [])},
-                    candidate_key=None,
-                    runtime_cookie_probes=self.runtime_cookie_probes,
-                    probe_unsent_guards=True,
-                )
-            except (OSError, RuntimeError, ValueError) as exc:
-                self._record_event({
-                    "kind": "REPLAY_GUARD_DISCOVERY", "status": "REJECTED",
-                    "reason": "CORRELATION_OR_PROVENANCE_INCOMPLETE", "version": version_name,
-                    "request_id": evidence.get("request_id"), "detail": str(exc),
-                })
-                break
-            probes = unsent_guard_probes(result)
-            if not probes:
-                break
-            self._record_event({
-                "kind": "REPLAY_GUARD_DISCOVERY", "status": "PENDING", "reason": "UNSENT_GUARD",
-                "version": version_name, "worker_run_id": replay_run_id,
-                "request_id": evidence.get("request_id"),
-                "parameters": [_safe_parameter_identity(row) for row in probes],
-            })
-            convergence = {
-                **result, "new_parameters": [], "pending_probes": probes,
-                "known_parameters": current.get("known_parameters", []),
-            }
-            self._replay_discovery_active = True
-            try:
-                next_child = self._run_pending_probe(
-                    parent={**current, "worker_run_id": replay_run_id}, evidence=evidence,
-                    raw_report=raw_report, convergence=convergence, probe=probes[0],
-                    seed=current.get("seed_item") or {}, deadline=deadline,
-                )
-            finally:
-                self._replay_discovery_active = False
-            next_evidence = self._replay_evidence.pop(str((next_child or {}).get("version") or ""), None)
-            if (
-                next_child is None or next_evidence is None
-                or (next_child.get("replay_result") or {}).get("passed") is not True
-            ):
-                break
-            if running_parent is not None and not self._descendant_proves_batch(running_parent, next_child):
-                break  # keep the verified ancestor as the handoff target
-            current["worker_status"] = "not_started_superseded"
-            current["terminal_reason"] = f"SUPERSEDED_BY_{next_child['version']}"
-            covered = {
-                _parameter_key(parameter) for parameter in next_child.get("known_parameters") or []
-                if isinstance(parameter, Mapping)
-            }
-            superseded = {
-                str(version.get("version")) for version in self.state["versions"]
-                if version.get("worker_status") == "not_started_superseded"
-            }
-            queue = self.state.get("pending_probe_queue", [])
-            for row in [row for row in queue if row.get("parent_version") in superseded
-                        and _parameter_key(row.get("candidate") or {}) in covered]:
-                # Otherwise a later drain would stop the descendant to restart this version.
-                queue.remove(row)
-                self._record_event({
-                    "kind": "PARAMETER_PROBE", "status": "SKIPPED", "reason": "ADMITTED_FROM_TRACE",
-                    "version": row.get("parent_version"), "request_id": (row.get("candidate") or {}).get("request_id"),
-                    "candidate": dict(row.get("candidate") or {}),
-                })
-            self._record_event({
-                "kind": "CHILD_REPLAY", "status": "PASS", "reason": current["terminal_reason"],
-                "hook_name": current.get("hook_name"), "version": version_name,
-                "probe_id": None, "parameter": None,
-                "timing": dict((current.get("replay_result") or {}).get("timing") or {}),
-            })
-            current, evidence = next_child, next_evidence
-        return current
-
-    def _descendant_proves_batch(self, running_parent: Mapping[str, Any], descendant: dict[str, Any]) -> bool:
-        """The worker gets the last descendant: its own replay must prove every field new over the parent."""
-        replay_result = descendant["replay_result"]
-        if descendant.get("evidence_origin", "worker_poll") != "worker_poll":
-            return True
-        rows = (replay_result.get("runner") or {}).get("runs") or [{}]
-        proof = {"request": rows[0].get("request_payload") or {}, "zend": rows[0].get("zend_payload") or {}}
-        batch = self._parameter_replay_fields(running_parent, descendant, proof)
-        if not batch:
-            return True
-        replay_result.update(verification_policy=PARAMETER_REPLAY_POLICY, verified_parameters=batch)
-        missing = parameter_replay_failures(batch, proof["request"], proof["zend"])
-        if not missing:
-            return True
-        replay_result.update(passed=False, unverified_parameters=missing)
-        descendant.update(status="replay_failed", worker_status="not_started_replay_failed",
-                          terminal_reason="PARAMETER_REPLAY_NOT_VERIFIED")
-        self._record_event({
-            "kind": "CHILD_REPLAY", "status": "REJECTED", "reason": "PARAMETER_REPLAY_NOT_VERIFIED",
-            "hook_name": descendant.get("hook_name"), "version": descendant.get("version"),
-            "probe_id": None, "parameter": None, "timing": dict(replay_result.get("timing") or {}),
-        })
-        return False
+        return self._gate_runner.discover_replay_guards(
+            child, evidence, deadline=deadline, running_parent=running_parent,
+        )
 
     def _select_v0(self) -> tuple[Mapping[str, Any], dict[str, Any], str] | None:
-        payload = json.loads(filesystem_path(self.suggested_seeds).read_text(encoding="utf-8-sig"))
-        if not isinstance(payload, Mapping) or not isinstance(payload.get("suggested_seeds"), list):
-            raise ValueError("suggested_seeds.json must contain a suggested_seeds array")
-        self._raw_report = copy.deepcopy(dict(payload))
-        selected: tuple[Mapping[str, Any], dict[str, Any]] | None = None
-        for item in payload["suggested_seeds"]:
-            if not isinstance(item, Mapping):
-                continue
-            try:
-                _, config = self.build_config_fn(item, target_base="http://web", rest_route_fallback=True)
-            except SeedConfigSkip:
-                try:
-                    _, config = self.build_config_fn(
-                        item,
-                        target_base="http://web",
-                        replay_only=True,
-                        rest_route_fallback=True,
-                    )
-                except SeedConfigSkip:
-                    continue
-            valid, _ = validate_v0_config(config, require_fuzzing_ready=False)
-            if valid:
-                selected = (item, config)
-                break
-        if selected is None:
-            if self.bootstrap_config is None or not filesystem_path(self.bootstrap_config).is_file():
-                return None
-            selected = select_v0(self.suggested_seeds, self.bootstrap_config)
-            if selected is None:
-                return None
-        self._targets = self.list_targets_fn(
-            self._raw_report,
-            plugin_slug=self.plugin_slug,
-            legacy_run_id=f"{self.legacy_run_id}-v0",
-        )
-        item = selected[0]
-        matches = [
-            target for target in self._targets
-            if str(target.get("hook_name") or "") == str(item.get("hook_name") or "")
-            and str(target.get("callback_id") or "") == str(item.get("callback_id") or "")
-            and str(target.get("method") or "").upper() == str(selected[1].get("metadata", {}).get("resolved_method") or "").upper()
-        ]
-        if len(matches) != 1:
-            return None
-        context_key = _candidate_context_key(item, self.plugin_slug)
-        self.state["candidate_context_key"] = context_key
-        if context_key not in self.state["queued_candidate_context_keys"]:
-            self.state["queued_candidate_context_keys"].append(context_key)
-        identity = _candidate_identity(item, self.plugin_slug)
-        if identity not in self.state["queued_candidate_ids"]:
-            self.state["queued_candidate_ids"].append(identity)
-        return selected[0], selected[1], str(matches[0].get("candidate_key") or "")
+        return self._gate_runner.select_v0()
 
     def _new_version(
         self,
