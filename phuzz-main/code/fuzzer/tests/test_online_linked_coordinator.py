@@ -847,7 +847,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual([row["candidate"]["name"] for row in coordinator.state["pending_probe_queue"]], ["cn_nonce"])
 
     def test_non_ajax_child_replay_keeps_plain_handoff(self):
-        with tempfile.TemporaryDirectory() as tmp, patch("online_linked.coordinator._is_ajax", return_value=False):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("online_linked.coordinator._is_ajax", return_value=False), \
+                patch("online_linked.coordination.probe_runner._is_ajax", return_value=False):
             coordinator, log, sends = self._guard_chain_campaign(Path(tmp))
             self.assertEqual([send for send in sends if "-probe-" in send["run_id"]], [])
             self.assert_v1_handoff_without_nonce(coordinator, log, sends)
@@ -3584,6 +3586,56 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 event = coordinator.state["events"][-1]
                 self.assertEqual((event["status"], event["reason"], event["artifact_stage"]),
                                  ("REJECTED", "PROBE_ARTIFACT_CORRELATION_FAILED", stage))
+
+    def test_probe_runner_sees_instance_overrides_made_after_construction(self):
+        """Tests and campaign wiring replace limits and dependencies on a built coordinator;
+        the probe code must read them when it runs, not capture them when it is created."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator, parent, evidence, convergence = self.make_probe_context(
+                Path(tmp), log, names=("a",), accepted=("a",),
+            )
+            coordinator.MAX_PROBE_ATTEMPTS = 0
+
+            outcome = coordinator._run_pending_probe_once(
+                parent=parent, evidence=evidence, raw_report=coordinator._reports["v0"],
+                convergence=convergence, probe=convergence["pending_probes"][0],
+                seed=parent["seed_item"], deadline=None,
+            )
+
+            self.assertIsNone(outcome)
+            self.assertEqual(coordinator.state["events"][-1]["reason"], "PROBE_BUDGET_EXHAUSTED")
+            self.assertNotIn("probe:a", log)
+
+    def test_finish_probe_pending_timing_and_order(self):
+        """Fake clocks advance on every call, so the number and order of clock() reads is part
+        of the recorded timing; the event must be written before the checkpoint that saves it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator, parent, evidence, _ = self.make_probe_context(Path(tmp), log, names=("a",))
+            ticks = iter([10.0, 11.0, 12.0, 13.0])
+            clock_calls: list[float] = []
+
+            def clock():
+                clock_calls.append(next(ticks))
+                return clock_calls[-1]
+
+            calls: list[str] = []
+            coordinator.clock = clock
+            coordinator._record_event = lambda event, checkpoint=True: calls.append("record_event") or dict(event)
+            coordinator._write_state = lambda: calls.append("write_state")
+            attempt = {"_verify_started_at": 3, "_started_at": 1, "probe_id": "p1", "candidate": {"name": "a"}}
+
+            outcome = coordinator._probes._finish_probe_pending(
+                parent, evidence, attempt, {"request_id": "probe-a"}, {"status": "CONTINUE"}, {"name": "a"},
+            )
+
+            self.assertEqual(outcome["status"], "pending")
+            self.assertEqual(attempt["timing"], {"verify": 7.0, "total": 11.0})
+            self.assertEqual(len(clock_calls), 4)
+            self.assertEqual(calls, ["record_event", "write_state"])
+            self.assertNotIn("_verify_started_at", attempt)
+            self.assertNotIn("_started_at", attempt)
 
     def test_probe_dedupe_retries_changed_inputs_not_request_ids_or_key_order(self):
         with tempfile.TemporaryDirectory() as tmp:
