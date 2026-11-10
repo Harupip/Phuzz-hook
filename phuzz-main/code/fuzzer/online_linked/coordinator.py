@@ -43,6 +43,13 @@ from online_linked.coordination.candidate_identity import (
 from online_linked.coordination.checkpoint import validate_resume_checkpoint
 from online_linked.coordination.errors import OnlineLinkedError, ReplayArtifactError
 from online_linked.coordination.evidence_runner import EvidenceRunner
+from online_linked.coordination.gate_replay import (
+    gate_replay_name,
+    gate_replay_row,
+    guard_replay_summary,
+    load_gate_evidence,
+    unsent_guard_probes,
+)
 from online_linked.coordination.replay_artifacts import save_replay_artifacts
 from online_linked.coordination.pending_candidates import failed_batch_parameters
 from online_linked.coordination.probe_runner import ProbeRunner
@@ -53,6 +60,7 @@ from online_linked.coordination.probe_results import (
 )
 from online_linked.coordination.replay_request import restore_request_values
 from online_linked.coordination.runtime_discovery import merge_registry_callback
+from online_linked.coordination.version_record import new_version_record
 from online_linked.coordination.request_matching import (
     _is_ajax,
     _parameter_key,
@@ -77,7 +85,7 @@ from online_linked.coordination.worker import (
     worker_exit_code,
     worker_start_command,
 )
-from online_linked.evidence import correlate_runtime_pair, read_runtime_batch
+from online_linked.evidence import read_runtime_batch
 from core.online_handoff import DEFAULT_PRIORITY_ENERGY_MODE, priority_energy_mode as _priority_energy_mode
 from online_linked.export import (
     PARAMETER_REPLAY_POLICY, config_fields as _config_fields, config_fuzzable_fields as _config_fuzzable_fields,
@@ -528,10 +536,9 @@ class OnlineLinkedCoordinator:
             return False
         replay = copy.deepcopy(dict(config))
         self.force_replay_only_fn(replay)
-        reactivation = self.resume or bool(version.get("readiness_history"))
-        gate_name = "v0" if not reactivation else f"resume-{self.state.get('resume_count', 0)}-{version['version']}"
-        if reactivation:
-            gate_name += f"-activation-{len(version.get('readiness_history', []))}"
+        gate_name, reactivation = gate_replay_name(
+            version, resume=self.resume, resume_count=self.state.get("resume_count", 0),
+        )
         path = self._write_config(gate_name, replay, replay=True)
         # A child's handoff replay is the proof the exporter rechecks: store reactivations apart.
         child_proof = version.get("replay_result") if str(version.get("version")) != "v0" else None
@@ -540,13 +547,7 @@ class OnlineLinkedCoordinator:
             version["replay_config_path"] = str(path)
             version["replay_config_hash"] = config_hash(replay)
         parameter_policy = bool(child_proof) and child_proof.get("verification_policy") == PARAMETER_REPLAY_POLICY
-        seed = version["seed_item"].get("seed", {})
-        row = {
-            "config_slug": path.relative_to(self.config_root).with_suffix("").as_posix(),
-            "hook_name": version["hook_name"], "callback_id": version["callback_id"],
-            "resolved_method": version["resolved_method"], "entrypoint_type": version["entrypoint_type"],
-            "seed_variant_id": str(seed.get("seed_variant_id") or ""),
-        }
+        row = gate_replay_row(version, path, config_root=self.config_root)
         reason = "V0_CALLBACK_NOT_REACHED"
         readiness: dict[str, Any] = {
             "passed": False, "verification_policy": "callback_baseline_v1",
@@ -598,8 +599,9 @@ class OnlineLinkedCoordinator:
                 raise OnlineLinkedError(reason)
             if version["config_type"] != "fuzzing_ready":
                 readiness["probe_only"] = True
-            gate_evidence = self._load_gate_evidence(
+            gate_evidence = load_gate_evidence(
                 version, result_row, request_dir, zend_dir, observation,
+                plugin_slug=self.plugin_slug,
             )
             if gate_evidence is None or not self._baseline_identity_complete(
                 gate_evidence["request"], gate_evidence["zend"], version,
@@ -644,49 +646,6 @@ class OnlineLinkedCoordinator:
             readiness.update(reason=str(exc), passed=False)
             self.state.update(terminal_status="NOT_VERIFIED", terminal_reason=str(exc) if isinstance(exc, OnlineLinkedError) else reason)
             return False
-
-    def _load_gate_evidence(
-        self,
-        version: Mapping[str, Any],
-        result_row: Mapping[str, Any],
-        request_dir: Path,
-        zend_dir: Path,
-        convergence: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        request_name = str(result_row.get("matched_artifact") or "")
-        if Path(request_name).name != request_name or Path(request_name).suffix != ".json":
-            return None
-        request_path = request_dir / request_name
-        if not filesystem_path(request_path).is_file():
-            return None
-        zend_name = str(result_row.get("zend_artifact") or "")
-        if Path(zend_name).name != zend_name or Path(zend_name).stem != Path(request_name).stem:
-            zend_paths = [path for path in filesystem_path(zend_dir).glob("*.json") if path.stem == Path(request_name).stem]
-            if len(zend_paths) != 1:
-                return None
-            zend_name = zend_paths[0].name
-        zend_path = zend_dir / zend_name
-        if not filesystem_path(zend_path).is_file():
-            return None
-        request = json.loads(filesystem_path(request_path).read_text(encoding="utf-8-sig"))
-        zend = json.loads(filesystem_path(zend_path).read_text(encoding="utf-8-sig"))
-        evidence = correlate_runtime_pair(
-            version,
-            {
-                "request_name": request_name,
-                "request": request,
-                "zend_name": zend_name,
-                "zend": zend,
-            },
-            plugin_slug=self.plugin_slug,
-        )
-        if evidence is None:
-            return None
-        convergence_request_id = str(convergence.get("request_id") or "").strip()
-        if convergence_request_id and convergence_request_id != evidence["request_id"]:
-            return None
-        evidence["evidence_origin"] = "v0_gate"
-        return evidence
 
     def read_new_runtime_evidence(self, *, deadline: float | None = None) -> list[dict[str, Any]]:
         return self._evidence_runner.read_new_runtime_evidence(deadline=deadline)
@@ -1298,8 +1257,9 @@ class OnlineLinkedCoordinator:
         baseline_version = {**child, "worker_run_id": replay_run_id}
         baseline = None
         try:
-            baseline = self._load_gate_evidence(
+            baseline = load_gate_evidence(
                 baseline_version, replay_row, request_dir, zend_dir, {},
+                plugin_slug=self.plugin_slug,
             )
             if baseline is not None and not self._baseline_identity_complete(
                 baseline["request"], baseline["zend"], baseline_version,
@@ -1498,17 +1458,9 @@ class OnlineLinkedCoordinator:
             try:
                 result = self.converge_fn(
                     raw_report=raw_report,
-                    pass_run_summary={"legacy_run_id": replay_run_id, "runs": [{
-                        "config_slug": Path(str(current["replay_config_path"])).relative_to(self.config_root)
-                        .with_suffix("").as_posix(),
-                        "hook_name": current["hook_name"],
-                        "callback_id": current["callback_id"],
-                        "seed_variant_id": str(current.get("seed_variant_id") or ""),
-                        "callback_reached": True,
-                        "matched_artifact": str(evidence["request_name"]),
-                        "resolved_method": current["resolved_method"],
-                        "process_status": "replaying",
-                    }]},
+                    pass_run_summary=guard_replay_summary(
+                        current, evidence, config_root=self.config_root, replay_run_id=replay_run_id,
+                    ),
                     pass_artifacts_dir=replay_dir / "request",
                     zend_events_dir=replay_dir / "zend",
                     registry=self.registry,
@@ -1526,16 +1478,7 @@ class OnlineLinkedCoordinator:
                     "request_id": evidence.get("request_id"), "detail": str(exc),
                 })
                 break
-            unsent = {
-                (str(row.get("source") or "").upper(), str(row.get("name") or ""))
-                for row in (result.get("observed_parameters") or [])
-                if isinstance(row, Mapping) and row.get("candidate_reason") == "unsent_guard"
-            }
-            probes = [
-                dict(row) for row in (result.get("pending_probes") or [])
-                if isinstance(row, Mapping)
-                and (str(row.get("source") or "").upper(), str(row.get("name") or "")) in unsent
-            ]
+            probes = unsent_guard_probes(result)
             if not probes:
                 break
             self._record_event({
@@ -1683,32 +1626,10 @@ class OnlineLinkedCoordinator:
         *,
         config_generation_seconds: float | None = None,
     ) -> dict[str, Any]:
-        metadata = config.get("metadata") if isinstance(config.get("metadata"), Mapping) else {}
-        record = {
-            "version": name,
-            "parent_version": parent.get("version") if isinstance(parent, Mapping) else None,
-            "parent_config": parent.get("config_path") if isinstance(parent, Mapping) else None,
-            "config_path": str(config_path),
-            "config_type": str(config.get("config_type") or "").strip().lower(),
-            "config_hash": config_hash(config),
-            "discovery_event": discovery_event,
-            "replay_result": None,
-            "replay_config_path": None,
-            "worker_status": "pending",
-            "status": "pending",
-            "terminal_reason": "",
-            "hook_name": str(metadata.get("hook_name") or seed_item.get("hook_name") or ""),
-            "callback_id": str(metadata.get("callback_id") or seed_item.get("callback_id") or ""),
-            "canonical_callback": str(metadata.get("callback_repr") or seed_item.get("callback_repr") or ""),
-            "plugin_slug": self.plugin_slug,
-            "entrypoint_type": str(config.get("entrypoint_type") or ""),
-            "resolved_method": str(metadata.get("resolved_method") or ""),
-            "auth_context": str(metadata.get("auth_context") or "authenticated"),
-            "seed_variant_id": str(metadata.get("seed_variant_id") or (seed_item.get("seed") or {}).get("seed_variant_id") or ""),
-            "seed_item": copy.deepcopy(dict(seed_item)),
-        }
-        if config_generation_seconds is not None:
-            record["config_generation_seconds"] = max(0.0, float(config_generation_seconds))
+        record = new_version_record(
+            name, config, config_path, parent, discovery_event, seed_item,
+            plugin_slug=self.plugin_slug, config_generation_seconds=config_generation_seconds,
+        )
         self.state["versions"].append(record)
         self._write_state()
         return record

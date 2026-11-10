@@ -6809,6 +6809,232 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             for path in root.rglob("*.json"):
                 self.assertLess(len(str(path.resolve())), 260, path)
 
+    def _gate_ready_v0(self, tmp) -> tuple[OnlineLinkedCoordinator, dict[str, Any], dict[str, Any]]:
+        """Prepare v0 exactly as run() does before its first _gate_v0 call."""
+        coordinator = self.make_coordinator(Path(tmp), [])
+        item, config, target_key = coordinator._select_v0()
+        path = coordinator._write_config("v0", config)
+        version = coordinator._new_version("v0", config, path, None, None, item)
+        version["worker_run_id"] = f"{coordinator.legacy_run_id}-v0"
+        version["known_parameters"] = []
+        coordinator._reports["v0"] = copy.deepcopy(coordinator._raw_report or {})
+        coordinator._target_key = target_key
+        return coordinator, version, config
+
+    def test_gate_v0_budget_check_runs_after_gate_evidence_is_stored(self):
+        """The gate's last budget check sits after the evidence is stored and before the baseline.
+
+        A gate that runs out of budget there keeps its correlated evidence, unconsumed, but
+        never records a baseline. The clock moves inside _baseline_identity_complete, so this
+        also pins that the gate calls that check on the coordinator.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, version, config = self._gate_ready_v0(tmp)
+            deadline = coordinator.clock() + 100
+            original = coordinator._baseline_identity_complete
+
+            def verify_then_expire(request, zend, parent):
+                result = original(request, zend, parent)
+                coordinator.sleeper(deadline - coordinator.clock())
+                return result
+
+            coordinator._baseline_identity_complete = verify_then_expire
+            self.assertFalse(coordinator._gate_v0(version, config, deadline=deadline))
+            self.assertEqual(coordinator.state["terminal_reason"], "BUDGET_EXPIRED")
+            self.assertIsNotNone(coordinator._gate_evidence)
+            self.assertIs(version["gate_evidence"]["consumed"], False)
+            self.assertNotIn("baseline_evidence", version["readiness"])
+
+    def test_gate_v0_failure_reason_tracks_stage(self):
+        """A plain error is reported with the stage the gate had reached when it failed.
+
+        ``reason`` advances inside the gate's try block (callback, then provenance) and the
+        except clause reports it for errors that are not OnlineLinkedError. Splitting the try
+        body into several functions must not lose that value.
+        """
+        def boom(*args, **kwargs):
+            raise ValueError("boom")
+
+        cases = (
+            ("replay", "replay_runner", boom, "V0_CALLBACK_NOT_REACHED"),
+            ("converge", "converge_fn", boom, "V0_PROVENANCE_NOT_VERIFIED"),
+            ("blocked", "converge_fn", lambda **kwargs: {"runtime_block_reason": "BLOCKED_X"}, "BLOCKED_X"),
+        )
+        for stage, attribute, replacement, expected in cases:
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
+                coordinator, version, config = self._gate_ready_v0(tmp)
+                setattr(coordinator, attribute, replacement)
+                self.assertFalse(coordinator._gate_v0(version, config, deadline=coordinator.clock() + 100))
+                self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
+                self.assertEqual(coordinator.state["terminal_reason"], expected)
+                if stage == "replay":
+                    self.assertEqual(version["readiness"]["reason"], "boom")
+                if stage == "blocked":
+                    rejected = [event for event in coordinator.state["events"]
+                                if event.get("kind") == "V0_READINESS" and event.get("status") == "REJECTED"]
+                    self.assertEqual([event["reason"] for event in rejected], ["BLOCKED_X"])
+
+    def test_gate_v0_row_error_after_replay_config_is_recorded(self):
+        """The gate records replay_config_* before it builds the row, and readiness only after.
+
+        A config outside config_root fails while the row is built: the replay config is already
+        on the version, but the version must not claim a readiness record.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, version, config = self._gate_ready_v0(tmp)
+            # config_dir was derived from the old root, so relative_to() fails on the replay path.
+            coordinator.config_root = Path(tmp) / "elsewhere"
+            with self.assertRaises(ValueError) as raised:
+                coordinator._gate_v0(version, config, deadline=coordinator.clock() + 100)
+            self.assertIn("elsewhere", str(raised.exception))
+            self.assertTrue(Path(version["replay_config_path"]).is_file())
+            self.assertNotIn("readiness", version)
+
+    def _guard_round(self, tmp, *, running_parent=None, child_parameters=(), child_fields=None):
+        """One replay-guard round: v0 is current, its replay reports one unsent guard.
+
+        Returns (coordinator, v0, discover). discover(probe=...) calls _discover_replay_guards
+        with _run_pending_probe patched to ``probe``; the default builds v1 with
+        ``child_parameters`` and ``child_fields`` and a passing replay. ``running_parent`` is
+        a set of overrides on a copy of v0, the version whose worker is running.
+        """
+        coordinator, v0, config = self._gate_ready_v0(tmp)
+        v0["replay_config_path"] = str(coordinator._write_config("v0", config, replay=True))
+        coordinator._active_container = "c1"
+        evidence = {"worker_run_id": v0["worker_run_id"], "request_name": "req-v0.json", "request_id": "req-v0"}
+        guard = {"name": "g", "source": "POST", "location": "form"}
+        coordinator.converge_fn = lambda **kwargs: {
+            "status": "CONVERGED",
+            "observed_parameters": [{**guard, "candidate_reason": "unsent_guard"}],
+            "pending_probes": [dict(guard)],
+        }
+        running = None if running_parent is None else {**copy.deepcopy(v0), **running_parent}
+
+        def make_child(**kwargs):
+            child = coordinator._new_version(
+                "v1", config, Path(v0["config_path"]), v0, "REPLAY_GUARD_DISCOVERY", v0["seed_item"],
+            )
+            child["known_parameters"] = [dict(parameter) for parameter in child_parameters]
+            child["replay_result"] = {"passed": True, "runner": {"runs": [{
+                "request_payload": {"request_id": "req-v1", "http_method": "POST",
+                                    "request_params": {"body_params": {"action": "fixture", "seed": "base"}}},
+                "zend_payload": {"request_id": "req-v1", "events": []},
+            }]}}
+            child.update(child_fields or {})
+            coordinator._replay_evidence["v1"] = {
+                "version": "v1", "worker_run_id": "run-v1-replay",
+                "request_name": "req-v1.json", "request_id": "req-v1",
+            }
+            return child
+
+        def discover(probe=make_child):
+            with patch.object(coordinator, "_run_pending_probe", side_effect=probe):
+                return coordinator._discover_replay_guards(v0, evidence, deadline=None, running_parent=running)
+
+        return coordinator, v0, discover
+
+    def test_guard_round_skips_covered_queue_rows_one_checkpoint_at_a_time(self):
+        """Each skipped queue row is its own checkpoint, and it saves the remaining rows in order.
+
+        A resume after any of these checkpoints reads this queue. Comparing only lengths would
+        miss a reversed walk: the first checkpoint would then keep ["a", "d"], not ["b", "d"].
+        """
+        def parameter(name):
+            return {"name": name, "source": "POST", "location": "form", "request_id": "req-v0"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, v0, discover = self._guard_round(tmp, child_parameters=[parameter("a"), parameter("b")])
+            coordinator.state["pending_probe_queue"] = [
+                {"parent_version": "v0", "candidate": parameter(name)} for name in ("a", "b", "d")
+            ]
+            original = coordinator._write_state
+            snapshots = []
+
+            def snap():
+                # _record_event appends before it checkpoints: events[-1] caused this write.
+                event = coordinator.state["events"][-1]
+                snapshots.append((event["kind"], event["status"], (event.get("candidate") or {}).get("name"),
+                                  [row["candidate"]["name"] for row in coordinator.state["pending_probe_queue"]]))
+                original()
+
+            with patch.object(coordinator, "_write_state", side_effect=snap):
+                target = discover()
+            self.assertEqual([shot for shot in snapshots if shot[0] in {"PARAMETER_PROBE", "CHILD_REPLAY"}], [
+                ("PARAMETER_PROBE", "SKIPPED", "a", ["b", "d"]),
+                ("PARAMETER_PROBE", "SKIPPED", "b", ["d"]),
+                ("CHILD_REPLAY", "PASS", None, ["d"]),
+            ])
+            self.assertEqual([row["candidate"]["name"] for row in coordinator.state["pending_probe_queue"]], ["d"])
+            self.assertEqual(target["version"], "v1")
+            self.assertEqual(v0["worker_status"], "not_started_superseded")
+
+    def test_guard_round_resets_discovery_flag_when_probe_raises(self):
+        """A failing guard probe still clears the discovery flag (the finally clause).
+
+        The probe sees the flag set, so this also pins that the guard round calls
+        _run_pending_probe on the coordinator, where the patch applies.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, v0, discover = self._guard_round(tmp)
+
+            def failing_probe(**kwargs):
+                self.assertIs(coordinator._replay_discovery_active, True)
+                raise RuntimeError("boom")
+
+            with self.assertRaises(RuntimeError):
+                discover(failing_probe)
+            self.assertIs(coordinator._replay_discovery_active, False)
+            kinds = [(event.get("kind"), event.get("status")) for event in coordinator.state["events"]]
+            self.assertIn(("REPLAY_GUARD_DISCOVERY", "PENDING"), kinds)
+            self.assertNotIn("CHILD_REPLAY", [kind for kind, _ in kinds])
+
+    def test_guard_round_keeps_ancestor_when_descendant_misses_batch_field(self):
+        """A worker-poll descendant whose own replay does not prove a new field is rejected.
+
+        The running parent lacks ``n``; v1 adds it but its replay never sends it, so the verified
+        ancestor stays the handoff target. This is the only test through the descendant batch
+        check, so it fails if a refactor reaches that check through a host that lacks it.
+        """
+        new_field = {"name": "n", "source": "POST", "location": "form", "request_id": "req-v1"}
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, v0, discover = self._guard_round(
+                tmp, running_parent={"known_parameters": []}, child_parameters=[new_field],
+                child_fields={"evidence_origin": "worker_poll"},
+            )
+            worker_status = v0["worker_status"]
+            target = discover()
+            self.assertIs(target, v0)
+            child = coordinator._version("v1")
+            self.assertIs(child["replay_result"]["passed"], False)
+            self.assertEqual(child["terminal_reason"], "PARAMETER_REPLAY_NOT_VERIFIED")
+            self.assertTrue(any(
+                event.get("kind") == "CHILD_REPLAY" and event.get("status") == "REJECTED"
+                for event in coordinator.state["events"]
+            ))
+            self.assertEqual(v0["worker_status"], worker_status)
+
+    def test_select_v0_keeps_raw_report_when_builder_raises(self):
+        """_select_v0 stores the raw report before building, and targets and state only after.
+
+        A builder error leaves the report it read in place, with no targets listed and no
+        candidate queued in the state.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self.make_coordinator(Path(tmp), [])
+            payload = json.loads(Path(coordinator.suggested_seeds).read_text(encoding="utf-8"))
+            queued = {key: copy.deepcopy(coordinator.state[key])
+                      for key in ("queued_candidate_ids", "queued_candidate_context_keys")}
+
+            def failing_builder(*args, **kwargs):
+                raise RuntimeError("boom")
+
+            coordinator.build_config_fn = failing_builder
+            with self.assertRaises(RuntimeError):
+                coordinator._select_v0()
+            self.assertEqual(coordinator._raw_report, payload)
+            self.assertEqual(coordinator._targets, [])
+            self.assertEqual({key: coordinator.state[key] for key in queued}, queued)
+
 
 if __name__ == "__main__":
     unittest.main()
