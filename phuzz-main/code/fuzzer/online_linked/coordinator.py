@@ -42,13 +42,9 @@ from online_linked.coordination.candidate_identity import (
 )
 from online_linked.coordination.checkpoint import validate_resume_checkpoint
 from online_linked.coordination.errors import OnlineLinkedError, ReplayArtifactError
+from online_linked.coordination.evidence_runner import EvidenceRunner
 from online_linked.coordination.replay_artifacts import save_replay_artifacts
-from online_linked.coordination.pending_candidates import (
-    append_pending_rows,
-    failed_batch_parameters,
-    fresh_runtime_candidates,
-    without_discarded,
-)
+from online_linked.coordination.pending_candidates import failed_batch_parameters
 from online_linked.coordination.probe_runner import ProbeRunner
 from online_linked.coordination.probe_results import (
     ajax_branch_continuation,
@@ -56,18 +52,13 @@ from online_linked.coordination.probe_results import (
     sender_runner_row,
 )
 from online_linked.coordination.replay_request import restore_request_values
-from online_linked.coordination.runtime_discovery import (
-    foreign_callback,
-    merge_registry_callback,
-    registered_child_callback,
-)
+from online_linked.coordination.runtime_discovery import merge_registry_callback
 from online_linked.coordination.request_matching import (
     _is_ajax,
     _parameter_key,
     _replace_fuzzable_values_with_placeholder,
     _request_id,
     _request_payload_hash,
-    _runtime_candidate_key,
     _safe_parameter_identity,
     admission_complete,
     baseline_evidence,
@@ -86,7 +77,7 @@ from online_linked.coordination.worker import (
     worker_exit_code,
     worker_start_command,
 )
-from online_linked.evidence import RuntimeBatchTimeout, correlate_runtime_pair, read_runtime_batch
+from online_linked.evidence import correlate_runtime_pair, read_runtime_batch
 from core.online_handoff import DEFAULT_PRIORITY_ENERGY_MODE, priority_energy_mode as _priority_energy_mode
 from online_linked.export import (
     PARAMETER_REPLAY_POLICY, config_fields as _config_fields, config_fuzzable_fields as _config_fuzzable_fields,
@@ -103,8 +94,6 @@ from seed_generation.config.config_exporter import (
     export_seed_configs,
 )
 from seed_generation.convergence.convergence import materialize_convergence_seeds
-from discovery.entrypoints.entrypoints import seed_template_for_callback
-from discovery.entrypoints.method_resolution import resolve_http_methods
 from zend_discovery.engine import (
     candidate_from_seed_item, canonical_identity_id, resolve_request_transport,
 )
@@ -415,6 +404,11 @@ class OnlineLinkedCoordinator:
         # replace dependencies on the instance after construction.
         return ProbeRunner(self)
 
+    @property
+    def _evidence_runner(self) -> EvidenceRunner:
+        # Built per use, like _probes.
+        return EvidenceRunner(self)
+
     def _drain_pending_probes(self) -> None:
         self._probes.drain_pending_probes()
 
@@ -695,293 +689,20 @@ class OnlineLinkedCoordinator:
         return evidence
 
     def read_new_runtime_evidence(self, *, deadline: float | None = None) -> list[dict[str, Any]]:
-        """Read one bounded batch, then apply host-side evidence admission."""
-
-        version = self._version(self._active_version)
-        if version is None:
-            return []
-        remaining = self.max_seconds if deadline is None else deadline - self.clock()
-        if remaining <= 0:
-            self._reject_runtime_batch(version, "BUDGET_EXPIRED")
-            return []
-        started_at = self.clock()
-        try:
-            batch = self.runtime_batch_reader(
-                run_id=str(version.get("worker_run_id") or ""),
-                plugin_slug=self.plugin_slug,
-                timeout=remaining,
-                run_command=self.run_command,
-            )
-        except Exception as exc:
-            reason = "BUDGET_EXPIRED" if (
-                isinstance(exc, RuntimeBatchTimeout)
-                and deadline is not None and self.clock() >= deadline
-            ) else "RUNTIME_BATCH_READ_FAILED"
-            self._reject_runtime_batch(version, reason, detail=str(exc))
-            return []
-        if deadline is not None and self.clock() >= deadline:
-            self._reject_runtime_batch(version, "BUDGET_EXPIRED")
-            return []
-        if not isinstance(batch, Mapping) or not isinstance(batch.get("pairs"), list):
-            self._reject_runtime_batch(version, "RUNTIME_BATCH_INVALID_OUTPUT")
-            return []
-
-        stats = dict(batch.get("stats") or {}) if isinstance(batch.get("stats"), Mapping) else {}
-        stats["paired_count"] = len(batch["pairs"])
-        stats["transport_duration_seconds"] = round(max(0.0, self.clock() - started_at), 3)
-        stats["version"] = str(version["version"])
-        stats["worker_run_id"] = str(version.get("worker_run_id") or "")
-        stats["remaining_budget"] = max(0.0, remaining)
-        stats["last_attempt_complete"] = True
-        self.state["evidence_scan"] = stats
-        if int(stats.get("missing_zend") or 0) > 0:
-            self._record_event({
-                "kind": "EVIDENCE_SCAN", "status": "RETRY",
-                "reason": "ZEND_ARTIFACT_MISSING",
-                "version": version["version"],
-                "worker_run_id": version.get("worker_run_id"),
-                "missing_zend": int(stats["missing_zend"]),
-            })
-        if int(stats.get("invalid_payloads") or 0) > 0:
-            self._record_event({
-                "kind": "EVIDENCE_SCAN", "status": "REJECTED",
-                "reason": "RUNTIME_BATCH_INVALID_PAYLOAD",
-                "version": version["version"],
-                "worker_run_id": version.get("worker_run_id"),
-                "invalid_payloads": int(stats["invalid_payloads"]),
-            })
-
-        evidence: list[dict[str, Any]] = []
-        for pair in batch["pairs"]:
-            if deadline is not None and self.clock() >= deadline:
-                self._reject_runtime_batch(version, "BUDGET_EXPIRED")
-                return []
-            if not isinstance(pair, Mapping):
-                stats["invalid_payloads"] = int(stats.get("invalid_payloads") or 0) + 1
-                stats["last_reason"] = "HOST_CORRELATION_REJECTED"
-                continue
-            runtime_evidence = correlate_runtime_pair(version, pair, plugin_slug=self.plugin_slug)
-            if runtime_evidence is None:
-                continue
-            runtime_evidence["evidence_origin"] = "worker_poll"
-            request_name = runtime_evidence["request_name"]
-            request_payload = runtime_evidence["request"]
-            request_id = runtime_evidence["request_id"]
-            pair_key = (str(version["version"]), request_id)
-            if pair_key in self._seen_pairs:
-                continue
-            if deadline is not None and self.clock() >= deadline:
-                self._reject_runtime_batch(version, "BUDGET_EXPIRED")
-                return []
-            discovered = self._discover_runtime_candidates(runtime_evidence, deadline=deadline)
-            foreign = foreign_callback(request_payload, version)
-            if foreign is not None:
-                explicit_callback, explicit_hook = foreign
-                if any(
-                    candidate.get("callback_id") == explicit_callback
-                    or candidate.get("hook_name") == explicit_hook
-                    for candidate in discovered
-                ):
-                    self._seen_pairs.add(pair_key)
-                    continue
-                self._record_event({
-                    "kind": "ACTION_DISCOVERY",
-                    "status": "REJECTED",
-                    "reason": "ACTION_EXPANSION_NOT_IMPLEMENTED",
-                    "version": version["version"],
-                    "worker_run_id": version["worker_run_id"],
-                    "request_id": request_id,
-                    "callback_id": explicit_callback,
-                    "hook_name": explicit_hook,
-                })
-                self._seen_pairs.add(pair_key)
-                continue
-            self._seen_pairs.add(pair_key)
-            evidence.append(runtime_evidence)
-        self._write_state()
-        return evidence
+        return self._evidence_runner.read_new_runtime_evidence(deadline=deadline)
 
     def _reject_runtime_batch(
         self, version: Mapping[str, Any], reason: str, *, detail: str = "",
     ) -> None:
-        budget_expired = reason == "BUDGET_EXPIRED"
-        # Budget exhaustion stops observation, but does not revoke verified evidence.
-        if budget_expired and self.state["terminal_status"] is not None:
-            return
-        version_record = self._version(str(version.get("version") or ""))
-        if version_record is not None:
-            if not budget_expired:
-                version_record["status"] = "not_verified"
-            version_record["terminal_reason"] = reason
-        if not budget_expired:
-            self._failure = True
-        self.state["terminal_status"] = "BOUNDED_ONLINE_COMPLETE" if budget_expired else "NOT_VERIFIED"
-        self.state["terminal_reason"] = reason
-        self.state["evidence_scan"].update(last_attempt_complete=False, last_reason=reason)
-        self._record_event({
-            "kind": "EVIDENCE_SCAN", "status": "REJECTED", "reason": reason,
-            "version": version.get("version"),
-            "worker_run_id": version.get("worker_run_id"),
-            **({"detail": detail} if detail else {}),
-        })
+        self._evidence_runner.reject_runtime_batch(version, reason, detail=detail)
 
     def _consume_gate_evidence(self, version: Mapping[str, Any], *, deadline: float) -> None:
-        if self._gate_evidence_consumed or self._gate_evidence is None or self._gate_convergence is None:
-            return
-        if not self._active_container:
-            return
-        remaining = deadline - self.clock()
-        if remaining <= 0:
-            self._reject_runtime_batch(version, "BUDGET_EXPIRED")
-            return
-        try:
-            parent_exit_code = self._observe_parent_exit(timeout=remaining)
-        except (ParentInspectionTimeout, ParentInspectionError) as exc:
-            reason = "PARENT_CHECK_TIMEOUT" if isinstance(exc, ParentInspectionTimeout) else "PARENT_CHECK_ERROR"
-            self._reject_runtime_batch(version, reason, detail=str(exc))
-            return
-        if parent_exit_code is not None:
-            return
-        if self.clock() >= deadline:
-            self._reject_runtime_batch(version, "BUDGET_EXPIRED")
-            return
-        parent = self._version(str(version["version"]))
-        if parent is None:
-            return
-        raw_report = self._reports.get(str(parent["version"]))
-        if raw_report is None:
-            self._reject_runtime_batch(version, "V0_PROVENANCE_NOT_VERIFIED")
-            return
-        self._gate_evidence["evidence_origin"] = "v0_gate"
-        self._discover_runtime_candidates(self._gate_evidence, deadline=deadline)
-        deadline = self._deadline or deadline
-        if self.clock() < deadline:
-            self._handle_convergence_result(
-                parent=parent,
-                evidence=self._gate_evidence,
-                raw_report=raw_report,
-                result=self._gate_convergence,
-                seed=parent["seed_item"],
-                deadline=deadline,
-            )
-        self._gate_evidence_consumed = True
-        gate_meta = parent.get("gate_evidence")
-        if isinstance(gate_meta, dict):
-            gate_meta["consumed"] = True
-        self._seen_pairs.add((str(parent["version"]), str(self._gate_evidence["request_id"])))
-        self._write_state()
+        self._evidence_runner.consume_gate_evidence(version, deadline=deadline)
 
     def _discover_runtime_candidates(
         self, evidence: Mapping[str, Any], *, deadline: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Queue only runtime-registered HTTP callbacks with correlated parent metadata."""
-        parent = self._version(self._active_version)
-        request = evidence.get("request") if isinstance(evidence.get("request"), Mapping) else {}
-        coverage = request.get("hook_coverage") if isinstance(request, Mapping) else {}
-        registered = coverage.get("registered_callbacks") if isinstance(coverage, Mapping) else {}
-        if parent is None or not isinstance(registered, Mapping):
-            return []
-
-        discovered: list[dict[str, Any]] = []
-        parent_callback_id = str(parent.get("callback_id") or "")
-        parent_hook_name = str(parent.get("hook_name") or "")
-        request_id = str(evidence.get("request_id") or "")
-        for fallback_id, raw_callback in registered.items():
-            if deadline is not None and self.clock() >= deadline:
-                break
-            registered_child = registered_child_callback(
-                fallback_id, raw_callback,
-                parent_callback_id=parent_callback_id, parent_hook_name=parent_hook_name,
-                request_id=request_id, plugin_slug=self.plugin_slug,
-            )
-            if registered_child is None:
-                continue
-            callback, callback_id, hook_name = registered_child
-
-            seed_template = seed_template_for_callback(hook_name, callback)
-            if seed_template is None:
-                self._record_event({
-                    "kind": "ACTION_DISCOVERY",
-                    "status": "BLOCKED",
-                    "reason": "ACTION_EXPANSION_SETUP_REQUIRED",
-                    "version": parent["version"],
-                    "worker_run_id": parent["worker_run_id"],
-                    "request_id": request_id,
-                    "callback_id": callback_id,
-                    "hook_name": hook_name,
-                })
-                continue
-
-            decisions = resolve_http_methods(
-                route_declared_methods=callback.get("methods", callback.get("method")),
-                runtime_observation=callback,
-                expected_callback=callback,
-            )
-            for decision in decisions:
-                if decision.get("method_status") != "resolved" or not decision.get("replay_allowed"):
-                    self._record_event({
-                        "kind": "ACTION_DISCOVERY",
-                        "status": "BLOCKED",
-                        "reason": "ACTION_EXPANSION_SETUP_REQUIRED",
-                        "detail": decision.get("block_reason") or "HTTP method is not runtime-resolved",
-                        "version": parent["version"],
-                        "worker_run_id": parent["worker_run_id"],
-                        "request_id": request_id,
-                        "callback_id": callback_id,
-                        "hook_name": hook_name,
-                    })
-                    continue
-                seed = copy.deepcopy(seed_template)
-                seed.update(decision)
-                seed["seed_variant_id"] = str(decision.get("seed_variant_id") or "")
-                entrypoint_type = str(seed.get("entrypoint_type") or callback.get("entrypoint_type") or "")
-                candidate = {
-                    "callback_id": callback_id,
-                    "hook_name": hook_name,
-                    "entrypoint_type": entrypoint_type,
-                    "seed": seed,
-                }
-                identity = _candidate_identity(candidate, self.plugin_slug)
-                context_key = _candidate_context_key(candidate, self.plugin_slug)
-                if context_key in self.state["queued_candidate_context_keys"]:
-                    continue
-                child = {
-                    "hook_name": hook_name,
-                    "callback_id": callback_id,
-                    "callback_repr": str(callback.get("callback_repr") or callback_id),
-                    "seed": seed,
-                    "identity": identity,
-                    "context_key": context_key,
-                    "lineage": {
-                        "parent_version": parent["version"],
-                        "parent_request_id": request_id,
-                        "parent_callback_id": parent_callback_id,
-                        "parent_hook_name": parent_hook_name,
-                    },
-                }
-                self.state["candidate_queue"].append(child)
-                if identity not in self.state["queued_candidate_ids"]:
-                    self.state["queued_candidate_ids"].append(identity)
-                self.state["queued_candidate_context_keys"].append(context_key)
-                discovered.append(child)
-                self._extend_progress_budget("runtime_callback", context_key)
-                deadline = self._deadline if deadline is not None else None
-                self._record_event({
-                    "kind": "ACTION_DISCOVERY",
-                    "status": "ACCEPTED",
-                    "reason": "RUNTIME_REGISTERED_HTTP_CALLBACK",
-                    "version": parent["version"],
-                    "worker_run_id": parent["worker_run_id"],
-                    "request_id": request_id,
-                    "callback_id": callback_id,
-                    "hook_name": hook_name,
-                    "entrypoint_type": entrypoint_type,
-                    "resolved_method": decision["resolved_method"],
-                    "seed_variant_id": seed["seed_variant_id"],
-                    "lineage": child["lineage"],
-                })
-                self._merge_runtime_registry(callback)
-        return discovered
+        return self._evidence_runner.discover_runtime_candidates(evidence, deadline=deadline)
 
     def _merge_runtime_registry(self, callback: Mapping[str, Any]) -> None:
         if not merge_registry_callback(self.registry, callback):
@@ -1080,7 +801,7 @@ class OnlineLinkedCoordinator:
     ) -> dict[str, Any] | None:
         """Admit accepted evidence, or service one pending runtime probe."""
         if result.get("_pending_group_dispatch") is not True:
-            self._reconcile_pending_runtime_candidates(parent, evidence, result)
+            self._evidence_runner.reconcile_pending_runtime_candidates(parent, evidence, result)
         branch_failure = result.get("status") == "REPLAY_FAILED" or bool(result.get("missing_parameters"))
         if branch_failure and not result.get("runtime_block_reason") and _is_ajax(parent):
             result = ajax_branch_continuation(result, parent)
@@ -1387,86 +1108,10 @@ class OnlineLinkedCoordinator:
     def _retain_pending_runtime_candidates(
         self, groups: Sequence[Mapping[str, Any]], parent: Mapping[str, Any],
     ) -> None:
-        pending = self.state.setdefault("pending_runtime_candidates", [])
-        if not isinstance(pending, list):
-            pending = []
-            self.state["pending_runtime_candidates"] = pending
-        append_pending_rows(pending, groups, parent)
-        if groups:
-            self._write_state()
+        self._evidence_runner.retain_pending_runtime_candidates(groups, parent)
 
     def _discard_pending_runtime_candidates(self, groups: Sequence[Mapping[str, Any]]) -> None:
-        pending = self.state.get("pending_runtime_candidates")
-        if not isinstance(pending, list):
-            return
-        kept = without_discarded(pending, groups)
-        if kept is None:
-            return
-        self.state["pending_runtime_candidates"] = kept
-        self._write_state()
-
-    def _reconcile_pending_runtime_candidates(
-        self,
-        parent: Mapping[str, Any],
-        evidence: Mapping[str, Any],
-        result: Mapping[str, Any],
-    ) -> None:
-        fresh_candidates = fresh_runtime_candidates(result)
-        if self.resume and not result.get("runtime_block_reason"):
-            fresh_keys = {
-                _runtime_candidate_key(candidate) for candidate in fresh_candidates
-                if self._admission_complete({**dict(candidate), "evidence_kind": "fresh_proposal"}, evidence, parent)
-            }
-            self.state["pending_probe_queue"] = [row for row in self.state.get("pending_probe_queue", [])
-                if _runtime_candidate_key(row["candidate"]) not in fresh_keys]
-        pending = self.state.get("pending_runtime_candidates")
-        if not isinstance(pending, list) or not pending:
-            return
-        current_request_id = str(evidence.get("request_id") or "")
-        current_run_id = str(evidence.get("worker_run_id") or evidence.get("run_id") or "")
-        if not current_request_id and not current_run_id:
-            return
-        remaining = []
-        changed = False
-        for item in pending:
-            if not isinstance(item, Mapping):
-                continue
-            previous_request_id = str(item.get("request_id") or "")
-            previous_run_id = str(item.get("run_id") or "")
-            same_context = (
-                (not current_request_id or current_request_id == previous_request_id)
-                and (not current_run_id or current_run_id == previous_run_id)
-            )
-            if same_context:
-                remaining.append(item)
-                continue
-            key = _runtime_candidate_key(item)
-            matched = next(
-                (candidate for candidate in fresh_candidates
-                 if _runtime_candidate_key(candidate) == key),
-                None,
-            )
-            if self.resume and matched is None:
-                # Saved evidence remains a proposal until observed in this run.
-                remaining.append(item)
-                continue
-            self._record_event({
-                "kind": "PENDING_RUNTIME_CANDIDATE",
-                "status": "REQUEUED" if matched is not None else "RETIRED",
-                "reason": "FRESH_CHILD_CONTEXT" if matched is not None else "NOT_REOBSERVED_ON_CHILD",
-                "version": parent.get("version"),
-                "parameter": key[0],
-                "source": key[1],
-                "location": key[2],
-                "previous_request_id": previous_request_id,
-                "previous_run_id": previous_run_id,
-                "request_id": current_request_id,
-                "run_id": current_run_id,
-            })
-            changed = True
-        if changed:
-            self.state["pending_runtime_candidates"] = remaining
-            self._write_state()
+        self._evidence_runner.discard_pending_runtime_candidates(groups)
 
     @staticmethod
     def _config_request_key(config: Mapping[str, Any]) -> str:

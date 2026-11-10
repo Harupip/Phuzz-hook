@@ -1235,6 +1235,45 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(evidence[0]["evidence_origin"], "worker_poll")
             self.assertEqual(coordinator.state["evidence_scan"]["paired_count"], 1)
 
+    def test_evidence_runner_sees_reader_replaced_after_construction(self):
+        """The evidence read must use the reader on the coordinator at call time; a missing host
+        member would be swallowed by the read's except branch as RUNTIME_BATCH_READ_FAILED."""
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, _, _, _ = self.make_probe_context(Path(tmp), [])
+            coordinator.runtime_batch_reader = lambda **kwargs: {"pairs": [], "stats": {}}
+
+            self.assertEqual(coordinator.read_new_runtime_evidence(deadline=10.0), [])
+
+            self.assertEqual(coordinator.state["evidence_scan"]["paired_count"], 0)
+            self.assertIsNone(coordinator.state["terminal_status"])
+            self.assertNotIn("RUNTIME_BATCH_READ_FAILED", [
+                event.get("reason") for event in coordinator.state["events"]
+            ])
+
+    def test_runtime_poll_discovers_through_coordinator_method(self):
+        """Runtime discovery on the poll path must go through the coordinator method, so a patch
+        on the instance still intercepts it; a runner calling its own method would bypass it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, _, _, _ = self.make_probe_context(Path(tmp), [])
+            coordinator.runtime_batch_reader = lambda **kwargs: {"pairs": [{
+                "request_name": "req-v0.json",
+                "request": {
+                    "request_id": "req-v0", "legacy_run_id": "run-v0", "target_plugin": "fixture",
+                    "http_method": "POST",
+                    "request_params": {"body_params": {"action": "fixture", "seed": "base"}},
+                },
+                "zend_name": "req-v0.json",
+                "zend": {"request_id": "req-v0", "run_id": "run-v0"},
+            }], "stats": {}}
+
+            with patch.object(coordinator, "_discover_runtime_candidates", return_value=[]) as discover:
+                evidence = coordinator.read_new_runtime_evidence(deadline=10.0)
+
+            self.assertEqual([item["request_id"] for item in evidence], ["req-v0"])
+            discover.assert_called_once()
+            self.assertEqual(discover.call_args.args[0]["request_id"], "req-v0")
+            self.assertEqual(discover.call_args.kwargs, {"deadline": 10.0})
+
     def test_runtime_poll_retries_missing_zend_and_dedupes_only_after_admission(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, _, _, _ = self.make_probe_context(Path(tmp), [])
