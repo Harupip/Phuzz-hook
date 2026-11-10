@@ -850,7 +850,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
     def test_non_ajax_child_replay_keeps_plain_handoff(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 patch("online_linked.coordinator._is_ajax", return_value=False), \
-                patch("online_linked.coordination.probe_runner._is_ajax", return_value=False):
+                patch("online_linked.coordination.probe_runner._is_ajax", return_value=False), \
+                patch("online_linked.coordination.worker_runner._is_ajax", return_value=False):
             coordinator, log, sends = self._guard_chain_campaign(Path(tmp))
             self.assertEqual([send for send in sends if "-probe-" in send["run_id"]], [])
             self.assert_v1_handoff_without_nonce(coordinator, log, sends)

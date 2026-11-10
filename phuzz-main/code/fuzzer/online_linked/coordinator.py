@@ -5,11 +5,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import re
 import subprocess
 import sys
 import time
-import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -23,8 +21,6 @@ from hook_energy.seed_generation.generated_config_runner import (
     run_generated_configs,
 )
 from online_linked.probe_sender import (
-    ParentInspectionError,
-    ParentInspectionTimeout,
     run_in_container,
 )
 from hook_energy.seed_generation.online_common import (
@@ -38,23 +34,14 @@ from online_linked.coordination.candidate_identity import (
     _candidate_identity,
 )
 from online_linked.coordination.checkpoint import validate_resume_checkpoint
-from online_linked.coordination.errors import OnlineLinkedError, ReplayArtifactError
+from online_linked.coordination.errors import OnlineLinkedError
 from online_linked.coordination.evidence_runner import EvidenceRunner
-from online_linked.coordination.gate_replay import load_gate_evidence
 from online_linked.coordination.gate_runner import GateRunner
-from online_linked.coordination.handoff_replay import handoff_replay_row, replay_failure_reason
 from online_linked.coordination.replay_artifacts import save_replay_artifacts
 from online_linked.coordination.pending_candidates import failed_batch_parameters
-from online_linked.coordination.priority_descriptor import (
-    missing_verified_fields,
-    priority_descriptor,
-    priority_targets,
-    verified_fields,
-)
 from online_linked.coordination.probe_runner import ProbeRunner
 from online_linked.coordination.probe_results import (
     ajax_branch_continuation,
-    replay_verdict,
     sender_runner_row,
 )
 from online_linked.coordination.replay_request import restore_request_values
@@ -64,7 +51,7 @@ from online_linked.coordination.request_matching import (
     _is_ajax,
     _parameter_key,
     _replace_fuzzable_values_with_placeholder,
-    _request_id,
+    _request_id,  # re-exported for tests
     _request_payload_hash,
     _safe_parameter_identity,
     admission_complete,
@@ -79,18 +66,11 @@ from online_linked.coordination.request_matching import (
 )
 from online_linked.coordination.worker import (
     CommandRunner,
-    handoff_command,
-    matching_pause_ack,
-    remove_container,
-    worker_container_name,
     worker_exit_code,
-    worker_start_command,
 )
+from online_linked.coordination.worker_runner import WorkerRunner
 from online_linked.evidence import read_runtime_batch
 from core.online_handoff import DEFAULT_PRIORITY_ENERGY_MODE, priority_energy_mode as _priority_energy_mode
-from online_linked.export import (
-    PARAMETER_REPLAY_POLICY, config_fields as _config_fields, config_fuzzable_fields as _config_fuzzable_fields,
-)
 from hook_energy.seed_generation.zend_runtime.bridge_cli import (
     converge_iteration,
     list_convergence_targets,
@@ -102,7 +82,7 @@ from seed_generation.config.config_exporter import (
 )
 from seed_generation.convergence.convergence import materialize_convergence_seeds
 from zend_discovery.engine import (
-    candidate_from_seed_item, canonical_identity_id, resolve_request_transport,
+    resolve_request_transport,
 )
 ArtifactLister = Callable[[], set[str]]
 ArtifactLoader = Callable[[str], Any]
@@ -421,42 +401,16 @@ class OnlineLinkedCoordinator:
         # Built per use, like _probes.
         return GateRunner(self)
 
+    @property
+    def _worker_runner(self) -> WorkerRunner:
+        # Built per use, like _probes.
+        return WorkerRunner(self)
+
     def _drain_pending_probes(self) -> None:
         self._probes.drain_pending_probes()
 
     def _handle_worker_exit(self, worker_exit_code: int) -> None:
-        version = self._version(self._active_version)
-        if worker_exit_code == STOP_ON_VULN_EXIT_CODE:
-            self._attach_finding_artifact(version)
-            if version is not None:
-                version["status"] = "vuln_found"
-                version["terminal_reason"] = "VULN_FOUND"
-            self.state["terminal_status"] = "VULN_FOUND"
-            self.state["terminal_reason"] = "VULN_FOUND"
-            self._stop_active_worker("VULN_FOUND")
-        elif worker_exit_code != 0:
-            self._failure = True
-            if version is not None:
-                version["status"] = "worker_failed"
-                version["terminal_reason"] = f"WORKER_EXIT_CODE_{worker_exit_code}"
-            self.state["terminal_status"] = "NOT_VERIFIED"
-            self.state["terminal_reason"] = f"WORKER_EXIT_CODE_{worker_exit_code}"
-            self._stop_active_worker("WORKER_FAILED")
-        else:
-            self._failure = True
-            if version is not None:
-                version["status"] = "worker_exited"
-                version["worker_status"] = "exited"
-                version["terminal_reason"] = "WORKER_EXITED"
-            for worker in reversed(self.state["workers"]):
-                if worker.get("container_name") == self._active_container:
-                    worker["status"] = "exited"
-                    worker["terminal_reason"] = "WORKER_EXITED"
-                    break
-            self.state["terminal_status"] = "NOT_VERIFIED"
-            self.state["terminal_reason"] = "WORKER_EXITED"
-            self._active_container = ""
-        self._write_state()
+        return self._worker_runner.handle_worker_exit(worker_exit_code)
 
     def _attach_finding_artifact(self, version: Mapping[str, Any] | None) -> None:
         if version is None or self.load_finding_artifact is None:
@@ -481,10 +435,7 @@ class OnlineLinkedCoordinator:
                 break
 
     def _observe_parent_exit(self, *, timeout: float | None = None) -> int | None:
-        exit_code = self._worker_exit_code(timeout=timeout)
-        if exit_code is not None:
-            self._handle_worker_exit(exit_code)
-        return exit_code
+        return self._worker_runner.observe_parent_exit(timeout=timeout)
 
     @staticmethod
     def _sender_runner_row(base: Mapping[str, Any], result: Mapping[str, Any], run_id: str) -> dict[str, Any]:
@@ -1037,277 +988,7 @@ class OnlineLinkedCoordinator:
         *,
         deadline: float | None = None,
     ) -> bool:
-        """Replay/verify child in parent, then stop parent and start one worker."""
-
-        if self._observe_parent_exit() is not None:
-            child["worker_status"] = "not_started_parent_exited"
-            child["terminal_reason"] = str(self.state.get("terminal_reason") or "PARENT_WORKER_EXITED")
-            self._write_state()
-            return False
-        version_name = str(child["version"])
-        replay_dir = self.run_dir / "versions" / version_name / "replay"
-        request_dir = replay_dir / "request"
-        zend_dir = replay_dir / "zend"
-        row = handoff_replay_row(child, replay_path, config_root=self.config_root)
-        timeout = deadline - self.clock() if deadline is not None else self.max_seconds
-        if timeout <= 0:
-            child["worker_status"] = "not_started_budget_expired"
-            child["terminal_reason"] = "BUDGET_EXPIRED"
-            self._write_state()
-            return False
-        replay_run_id = f"{self.legacy_run_id}-{version_name}-replay"
-        replay_started_at = self.clock()
-        try:
-            sender_result = self._probes.run_light_sender(
-                config_path=replay_path,
-                request_id=_request_id(replay_run_id),
-                run_id=replay_run_id,
-                hook_name=row["hook_name"],
-                callback_id=row["callback_id"],
-                method=row["resolved_method"],
-                auth_context=str(child.get("auth_context") or "authenticated"),
-                seed_variant_id=str(child.get("seed_variant_id") or ""),
-                deadline=deadline,
-            )
-        except Exception as exc:
-            sender_result = {"status": "sender_error", "error": str(exc)}
-        if sender_result.get("status") == "parent_stopped":
-            exit_code = sender_result.get("parent_exit_code")
-            if isinstance(exit_code, int):
-                self._handle_worker_exit(exit_code)
-            child["worker_status"] = "not_started_parent_exited"
-            child["terminal_reason"] = str(self.state.get("terminal_reason") or "PARENT_WORKER_EXITED")
-            self._write_state()
-            return False
-        if sender_result.get("status") == "parent_container_missing":
-            self._failure = True
-            self._active_container = ""
-            child["worker_status"] = "not_started_parent_missing"
-            child["terminal_reason"] = "PARENT_CONTAINER_MISSING"
-            self.state["terminal_status"] = "NOT_VERIFIED"
-            self.state["terminal_reason"] = "PARENT_CONTAINER_MISSING"
-            self._write_state()
-            return False
-        if sender_result.get("status") in {"parent_check_timeout", "parent_check_error"}:
-            reason = "PARENT_CHECK_TIMEOUT" if sender_result.get("status") == "parent_check_timeout" else "PARENT_CHECK_ERROR"
-            self._failure = True
-            child["worker_status"] = "not_started_parent_check_timeout"
-            child["terminal_reason"] = reason
-            self.state["terminal_status"] = "NOT_VERIFIED"
-            self.state["terminal_reason"] = reason
-            self._write_state()
-            return False
-        parent_timeout = None if deadline is None else deadline - self.clock()
-        deadline_expired = parent_timeout is not None and parent_timeout <= 0
-        # Budget exhaustion is not evidence that the HTTP callback failed.
-        # Keep any received request/Zend artifacts, but do not admit a late gate.
-        if not deadline_expired:
-            try:
-                parent_exit_code = self._observe_parent_exit(timeout=parent_timeout)
-            except (ParentInspectionTimeout, ParentInspectionError) as exc:
-                reason = "PARENT_CHECK_TIMEOUT" if isinstance(exc, ParentInspectionTimeout) else "PARENT_CHECK_ERROR"
-                self._failure = True
-                child["worker_status"] = "not_started_parent_check_timeout"
-                child["terminal_reason"] = reason
-                self.state["terminal_status"] = "NOT_VERIFIED"
-                self.state["terminal_reason"] = reason
-                self._write_state()
-                return False
-            if parent_exit_code is not None:
-                child["worker_status"] = "not_started_parent_exited"
-                child["terminal_reason"] = str(self.state.get("terminal_reason") or "PARENT_WORKER_EXITED")
-                self._write_state()
-                return False
-        verify_started_at = self.clock()
-        replay_row = self._sender_runner_row(row, sender_result, replay_run_id)
-        replay_report = {
-            "legacy_run_id": replay_run_id,
-            "runs": [replay_row],
-            "timing": dict(sender_result.get("timing") or {}),
-        }
-        artifact_error = ""
-        artifact_stage = ""
-        try:
-            self._save_replay_artifacts(
-                {**replay_row, "_strict_correlation": False}, request_dir, zend_dir,
-            )
-        except ReplayArtifactError as exc:
-            artifact_error = str(exc)
-            artifact_stage = exc.stage
-        except (OSError, RuntimeError, ValueError) as exc:
-            artifact_error = str(exc)
-        baseline_version = {**child, "worker_run_id": replay_run_id}
-        baseline = None
-        try:
-            baseline = load_gate_evidence(
-                baseline_version, replay_row, request_dir, zend_dir, {},
-                plugin_slug=self.plugin_slug,
-            )
-            if baseline is not None and not self._baseline_identity_complete(
-                baseline["request"], baseline["zend"], baseline_version,
-            ):
-                baseline = None
-        except (OSError, RuntimeError, ValueError):
-            baseline = None
-        deadline_expired = deadline is not None and self.clock() >= deadline
-        verified_parameters = (
-            self._parameter_replay_fields(parent, child, baseline)
-            if child.get("evidence_origin", "worker_poll") == "worker_poll" else []
-        )
-        verdict = replay_verdict(
-            replay_row=replay_row, sender_result=sender_result, baseline=baseline,
-            verified_parameters=verified_parameters, deadline_expired=deadline_expired, artifact_error=artifact_error,
-        )
-        replay_passed, non_success_response = verdict.callback_passed, verdict.non_success_response
-        response_status, parameter_failures = verdict.response_status, verdict.parameter_failures
-        transport_failed = verdict.transport_failed
-        replay_result = {
-            "passed": verdict.passed,
-            "guard_status": "unknown",
-            "budget_expired": deadline_expired,
-            "config_path": str(replay_path),
-            "config_hash": self.config_hash(replay_path),
-            "runner": replay_report,
-            "verification_policy": PARAMETER_REPLAY_POLICY if verified_parameters else "callback_baseline_v1",
-            "response_status": response_status,
-        }
-        if verified_parameters:
-            replay_result["verified_parameters"] = verified_parameters
-            if parameter_failures:
-                replay_result["unverified_parameters"] = parameter_failures
-            if transport_failed:
-                replay_result["transport_error"] = True
-        if replay_result["passed"]:
-            replay_result["baseline_evidence"] = self._baseline_evidence(baseline, child)
-        replay_result["timing"] = dict(sender_result.get("timing") or {})
-        replay_result["timing"]["verify"] = round(self.clock() - verify_started_at, 3)
-        replay_result["timing"]["total"] = round(self.clock() - replay_started_at, 3)
-        replay_result["timing"].setdefault("handoff", 0.0)
-        if artifact_error:
-            replay_result["artifact_error"] = artifact_error
-            if artifact_stage:
-                replay_result["artifact_stage"] = artifact_stage
-        child["replay_result"] = replay_result
-        self.state.setdefault("replay_results", []).append(replay_result)
-
-        def record_replay_event(status: str, reason: str) -> None:
-            self._record_event({
-                "kind": "CHILD_REPLAY", "status": status, "reason": reason,
-                "hook_name": child.get("hook_name"), "version": version_name,
-                "probe_id": None, "parameter": None, "timing": dict(replay_result["timing"]),
-            })
-
-        if replay_passed and non_success_response:
-            child["status"] = "guard_unverified"
-            child["worker_status"] = "not_started_guard_unverified"
-            child["terminal_reason"] = "GUARD_SATISFACTION_UNKNOWN"
-            if not self._replay_discovery_active:
-                self.state.update(terminal_status="PARTIAL", terminal_reason="GUARD_SATISFACTION_UNKNOWN")
-            record_replay_event("DEFERRED", "GUARD_SATISFACTION_UNKNOWN")
-            self._write_state()
-            return False
-
-        if replay_passed:
-            child["status"] = "replay_pass"
-            child["terminal_reason"] = ""
-            self._write_state()
-            if self._replay_discovery_active:
-                # The caller hands off once, after choosing among verified children.
-                self._replay_evidence[version_name] = {**baseline, "evidence_origin": "child_replay"}
-                return True
-            if _is_ajax(child):
-                target = self._discover_replay_guards(
-                    child, {**baseline, "evidence_origin": "child_replay"}, deadline=deadline,
-                    running_parent=parent,
-                )
-                if self.state.get("terminal_status") in {"NOT_VERIFIED", "VULN_FOUND"} or not self._active_container:
-                    child["worker_status"] = "not_started_parent_exited"
-                    child["terminal_reason"] = str(self.state.get("terminal_reason") or "PARENT_WORKER_EXITED")
-                    record_replay_event("PASS", child["terminal_reason"])
-                    self._write_state()
-                    return False
-                if deadline is not None and self._deadline is not None:
-                    deadline = max(deadline, self._deadline)
-                if target is not child:
-                    # record_replay_event reads these names, so its events describe the target.
-                    child, version_name = target, str(target["version"])
-                    replay_result = child["replay_result"]
-                    merged_report = self._reports.get(version_name, merged_report)
-            if self._observe_parent_exit() is not None:
-                child["worker_status"] = "not_started_parent_exited"
-                child["terminal_reason"] = str(self.state.get("terminal_reason") or "PARENT_WORKER_EXITED")
-                record_replay_event("PASS", "PARENT_WORKER_EXITED")
-                self._write_state()
-                return False
-            handoff_started_at = self.clock()
-            priority_seed, blocked = self._priority_seed(parent, child, replay_result)
-            if blocked:
-                # The config would drop a field the replay proved: keep the parent instead.
-                replay_result["passed"] = False
-                child.update(status="replay_failed", worker_status="not_started_replay_failed", terminal_reason=blocked)
-                record_replay_event("REJECTED", blocked)
-                self._write_state()
-                return False
-            if not self._stop_worker(parent, "HANDOFF_TO_" + str(child["version"])):
-                child["worker_status"] = "not_started_parent_stop_failed"
-                child["terminal_reason"] = "WORKER_STOP_FAILED"
-                replay_result["timing"]["handoff"] = round(self.clock() - handoff_started_at, 3)
-                record_replay_event("PASS", "WORKER_STOP_FAILED")
-                self._write_state()
-                return False
-            if self._start_worker(child, deadline=deadline, priority_seed=priority_seed):
-                self._active_version = str(child["version"])
-                if child.get("resolved_method") != parent.get("resolved_method"):
-                    candidate = candidate_from_seed_item(merged_report["suggested_seeds"][0], plugin_slug=self.plugin_slug)
-                    variant = str(merged_report["suggested_seeds"][0]["seed"].get("seed_variant_id") or "")
-                    self._target_key = canonical_identity_id(candidate) + (f"::{variant}" if variant else "")
-                replay_result["timing"]["handoff"] = round(self.clock() - handoff_started_at, 3)
-                record_replay_event("PASS", (
-                    "PARAMETER_REPLAY_VERIFIED" if replay_result["verification_policy"] == PARAMETER_REPLAY_POLICY
-                    else "CALLBACK_BASELINE_VERIFIED"
-                ))
-                self._write_state()
-                return True
-            replay_result["timing"]["handoff"] = round(self.clock() - handoff_started_at, 3)
-            if child["worker_status"] == "not_started_budget_expired":
-                record_replay_event("PASS", "BUDGET_EXPIRED")
-                self._write_state()
-                return False
-            child["terminal_reason"] = "WORKER_START_FAILED"
-            self._failure = True
-            self.state["terminal_status"] = "NOT_VERIFIED"
-            self.state["terminal_reason"] = "CHILD_WORKER_START_FAILED"
-            record_replay_event("PASS", "CHILD_WORKER_START_FAILED")
-            self._write_state()
-        else:
-            child["status"] = "replay_failed"
-            child["worker_status"] = "not_started_replay_failed"
-            if deadline_expired:
-                child["terminal_reason"] = "CANDIDATE_BUDGET_EXPIRED"
-                self.state["terminal_status"] = "BOUNDED_ONLINE_COMPLETE"
-                self.state["terminal_reason"] = "BUDGET_EXPIRED"
-                record_replay_event("DEFERRED", "CANDIDATE_BUDGET_EXPIRED")
-                self._write_state()
-                return False
-            child["terminal_reason"] = replay_failure_reason(
-                artifact_error=artifact_error, replay_report=replay_report, replay_row=replay_row,
-                replay_result=replay_result,
-            )
-            # A paused parent resumes its round (or fails loudly in _resume_parent).
-            if not self._replay_discovery_active and self._pause is None:
-                self._failure = True
-                self.state["terminal_status"] = "NOT_VERIFIED"
-                self.state["terminal_reason"] = "CHILD_REPLAY_FAILED"
-            record_replay_event(
-                "REJECTED",
-                str(
-                    replay_result.get("artifact_error")
-                    or replay_row.get("validation_reason")
-                    or "CALLBACK_BASELINE_NOT_VERIFIED"
-                ),
-            )
-            self._write_state()
-        return False
+        return self._worker_runner.handoff_to_next_worker(parent, child, merged_report, replay_path, deadline=deadline)
 
     def _discover_replay_guards(
         self, child: dict[str, Any], evidence: Mapping[str, Any], *, deadline: float | None,
@@ -1343,57 +1024,7 @@ class OnlineLinkedCoordinator:
         self, version: dict[str, Any], *, deadline: float | None = None,
         priority_seed: Mapping[str, Any] | None = None,
     ) -> bool:
-        if self._active_container:
-            return False
-        if deadline is not None and self.clock() >= deadline:
-            version["worker_status"] = "not_started_budget_expired"
-            version["terminal_reason"] = "BUDGET_EXPIRED"
-            self._write_state()
-            return False
-        version_name = str(version["version"])
-        config_path = Path(str(version["config_path"]))
-        runtime_slug = config_path.relative_to(self.config_root).with_suffix("").as_posix()
-        container_name = worker_container_name(self.legacy_run_id, version_name)
-        worker_run_id = str(version.get("worker_run_id") or f"{self.legacy_run_id}-{version_name}")
-        version["worker_run_id"] = worker_run_id
-        handoff_key = f"{version_name}-{uuid.uuid4().hex}"
-        version["handoff_key"] = handoff_key
-        # The priority round belongs to the first activation of a verified config only.
-        grant = priority_seed is not None and not version.get("priority_seed")
-        command = worker_start_command(
-            version, container_name=container_name, runtime_slug=runtime_slug, service=self.service,
-            priority_seed=priority_seed if grant else None,
-        )
-        try:
-            timeout = 30 if deadline is None else min(30, max(0.0, deadline - self.clock()))
-            result = self.run_command(command, timeout=timeout, check=False, capture_output=True, text=True)
-        except Exception as exc:
-            version["worker_status"] = "start_failed"
-            version["terminal_reason"] = f"WORKER_START_FAILED: {exc}"
-            self._failure = True
-            self._write_state()
-            return False
-        if int(getattr(result, "returncode", 1)) != 0:
-            version["worker_status"] = "start_failed"
-            version["terminal_reason"] = str(getattr(result, "stderr", "") or "WORKER_START_FAILED").strip()
-            self._failure = True
-            self._write_state()
-            return False
-        version["worker_status"] = "started"
-        version["status"] = "replaying" if version.get("config_type") == "replay_only" else "fuzzing"
-        if grant:
-            version["priority_seed"] = dict(priority_seed)
-        self._active_container = container_name
-        self._worker_started_at[version_name] = self.clock()
-        self.state["workers"].append({
-            "version": version_name,
-            "container_name": container_name,
-            "run_id": worker_run_id,
-            "status": "started",
-            "command": command,
-        })
-        self._write_state()
-        return True
+        return self._worker_runner.start_worker(version, deadline=deadline, priority_seed=priority_seed)
 
     def _worker_exit_code(self, timeout: float | None = None) -> int | None:
         return worker_exit_code(self._active_container, timeout=timeout, run_command=self.run_command)
@@ -1401,161 +1032,19 @@ class OnlineLinkedCoordinator:
     def _priority_seed(
         self, parent: Mapping[str, Any], child: Mapping[str, Any], replay_result: Mapping[str, Any],
     ) -> tuple[dict[str, Any] | None, str | None]:
-        """Reference the verified replay seed and its fuzzable new fields; never request values.
-
-        Returns (descriptor, block_reason); a block reason stops the handoff.
-        """
-        if replay_result.get("verification_policy") != PARAMETER_REPLAY_POLICY:
-            return None, None
-        event = {"kind": "PRIORITY_SEED", "version": child.get("version")}
-        verified = verified_fields(replay_result)
-
-        try:
-            child_path = Path(str(child["config_path"]))
-            all_fields = _config_fields(child_path, fuzzable_only=False)
-            # Only fields the running parent could not fuzz are new (nested selectors included).
-            fuzzable = _config_fuzzable_fields(child_path) - _config_fuzzable_fields(Path(str(parent["config_path"])))
-            replay_slug = Path(str(child["replay_config_path"])).relative_to(self.config_root).with_suffix("").as_posix()
-        except (KeyError, OSError, ValueError, re.error) as exc:
-            self._record_event({**event, "status": "REJECTED", "reason": "CONFIG_FIELDS_UNAVAILABLE", "detail": str(exc)})
-            return None, "CONFIG_FIELDS_UNAVAILABLE"
-        missing = missing_verified_fields(verified, all_fields)
-        if missing:
-            self._record_event({**event, "status": "REJECTED", "reason": "VERIFIED_FIELD_NOT_IN_CONFIG",
-                                "fields": [list(field) for field in missing]})
-            return None, "VERIFIED_FIELD_NOT_IN_CONFIG"
-        # A verified field the updated config keeps fixed gets no priority attempts.
-        targets = priority_targets(verified, fuzzable)
-        if not targets:
-            # The plan switches config only for a new fuzzable param: keep the parent.
-            self._record_event({**event, "status": "REJECTED", "reason": "NO_NEW_FUZZABLE_TARGET"})
-            return None, "NO_NEW_FUZZABLE_TARGET"
-        ack = parent.get("pause_ack") if isinstance(parent.get("pause_ack"), Mapping) else {}
-        attempt = next((row for row in reversed(self.state.get("attempts", []))
-                        if row.get("version") == child.get("version")), {})
-        descriptor = priority_descriptor(
-            replay_slug=replay_slug, child=child, targets=targets, mode=self.priority_energy_mode,
-            ack=ack, attempt=attempt, replay_result=replay_result,
-        )
-        self._record_event({
-            **event, "status": "GRANTED", "reason": "PARAMETER_REPLAY_VERIFIED", "mode": descriptor["mode"],
-            "discovery_request_id": attempt.get("request_id"), "pause_round_id": ack.get("round_id"),
-            "allocated_energy": descriptor["allocated_energy"], "attempts_used": descriptor["attempts_used"],
-            "targets": descriptor["targets"], "seed_phuzz_energy": descriptor.get("seed_phuzz_energy"),
-        })
-        return descriptor, None
-
-    def _handoff_command(self, *args: str, deadline: float | None) -> dict[str, Any] | None:
-        return handoff_command(
-            self._active_container, *args, deadline=deadline, clock=self.clock, run_command=self.run_command,
-        )
+        return self._worker_runner.priority_seed(parent, child, replay_result)
 
     def _pause_parent(self, parent: Mapping[str, Any], deadline: float | None, *, request_id: str = "") -> bool:
-        """Ask the running worker to stop between requests and wait for its matching ACK."""
-        key = str(parent.get("handoff_key") or "")
-        run_id = str(parent.get("worker_run_id") or "")
-        event = {"kind": "WORKER_PAUSE", "version": parent.get("version"), "worker_run_id": run_id}
-        if not key or not self._active_container:
-            self._record_event({**event, "status": "REJECTED", "reason": "PAUSE_UNAVAILABLE"})
-            return False
-        token = uuid.uuid4().hex
-        self._pause = {"container": self._active_container, "key": key, "token": token}
-        try:
-            return self._await_pause_ack(parent, event, key, token, run_id, deadline, request_id)
-        except BaseException:
-            self._resume_parent()
-            raise
-
-    def _await_pause_ack(
-        self, parent: Mapping[str, Any], event: Mapping[str, Any], key: str, token: str, run_id: str,
-        deadline: float | None, request_id: str = "",
-    ) -> bool:
-        self._record_event({**event, "status": "REQUESTED", "reason": "PARAMETER_HANDOFF"})
-        wait_until = (deadline - 2 * self._sender_seconds if deadline is not None
-                      else self.clock() + self.max_seconds)
-        reason = "PAUSE_REQUEST_FAILED"
-        if self._handoff_command("request", key, token, run_id, *([request_id] if request_id else []),
-                                 deadline=wait_until) is not None:
-            reason = "PAUSE_ACK_TIMEOUT"
-            while self.clock() < wait_until:
-                ack = self._handoff_command("ack", key, deadline=wait_until)
-                snapshot = matching_pause_ack(ack, token=token, run_id=run_id)
-                if snapshot is not None:
-                    record = self._version(str(parent.get("version"))) or {}
-                    record["pause_ack"] = {**snapshot, "token": token, "acked_at": self.clock()}
-                    self._record_event({**event, "status": "ACKNOWLEDGED", "reason": "PAUSE_ACK", **snapshot})
-                    return True
-                try:
-                    exit_code = self._worker_exit_code(timeout=min(10.0, max(0.0, wait_until - self.clock())))
-                except (ParentInspectionTimeout, ParentInspectionError):
-                    exit_code = None
-                if exit_code is not None:
-                    reason = "PAUSE_WORKER_EXITED"
-                    break
-                self.sleeper(min(0.2, max(0.0, wait_until - self.clock())))
-        self._record_event({**event, "status": "REJECTED", "reason": reason})
-        self._resume_parent()
-        return False
+        return self._worker_runner.pause_parent(parent, deadline, request_id=request_id)
 
     def _resume_parent(self) -> bool:
-        """Release the pause only for the same worker container while it still runs."""
-        pause, self._pause = self._pause, None
-        if pause is None or self._active_container != pause["container"]:
-            return True
-        try:
-            running = self._worker_exit_code(timeout=10.0) is None
-        except (ParentInspectionTimeout, ParentInspectionError):
-            running = True  # unknown: the token-guarded release is harmless if the container is gone
-        response = self._handoff_command("release", pause["key"], pause["token"], deadline=None) if running else None
-        # {"released": false}: no request with this token is pending, so nothing is paused.
-        released = response is not None
-        version = self._version(self._active_version) or {}
-        if released:
-            reason = "PAUSE_RELEASED" if response.get("released") is True else "PAUSE_NOT_PENDING"
-        else:
-            reason = "PAUSE_RELEASE_FAILED" if running else "PAUSED_WORKER_NOT_RUNNING"
-        self._record_event({
-            "kind": "WORKER_PAUSE", "status": "RELEASED" if released else "REJECTED", "reason": reason,
-            "version": version.get("version"), "worker_run_id": version.get("worker_run_id"),
-        })
-        if not released and running and self.state.get("terminal_status") is None:
-            self._failure = True
-            self.state.update(terminal_status="NOT_VERIFIED", terminal_reason="PAUSE_RELEASE_FAILED")
-            self._write_state()
-        return released
+        return self._worker_runner.resume_parent()
 
     def _stop_active_worker(self, reason: str) -> None:
-        version = self._version(self._active_version)
-        if version is not None:
-            self._stop_worker(version, reason)
+        return self._worker_runner.stop_active_worker(reason)
 
     def _stop_worker(self, version: Mapping[str, Any], reason: str) -> bool:
-        container_name = self._active_container
-        if not container_name:
-            return True
-        stopped, error = remove_container(
-            container_name, clock=self.clock, sleeper=self.sleeper, run_command=self.run_command,
-        )
-        status = "stopped" if stopped else "stop_failed"
-        for worker in reversed(self.state["workers"]):
-            if worker.get("container_name") == container_name:
-                worker["status"] = status
-                worker["terminal_reason"] = reason
-                if not stopped:
-                    worker["stop_error"] = error
-                break
-        record = self._version(str(version["version"]))
-        if record is not None:
-            record["worker_status"] = "stopped" if status == "stopped" else status
-            record["terminal_reason"] = reason
-        if stopped:
-            self._active_container = ""
-        else:
-            self._failure = True
-            self.state["terminal_status"] = "NOT_VERIFIED"
-            self.state["terminal_reason"] = "WORKER_STOP_FAILED"
-        self._write_state()
-        return stopped
+        return self._worker_runner.stop_worker(version, reason)
 
     def _save_replay_artifacts(
         self, row: Mapping[str, Any], request_dir: Path, zend_dir: Path,
