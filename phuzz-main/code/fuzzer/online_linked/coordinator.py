@@ -43,6 +43,12 @@ from online_linked.coordination.candidate_identity import (
 from online_linked.coordination.checkpoint import validate_resume_checkpoint
 from online_linked.coordination.errors import OnlineLinkedError, ReplayArtifactError
 from online_linked.coordination.replay_artifacts import save_replay_artifacts
+from online_linked.coordination.pending_candidates import (
+    append_pending_rows,
+    failed_batch_parameters,
+    fresh_runtime_candidates,
+    without_discarded,
+)
 from online_linked.coordination.probe_runner import ProbeRunner
 from online_linked.coordination.probe_results import (
     ajax_branch_continuation,
@@ -50,6 +56,11 @@ from online_linked.coordination.probe_results import (
     sender_runner_row,
 )
 from online_linked.coordination.replay_request import restore_request_values
+from online_linked.coordination.runtime_discovery import (
+    foreign_callback,
+    merge_registry_callback,
+    registered_child_callback,
+)
 from online_linked.coordination.request_matching import (
     _is_ajax,
     _parameter_key,
@@ -763,11 +774,9 @@ class OnlineLinkedCoordinator:
                 self._reject_runtime_batch(version, "BUDGET_EXPIRED")
                 return []
             discovered = self._discover_runtime_candidates(runtime_evidence, deadline=deadline)
-            explicit_callback = str(request_payload.get("callback_id") or "").strip()
-            explicit_hook = str(request_payload.get("hook_name") or "").strip()
-            if (explicit_callback and explicit_callback != str(version.get("callback_id") or "")) or (
-                explicit_hook and explicit_hook != str(version.get("hook_name") or "")
-            ):
+            foreign = foreign_callback(request_payload, version)
+            if foreign is not None:
+                explicit_callback, explicit_hook = foreign
                 if any(
                     candidate.get("callback_id") == explicit_callback
                     or candidate.get("hook_name") == explicit_hook
@@ -880,29 +889,14 @@ class OnlineLinkedCoordinator:
         for fallback_id, raw_callback in registered.items():
             if deadline is not None and self.clock() >= deadline:
                 break
-            if not isinstance(raw_callback, Mapping):
+            registered_child = registered_child_callback(
+                fallback_id, raw_callback,
+                parent_callback_id=parent_callback_id, parent_hook_name=parent_hook_name,
+                request_id=request_id, plugin_slug=self.plugin_slug,
+            )
+            if registered_child is None:
                 continue
-            callback = dict(raw_callback)
-            callback_id = str(callback.get("callback_id") or fallback_id).strip()
-            hook_name = str(callback.get("hook_name") or "").strip()
-            if not callback_id or not hook_name or callback_id == parent_callback_id:
-                continue
-            if not callback.get("registered_inside_callback"):
-                continue
-            parent_callback = callback.get("parent_callback") if isinstance(callback.get("parent_callback"), Mapping) else {}
-            parent_ids = {
-                str(callback.get("parent_callback_id") or "").strip(),
-                str(parent_callback.get("callback_id") or "").strip(),
-            }
-            parent_hooks = {
-                str(callback.get("parent_hook_name") or "").strip(),
-                str(parent_callback.get("hook_name") or "").strip(),
-            }
-            if parent_callback_id not in parent_ids and parent_hook_name not in parent_hooks:
-                continue
-            callback.setdefault("callback_id", callback_id)
-            callback.setdefault("request_id", request_id)
-            callback.setdefault("target_plugin", self.plugin_slug)
+            callback, callback_id, hook_name = registered_child
 
             seed_template = seed_template_for_callback(hook_name, callback)
             if seed_template is None:
@@ -990,27 +984,8 @@ class OnlineLinkedCoordinator:
         return discovered
 
     def _merge_runtime_registry(self, callback: Mapping[str, Any]) -> None:
-        callback_id = str(callback.get("callback_id") or "").strip()
-        canonical = str(callback.get("callback_repr") or callback_id).strip()
-        if not callback_id or not canonical:
+        if not merge_registry_callback(self.registry, callback):
             return
-        callback_map = self.registry.setdefault("callback_map", {})
-        if not isinstance(callback_map, dict):
-            callback_map = {}
-            self.registry["callback_map"] = callback_map
-        callback_map[callback_id] = canonical
-        registrations = self.registry.setdefault("registrations", [])
-        if not isinstance(registrations, list):
-            registrations = []
-            self.registry["registrations"] = registrations
-        if any(str(row.get("callback_id") or "") == callback_id for row in registrations if isinstance(row, Mapping)):
-            return
-        registrations.append({
-            "callback_id": callback_id,
-            "callback": canonical,
-            "canonical_callback": canonical,
-            "callback_type": "static_method" if "::" in canonical else "function",
-        })
         if self.registry_path is not None:
             if self.registry_checkpoint_callback is not None:
                 self.registry_checkpoint_callback(self.registry)
@@ -1407,33 +1382,7 @@ class OnlineLinkedCoordinator:
     def _failed_batch_parameters(
         self, parent: Mapping[str, Any], proposed: Sequence[Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Return fields of children whose baseline did not pass in this callback/method context.
-
-        The parent keeps fuzzing after such a failure, so without this the next
-        update would drop that batch instead of replaying it in the union.
-        """
-        method = str(parent.get("resolved_method") or "").upper()
-        seen = {_parameter_key(parameter) for parameter in proposed if isinstance(parameter, Mapping)}
-        carried: list[dict[str, Any]] = []
-        for version in self.state.get("versions", []):
-            if (
-                not isinstance(version, Mapping) or version.get("version") == "v0"
-                # A failed replay-guard child is a rejected probe, not a parent batch.
-                or version.get("discovery_origin") == "replay_guard"
-                or (version.get("replay_result") or {}).get("passed") is True
-                or str(version.get("callback_id") or "") != str(parent.get("callback_id") or "")
-                or str(version.get("resolved_method") or "").upper() != method
-            ):
-                continue
-            for parameter in version.get("known_parameters") or []:
-                if (
-                    isinstance(parameter, Mapping)
-                    and _parameter_key(parameter) not in seen
-                    and str(parameter.get("request_method") or method).upper() == method
-                ):
-                    seen.add(_parameter_key(parameter))
-                    carried.append(dict(parameter))
-        return carried
+        return failed_batch_parameters(parent, proposed, versions=self.state.get("versions", []))
 
     def _retain_pending_runtime_candidates(
         self, groups: Sequence[Mapping[str, Any]], parent: Mapping[str, Any],
@@ -1442,44 +1391,7 @@ class OnlineLinkedCoordinator:
         if not isinstance(pending, list):
             pending = []
             self.state["pending_runtime_candidates"] = pending
-        existing = {
-            (
-                str(item.get("name") or ""),
-                str(item.get("source") or "").upper(),
-                str(item.get("location") or "").lower(),
-                str(item.get("request_id") or ""),
-                str(item.get("run_id") or ""),
-            )
-            for item in pending if isinstance(item, Mapping)
-        }
-        for group in groups:
-            evidence = group.get("evidence") if isinstance(group.get("evidence"), Mapping) else {}
-            request_id = str(evidence.get("request_id") or "")
-            run_id = str(evidence.get("worker_run_id") or evidence.get("run_id") or "")
-            for parameter in group.get("parameters", []):
-                if not isinstance(parameter, Mapping):
-                    continue
-                row = dict(_safe_parameter_identity(parameter))
-                row.update({
-                    "parameter": copy.deepcopy(dict(parameter)),
-                    "evidence": copy.deepcopy(dict(evidence)),
-                    "parent_version": parent.get("version"),
-                    "config_path": parent.get("config_path"),
-                    "request_id": request_id,
-                    "run_id": run_id,
-                    "callback_id": str(parameter.get("callback_id") or parent.get("callback_id") or ""),
-                    "canonical_callback": str(
-                        parameter.get("canonical_callback") or parent.get("canonical_callback") or ""
-                    ),
-                    "candidate_status": "pending_runtime_proposal",
-                })
-                key = (
-                    row["name"], row["source"], row["location"], row["request_id"], row["run_id"],
-                )
-                if key in existing:
-                    continue
-                pending.append(row)
-                existing.add(key)
+        append_pending_rows(pending, groups, parent)
         if groups:
             self._write_state()
 
@@ -1487,30 +1399,10 @@ class OnlineLinkedCoordinator:
         pending = self.state.get("pending_runtime_candidates")
         if not isinstance(pending, list):
             return
-        discard = set()
-        for group in groups:
-            evidence = group.get("evidence") if isinstance(group.get("evidence"), Mapping) else {}
-            request_id = str(evidence.get("request_id") or "")
-            run_id = str(evidence.get("worker_run_id") or evidence.get("run_id") or "")
-            for parameter in group.get("parameters", []):
-                if not isinstance(parameter, Mapping):
-                    continue
-                identity = _safe_parameter_identity(parameter)
-                discard.add((
-                    identity["name"], identity["source"], identity["location"], request_id, run_id,
-                ))
-        if not discard:
+        kept = without_discarded(pending, groups)
+        if kept is None:
             return
-        self.state["pending_runtime_candidates"] = [
-            item for item in pending
-            if not isinstance(item, Mapping) or (
-                str(item.get("name") or ""),
-                str(item.get("source") or "").upper(),
-                str(item.get("location") or "").lower(),
-                str(item.get("request_id") or ""),
-                str(item.get("run_id") or ""),
-            ) not in discard
-        ]
+        self.state["pending_runtime_candidates"] = kept
         self._write_state()
 
     def _reconcile_pending_runtime_candidates(
@@ -1519,11 +1411,7 @@ class OnlineLinkedCoordinator:
         evidence: Mapping[str, Any],
         result: Mapping[str, Any],
     ) -> None:
-        fresh_candidates = []
-        for field in ("pending_probes", "new_parameters", "observed_parameters"):
-            values = result.get(field)
-            if isinstance(values, list):
-                fresh_candidates.extend(item for item in values if isinstance(item, Mapping))
+        fresh_candidates = fresh_runtime_candidates(result)
         if self.resume and not result.get("runtime_block_reason"):
             fresh_keys = {
                 _runtime_candidate_key(candidate) for candidate in fresh_candidates

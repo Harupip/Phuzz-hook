@@ -1274,6 +1274,141 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             third = coordinator.read_new_runtime_evidence(deadline=10.0)
             self.assertEqual(third, [])
 
+    def test_runtime_batch_read_clock_sequence(self):
+        """Pins the number of clock() reads so moving the body cannot drop or add deadline checks."""
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, _, _, _ = self.make_probe_context(Path(tmp), [])
+            calls = []
+
+            def counting_clock():
+                calls.append(len(calls))
+                return float(len(calls) - 1)
+
+            coordinator.clock = counting_clock
+            coordinator.runtime_batch_reader = lambda **kwargs: {"pairs": [{
+                "request_name": "req-v0.json",
+                "request": {
+                    "request_id": "req-v0", "legacy_run_id": "run-v0", "target_plugin": "fixture",
+                    "http_method": "POST",
+                    "request_params": {"body_params": {"action": "fixture", "seed": "base"}},
+                },
+                "zend_name": "req-v0.json",
+                "zend": {"request_id": "req-v0", "run_id": "run-v0"},
+            }], "stats": {}}
+
+            evidence = coordinator.read_new_runtime_evidence(deadline=1000.0)
+
+            self.assertEqual(len(evidence), 1)
+            # 6 = value measured at 2df598ea (wave 4 BASE).
+            self.assertEqual(len(calls), 6)
+
+    def test_runtime_batch_read_failure_reasons(self):
+        """An expired budget is a bounded stop; any other read error is a failure, not a timeout."""
+        from online_linked.evidence import RuntimeBatchTimeout
+        cases = (
+            ("timeout", RuntimeBatchTimeout("RUNTIME_BATCH_TIMEOUT"), "BUDGET_EXPIRED", False),
+            ("value_error", ValueError("bad batch"), "RUNTIME_BATCH_READ_FAILED", True),
+        )
+        for label, error, reason, failed in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                coordinator, _, _, _ = self.make_probe_context(Path(tmp), [])
+
+                def reader(**kwargs):
+                    coordinator.clock.now = 10.0
+                    raise error
+
+                coordinator.runtime_batch_reader = reader
+                self.assertEqual(coordinator.read_new_runtime_evidence(deadline=10.0), [])
+                self.assertEqual(coordinator.state["terminal_reason"], reason)
+                self.assertIs(coordinator._failure, failed)
+
+    def test_scan_event_written_before_next_counter_fails(self):
+        """Each EVIDENCE_SCAN event is written before the next counter is read; a bad counter must not lose it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, _, _, _ = self.make_probe_context(Path(tmp), [])
+            coordinator.runtime_batch_reader = lambda **kwargs: {
+                "pairs": [], "stats": {"missing_zend": 1, "invalid_payloads": "bad"},
+            }
+
+            with self.assertRaises(ValueError):
+                coordinator.read_new_runtime_evidence(deadline=10.0)
+
+            written = [
+                json.loads(line)
+                for line in coordinator.events_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertIn(
+                ("EVIDENCE_SCAN", "ZEND_ARTIFACT_MISSING"),
+                [(event.get("kind"), event.get("reason")) for event in written],
+            )
+
+    def _reconcile_fixture(self, root: Path, second_row: dict):
+        coordinator, parent, _, _ = self.make_probe_context(root, [])
+        first_row = {"name": "a", "source": "POST", "location": "form",
+                     "request_id": "req-old", "run_id": "run-old"}
+        coordinator.state["pending_runtime_candidates"] = [first_row, second_row]
+        snapshots = []
+        record = coordinator._record_event
+
+        def recording(event, **kwargs):
+            if event.get("kind") == "PENDING_RUNTIME_CANDIDATE":
+                snapshots.append((event["status"], event["parameter"],
+                                  len(coordinator.state["pending_runtime_candidates"])))
+            return record(event, **kwargs)
+
+        coordinator._record_event = recording
+        evidence = {"request_id": "req-new", "worker_run_id": "run-new"}
+        result = {
+            "status": "CONTINUE",
+            "new_parameters": [{"name": "a", "source": "POST", "location": "form"}],
+            "runtime_block_reason": "TEST_STOP",
+        }
+
+        def call():
+            return coordinator._handle_convergence_result(
+                parent=parent, evidence=evidence, raw_report={}, result=result, seed={}, deadline=None,
+            )
+
+        return coordinator, snapshots, call
+
+    def test_reconcile_records_events_before_replacing_pending(self):
+        """Each pending-row event checkpoints while the old list is still in place; the list is replaced last."""
+        with tempfile.TemporaryDirectory() as tmp:
+            second = {"name": "b", "source": "POST", "location": "form",
+                      "request_id": "req-old", "run_id": "run-old"}
+            coordinator, snapshots, call = self._reconcile_fixture(Path(tmp), second)
+
+            self.assertIsNone(call())
+
+            self.assertEqual(snapshots, [("REQUEUED", "a", 2), ("RETIRED", "b", 2)])
+            self.assertEqual(coordinator.state["pending_runtime_candidates"], [])
+
+    def test_reconcile_interrupted_keeps_first_event_and_old_pending(self):
+        """An error while reading row 2 must leave row 1's event and checkpoint, with the old list intact."""
+
+        class ExplodingRow(dict):
+            def get(self, key, default=None):
+                if key == "request_id":
+                    raise RuntimeError("boom")
+                return super().get(key, default)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            second = ExplodingRow(name="b", source="POST", location="form",
+                                  request_id="req-old", run_id="run-old")
+            coordinator, snapshots, call = self._reconcile_fixture(Path(tmp), second)
+
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                call()
+
+            self.assertEqual(snapshots, [("REQUEUED", "a", 2)])
+            self.assertEqual(len(coordinator.state["pending_runtime_candidates"]), 2)
+            checkpoint = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(checkpoint["pending_runtime_candidates"]), 2)
+            self.assertIn("REQUEUED", [
+                event.get("status") for event in checkpoint["events"]
+                if event.get("kind") == "PENDING_RUNTIME_CANDIDATE"
+            ])
+
     def test_bounded_parent_inspection_rejects_failed_or_invalid_output(self):
         coordinator = object.__new__(OnlineLinkedCoordinator)
         coordinator._active_container = "parent"
