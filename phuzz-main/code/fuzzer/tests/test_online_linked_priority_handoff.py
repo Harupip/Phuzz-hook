@@ -187,6 +187,8 @@ class PriorityRoundTests(unittest.TestCase):
                    expect=StopIteration, online_linked: bool = False):
         """Run fuzz_fast until the normal scheduler asks for its first candidate."""
         worker = _worker(CHILD_CONFIG)
+        worker.output_dir = str(self.root / "worker-output")
+        os.makedirs(worker.output_dir, exist_ok=True)
         sends: list[dict] = []
         mutations: list[tuple[str, str]] = []
 
@@ -273,6 +275,23 @@ class PriorityRoundTests(unittest.TestCase):
         # Missing seed coverage: PHUZZ base 1, reported, never the scheduler's energy.
         _, _, mutations, summary = self.run_worker(self.descriptor(), coverage=0)
         self.assertEqual((len(mutations), summary[-1]["seed_coverage"]), (3, "SEED_COVERAGE_UNAVAILABLE"))
+
+    def test_priority_result_is_kept_per_worker_for_later_checks(self) -> None:
+        # stdout dies with the container and the worker wipes its own fuzzer-N folder on start,
+        # so each handoff's round is kept in one file named after the worker run, outside that folder.
+        worker, _, mutations, summary = self.run_worker(self.descriptor(), online_linked=True)
+        path = Path(worker.output_dir).parent / "priority" / "run-v1.json"
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(saved, {**summary[-1], "worker_run_id": "run-v1"})
+        self.assertEqual((saved["status"], saved["granted"], saved["attempted"]), ("DONE", 8, len(mutations)))
+        self.assertNotIn(Path(worker.output_dir), path.parents)
+        # A rejected priority seed is kept too, so a check shows why no round ran.
+        with patch.dict(os.environ, {"HOOKPHUZZ_LEGACY_RUN_ID": "run/cand 7-v2"}):
+            self.run_worker(self.descriptor(replay_slug="../outside"), expect=SystemExit)
+        rejected = json.loads((path.parent / "run-cand-7-v2.json").read_text(encoding="utf-8"))
+        self.assertEqual(rejected["status"], "REJECTED")
+        # The earlier worker's file is still there.
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "DONE")
 
     def test_energy_is_cached_only_for_requests_with_coverage(self) -> None:
         # A request without coverage has no measured PHUZZ energy: it must not seed a later handoff.

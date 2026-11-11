@@ -22,6 +22,7 @@ param(
 $ErrorActionPreference = "Stop"
 $codeRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $outputRoot = Join-Path $codeRoot "fuzzer\output\online-linked"
+$workersRoot = Join-Path $codeRoot "fuzzer\output\workers"
 
 function Read-JsonFile([string]$Path) {
     # The coordinator may be rewriting the file; a failed read is retried next refresh.
@@ -38,6 +39,35 @@ function Get-RunDirectory {
         Sort-Object LastWriteTime | Select-Object -Last 1
     if (-not $latest) { throw "No online-linked run under $outputRoot" }
     return $latest
+}
+
+function Show-PriorityRounds($State, [string]$StatePath) {
+    # A worker started by a new-param handoff keeps its priority round in
+    # fuzzer/output/workers/priority/<worker_run_id>.json (name sanitized as in fuzzer.py _priority_log).
+    $granted = @()
+    $eventsPath = Join-Path (Split-Path -Parent $StatePath) "events.jsonl"
+    if (Test-Path -LiteralPath $eventsPath -PathType Leaf) {
+        $granted = @(Get-Content -LiteralPath $eventsPath -Encoding UTF8 | Where-Object { $_ -like '*"PRIORITY_SEED"*' } |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch { } } |
+            Where-Object { $_.status -eq "GRANTED" } | ForEach-Object { $_.version })
+    }
+    foreach ($version in @($State.versions | Where-Object { $_ })) {
+        $name = ([string]$version.worker_run_id -replace '[^A-Za-z0-9_.-]+', '-').Trim('-')
+        $round = $null
+        if ($name) { $round = Read-JsonFile (Join-Path $workersRoot ("priority\{0}.json" -f $name)) }
+        if (-not $round) {
+            if ($granted -contains $version.version) { Write-Host ("Priority round {0}: granted, worker result not saved yet" -f $version.version) }
+            continue
+        }
+        if ($round.status -ne "DONE") {
+            Write-Host ("Priority round {0}: {1} {2} {3}" -f $version.version, $round.status, $round.reason, $round.detail)
+            continue
+        }
+        $perField = @($round.per_field.PSObject.Properties | ForEach-Object { "{0}={1}" -f $_.Name, $_.Value }) -join ", "
+        Write-Host ("Priority round {0}: mode={1}  seed_energy={2} ({3})  bonus={4}  granted={5}  attempted={6}" -f
+            $version.version, $round.mode, $round.seed_energy, $round.seed_energy_source, $round.bonus, $round.granted, $round.attempted)
+        Write-Host ("    per_field: {0}" -f $perField)
+    }
 }
 
 function Show-Campaign($RunDirectory) {
@@ -62,6 +92,8 @@ function Show-Campaign($RunDirectory) {
         @{ Name = "params"; Expression = { (@($_.known_parameters) | ForEach-Object { $_.name }) -join "," } } |
         Format-Table -AutoSize | Out-Host
 
+    Show-PriorityRounds $state $active.state_path
+
     if ($EventCount -eq 0) { return }
     $eventsPath = Join-Path (Split-Path -Parent $active.state_path) "events.jsonl"
     if (-not (Test-Path -LiteralPath $eventsPath -PathType Leaf)) { Write-Host "No events yet."; return }
@@ -72,6 +104,16 @@ function Show-Campaign($RunDirectory) {
     Write-Host "Latest events:"
     $events | Where-Object { $_.kind -ne "RUNTIME_OBSERVATION" } | Select-Object -Last $EventCount | ForEach-Object {
         Write-Host ("  {0,-24} {1,-9} {2,-32} {3}" -f $_.kind, $_.status, $_.reason, $_.version)
+        if ($_.kind -eq "PRIORITY_SEED" -and $_.status -eq "GRANTED") {
+            # Priority round grant (core/online_handoff.py priority_energy); the worker logs the attempts it ran.
+            $targets = @($_.targets | ForEach-Object { $_ -join ":" })
+            $seed = if ($null -ne $_.seed_phuzz_energy) { $_.seed_phuzz_energy } else { "rescored by worker" }
+            $grant = if ($_.mode -eq "carryover") {
+                "max(1, {0} - {1}) = {2}" -f $_.allocated_energy, $_.attempts_used, [Math]::Max(1, $_.allocated_energy - $_.attempts_used)
+            } else { "seed ({0}) + {1} new field(s)" -f $seed, $targets.Count }
+            Write-Host ("      mode={0}  allocated={1}  used={2}  seed_energy={3}" -f $_.mode, $_.allocated_energy, $_.attempts_used, $seed)
+            Write-Host ("      targets={0}  grant={1}" -f ($targets -join ","), $grant)
+        }
     }
 }
 

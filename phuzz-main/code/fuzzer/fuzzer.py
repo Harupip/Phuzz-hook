@@ -1026,6 +1026,18 @@ class Fuzzer:
 
     def _priority_log(self, payload):
         print("[priority] " + json.dumps(payload, sort_keys=True))
+        # Host copy for later checks and scripts/wordpress/watch-online-linked.ps1: stdout dies with the
+        # container and fuzzer-N is wiped on start, so keep one file per worker run beside those folders.
+        run_id = os.environ.get("HOOKPHUZZ_LEGACY_RUN_ID", "")
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip("-") or f"fuzzer-{self.fuzzer_id}"
+        path = os.path.join(os.path.dirname(self.output_dir), "priority", name + ".json")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + ".tmp", "w", encoding="utf-8") as handle:
+                json.dump({**payload, "worker_run_id": run_id}, handle, sort_keys=True)
+            os.replace(path + ".tmp", path)
+        except OSError as exc:
+            print(f"[priority] could not save {path}: {exc}")
 
     def _load_priority_seed(self):
         """Build the verified replay seed of HOOKPHUZZ_PRIORITY_SEED, or None after logging why not."""
