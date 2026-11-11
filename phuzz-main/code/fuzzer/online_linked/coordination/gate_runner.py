@@ -201,7 +201,7 @@ class GateRunner:
                     return False
             elif version["config_type"] == "fuzzing_ready":
                 try:
-                    guard_unknown = not 200 <= int(status) < 300
+                    guard_unknown = not (200 <= int(status) < 300 or int(status) == 302)
                 except (TypeError, ValueError):
                     guard_unknown = True
                 if guard_unknown:

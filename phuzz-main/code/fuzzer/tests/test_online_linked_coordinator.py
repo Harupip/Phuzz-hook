@@ -2356,8 +2356,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator.state['terminal_reason'], 'GUARD_SATISFACTION_UNKNOWN')
             self.assertNotIn('worker_start', log)
 
-    def test_v0_successful_responses_keep_existing_fuzz_gate(self):
-        for status in (200, 201, 204):
+    def test_v0_2xx_and_302_with_callback_evidence_start_fuzzing(self):
+        for status in (200, 201, 204, 302):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
                 log = []
                 coordinator = self.make_coordinator(Path(tmp), log)

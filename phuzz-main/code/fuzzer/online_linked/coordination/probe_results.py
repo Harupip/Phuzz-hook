@@ -129,7 +129,7 @@ def replay_verdict(
         non_success_response = False
     else:
         try:
-            non_success_response = (bool(sender_result.get("error")) or not 200 <= int(response_status) <= 299
+            non_success_response = (bool(sender_result.get("error")) or not (200 <= int(response_status) <= 299 or int(response_status) == 302)
                                     or int(artifact_status) != int(response_status))
         except (TypeError, ValueError):
             non_success_response = True

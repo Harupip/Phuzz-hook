@@ -57,6 +57,19 @@ class OnlineLinkedExportTests(unittest.TestCase):
                 candidate, _ = self.write_state(versions=[version])
                 self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / name), 1)
 
+    def test_baseline_302_exports_with_correlated_callback_proof(self):
+        for name in ("v0", "v1"):
+            with self.subTest(name=name):
+                version = self.baseline_version(name)
+                gate = version["readiness" if name == "v0" else "replay_result"]
+                row = gate["runner"]["runs"][0]
+                row["request_payload"]["response"]["status_code"] = 302
+                candidate, _ = self.write_state(versions=[version])
+                self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / name), 1)
+                row["callback_reached"] = False
+                candidate, _ = self.write_state(versions=[version])
+                self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / (name + "-no-callback")), 0)
+
     def test_baseline_policy_rejects_incomplete_or_mismatched_proof(self):
         for field in ("request_id", "run_id", "plugin_slug", "callback_id", "http_method", "auth_context", "seed_variant_id"):
             for value in (None, "wrong"):
@@ -121,7 +134,7 @@ class OnlineLinkedExportTests(unittest.TestCase):
                 mutate(version)
                 candidate, _ = self.write_state(versions=[version])
                 self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / name), 0)
-        # The historical policy keeps its 2xx requirement.
+        # The callback baseline policy still rejects HTTP 500.
         version = self.baseline_version()
         version["replay_result"]["runner"]["runs"][0]["request_payload"]["response"]["status_code"] = 500
         candidate, _ = self.write_state(versions=[version])

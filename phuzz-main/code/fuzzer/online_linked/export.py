@@ -448,8 +448,8 @@ def _verified_base(version: dict, versions: dict | None = None) -> tuple[bytes, 
     if policy == "callback_baseline_v1":
         _verify_baseline_gate(version, gate, config)
     elif policy == PARAMETER_REPLAY_POLICY:
-        # HTTP status is diagnostic here; the field proof replaces the 2xx rule.
-        _verify_baseline_gate(version, gate, config, require_2xx=False)
+        # HTTP status is diagnostic here; the field proof replaces the response status rule.
+        _verify_baseline_gate(version, gate, config, require_success_response=False)
         fields = gate.get("verified_parameters")
         row = gate["runner"]["runs"][0]
         if not isinstance(fields, list) or not fields or parameter_replay_failures(
@@ -477,7 +477,7 @@ def _verified_base(version: dict, versions: dict | None = None) -> tuple[bytes, 
     return content, config
 
 
-def _verify_baseline_gate(version: dict, gate: dict, config: dict, *, require_2xx: bool = True) -> None:
+def _verify_baseline_gate(version: dict, gate: dict, config: dict, *, require_success_response: bool = True) -> None:
     proof = gate.get("baseline_evidence")
     fields = {"request_id", "run_id", "plugin_slug", "callback_id", "http_method", "auth_context", "seed_variant_id"}
     if (not isinstance(proof, dict) or not fields <= proof.keys()
@@ -533,7 +533,8 @@ def _verify_baseline_gate(version: dict, gate: dict, config: dict, *, require_2x
     if request.get("target_plugin") != proof["plugin_slug"] or str(request.get("http_method") or request.get("method") or "").upper() != proof["http_method"]:
         raise ValueError("BASELINE_REQUEST_MISMATCH")
     response = request.get("response")
-    if require_2xx and (not isinstance(response, dict) or not 200 <= int(response.get("status_code", 0)) < 300):
+    if require_success_response and (not isinstance(response, dict) or not (
+            200 <= int(response.get("status_code", 0)) < 300 or int(response.get("status_code", 0)) == 302)):
         raise ValueError("BASELINE_HTTP_NOT_VERIFIED")
     replay_path = Path(version["replay_config_path"])
     if (gate.get("config_path") != str(replay_path) or gate.get("config_hash") != version.get("replay_config_hash")
