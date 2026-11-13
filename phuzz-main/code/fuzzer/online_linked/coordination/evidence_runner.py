@@ -82,6 +82,21 @@ class EvidenceRunner:
         version = self._host._version(self._host._active_version)
         if version is None:
             return []
+        group = getattr(self._host, "_parallel_group", None)
+        if group is None:
+            return self._read_run(version, deadline=deadline)
+        # Parallel phase: node 1 first, then each extra node under its own run id.
+        evidence = self._read_run(version, deadline=deadline)
+        for node in list(group["nodes"]):
+            if self._host.state["terminal_status"] is not None:
+                break
+            evidence.extend(self._read_run(
+                {**version, "worker_run_id": node["worker_run_id"]}, deadline=deadline, node=True))
+        return evidence
+
+    def _read_run(
+        self, version: Mapping[str, Any], *, deadline: float | None, node: bool = False,
+    ) -> list[dict[str, Any]]:
         remaining = self._host.max_seconds if deadline is None else deadline - self._host.clock()
         if remaining <= 0:
             self.reject_runtime_batch(version, "BUDGET_EXPIRED")
@@ -149,7 +164,9 @@ class EvidenceRunner:
             request_name = runtime_evidence["request_name"]
             request_payload = runtime_evidence["request"]
             request_id = runtime_evidence["request_id"]
-            pair_key = (str(version["version"]), request_id)
+            # Request ids are only unique within one fuzzer node.
+            pair_key = (str(version["version"]),
+                        f"{version['worker_run_id']}/{request_id}" if node else request_id)
             if pair_key in self._host._seen_pairs:
                 continue
             if deadline is not None and self._host.clock() >= deadline:

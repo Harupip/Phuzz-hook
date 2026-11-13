@@ -22,6 +22,8 @@ pwsh -NoProfile -File ./phuzz.ps1 -PluginSlug imsanity -DryRun
 pwsh -NoProfile -NonInteractive -File ./phuzz.ps1 -PluginSlug imsanity
 # Override ngân sách ban đầu, không sửa phuzz.env
 pwsh -NoProfile -NonInteractive -File ./phuzz.ps1 -PluginSlug imsanity -OnlineTimeoutSeconds 60 -OnlineMaxVersions 3 -OnlineMaxCandidates 32 -OnlineCampaignTimeoutSeconds 3600
+# Bật fuzz song song 10 node sau khi callback hết param mới (mặc định tắt)
+pwsh -NoProfile -NonInteractive -File ./phuzz.ps1 -PluginSlug imsanity -OnlineParallel 1 -OnlineParallelNodes 10 -OnlineParallelSeconds 240
 ```
 
 Không tham số: wrapper có menu local plugin từ cả thư mục ưu tiên và `_plugins`, dedupe theo slug. Có `-PluginSlug` hoặc `-DryRun`: không hỏi chọn plugin; `-DryRun` không có slug dùng plugin mặc định. Dry-run chưa kiểm tra archive/config/Docker readiness.
@@ -40,6 +42,8 @@ Mỗi plugin có run ID, campaign budget và artifacts riêng. Batch tắt compa
 ## Settings và chạy không tương tác
 
 Ưu tiên CLI > `phuzz.env` > loader defaults. Snapshot file ngày 2026-10-09: `ONLINE_TIMEOUT_SECONDS=30`, `ONLINE_MAX_VERSIONS=9`, `ONLINE_MAX_CANDIDATES=32`, `ONLINE_CAMPAIGN_TIMEOUT_SECONDS=3600`; defaults loader khác file. Các giá trị này là **initial budget**, có thể tăng khi có progress đã xác minh tới hard cap. Xem [budget/resume](online-linked-flow.md#initial-budget-và-hard-cap).
+
+`ONLINE_PARALLEL` (0/1, mặc định 0), `ONLINE_PARALLEL_NODES` (2–50, mặc định 10, tính cả worker đang chạy) và `ONLINE_PARALLEL_SECONDS` (mặc định 240) bật giai đoạn fuzz song song: khi callback hết cửa sổ `ONLINE_TIMEOUT_SECONDS` mà không có param mới, coordinator chạy N node trên config hiện tại thay vì kết thúc ngay; node nào tìm ra param mới thì pause cả nhóm, replay, PASS thì quay về 1 worker version mới. Mỗi callback dài thêm tối đa `ONLINE_PARALLEL_SECONDS` mỗi lần vào Parallel, vẫn bị chặn bởi campaign budget, nên plugin nhiều callback có thể hết campaign sớm hơn. Chi tiết: [giai đoạn song song](online-linked-flow.md#giai-đoạn-fuzz-song-song-n-node-opt-in-2026-11-13).
 
 `ONLINE_COMPARE_PROMPT=1` hỏi so sánh khi single-plugin run kết thúc, terminal tương tác và có final export. Chạy `-NonInteractive` hoặc đặt setting `0` để batch tooling không đợi trả lời. `-NoFollowLogs` giữ tương thích, không vô hiệu prompt này. `-StopOnVulnCount 0` chỉ tắt dừng theo số finding.
 
@@ -63,6 +67,17 @@ Script làm mới mỗi 5 giây, Ctrl+C để thoát; tự chuyển sang candida
 Màn hình gồm trạng thái campaign, candidate đang chạy, bảng version (`version`, `parent_version`, `status`, `worker_status`, `terminal_reason`, tham số đã biết) và các event gần nhất (bỏ `RUNTIME_OBSERVATION`). Dưới mỗi dòng `PRIORITY_SEED GRANTED`, script in thêm `mode`, `allocated`/`used` (snapshot ACK của worker cũ), `seed_energy` (`rescored by worker` khi worker mới tự chấm lại seed), param đích và số lượt ưu tiên được cấp. Dòng `Priority round vN` (trên phần event) là kết quả thực tế của worker vN: `seed_energy` và nguồn điểm, `bonus`, `granted`, `attempted`, `per_field`, hoặc lý do `REJECTED`. Chỉ worker được khởi động do tìm thấy param mới mới ghi kết quả này, vào `fuzzer/output/workers/priority/<worker_run_id>.json` (cùng nội dung dòng `[priority]` trong `docker logs`), mỗi lần handoff một file; trong lúc lượt còn chạy script hiện `granted, worker result not saved yet`. Thư mục này nằm ngoài `fuzzer-N` nên worker sau không xóa, có thể mở lại để kiểm tra sau khi run xong (wrapper Bash vẫn xóa cả `fuzzer/output`). Nội dung config của version nằm ở `fuzzer/configs/online-linked/<slug>/<storage-id>/versions/vN/vN-config.json` (trường `config_path` trong `state.json`).
 
 Candidate báo `V0_PREREQUISITE_GATE_FAILED` và `No version yet.` là không dựng được v0, thường là hook nội bộ không có direct HTTP mapping (`missing_requirements: ['direct_http_mapping']`); không có file config cho candidate đó. Script không hiển thị request đang fuzz, coverage hay finding.
+
+Khi `ONLINE_PARALLEL=1` và candidate đang ở giai đoạn song song, dưới bảng version có thêm một dòng `Parallel: <live>/<requested> nodes, <N>s left` (`live` tính cả node 1, giảm khi node crash hoặc bị gỡ vì không ACK pause; số giây tính từ lần coordinator lưu state gần nhất nên lệch vài giây). Bảng vẫn một dòng cho mỗi version, không liệt kê từng node. Hết Parallel thì dòng này biến mất; xem `PARALLEL_START`/`PARALLEL_PAUSE`/`PARALLEL_END` trong event.
+
+Mỗi node là một container riêng `hookphuzz-online-linked-<run>-<candidate>-vN-n{k}` (node 1 không có hậu tố), cùng compose project `code`, cùng network và `/sync-tmpfs`. Docker Desktop hiển thị chúng ngoài nhóm `code` vì được tạo bằng `docker compose run` (`oneoff=True`), khác PHUZZ cũ dùng `compose up`; chỉ khác hiển thị. Xem node đang fuzz gì qua log từng container (mỗi dòng `[req N]` có URL, param bị mutate, payload, status):
+
+```powershell
+docker ps --filter name=hookphuzz-online-linked --format '{{.Names}}'
+docker logs -f --tail 20 <tên-container-node>
+# Request mới nhất của mỗi node
+docker ps --filter name=hookphuzz-online-linked --format '{{.Names}}' | ForEach-Object { $last = docker logs --tail 40 $_ 2>&1 | Select-String '^\[req' | Select-Object -Last 1; "{0,-8} {1}" -f ($_ -replace '.*plugin-',''), $last }
+```
 
 ## Đọc kết quả và debug
 

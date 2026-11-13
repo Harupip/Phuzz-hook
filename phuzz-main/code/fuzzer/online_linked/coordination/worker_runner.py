@@ -25,6 +25,7 @@ from online_linked.coordination.worker import (
     CommandRunner,
     handoff_command,
     matching_pause_ack,
+    parallel_node_id,
     remove_container,
     worker_container_name,
     worker_start_command,
@@ -331,6 +332,8 @@ class WorkerRunner:
                 record_replay_event("REJECTED", blocked)
                 self._host._write_state()
                 return False
+            if getattr(self._host, "_parallel_group", None) is not None:
+                self._host._parallel.end_for_handoff(str(child["version"]))
             if not self._host._stop_worker(parent, "HANDOFF_TO_" + str(child["version"])):
                 child["worker_status"] = "not_started_parent_stop_failed"
                 child["terminal_reason"] = "WORKER_STOP_FAILED"
@@ -416,6 +419,7 @@ class WorkerRunner:
         command = worker_start_command(
             version, container_name=container_name, runtime_slug=runtime_slug, service=self._host.service,
             priority_seed=priority_seed if grant else None,
+            fuzzer_node_id=parallel_node_id(version_name, 1) if getattr(self._host, "parallel", False) else None,
         )
         try:
             timeout = 30 if deadline is None else min(30, max(0.0, deadline - self._host.clock()))
@@ -506,13 +510,18 @@ class WorkerRunner:
         token = uuid.uuid4().hex
         self._host._pause = {"container": self._host._active_container, "key": key, "token": token}
         try:
-            return self.await_pause_ack(parent, event, key, token, run_id, deadline, request_id)
+            acknowledged = self.await_pause_ack(parent, event, key, token, run_id, deadline, request_id)
+            if acknowledged and getattr(self._host, "_parallel_group", None) is not None:
+                self._host._parallel.pause_nodes(deadline, request_id=request_id)
+            return acknowledged
         except BaseException:
             self._host._resume_parent()
             raise
 
     def resume_parent(self) -> bool:
         """Release the pause only for the same worker container while it still runs."""
+        if getattr(self._host, "_parallel_group", None) is not None:
+            self._host._parallel.release_nodes()
         pause, self._host._pause = self._host._pause, None
         if pause is None or self._host._active_container != pause["container"]:
             return True

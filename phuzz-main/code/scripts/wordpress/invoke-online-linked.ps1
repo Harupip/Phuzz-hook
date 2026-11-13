@@ -11,6 +11,9 @@ function Invoke-OnlineLinked {
         [Parameter(Mandatory)][int]$OnlineMaxVersions,
         [Parameter(Mandatory)][int]$OnlineMaxCandidates,
         [Parameter(Mandatory)][int]$OnlineCampaignTimeoutSeconds,
+        [int]$OnlineParallel = 0,
+        [int]$OnlineParallelNodes = 10,
+        [int]$OnlineParallelSeconds = 240,
         [bool]$OnlineComparePrompt = $false,
         [Parameter(Mandatory)][string]$OverridePath,
         [Parameter(Mandatory)][string[]]$ComposeArgs
@@ -35,9 +38,14 @@ function Invoke-OnlineLinked {
         "--max-versions", "$OnlineMaxVersions",
         "--max-candidates", "$OnlineMaxCandidates",
         "--campaign-seconds", "$OnlineCampaignTimeoutSeconds",
+        "--parallel-nodes", "$OnlineParallelNodes",
+        "--parallel-seconds", "$OnlineParallelSeconds",
         "--sync-registry",
         "--service", $Service
     )
+    if ($OnlineParallel -eq 1) {
+        $onlineLinkedArgs += "--parallel"
+    }
 
     $previousComposeFile = $env:COMPOSE_FILE
     $previousPythonPath = $env:PYTHONPATH

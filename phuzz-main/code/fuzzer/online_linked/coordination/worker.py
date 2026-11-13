@@ -27,17 +27,45 @@ def matching_pause_ack(
         "round_id", "allocated_energy", "attempts_used", "request_id", "seed_phuzz_energy")}
 
 
+MAX_PARALLEL_NODES = 50  # FUZZER_NODE_ID 100 is reserved for gate replay.
+
+
+def parallel_node_id(version_name: str, node_index: int) -> int:
+    if node_index < 1 or node_index > MAX_PARALLEL_NODES:
+        raise ValueError(f"parallel node index out of range: {node_index}")
+    return 1 + int(version_name[1:]) * 100 + (node_index - 1)
+
+
+def parallel_node_name(base: str, node_index: int) -> str:
+    return base if node_index == 1 else f"{base}-n{node_index}"
+
+
+def container_running(container_name: str, *, timeout: float, run_command: CommandRunner) -> bool:
+    if not container_name or timeout <= 0:
+        return False
+    try:
+        result = run_command(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+            timeout=timeout, check=False, capture_output=True, text=True,
+        )
+    except Exception:
+        return False
+    return (int(getattr(result, "returncode", 1)) == 0
+            and str(getattr(result, "stdout", "") or "").strip().lower() == "true")
+
+
 def worker_start_command(
     version: Mapping[str, Any], *, container_name: str, runtime_slug: str, service: str,
-    priority_seed: Mapping[str, Any] | None,
+    priority_seed: Mapping[str, Any] | None, fuzzer_node_id: int | None = None,
 ) -> list[str]:
     version_name = str(version["version"])
     worker_run_id = str(version["worker_run_id"])
     handoff_key = str(version["handoff_key"])
+    node_id = 1 + int(version_name[1:]) if fuzzer_node_id is None else fuzzer_node_id
     command = [
         "docker", "compose", "run", "-d", "--no-deps", "--name", container_name,
         "-e", f"FUZZER_CONFIG={runtime_slug}",
-        "-e", f"FUZZER_NODE_ID={1 + int(version_name[1:])}",
+        "-e", f"FUZZER_NODE_ID={node_id}",
         "-e", f"HOOKPHUZZ_LEGACY_RUN_ID={worker_run_id}",
         "-e", f"HOOKPHUZZ_FINDING_ARTIFACT=/shared-tmpfs/fuzzer-findings/{worker_run_id}.json",
         "-e", "HOOKPHUZZ_CMPLOG=1",

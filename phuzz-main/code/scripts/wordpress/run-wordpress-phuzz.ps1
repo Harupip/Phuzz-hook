@@ -20,6 +20,12 @@ param(
     [int]$OnlineMaxCandidates,
     [ValidateRange(1, 86400)]
     [int]$OnlineCampaignTimeoutSeconds,
+    [ValidateRange(0, 1)]
+    [int]$OnlineParallel,
+    [ValidateRange(2, 50)]
+    [int]$OnlineParallelNodes,
+    [ValidateRange(1, 86400)]
+    [int]$OnlineParallelSeconds,
     [ValidateRange(0, 100000)]
     [int]$StopOnVulnCount
 )
@@ -39,6 +45,9 @@ $OnlineTimeoutSeconds = $runtimeSettings["OnlineTimeoutSeconds"]
 $OnlineMaxVersions = $runtimeSettings["OnlineMaxVersions"]
 $OnlineMaxCandidates = $runtimeSettings["OnlineMaxCandidates"]
 $OnlineCampaignTimeoutSeconds = $runtimeSettings["OnlineCampaignTimeoutSeconds"]
+$OnlineParallel = $runtimeSettings["OnlineParallel"]
+$OnlineParallelNodes = $runtimeSettings["OnlineParallelNodes"]
+$OnlineParallelSeconds = $runtimeSettings["OnlineParallelSeconds"]
 $StopOnVulnCount = $runtimeSettings["StopOnVulnCount"]
 $pluginScript = Join-Path $scriptRoot "web\applications\wordpress\_plugins\download-plugins.ps1"
 $fuzzerService = "fuzzer-wordpress-plugin"
@@ -781,6 +790,9 @@ try {
         -OnlineMaxVersions $OnlineMaxVersions `
         -OnlineMaxCandidates $OnlineMaxCandidates `
         -OnlineCampaignTimeoutSeconds $OnlineCampaignTimeoutSeconds `
+        -OnlineParallel $OnlineParallel `
+        -OnlineParallelNodes $OnlineParallelNodes `
+        -OnlineParallelSeconds $OnlineParallelSeconds `
         -OnlineComparePrompt ([bool]$runtimeSettings["OnlineComparePrompt"] -and -not $NoComparePrompt) `
         -OverridePath $overridePath `
         -ComposeArgs $composeArgs

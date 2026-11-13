@@ -20,6 +20,12 @@ param(
     [int]$OnlineMaxCandidates,
     [ValidateRange(1, 86400)]
     [int]$OnlineCampaignTimeoutSeconds,
+    [ValidateRange(0, 1)]
+    [int]$OnlineParallel,
+    [ValidateRange(2, 50)]
+    [int]$OnlineParallelNodes,
+    [ValidateRange(1, 86400)]
+    [int]$OnlineParallelSeconds,
     [ValidateRange(0, 100000)]
     [int]$StopOnVulnCount,
     [switch]$DryRun,
@@ -56,6 +62,9 @@ Options:
   -OnlineMaxVersions <count>       Versions including v0. Default: 2.
   -OnlineMaxCandidates <count>     Candidates per campaign. Default: 32.
   -OnlineCampaignTimeoutSeconds    Total campaign budget. Default: 3600.
+  -OnlineParallel <0|1>            Fuzz with several nodes after the quiet window. Default: 0.
+  -OnlineParallelNodes <count>     Parallel nodes including the running worker (2-50). Default: 10.
+  -OnlineParallelSeconds <seconds> Parallel phase length once all nodes run. Default: 240.
   -StopOnVulnCount <count>         Stop after this many findings; 0 keeps fuzzing.
   -UseZendDiscovery                Accepted for existing online-linked commands; always enabled.
   -NoFollowLogs                    Accepted for existing online-linked commands; campaigns are bounded.
@@ -141,6 +150,9 @@ $OnlineTimeoutSeconds = $runtimeSettings["OnlineTimeoutSeconds"]
 $OnlineMaxVersions = $runtimeSettings["OnlineMaxVersions"]
 $OnlineMaxCandidates = $runtimeSettings["OnlineMaxCandidates"]
 $OnlineCampaignTimeoutSeconds = $runtimeSettings["OnlineCampaignTimeoutSeconds"]
+$OnlineParallel = $runtimeSettings["OnlineParallel"]
+$OnlineParallelNodes = $runtimeSettings["OnlineParallelNodes"]
+$OnlineParallelSeconds = $runtimeSettings["OnlineParallelSeconds"]
 $StopOnVulnCount = $runtimeSettings["StopOnVulnCount"]
 
 if ($AllPlugins -and $PSBoundParameters.ContainsKey("PluginSlug")) {
@@ -180,6 +192,9 @@ $runnerParams["OnlineTimeoutSeconds"] = $OnlineTimeoutSeconds
 $runnerParams["OnlineMaxVersions"] = $OnlineMaxVersions
 $runnerParams["OnlineMaxCandidates"] = $OnlineMaxCandidates
 $runnerParams["OnlineCampaignTimeoutSeconds"] = $OnlineCampaignTimeoutSeconds
+$runnerParams["OnlineParallel"] = $OnlineParallel
+$runnerParams["OnlineParallelNodes"] = $OnlineParallelNodes
+$runnerParams["OnlineParallelSeconds"] = $OnlineParallelSeconds
 
 if ($AllPlugins) {
     $batchDirectory = if ($pluginZipDir) { $pluginZipDir } else { $pluginDir }

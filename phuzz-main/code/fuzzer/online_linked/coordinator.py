@@ -37,6 +37,7 @@ from online_linked.coordination.checkpoint import validate_resume_checkpoint
 from online_linked.coordination.errors import OnlineLinkedError
 from online_linked.coordination.evidence_runner import EvidenceRunner
 from online_linked.coordination.gate_runner import GateRunner
+from online_linked.coordination.parallel_runner import ParallelRunner
 from online_linked.coordination.replay_artifacts import save_replay_artifacts
 from online_linked.coordination.pending_candidates import failed_batch_parameters
 from online_linked.coordination.probe_runner import ProbeRunner
@@ -155,6 +156,9 @@ class OnlineLinkedCoordinator:
         registry_checkpoint_callback: Callable[[Mapping[str, Any]], None] | None = None,
         resume: bool = False,
         priority_energy_mode: str = DEFAULT_PRIORITY_ENERGY_MODE,
+        parallel: bool = False,
+        parallel_nodes: int = 10,
+        parallel_seconds: int = 240,
     ) -> None:
         if type(max_seconds) is not int or type(max_versions) is not int:
             raise ValueError("initial candidate budgets must be positive integers")
@@ -185,6 +189,11 @@ class OnlineLinkedCoordinator:
         self.registry_checkpoint_callback = registry_checkpoint_callback
         # Fixed by the batch checkpoint; the worker of each verified handoff receives it.
         self.priority_energy_mode = _priority_energy_mode(priority_energy_mode)
+        self.parallel = bool(parallel)
+        self.parallel_nodes = int(parallel_nodes)
+        self.parallel_seconds = int(parallel_seconds)
+        # Nodes 2..N of the active version while the parallel phase runs (ParallelRunner owns it).
+        self._parallel_group: dict[str, Any] | None = None
         self._deadline: float | None = None
         self._hard_deadline: float | None = None
         self._progress_keys: set[tuple[str, str]] = set()
@@ -256,6 +265,9 @@ class OnlineLinkedCoordinator:
             "terminal_reason": None,
             "evidence_scan": {},
         }
+        if self.parallel:
+            self.state["parallel_settings"] = {
+                "enabled": True, "nodes": self.parallel_nodes, "seconds": self.parallel_seconds}
         self.state_path = self.run_dir / "state.json"
         self.events_path = self.run_dir / "events.jsonl"
         self._raw_report: dict[str, Any] | None = None
@@ -336,42 +348,51 @@ class OnlineLinkedCoordinator:
                 return 1 if self._failure else 0
 
             deadline = self._deadline or deadline
-            while self.clock() < deadline:
-                if self.state["terminal_status"] in {"PARTIAL", "NOT_VERIFIED", "VULN_FOUND"}:
-                    break
-                self._drain_pending_probes()
-                deadline = self._candidate_deadline()
-                if self.state["terminal_status"] is not None or not self._active_container or self.clock() >= deadline:
-                    break
-                worker_exit_code = self._observe_parent_exit(timeout=min(30.0, max(0.0, deadline - self.clock())))
-                if worker_exit_code is not None:
-                    if worker_exit_code == STOP_ON_VULN_EXIT_CODE:
-                        return 1 if self._failure else 0
-                    return 1
-                for evidence in self.read_new_runtime_evidence(deadline=deadline):
-                    deadline = self._deadline or deadline
-                    self.advance_online_version(evidence, deadline=deadline)
+            while True:
+                while self.clock() < deadline:
+                    if self.state["terminal_status"] in {"PARTIAL", "NOT_VERIFIED", "VULN_FOUND"}:
+                        break
+                    self._drain_pending_probes()
+                    deadline = self._candidate_deadline()
+                    if self.state["terminal_status"] is not None or not self._active_container or self.clock() >= deadline:
+                        break
+                    worker_exit_code = self._observe_parent_exit(timeout=min(30.0, max(0.0, deadline - self.clock())))
+                    if worker_exit_code is not None:
+                        if worker_exit_code == STOP_ON_VULN_EXIT_CODE:
+                            return 1 if self._failure else 0
+                        return 1
+                    for evidence in self.read_new_runtime_evidence(deadline=deadline):
+                        deadline = self._deadline or deadline
+                        self.advance_online_version(evidence, deadline=deadline)
+                        deadline = self._deadline or deadline
+                        if self.state["terminal_status"] in {"PARTIAL", "NOT_VERIFIED", "VULN_FOUND"} or not self._active_container:
+                            break
                     deadline = self._deadline or deadline
                     if self.state["terminal_status"] in {"PARTIAL", "NOT_VERIFIED", "VULN_FOUND"} or not self._active_container:
                         break
-                deadline = self._deadline or deadline
-                if self.state["terminal_status"] in {"PARTIAL", "NOT_VERIFIED", "VULN_FOUND"} or not self._active_container:
-                    break
-                worker_exit_code = self._worker_exit_code(timeout=min(30.0, max(0.0, deadline - self.clock())))
-                if worker_exit_code is not None:
-                    self._handle_worker_exit(worker_exit_code)
-                    if worker_exit_code == STOP_ON_VULN_EXIT_CODE:
+                    worker_exit_code = self._worker_exit_code(timeout=min(30.0, max(0.0, deadline - self.clock())))
+                    if worker_exit_code is not None:
+                        self._handle_worker_exit(worker_exit_code)
+                        if worker_exit_code == STOP_ON_VULN_EXIT_CODE:
+                            return 1 if self._failure else 0
+                        return 1
+                    if self._parallel.poll_exits() is not None:
                         return 1 if self._failure else 0
-                    return 1
-                remaining = deadline - self.clock()
-                if remaining > 0:
-                    self.sleeper(min(0.5, remaining))
+                    remaining = deadline - self.clock()
+                    if remaining > 0:
+                        self.sleeper(min(0.5, remaining))
+                # Opt-in: the quiet window ended, so fuzz this config with N nodes instead of stopping.
+                active = self._version(self._active_version)
+                if active is None or not self._parallel.can_start() or not self._parallel.start(active):
+                    break
+                deadline = self._candidate_deadline()
             self._stop_active_worker(self.state["terminal_reason"] or "NO_NEW_PROGRESS")
             self._mark_campaign_expired_if_needed()
             if self.state["terminal_status"] is None:
                 self.state["terminal_status"] = "BOUNDED_ONLINE_COMPLETE"
                 self.state["terminal_reason"] = "NO_NEW_PROGRESS"
-            if self.state["terminal_status"] == "BOUNDED_ONLINE_COMPLETE" and self._hard_deadline is not None and self.clock() >= self._hard_deadline:
+            if (self.state["terminal_status"] == "BOUNDED_ONLINE_COMPLETE" and self._hard_deadline is not None
+                    and self.clock() >= self._hard_deadline and not self._ran_parallel()):
                 self.state.update(terminal_status="PARTIAL", terminal_reason="HARD_CANDIDATE_TIME_CAP")
             elif self.state["terminal_status"] == "BOUNDED_ONLINE_COMPLETE" and self.state.get("pending_runtime_candidates"):
                 self.state["terminal_status"] = "PARTIAL"
@@ -384,6 +405,18 @@ class OnlineLinkedCoordinator:
             self._write_state()
             self._stop_active_worker("COORDINATOR_ERROR")
             return 1
+        finally:
+            if getattr(self, "_parallel_group", None) is not None:
+                self._parallel.stop_nodes(self.state.get("terminal_reason") or "CANDIDATE_ENDED")
+
+    @property
+    def _parallel(self) -> ParallelRunner:
+        # Built per use, like _probes.
+        return ParallelRunner(self)
+
+    def _ran_parallel(self) -> bool:
+        """The candidate hard cap does not apply to a version that ran the parallel phase."""
+        return "parallel" in (self._version(self._active_version) or {})
 
     @property
     def _probes(self) -> ProbeRunner:
@@ -412,10 +445,10 @@ class OnlineLinkedCoordinator:
     def _handle_worker_exit(self, worker_exit_code: int) -> None:
         return self._worker_runner.handle_worker_exit(worker_exit_code)
 
-    def _attach_finding_artifact(self, version: Mapping[str, Any] | None) -> None:
+    def _attach_finding_artifact(self, version: Mapping[str, Any] | None, *, run_id: str | None = None) -> None:
         if version is None or self.load_finding_artifact is None:
             return
-        run_id = str(version.get("worker_run_id") or "").strip()
+        run_id = str(run_id or version.get("worker_run_id") or "").strip()
         if not run_id:
             return
         artifact_name = f"{run_id}.json"
@@ -467,9 +500,20 @@ class OnlineLinkedCoordinator:
             self.campaign_deadline = campaign_deadline
         self._progress_keys.add(identity)
         reserve = 2 * self._sender_seconds if kind == "verified_parameter" else 0.0
-        self._deadline = max(deadline, now + self.max_seconds + reserve) if kind == "verified_parameter" else deadline
-        if self._hard_deadline is not None:
-            self._deadline = min(self._hard_deadline, self._deadline)
+        group = getattr(self, "_parallel_group", None)
+        if group is not None:
+            if kind == "verified_parameter":
+                discovery = now + self.max_seconds + reserve
+                if self._hard_deadline is not None:
+                    discovery = min(self._hard_deadline, discovery)
+                if self.campaign_deadline is not None:
+                    discovery = min(discovery, self.campaign_deadline)
+                group["discovery_deadline"] = discovery
+            self._deadline = deadline
+        else:
+            self._deadline = max(deadline, now + self.max_seconds + reserve) if kind == "verified_parameter" else deadline
+            if self._hard_deadline is not None:
+                self._deadline = min(self._hard_deadline, self._deadline)
         if self.campaign_deadline is not None:
             self._deadline = min(self._deadline, self.campaign_deadline)
         self.max_versions = min(self.hard_versions, self.max_versions + 1)
@@ -534,8 +578,10 @@ class OnlineLinkedCoordinator:
         self._copy_json(zend_dir / zend_name, evidence.get("zend"))
         seed = parent.get("seed_item") if isinstance(parent.get("seed_item"), Mapping) else {}
         seed_variant_id = str((seed.get("seed") or {}).get("seed_variant_id") or "") if isinstance(seed.get("seed"), Mapping) else ""
+        evidence_run_id = str(evidence.get("worker_run_id") or "")
+        observed_run_id = evidence_run_id if self._parallel.owns_run_id(evidence_run_id) else str(parent["worker_run_id"])
         summary = {
-            "legacy_run_id": parent["worker_run_id"],
+            "legacy_run_id": observed_run_id,
             "runs": [{
                 "config_slug": Path(parent["config_path"]).relative_to(self.config_root).with_suffix("").as_posix(),
                 "hook_name": parent["hook_name"],
@@ -555,7 +601,7 @@ class OnlineLinkedCoordinator:
                 zend_events_dir=zend_dir,
                 registry=self.registry,
                 plugin_slug=self.plugin_slug,
-                legacy_run_id=str(parent["worker_run_id"]),
+                legacy_run_id=observed_run_id,
                 known_state={"known_parameters": parent.get("known_parameters", [])},
                 candidate_key=self._target_key,
                 runtime_cookie_probes=self.runtime_cookie_probes,
@@ -1041,6 +1087,7 @@ class OnlineLinkedCoordinator:
         return self._worker_runner.resume_parent()
 
     def _stop_active_worker(self, reason: str) -> None:
+        self._parallel.stop_nodes(reason)
         return self._worker_runner.stop_active_worker(reason)
 
     def _stop_worker(self, version: Mapping[str, Any], reason: str) -> bool:
@@ -1089,7 +1136,7 @@ class OnlineLinkedCoordinator:
 
     def _write_state(self) -> None:
         if self.state.get("terminal_status") == "BOUNDED_ONLINE_COMPLETE":
-            if self._hard_deadline is not None and self.clock() >= self._hard_deadline:
+            if self._hard_deadline is not None and self.clock() >= self._hard_deadline and not self._ran_parallel():
                 self.state.update(terminal_status="PARTIAL", terminal_reason="HARD_CANDIDATE_TIME_CAP")
             elif self.state.get("pending_runtime_candidates") or self.state.get("pending_probe_queue"):
                 self.state["terminal_status"] = "PARTIAL"
@@ -1171,6 +1218,7 @@ class OnlineLinkedCoordinator:
                 if not self._stop_worker(version, "RESUME_REVALIDATION"):
                     raise ValueError("resume previous worker could not be stopped")
                 break
+        self._parallel.remove_leftover_nodes(version, "RESUME_REVALIDATION")
         return version, config
 
     def _version(self, name: str) -> dict[str, Any] | None:

@@ -3131,6 +3131,419 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertTrue(any("HOOKPHUZZ_FINDING_ARTIFACT=" in item for item in coordinator.state["workers"][0]["command"]))
             self.assertIn("worker_stop", log)
 
+    # --- Parallel phase (opt-in): N nodes on the current config after the quiet window ---
+
+    NODE1 = "hookphuzz-online-linked-run-v0"
+
+    def _parallel_docker(self, coordinator, log, *, running=None, exit_codes=None):
+        """Wrap the fixture's docker fake: node liveness, node exits, and start/rm traces."""
+        base = coordinator.run_command
+        starts: list[tuple[float, list[str]]] = []
+        inspected: dict[str, int] = {}
+
+        def run_command(command, **kwargs):
+            if command[:4] == ["docker", "inspect", "-f", "{{.State.Running}}"]:
+                name = command[4]
+                inspected[name] = inspected.get(name, 0) + 1
+                alive = running(name, inspected[name]) if running else True
+                return subprocess.CompletedProcess(command, 0, "true\n" if alive else "false\n", "")
+            if command[:2] == ["docker", "inspect"] and exit_codes and command[-1] in exit_codes:
+                code = exit_codes[command[-1]](coordinator)
+                if code is not None:
+                    return subprocess.CompletedProcess(command, 0, f"{code}\n", "")
+            if command[:3] == ["docker", "compose", "run"]:
+                starts.append((coordinator.clock(), command))
+            elif command[:3] == ["docker", "rm", "-f"]:
+                log.append("rm:" + command[3])
+            return base(command, **kwargs)
+
+        coordinator.run_command = run_command
+        return starts
+
+    @staticmethod
+    def _command_env(command):
+        return dict(command[i + 1].split("=", 1) for i, arg in enumerate(command) if arg == "-e")
+
+    def _quiet_reader(self, coordinator, calls, *, pairs_for=None):
+        def reader(*, run_id, plugin_slug, timeout, run_command):
+            calls.append((coordinator.clock(), run_id))
+            pairs = pairs_for(run_id) if pairs_for else []
+            return {"pairs": pairs, "stats": {"file_count": len(pairs), "paired_count": len(pairs)}}
+        return reader
+
+    def test_parallel_off_keeps_single_worker_and_node_id(self):
+        """Default mode must stay the single-worker coordinator."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False)
+            starts = self._parallel_docker(coordinator, log)
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(self._command_env(starts[0][1])["FUZZER_NODE_ID"], "1")
+            self.assertTrue(all("parallel" not in version for version in coordinator.state["versions"]))
+            self.assertNotIn("parallel_settings", coordinator.state)
+            self.assertEqual(coordinator.state["terminal_reason"], "NO_NEW_PROGRESS")
+
+    def test_parallel_starts_nodes_after_quiet_window(self):
+        """Extra nodes join only once discovery is quiet, sharing node 1's queue but not its identity."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+            starts = self._parallel_docker(coordinator, log)
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            self.assertEqual(len(starts), 3)
+            node1 = self._command_env(starts[0][1])
+            self.assertEqual(node1["FUZZER_NODE_ID"], "1")
+            for (started_at, command), k in zip(starts[1:], (2, 3)):
+                self.assertGreaterEqual(started_at, 2, "nodes must wait for the quiet window")
+                self.assertEqual(command[command.index("--name") + 1], f"{self.NODE1}-n{k}")
+                env = self._command_env(command)
+                self.assertEqual(env["FUZZER_NODE_ID"], str(k))
+                self.assertEqual(env["HOOKPHUZZ_LEGACY_RUN_ID"], f"run-v0-n{k}")
+                self.assertEqual(env["HOOKPHUZZ_FINDING_ARTIFACT"], f"/shared-tmpfs/fuzzer-findings/run-v0-n{k}.json")
+                self.assertEqual(env["HOOKPHUZZ_SYNC_NAMESPACE"], node1["HOOKPHUZZ_SYNC_NAMESPACE"])
+                self.assertNotIn("HOOKPHUZZ_PRIORITY_SEED", env)
+            keys = {self._command_env(command)["HOOKPHUZZ_HANDOFF_KEY"] for _, command in starts}
+            self.assertEqual(len(keys), 3, "each node needs its own pause channel")
+            self.assertEqual(coordinator.state["parallel_settings"], {"enabled": True, "nodes": 3, "seconds": 5})
+            self.assertTrue(any(event["kind"] == "PARALLEL_START" for event in coordinator.state["events"]))
+
+    def test_parallel_clock_starts_when_all_nodes_running(self):
+        """Slow container start-up must not eat into the parallel fuzzing time."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+            self._parallel_docker(coordinator, log, running=lambda name, calls: not name.endswith("-n3") or calls > 4)
+            coordinator.run()
+            parallel = coordinator.state["versions"][0]["parallel"]
+            self.assertGreaterEqual(parallel["all_running_at"] - parallel["started_at"], 2)
+            self.assertEqual(parallel["deadline"], parallel["all_running_at"] + 5)
+            self.assertEqual([node["node_index"] for node in parallel["nodes"] if node["started"]], [1, 2, 3])
+
+    def test_parallel_expiry_ends_no_new_progress_and_removes_nodes(self):
+        """Parallel expiry is a normal quiet end; the candidate hard cap must not turn it PARTIAL."""
+        for hard_seconds in (None, 2):
+            with self.subTest(hard_seconds=hard_seconds), tempfile.TemporaryDirectory() as tmp:
+                log: list[str] = []
+                coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+                if hard_seconds is not None:
+                    coordinator.hard_seconds = coordinator.state["hard_seconds"] = hard_seconds
+                self._parallel_docker(coordinator, log)
+                self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+                self.assertEqual(coordinator.state["terminal_status"], "BOUNDED_ONLINE_COMPLETE")
+                self.assertEqual(coordinator.state["terminal_reason"], "NO_NEW_PROGRESS")
+                parallel = coordinator.state["versions"][0]["parallel"]
+                self.assertGreaterEqual(coordinator.clock(), parallel["deadline"])
+                self.assertEqual(parallel["end_reason"], "NO_NEW_PROGRESS")
+                for name in (f"{self.NODE1}-n2", f"{self.NODE1}-n3", self.NODE1):
+                    self.assertIn("rm:" + name, log)
+                self.assertIsNone(coordinator._parallel_group)
+
+    def test_parallel_bounded_by_campaign_deadline(self):
+        """The campaign budget still wins over the parallel clock."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True,
+                                                campaign_deadline=4.0)
+            self._parallel_docker(coordinator, log)
+            coordinator.run()
+            parallel = coordinator.state["versions"][0]["parallel"]
+            self.assertEqual(parallel["deadline"], 4.0)
+            for name in (f"{self.NODE1}-n2", f"{self.NODE1}-n3", self.NODE1):
+                self.assertIn("rm:" + name, log)
+
+    def test_parallel_resume_does_not_restore_group(self):
+        """Resume revalidates node 1 only; nodes left by a killed coordinator are removed, not reused."""
+        class Killed(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log: list[str] = []
+            coordinator = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+            self._parallel_docker(coordinator, log)
+            snapshot = root / "killed-state.json"
+            sleep = coordinator.sleeper
+
+            def kill_during_parallel(seconds):
+                if coordinator._parallel_group is not None:
+                    coordinator._write_state()
+                    shutil.copyfile(coordinator.state_path, snapshot)
+                    raise Killed()
+                sleep(seconds)
+
+            coordinator.sleeper = kill_during_parallel
+            with self.assertRaises(Killed):
+                coordinator.run()
+            saved = json.loads(snapshot.read_text())
+            saved["terminal_status"] = "PARTIAL"  # what the batch records for an interrupted candidate
+            coordinator.state_path.write_text(json.dumps(saved), encoding="utf-8")
+
+            log.clear()
+            restored = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+            restored.resume = True
+            starts = self._parallel_docker(restored, log)
+            fixture_gate = restored.replay_runner
+
+            def resume_gate(rows, **kwargs):
+                # The fixture's v0 gate answers for run-v0 only; relabel it as the resumed run.
+                run_id = kwargs["legacy_run_id"]
+                if "-resume-" not in run_id:
+                    return fixture_gate(rows, **kwargs)
+                report = fixture_gate(rows, **{**kwargs, "legacy_run_id": "run-v0"})
+                report["legacy_run_id"] = run_id
+                for row in report["runs"]:
+                    row["request_payload"]["legacy_run_id"] = run_id
+                    row["zend_payload"]["run_id"] = run_id
+                return report
+
+            restored.replay_runner = resume_gate
+            restored.run()
+            self.assertEqual(restored.state["terminal_reason"], "NO_NEW_PROGRESS")
+            names = [command[command.index("--name") + 1] for _, command in starts]
+            self.assertEqual(names, [self.NODE1])
+            self.assertIn(f"rm:{self.NODE1}-n2", log)
+            self.assertIn(f"rm:{self.NODE1}-n3", log)
+
+    def test_parallel_interrupt_while_nodes_boot_leaves_no_orphans(self):
+        """Ctrl-C while extra nodes boot must still remove every node already started."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+
+            def interrupt(name, calls):
+                raise KeyboardInterrupt()
+
+            self._parallel_docker(coordinator, log, running=interrupt)
+            with self.assertRaises(KeyboardInterrupt):
+                coordinator.run()
+            self.assertIn(f"rm:{self.NODE1}-n2", log)
+            self.assertIn(f"rm:{self.NODE1}-n3", log)
+            self.assertIsNone(coordinator._parallel_group)
+
+    def test_parallel_reads_evidence_from_every_node(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            calls: list[tuple[float, str]] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+            coordinator.runtime_batch_reader = self._quiet_reader(coordinator, calls)
+            self._parallel_docker(coordinator, log)
+            coordinator.run()
+            run_ids = [run_id for _, run_id in calls]
+            self.assertIn(["run-v0", "run-v0-n2", "run-v0-n3"],
+                          [run_ids[i:i + 3] for i in range(len(run_ids) - 2)])
+
+    def test_parallel_node_evidence_triggers_handoff(self):
+        """A parameter seen only by node 3 must be admitted and verified like node-1 evidence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            calls: list[tuple[float, str]] = []
+            coordinator = self.make_coordinator(
+                Path(tmp), log, parallel=True, request_names={"req-n3.json"}, zend_names={"req-n3.json"})
+
+            def pairs_for(run_id):
+                if run_id != "run-v0-n3":
+                    return []
+                return [{
+                    "request_name": "req-n3.json", "zend_name": "req-n3.json",
+                    "request": {"request_id": "req-n3", "legacy_run_id": run_id, "target_plugin": "fixture",
+                                "http_method": "POST",
+                                "request_params": {"body_params": {"action": "fixture", "seed": "base"}}},
+                    "zend": {"request_id": "req-n3", "run_id": run_id},
+                }]
+
+            coordinator.runtime_batch_reader = self._quiet_reader(coordinator, calls, pairs_for=pairs_for)
+            original_converge = coordinator.converge_fn
+            converged_run_ids = []
+
+            def converge(**kwargs):
+                if kwargs["pass_run_summary"]["runs"][0].get("process_status") == "replaying":
+                    return original_converge(**kwargs)
+                converged_run_ids.append(kwargs["legacy_run_id"])
+                result = original_converge(**{**kwargs, "legacy_run_id": "run-v0"})
+                for parameter in result.get("new_parameters", []):
+                    parameter["run_id"] = kwargs["legacy_run_id"]  # the bridge stamps the analysed run
+                return result
+
+            coordinator.converge_fn = converge
+            self._parallel_docker(coordinator, log)
+            coordinator.run()
+            self.assertEqual(converged_run_ids[:1], ["run-v0-n3"])
+            versions = [version["version"] for version in coordinator.state["versions"]]
+            self.assertIn("v1", versions)
+            replay_events = [event for event in coordinator.state["events"]
+                             if event.get("kind") == "CHILD_REPLAY" and event.get("version") == "v1"]
+            self.assertEqual([event["status"] for event in replay_events][:1], ["PASS"])
+            accepted = next(event for event in coordinator.state["events"]
+                            if event.get("kind") == "PARAMETER_DISCOVERY" and event.get("status") == "ACCEPTED")
+            self.assertEqual(accepted["evidence_run_id"], "run-v0-n3")
+
+    def test_parallel_node_crash_is_dropped(self):
+        """One crashed extra node must not fail the callback; the others keep fuzzing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            calls: list[tuple[float, str]] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+            coordinator.runtime_batch_reader = self._quiet_reader(coordinator, calls)
+            crash = lambda c: 1 if c._parallel_group is not None and c.clock() >= 4 else None
+            self._parallel_docker(coordinator, log, exit_codes={f"{self.NODE1}-n2": crash})
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            self.assertEqual(coordinator.state["terminal_status"], "BOUNDED_ONLINE_COMPLETE")
+            exits = [event for event in coordinator.state["events"] if event.get("kind") == "PARALLEL_NODE_EXIT"]
+            self.assertEqual([(event["node_index"], event["exit_code"]) for event in exits], [(2, 1)])
+            self.assertIn(f"rm:{self.NODE1}-n2", log)
+            late = {run_id for at, run_id in calls if at >= 5}
+            self.assertIn("run-v0-n3", late)
+            self.assertNotIn("run-v0-n2", late)
+
+    def test_parallel_node_vuln_stops_all(self):
+        """A finding from any node ends the callback like a node-1 finding, with that node's artifact."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+            loaded = []
+            coordinator.load_finding_artifact = lambda name: loaded.append(name) or {"run_id": name[:-5]}
+            vuln = lambda c: STOP_ON_VULN_EXIT_CODE if c._parallel_group is not None else None
+            self._parallel_docker(coordinator, log, exit_codes={f"{self.NODE1}-n2": vuln})
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            self.assertEqual(coordinator.state["terminal_status"], "VULN_FOUND")
+            self.assertEqual(loaded, ["run-v0-n2.json"])
+            self.assertEqual(coordinator.state["versions"][0]["finding_artifact"], {"run_id": "run-v0-n2"})
+            for name in (f"{self.NODE1}-n2", f"{self.NODE1}-n3", self.NODE1):
+                self.assertIn("rm:" + name, log)
+
+    def _parallel_handoff_run(self, root, log, **kwargs):
+        """A v0 parameter appears only after Parallel started, from node 3."""
+        calls: list[tuple[float, str]] = []
+        coordinator = self.make_coordinator(
+            root, log, parallel=True, request_names={"req-n3.json"}, zend_names={"req-n3.json"}, **kwargs)
+
+        def pairs_for(run_id):
+            if run_id != "run-v0-n3":
+                return []
+            return [{
+                "request_name": "req-n3.json", "zend_name": "req-n3.json",
+                "request": {"request_id": "req-n3", "legacy_run_id": run_id, "target_plugin": "fixture",
+                            "http_method": "POST",
+                            "request_params": {"body_params": {"action": "fixture", "seed": "base"}}},
+                "zend": {"request_id": "req-n3", "run_id": run_id},
+            }]
+
+        coordinator.runtime_batch_reader = self._quiet_reader(coordinator, calls, pairs_for=pairs_for)
+        original_converge = coordinator.converge_fn
+
+        def converge(**kw):
+            if kw["pass_run_summary"]["runs"][0].get("process_status") == "replaying":
+                return original_converge(**kw)
+            result = original_converge(**{**kw, "legacy_run_id": "run-v0"})
+            for parameter in result.get("new_parameters", []):
+                parameter["run_id"] = kw["legacy_run_id"]
+            return result
+
+        coordinator.converge_fn = converge
+        starts = self._parallel_docker(coordinator, log)
+        return coordinator, starts
+
+    def test_parallel_pause_waits_for_every_node_before_replay(self):
+        """Replay must see no request from any node: every node acknowledges the pause first."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator, _ = self._parallel_handoff_run(Path(tmp), log)
+            coordinator.run()
+            replay = next(i for i, entry in enumerate(log) if entry.startswith("sender_timeout:run-v1-replay"))
+            before = log[:replay]
+            self.assertEqual(before.count("pause_requested"), 3)
+            self.assertEqual(before.count("pause_ack"), 3)
+
+    def test_parallel_unacked_node_removed_before_replay(self):
+        """A node that cannot be paused is removed, so replay stays clean."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            acks = lambda request: None if request["worker_run_id"].endswith("-n2") else {
+                **request, "round_id": 1, "allocated_energy": 20, "attempts_used": 9, "seed_phuzz_energy": 31}
+            # A long phase: the stuck node may cost at most the node ACK wait, not the phase.
+            coordinator, _ = self._parallel_handoff_run(Path(tmp), log, pause_ack=acks, parallel_seconds=60)
+            coordinator.run()
+            replay = next(i for i, entry in enumerate(log) if entry.startswith("sender_timeout:run-v1-replay"))
+            self.assertIn(f"rm:{self.NODE1}-n2", log[:replay])
+            self.assertTrue(any(event.get("kind") == "PARALLEL_PAUSE" and event.get("reason") == "NODE_REMOVED"
+                                and event.get("node_index") == 2 for event in coordinator.state["events"]))
+            self.assertIn("v1", [version["version"] for version in coordinator.state["versions"]])
+
+    def test_parallel_handoff_pass_stops_group_and_returns_to_single_worker(self):
+        """A verified parameter ends Parallel: the new config restarts single-worker discovery."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator, starts = self._parallel_handoff_run(Path(tmp), log, max_versions=2)
+            observed = {}
+            original_start = coordinator._start_worker
+
+            def start_worker(version, **kwargs):
+                if version["version"] == "v1":
+                    observed["group"] = coordinator._parallel_group
+                    observed["candidate_deadline"] = coordinator.state.get("candidate_deadline")
+                    observed["deadline"] = coordinator._deadline
+                    observed["parallel_deadline"] = coordinator.state["versions"][0]["parallel"]["deadline"]
+                    observed["at"] = coordinator.clock()
+                return original_start(version, **kwargs)
+
+            coordinator._start_worker = start_worker
+            coordinator.run()
+            self.assertIsNone(observed["group"], "nodes must stop before the new worker starts")
+            # Discovery restarts with a fresh quiet window, not the remaining parallel time.
+            self.assertEqual(observed["deadline"], observed["candidate_deadline"])
+            self.assertGreater(observed["deadline"], observed["at"])
+            self.assertNotEqual(observed["deadline"], observed["parallel_deadline"])
+            node_rms = [entry for entry in log if entry.startswith(f"rm:{self.NODE1}-n")]
+            self.assertEqual(sorted(set(node_rms)), [f"rm:{self.NODE1}-n2", f"rm:{self.NODE1}-n3"])
+            v1_starts = [command for _, command in starts if "--name" in command
+                         and command[command.index("--name") + 1].endswith("-v1")]
+            self.assertEqual(len(v1_starts), 1)
+            self.assertEqual(self._command_env(v1_starts[0])["FUZZER_NODE_ID"], "101")
+            parallel = coordinator.state["versions"][0]["parallel"]
+            self.assertEqual(parallel["end_reason"], "HANDOFF_TO_v1")
+
+    def test_parallel_replay_fail_releases_group(self):
+        """A failed replay resumes every node and keeps the original parallel deadline."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator, _ = self._parallel_handoff_run(Path(tmp), log, replay_passes=False)
+            seen = {}
+            original_resume = coordinator._resume_parent
+
+            def resume_parent():
+                result = original_resume()
+                if coordinator._parallel_group is not None and "deadline" not in seen:
+                    seen["deadline"] = coordinator._parallel_group["deadline"]
+                    seen["released"] = log.count("pause_released")
+                    seen["active"] = True
+                return result
+
+            coordinator._resume_parent = resume_parent
+            coordinator.run()
+            self.assertTrue(seen.get("active"), "group must stay active after a failed replay")
+            self.assertEqual(seen["released"], 3)
+            parallel = coordinator.state["versions"][0]["parallel"]
+            self.assertEqual(seen["deadline"], parallel["deadline"])
+            self.assertEqual(parallel["end_reason"], "NO_NEW_PROGRESS")
+            self.assertNotIn(coordinator.state["terminal_reason"], {"CHILD_REPLAY_FAILED", "PAUSE_RELEASE_FAILED"})
+
+    def test_parallel_coordinator_error_removes_nodes(self):
+        """No orphan nodes when the coordinator itself fails during Parallel."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator, _ = self._parallel_handoff_run(Path(tmp), log)
+
+            def explode(evidence, **kwargs):
+                raise RuntimeError("boom")
+
+            coordinator.advance_online_version = explode
+            self.assertEqual(coordinator.run(), 1)
+            self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
+            for name in (f"{self.NODE1}-n2", f"{self.NODE1}-n3", self.NODE1):
+                self.assertIn("rm:" + name, log)
+            self.assertIsNone(coordinator._parallel_group)
+
     def make_coordinator(
         self,
         root: Path,
@@ -3152,6 +3565,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
         runtime_batch_reader=None,
         campaign_dir: Path | None = None,
         pause_ack=None,
+        parallel: bool = False,
+        parallel_nodes: int = 3,
+        parallel_seconds: int = 5,
     ) -> OnlineLinkedCoordinator:
         item = seed_item()
         control_root = root / "handoff-control"
@@ -3420,6 +3836,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             run_command=run_command,
             clock=clock,
             sleeper=clock.sleep,
+            parallel=parallel,
+            parallel_nodes=parallel_nodes,
+            parallel_seconds=parallel_seconds,
         )
 
         def light_sender(container_name, **kwargs):

@@ -302,6 +302,9 @@ def run_online_linked(args: argparse.Namespace) -> int:
                     credit_progress(kind, key if kind == "runtime_callback" else identity + ":" + key),
                 registry_checkpoint_callback=checkpoint,
                 priority_energy_mode=batch_state["priority_energy_mode"],
+                parallel=bool(getattr(args, "parallel", False)),
+                parallel_nodes=getattr(args, "parallel_nodes", 10),
+                parallel_seconds=getattr(args, "parallel_seconds", 240),
             )
             candidate_record["state_path"] = str(coordinator.state_path)
             checkpoint()
@@ -438,6 +441,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hard-campaign-seconds", type=int, help="Absolute campaign seconds (default max(86400, initial))")
     parser.add_argument("--hard-candidate-seconds", type=int, help="Absolute candidate seconds (default: no candidate hard cap)")
     parser.add_argument("--hard-max-versions", type=int, help="Absolute versions including v0 (default max(20, 4 * initial))")
+    parser.add_argument("--parallel", action="store_true",
+                        help="After the quiet window, fuzz the current config with several nodes (default off)")
+    parser.add_argument("--parallel-nodes", type=int, choices=range(2, 51), default=10,
+                        help="Total nodes in the parallel phase, including the running worker (default 10)")
+    parser.add_argument("--parallel-seconds", type=int, choices=range(1, 86401), default=240,
+                        help="Parallel phase seconds, counted once every node runs (default 240)")
     parser.add_argument("--resume", action="store_true", help="Reload this run's checkpoint; retain caps and credits, recheck gates")
     parser.add_argument("--sync-registry", action="store_true")
     parser.add_argument("--runtime-cookie-probes", action="store_true")

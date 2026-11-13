@@ -92,6 +92,19 @@ function Show-Campaign($RunDirectory) {
         @{ Name = "params"; Expression = { (@($_.known_parameters) | ForEach-Object { $_.name }) -join "," } } |
         Format-Table -AutoSize | Out-Host
 
+    # Parallel phase (ONLINE_PARALLEL=1): the deadline is the coordinator's monotonic clock,
+    # so the time left comes from budget.remaining_seconds at the last save.
+    $parallel = @($state.versions | Where-Object { $_ -and $_.parallel -and -not $_.parallel.ended_at }) | Select-Object -Last 1
+    if ($parallel) {
+        $live = @($parallel.parallel.nodes | Where-Object { $_.started -and -not $_.stop_reason -and $null -eq $_.exit_code }).Count
+        $left = "?"
+        if ($state.budget -and $null -ne $state.budget.remaining_seconds -and $state.budget.saved_at) {
+            $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+            $left = [Math]::Max(0, [int]($state.budget.remaining_seconds - ($now - $state.budget.saved_at)))
+        }
+        Write-Host ("Parallel: {0}/{1} nodes, {2}s left" -f $live, $parallel.parallel.requested_nodes, $left)
+    }
+
     Show-PriorityRounds $state $active.state_path
 
     if ($EventCount -eq 0) { return }
