@@ -24,6 +24,7 @@ from online_linked.coordination.candidate_identity import (
     _candidate_context_key,
     _candidate_slug,
 )
+from online_linked.coordination.parallel_runner import checkpoint_parallel_cleanup_pending
 from online_linked.export import export_online_linked_batch
 
 
@@ -234,8 +235,29 @@ def run_online_linked(args: argparse.Namespace) -> int:
         return campaign_deadline
 
     next_index = max([entry[0] for entry in queue] + [row["index"] for row in batch_state["candidates"]] + [0]) + 1
+    cleanup_blockers = {
+        row["index"] for row in batch_state["candidates"]
+        if row.get("terminal_status") == "PARTIAL" and row.get("terminal_reason") == "PARALLEL_CLEANUP_PENDING"
+    }
+    if resume:
+        for row in batch_state["candidates"]:
+            if row.get("terminal_reason") != "CANDIDATE_INTERRUPTED" or not row.get("state_path"):
+                continue
+            state_path = filesystem_path(Path(row["state_path"]))
+            try:
+                interrupted = json.loads(state_path.read_text(encoding="utf-8-sig"))
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                if getattr(args, "parallel", False):
+                    cleanup_blockers.add(row["index"])
+                continue
+            if checkpoint_parallel_cleanup_pending(interrupted):
+                cleanup_blockers.add(row["index"])
     while queue:
-        queue.sort(key=lambda entry: not str(entry[1].get("hook_name") or "").startswith("wp_ajax_"))
+        queue.sort(key=lambda entry: (
+            entry[0] not in cleanup_blockers, not str(entry[1].get("hook_name") or "").startswith("wp_ajax_"),
+        ))
         previous = next((row for row in batch_state["candidates"] if row["index"] == queue[0][0]), None)
         if previous is None and len(batch_state["candidates"]) >= max_candidates:
             reason = "HARD_CANDIDATE_COUNT_CAP" if max_candidates >= hard_max_candidates else "CANDIDATE_BUDGET_EXPIRED"
@@ -276,10 +298,17 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 batch_state["candidates"].append(candidate_record)
             else:
                 batch_state["candidates"][batch_state["candidates"].index(previous)] = candidate_record
-            candidate_record.update(terminal_status="PARTIAL", terminal_reason="CANDIDATE_INTERRUPTED",
-                                    state_path=(previous or {}).get("state_path"))
+            candidate_record.update(
+                terminal_status="PARTIAL",
+                terminal_reason="PARALLEL_CLEANUP_PENDING" if index in cleanup_blockers else "CANDIDATE_INTERRUPTED",
+                state_path=(previous or {}).get("state_path"),
+            )
             active_entry = (index, raw_item, source)
             checkpoint()
+            resume_candidate = bool(previous and previous.get("state_path")
+                                    and filesystem_path(Path(previous["state_path"])).is_file())
+            if index in cleanup_blockers and not resume_candidate:
+                raise ValueError("parallel cleanup checkpoint missing")
             coordinator = OnlineLinkedCoordinator(
                 suggested_seeds=candidate_input,
                 bootstrap_config=Path(args.bootstrap_config) if args.bootstrap_config else None,
@@ -297,7 +326,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 campaign_dir=batch_dir,
                 hard_seconds=hard_seconds,
                 hard_versions=hard_versions,
-                resume=bool(previous and previous.get("state_path") and Path(previous["state_path"]).is_file()),
+                resume=resume_candidate,
                 progress_callback=lambda kind, key, identity=candidate_record["identity"]:
                     credit_progress(kind, key if kind == "runtime_callback" else identity + ":" + key),
                 registry_checkpoint_callback=checkpoint,
@@ -317,7 +346,11 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 "terminal_reason": coordinator.state.get("terminal_reason"),
                 "versions": len(coordinator.state.get("versions", [])),
             })
-            if coordinator.state.get("terminal_status") == "PARTIAL":
+            if index in cleanup_blockers and not coordinator.resume_cleanup_confirmed:
+                if candidate_record["terminal_reason"] != "PARALLEL_CLEANUP_PENDING":
+                    candidate_record["detail"] = candidate_record["terminal_reason"]
+                candidate_record.update(terminal_status="PARTIAL", terminal_reason="PARALLEL_CLEANUP_PENDING")
+            if candidate_record["terminal_status"] == "PARTIAL":
                 blocked_pending.append((index, dict(raw_item), source))
             for child in coordinator.state.get("candidate_queue", []):
                 if not isinstance(child, Mapping):
@@ -372,19 +405,26 @@ def run_online_linked(args: argparse.Namespace) -> int:
         except Exception as exc:
             # Candidate-local failures must not discard the remaining batch.
             skipped = True
+            detail = f"CANDIDATE_FAILED: {type(exc).__name__}: {exc}"
             candidate_record.update({
                 "exit_code": 2,
                 "state_path": candidate_record.get("state_path", ""),
                 "terminal_status": "PARTIAL" if previous else "NOT_VERIFIED",
-                "terminal_reason": f"CANDIDATE_FAILED: {type(exc).__name__}: {exc}",
+                "terminal_reason": "PARALLEL_CLEANUP_PENDING" if index in cleanup_blockers else detail,
                 "versions": candidate_record.get("versions", 0),
             })
+            if index in cleanup_blockers:
+                candidate_record["detail"] = detail
             if previous:
                 blocked_pending.append((index, dict(raw_item), source))
         active_entry = None
         if candidate_record not in batch_state["candidates"]:
             batch_state["candidates"].append(candidate_record)
         checkpoint()
+        if (candidate_record.get("terminal_status") == "PARTIAL"
+                and candidate_record.get("terminal_reason") == "PARALLEL_CLEANUP_PENDING"):
+            batch_state["campaign_status"] = "PARALLEL_CLEANUP_PENDING"
+            break
 
     if batch_state["campaign_status"] == "running" and time.monotonic() >= campaign_deadline:
         batch_state["campaign_status"] = "CAMPAIGN_BUDGET_EXPIRED"

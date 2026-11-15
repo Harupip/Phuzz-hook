@@ -32,6 +32,25 @@ NODE_START_WAIT_SECONDS = 30.0
 NODE_PAUSE_WAIT_SECONDS = 30.0
 
 
+def pending_parallel_nodes(version: Mapping[str, Any]) -> list[dict[str, Any]]:
+    parallel = version.get("parallel") or {}
+    return [
+        node for node in parallel.get("nodes", [])
+        if node.get("node_index", 1) >= 2
+        and ("stop_error" in node or (node.get("started") and node.get("stop_reason") is None))
+    ]
+
+
+def checkpoint_parallel_cleanup_pending(state: Mapping[str, Any]) -> bool:
+    name = (state.get("checkpoint") or {}).get("active_version")
+    version = next((row for row in state.get("versions", []) if row.get("version") == name), {})
+    return "parallel" in version and (
+        bool(pending_parallel_nodes(version))
+        or any(worker.get("version") == name and worker.get("status") in {"started", "stop_failed"}
+               for worker in state.get("workers", []))
+    )
+
+
 class ParallelHost(Protocol):
     state: dict[str, Any]
     clock: Callable[[], float]
@@ -221,11 +240,11 @@ class ParallelRunner:
             host._write_state()
         return None
 
-    def pause_nodes(self, deadline: float | None, *, request_id: str = "") -> None:
-        """Pause every extra node like node 1; a node without a matching ACK is removed."""
+    def pause_nodes(self, deadline: float | None, *, request_id: str = "") -> bool:
+        """Confirm each extra node is paused or removed before replay."""
         group = self._group
         if group is None:
-            return
+            return True
         host = self._host
         version = host._version(group["version"])
         wait_until = (deadline - 2 * host._sender_seconds if deadline is not None
@@ -250,8 +269,15 @@ class ParallelRunner:
             # Replay must stay clean: a node we cannot pause does not keep fuzzing.
             group["nodes"].remove(node)
             removed = self._remove(node, "PAUSE_NOT_ACKNOWLEDGED")
-            self._event("PARALLEL_PAUSE", "REJECTED", "NODE_REMOVED" if removed else "NODE_REMOVE_FAILED",
-                        version, node)
+            if removed:
+                self._event("PARALLEL_PAUSE", "REJECTED", "NODE_REMOVED", version, node)
+        unresolved = [
+            node for node in (version or {}).get("parallel", {}).get("nodes", [])
+            if node["node_index"] >= 2 and "stop_error" in node
+        ]
+        for node in unresolved:
+            self._event("PARALLEL_PAUSE", "REJECTED", "NODE_REMOVE_FAILED", version, node,
+                        detail=node["stop_error"])
         if paused:
             host._record_event({
                 "kind": "PARALLEL_PAUSE", "status": "ACKNOWLEDGED", "reason": "PAUSE_ACK",
@@ -259,6 +285,7 @@ class ParallelRunner:
                 "at": host.clock(),
             })
         host._write_state()
+        return not unresolved
 
     def release_nodes(self) -> None:
         group = self._group
@@ -281,10 +308,11 @@ class ParallelRunner:
             discovery = host.clock() + host.max_seconds
             if host.campaign_deadline is not None:
                 discovery = min(discovery, host.campaign_deadline)
-        stopped = self.stop_nodes("HANDOFF_TO_" + child_version)
+        if not self.stop_nodes("HANDOFF_TO_" + child_version):
+            return False
         host._deadline = discovery
         host.state["candidate_deadline"] = discovery
-        return stopped
+        return True
 
     def stop_nodes(self, reason: str) -> bool:
         """Remove nodes 2..N and close the group; node 1 is the caller's to stop."""
@@ -292,14 +320,20 @@ class ParallelRunner:
         if group is None:
             return True
         host = self._host
-        stopped = all([self._remove(node, reason) for node in list(group["nodes"])])
-        host._parallel_group = None
-        version = host._version(group["version"])
-        if version is not None and isinstance(version.get("parallel"), dict):
-            for node in version["parallel"]["nodes"]:
-                if node["node_index"] == 1 and node["stop_reason"] is None:
-                    node["stop_reason"] = reason
-            version["parallel"].update(ended_at=host.clock(), end_reason=reason)
+        parallel = (host._version(group["version"]) or {}).get("parallel")
+        nodes = parallel["nodes"] if parallel is not None else group["nodes"]
+        stopped = all([
+            self._remove(node, reason) for node in nodes
+            if node["node_index"] >= 2 and (node.get("stop_reason") is None or "stop_error" in node)
+        ])
+        group["nodes"] = [node for node in group["nodes"] if "stop_error" in node]
+        if stopped:
+            host._parallel_group = None
+            if parallel is not None:
+                for node in nodes:
+                    if node["node_index"] == 1 and node.get("stop_reason") is None:
+                        node["stop_reason"] = reason
+                parallel.update(ended_at=host.clock(), end_reason=reason)
         host._record_event({
             "kind": "PARALLEL_END", "status": "ENDED" if stopped else "REJECTED",
             "reason": reason if stopped else "NODE_STOP_FAILED", "version": group["version"],
@@ -308,24 +342,27 @@ class ParallelRunner:
         host._write_state()
         return stopped
 
-    def remove_leftover_nodes(self, version: Mapping[str, Any], reason: str) -> None:
-        """Remove nodes a killed coordinator left running; resume never restores the group."""
+    def remove_leftover_nodes(self, version: Mapping[str, Any], reason: str) -> bool:
+        """Confirm removal of extra nodes before resume revalidates the config."""
         parallel = version.get("parallel")
         if not isinstance(parallel, dict):
-            return
-        for node in parallel.get("nodes", []):
-            if node.get("node_index", 1) >= 2 and node.get("started") and node.get("stop_reason") is None:
-                self._remove(node, reason)
-        if parallel.get("ended_at") is None:
+            return True
+        stopped = all([self._remove(node, reason) for node in pending_parallel_nodes(version)])
+        if not stopped:
+            parallel.update(ended_at=None, end_reason=None)
+        elif parallel.get("ended_at") is None:
             parallel.update(ended_at=self._host.clock(), end_reason=reason)
+        return stopped
 
     def _remove(self, node: dict[str, Any], reason: str) -> bool:
         stopped, error = remove_container(
             node["container_name"], clock=self._host.clock, sleeper=self._host.sleeper,
             run_command=self._host.run_command,
         )
-        node["stop_reason"] = reason
-        if not stopped:
+        if stopped:
+            node["stop_reason"] = reason
+            node.pop("stop_error", None)
+        else:
             node["stop_error"] = error
         return stopped
 

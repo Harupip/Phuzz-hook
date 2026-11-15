@@ -155,8 +155,13 @@ def remove_container(
             capture_output=True,
             text=True,
         )
+        absence_messages = {
+            f"Error: No such container: {container_name}",
+            f"Error response from daemon: No such container: {container_name}",
+        }
         stopped = int(getattr(result, "returncode", 1)) == 0
         error = str(getattr(result, "stderr", "") or "WORKER_STOP_FAILED").strip() if not stopped else ""
+        stopped = stopped or error in absence_messages
         if not stopped and "removal of container" in error and "is already in progress" in error:
             # Do not reuse the name until Docker confirms removal has finished.
             while True:
@@ -169,10 +174,7 @@ def remove_container(
                 )
                 if int(getattr(inspection, "returncode", 1)) != 0:
                     detail = str(getattr(inspection, "stderr", "") or "").strip()
-                    stopped = detail in {
-                        f"Error: No such container: {container_name}",
-                        f"Error response from daemon: No such container: {container_name}",
-                    }
+                    stopped = detail in absence_messages
                     if not stopped:
                         error = detail or error
                     break
@@ -180,4 +182,4 @@ def remove_container(
     except Exception as exc:
         stopped = False
         error = str(exc)
-    return stopped, error
+    return stopped, "" if stopped else error

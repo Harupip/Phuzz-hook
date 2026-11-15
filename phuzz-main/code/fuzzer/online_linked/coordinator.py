@@ -37,7 +37,7 @@ from online_linked.coordination.checkpoint import validate_resume_checkpoint
 from online_linked.coordination.errors import OnlineLinkedError
 from online_linked.coordination.evidence_runner import EvidenceRunner
 from online_linked.coordination.gate_runner import GateRunner
-from online_linked.coordination.parallel_runner import ParallelRunner
+from online_linked.coordination.parallel_runner import ParallelRunner, checkpoint_parallel_cleanup_pending
 from online_linked.coordination.replay_artifacts import save_replay_artifacts
 from online_linked.coordination.pending_candidates import failed_batch_parameters
 from online_linked.coordination.probe_runner import ProbeRunner
@@ -198,6 +198,7 @@ class OnlineLinkedCoordinator:
         self._hard_deadline: float | None = None
         self._progress_keys: set[tuple[str, str]] = set()
         self.resume = resume
+        self.resume_cleanup_confirmed = False
         self._budget_started_at: float | None = None
         self._elapsed_seconds = 0.0
         self.runtime_cookie_probes = bool(runtime_cookie_probes)
@@ -285,15 +286,33 @@ class OnlineLinkedCoordinator:
 
     def run(self) -> int:
         try:
+            result = self._run_candidate()
+        finally:
+            if self.state.get("terminal_reason") != "PARALLEL_CLEANUP_PENDING":
+                if self._parallel.active():
+                    self._stop_active_worker(self.state.get("terminal_reason") or "CANDIDATE_ENDED")
+                self._mark_parallel_cleanup_pending()
+        return 1 if self.state.get("terminal_reason") == "PARALLEL_CLEANUP_PENDING" else result
+
+    def _mark_parallel_cleanup_pending(self) -> bool:
+        if not self._parallel.active() and not (self._active_container and self._ran_parallel()):
+            return False
+        self.state.update(terminal_status="PARTIAL", terminal_reason="PARALLEL_CLEANUP_PENDING")
+        self._write_state()
+        return True
+
+    def _run_candidate(self) -> int:
+        try:
             check_directory_io(self.run_dir)
             check_directory_io(self.config_dir)
         except OSError as exc:
             self.state.update(terminal_status="NOT_VERIFIED", terminal_reason=str(exc))
             print(str(exc), file=sys.stderr)
-            try:
-                self._write_state()
-            except OSError:
-                pass
+            if not self.resume:
+                try:
+                    self._write_state()
+                except OSError:
+                    pass
             return 2
         resumed = self._load_checkpoint() if self.resume else None
         self._write_state()
@@ -302,6 +321,8 @@ class OnlineLinkedCoordinator:
             selected = None if resumed else self._select_v0()
             if resumed:
                 version, config = resumed
+                if self.state["terminal_reason"] == "PARALLEL_CLEANUP_PENDING":
+                    return 1
                 deadline = self._candidate_deadline()
                 if self.clock() >= deadline:
                     self.state.update(terminal_status="PARTIAL", terminal_reason="RESUME_BUDGET_EXHAUSTED")
@@ -387,6 +408,8 @@ class OnlineLinkedCoordinator:
                     break
                 deadline = self._candidate_deadline()
             self._stop_active_worker(self.state["terminal_reason"] or "NO_NEW_PROGRESS")
+            if self._mark_parallel_cleanup_pending():
+                return 1
             self._mark_campaign_expired_if_needed()
             if self.state["terminal_status"] is None:
                 self.state["terminal_status"] = "BOUNDED_ONLINE_COMPLETE"
@@ -405,9 +428,6 @@ class OnlineLinkedCoordinator:
             self._write_state()
             self._stop_active_worker("COORDINATOR_ERROR")
             return 1
-        finally:
-            if getattr(self, "_parallel_group", None) is not None:
-                self._parallel.stop_nodes(self.state.get("terminal_reason") or "CANDIDATE_ENDED")
 
     @property
     def _parallel(self) -> ParallelRunner:
@@ -803,7 +823,10 @@ class OnlineLinkedCoordinator:
         if deadline is not None and deadline - self.clock() < 2 * self._sender_seconds:
             defer_reason = "INSUFFICIENT_VERIFICATION_BUDGET"
         elif owns_pause and not self._pause_parent(parent, deadline, request_id=str(discovery.get("request_id") or "")):
-            defer_reason = "PARENT_PAUSE_NOT_ACKNOWLEDGED"
+            defer_reason = (
+                "PARALLEL_NODE_STOP_FAILED" if self.state["terminal_reason"] == "PARALLEL_NODE_STOP_FAILED"
+                else "PARENT_PAUSE_NOT_ACKNOWLEDGED"
+            )
         elif deadline is not None and deadline - self.clock() < 2 * self._sender_seconds:
             # The ACK wait spent the reserve: resume the parent and keep the batch.
             defer_reason = "INSUFFICIENT_VERIFICATION_BUDGET"
@@ -1163,6 +1186,9 @@ class OnlineLinkedCoordinator:
 
     def _load_checkpoint(self) -> tuple[dict[str, Any], dict[str, Any]]:
         saved = json.loads(self.state_path.read_text(encoding="utf-8-sig"))
+        if saved.get("terminal_status") not in {None, "PARTIAL"} and checkpoint_parallel_cleanup_pending(saved):
+            # A stop failure can reach disk before the final candidate verdict.
+            saved = {**saved, "terminal_status": "PARTIAL", "terminal_reason": "PARALLEL_CLEANUP_PENDING"}
         validate_resume_checkpoint(saved, expected=self.state)
         checkpoint = saved.get("checkpoint", {})
         if checkpoint.get("input_hash") != hashlib.sha256(self.suggested_seeds.read_bytes()).hexdigest():
@@ -1209,16 +1235,27 @@ class OnlineLinkedCoordinator:
             self._deadline = min(self._deadline, self.campaign_deadline)
         self._progress_keys = {tuple(key) for key in budget["progress_keys"]}
         self.max_versions = saved["max_versions"]
+        reason = "RESUME_REVALIDATION"
+        parallel_version = "parallel" in version
+        stopped = self._parallel.remove_leftover_nodes(version, reason)
+        for worker in reversed(saved["workers"]):
+            if worker.get("version") != version["version"]:
+                continue
+            status = worker.get("status")
+            if status == "started" or (parallel_version and status == "stop_failed"):
+                self._active_container = worker["container_name"]
+                if not self._stop_worker(version, reason):
+                    if not parallel_version:
+                        raise ValueError("resume previous worker could not be stopped")
+                    stopped = False
+                break
+        if not stopped:
+            self.state.update(terminal_status="PARTIAL", terminal_reason="PARALLEL_CLEANUP_PENDING")
+            return version, config
+        self.resume_cleanup_confirmed = True
         version["previous_worker_run_id"] = version.get("worker_run_id")
         version["worker_run_id"] = f"{self.legacy_run_id}-{version['version']}-resume-{self.state['resume_count']}"
         version.setdefault("readiness_history", []).append(copy.deepcopy(version.get("readiness")))
-        for worker in saved["workers"]:
-            if worker.get("version") == version["version"] and worker.get("status") == "started":
-                self._active_container = worker["container_name"]
-                if not self._stop_worker(version, "RESUME_REVALIDATION"):
-                    raise ValueError("resume previous worker could not be stopped")
-                break
-        self._parallel.remove_leftover_nodes(version, "RESUME_REVALIDATION")
         return version, config
 
     def _version(self, name: str) -> dict[str, Any] | None:

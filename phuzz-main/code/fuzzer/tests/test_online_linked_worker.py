@@ -4,6 +4,7 @@ import unittest
 from online_linked.coordination.worker import (
     container_running,
     matching_pause_ack,
+    remove_container,
     parallel_node_id,
     parallel_node_name,
     worker_container_name,
@@ -56,6 +57,35 @@ class WorkerHelpersTests(unittest.TestCase):
         command = worker_start_command(version, **kwargs, fuzzer_node_id=105)
         self.assertIn("FUZZER_NODE_ID=105", command)
         self.assertNotIn("FUZZER_NODE_ID=2", command)
+
+    def test_remove_container_only_accepts_confirmed_absence(self):
+        target = "worker"
+        absent = f"Error response from daemon: No such container: {target}"
+        removing = f"Error response from daemon: removal of container {target} is already in progress"
+        daemon_error = "Cannot connect to the Docker daemon"
+        for first, inspection, expected in (
+            (absent, None, True),
+            (removing, f"Error: No such container: {target}", True),
+            (absent + "-other", None, False),
+            (removing, absent + "-other", False),
+            (daemon_error, None, False),
+            (removing, daemon_error, False),
+            (subprocess.TimeoutExpired("docker", 30), None, False),
+            (removing, subprocess.TimeoutExpired("docker", 30), False),
+        ):
+            with self.subTest(first=first, inspection=inspection):
+                responses = iter((first, inspection))
+
+                def run(command, **kwargs):
+                    response = next(responses)
+                    if isinstance(response, Exception):
+                        raise response
+                    return subprocess.CompletedProcess(command, 1, "", response)
+
+                stopped, error = remove_container(target, clock=lambda: 0, sleeper=lambda _: None, run_command=run)
+                self.assertEqual(stopped, expected)
+                if not stopped:
+                    self.assertTrue(error)
 
     def test_container_running_true_only_for_running(self):
         """The parallel clock may start only when Docker positively reports the node running."""

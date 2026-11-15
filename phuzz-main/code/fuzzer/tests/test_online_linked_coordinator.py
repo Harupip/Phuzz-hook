@@ -2916,6 +2916,106 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "policy.*new run"):
                 run_online_linked(args)
 
+    def test_parallel_cleanup_pending_blocks_other_campaign_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = {"hook_name": "template_redirect", "callback_id": "cb-parent",
+                       "seed": {"method": "GET", "path": "/fixture"}}
+            child = seed_item()
+            suggested = root / "suggested.json"
+            suggested.write_text(json.dumps({"suggested_seeds": [initial]}), encoding="utf-8")
+            registry = root / "registry.json"
+            registry.write_text("{}", encoding="utf-8")
+            runs = []
+            preflight_fails = False
+
+            class FakeCoordinator:
+                def __init__(self, **kwargs):
+                    self.resume = kwargs["resume"]
+                    self.resume_cleanup_confirmed = False
+                    self.item = json.loads(kwargs["suggested_seeds"].read_text())["suggested_seeds"][0]
+                    self.state_path = root / (self.item["callback_id"] + ".json")
+                    self.state = {}
+
+                def run(self):
+                    callback = self.item["callback_id"]
+                    runs.append((callback, self.resume))
+                    if callback == initial["callback_id"] and not self.resume:
+                        self.state.update(terminal_status="PARTIAL", terminal_reason="PARALLEL_CLEANUP_PENDING",
+                                          candidate_queue=[child])
+                    elif self.resume and preflight_fails:
+                        self.state.update(terminal_status="NOT_VERIFIED", terminal_reason="directory I/O failed")
+                        return 2
+                    else:
+                        self.resume_cleanup_confirmed = self.resume
+                        self.state.update(terminal_status="BOUNDED_ONLINE_COMPLETE", terminal_reason="NO_NEW_PROGRESS")
+                    self.state_path.write_text(json.dumps(self.state), encoding="utf-8")
+                    return int(self.state["terminal_status"] == "PARTIAL")
+
+            args = SimpleNamespace(
+                suggested_seeds=str(suggested), bootstrap_config="", config_root=str(root / "configs"),
+                output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="run",
+                max_seconds=60, max_versions=2, max_candidates=2, campaign_seconds=60,
+                callback_registry=str(registry), service="fuzzer-wordpress-plugin",
+            )
+            batch_path = root / "output/online-linked/run/batch-state.json"
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0):
+                self.assertEqual(run_online_linked(args), 0)
+                self.assertEqual(runs, [(initial["callback_id"], False)])
+                saved = json.loads(batch_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["campaign_status"], "PARTIAL")
+                self.assertEqual(saved["terminal_reason"], "PARALLEL_CLEANUP_PENDING")
+                self.assertCountEqual([row["item"]["callback_id"] for row in saved["pending_candidates"]],
+                                      [initial["callback_id"], child["callback_id"]])
+                saved["pending_candidates"].sort(key=lambda row: row["item"]["callback_id"] != child["callback_id"])
+                args.resume = True
+                state_path = root / "cb-parent.json"
+                original_state = state_path.read_text(encoding="utf-8")
+                for failure in ("preflight", "missing_checkpoint", "budget_expired"):
+                    with self.subTest(failure=failure):
+                        snapshot = copy.deepcopy(saved)
+                        if failure == "budget_expired":
+                            snapshot["budget"]["remaining_seconds"] = 0
+                        batch_path.write_text(json.dumps(snapshot), encoding="utf-8")
+                        state_path.write_text(original_state, encoding="utf-8")
+                        preflight_fails = failure == "preflight"
+                        if failure == "missing_checkpoint":
+                            state_path.unlink()
+                        runs.clear()
+                        self.assertEqual(run_online_linked(args), 0)
+                        self.assertEqual(runs, [(initial["callback_id"], True)] if preflight_fails else [])
+                        blocked = json.loads(batch_path.read_text(encoding="utf-8"))
+                        self.assertEqual(blocked["campaign_status"], "PARTIAL")
+                        reasons = {row["terminal_reason"] for row in blocked["pending_candidates"]}
+                        self.assertIn("PARALLEL_CLEANUP_PENDING", reasons)
+                        self.assertEqual(len(blocked["pending_candidates"]), 2)
+
+                with self.subTest("recorded_parallel_interruption"):
+                    interrupted = copy.deepcopy(saved)
+                    interrupted["candidates"][0]["terminal_reason"] = "CANDIDATE_INTERRUPTED"
+                    interrupted["pending_candidates"][-1]["terminal_reason"] = "CANDIDATE_INTERRUPTED"
+                    batch_path.write_text(json.dumps(interrupted), encoding="utf-8")
+                    state_path.write_text(json.dumps({
+                        "checkpoint": {"active_version": "v0"},
+                        "versions": [{"version": "v0", "parallel": {"nodes": [
+                            {"node_index": 2, "started": True, "stop_reason": None},
+                        ]}}],
+                    }), encoding="utf-8")
+                    preflight_fails = False
+                    runs.clear()
+                    self.assertEqual(run_online_linked(args), 0)
+                    self.assertEqual(runs, [(initial["callback_id"], True), (child["callback_id"], False)])
+
+                batch_path.write_text(json.dumps(saved), encoding="utf-8")
+                state_path.write_text(original_state, encoding="utf-8")
+                runs.clear()
+                self.assertEqual(run_online_linked(args), 0)
+                self.assertEqual(runs, [(initial["callback_id"], True), (child["callback_id"], False)])
+                done = json.loads(batch_path.read_text(encoding="utf-8"))
+                self.assertFalse(done["pending_candidates"])
+                self.assertEqual(done["campaign_status"], "complete")
+
     def test_online_linked_batch_does_not_sync_or_queue_after_campaign_deadline(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3305,6 +3405,64 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertIn(f"rm:{self.NODE1}-n2", log)
             self.assertIn(f"rm:{self.NODE1}-n3", log)
 
+    def test_parallel_resume_retries_failed_removal_before_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log: list[str] = []
+            coordinator = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+            self._parallel_docker(coordinator, log)
+            self.assertEqual(coordinator.run(), 0)
+            node2 = f"{self.NODE1}-n2"
+            saved = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            saved.update(terminal_status="PARTIAL", terminal_reason="PARALLEL_CLEANUP_PENDING")
+            saved["budget"]["remaining_seconds"] = 60
+            saved["versions"][0]["parallel"]["nodes"][1].update(
+                stop_reason="NO_NEW_PROGRESS", stop_error="old Docker error",
+            )
+            saved["workers"][0].update(status="stop_failed", stop_error="old Docker error")
+            coordinator.state_path.write_text(json.dumps(saved), encoding="utf-8")
+
+            with patch("online_linked.coordinator.check_directory_io", side_effect=OSError("directory I/O failed")):
+                restored = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+                restored.resume = True
+                self.assertNotEqual(restored.run(), 0)
+            after_preflight = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(after_preflight, saved)
+
+            error = "Cannot connect to the Docker daemon"
+            for fails in (True, False):
+                log.clear()
+                restored = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+                restored.resume = True
+                starts = self._parallel_docker(restored, log)
+                docker = restored.run_command
+
+                def run_command(command, **kwargs):
+                    result = docker(command, **kwargs)
+                    if fails and command[:3] == ["docker", "rm", "-f"] and command[3] in {node2, self.NODE1}:
+                        return subprocess.CompletedProcess(command, 1, "", error)
+                    return result
+
+                restored.run_command = run_command
+                restored._gate_v0 = lambda *args, **kwargs: log.append("resume_gate") or True
+                result = restored.run()
+                removals = [entry for entry in log if entry.startswith("rm:")]
+                self.assertEqual(removals[:2], [f"rm:{node2}", f"rm:{self.NODE1}"])
+                saved = json.loads(restored.state_path.read_text(encoding="utf-8"))
+                node = saved["versions"][0]["parallel"]["nodes"][1]
+                if fails:
+                    self.assertNotIn("resume_gate", log)
+                    self.assertEqual(starts, [])
+                    self.assertNotEqual(result, 0)
+                    self.assertEqual(saved["terminal_status"], "PARTIAL")
+                    self.assertEqual(saved["terminal_reason"], "PARALLEL_CLEANUP_PENDING")
+                    self.assertEqual(node["stop_error"], error)
+                    self.assertEqual(saved["workers"][0]["status"], "stop_failed")
+                else:
+                    self.assertLess(log.index(f"rm:{self.NODE1}"), log.index("resume_gate"))
+                    self.assertEqual(result, 0)
+                    self.assertNotIn("stop_error", node)
+
     def test_parallel_interrupt_while_nodes_boot_leaves_no_orphans(self):
         """Ctrl-C while extra nodes boot must still remove every node already started."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -3470,6 +3628,50 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                                 and event.get("node_index") == 2 for event in coordinator.state["events"]))
             self.assertIn("v1", [version["version"] for version in coordinator.state["versions"]])
 
+    def test_parallel_blocks_replay_when_unacked_node_remove_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+
+            def ack(request):
+                if not request["worker_run_id"].endswith("-n2"):
+                    return {**request, "round_id": 1, "allocated_energy": 20,
+                            "attempts_used": 9, "seed_phuzz_energy": 31}
+
+            coordinator, starts = self._parallel_handoff_run(
+                Path(tmp), log, pause_ack=ack, parallel_seconds=60,
+            )
+            stuck = f"{self.NODE1}-n2"
+            error = "Cannot connect to the Docker daemon"
+            released = []
+            docker = coordinator.run_command
+
+            def run_command(command, **kwargs):
+                if command == ["docker", "rm", "-f", stuck]:
+                    return subprocess.CompletedProcess(command, 1, "", error)
+                if command[:2] == ["docker", "exec"] and command[6:7] == ["release"]:
+                    released.append(command[2])
+                return docker(command, **kwargs)
+
+            coordinator.run_command = run_command
+            self.assertNotEqual(coordinator.run(), 0)
+
+            self.assertFalse(any(entry.startswith("sender_timeout:run-v1-replay") for entry in log))
+            self.assertEqual([command[command.index("--name") + 1] for _, command in starts],
+                             [self.NODE1, stuck, f"{self.NODE1}-n3"])
+            self.assertCountEqual(released, [self.NODE1, f"{self.NODE1}-n3"])
+            saved = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["terminal_status"], "PARTIAL")
+            self.assertEqual(saved["terminal_reason"], "PARALLEL_CLEANUP_PENDING")
+            node = saved["versions"][0]["parallel"]["nodes"][1]
+            self.assertEqual(node["stop_error"], error)
+            self.assertIsNone(node["stop_reason"])
+            self.assertTrue(saved["pending_runtime_candidates"])
+            failed = next(event for event in saved["events"]
+                          if event["kind"] == "PARALLEL_PAUSE" and event["reason"] == "NODE_REMOVE_FAILED")
+            self.assertEqual((failed["container_name"], failed["detail"]), (stuck, error))
+            self.assertTrue(any(event["status"] == "DEFERRED" and event["reason"] == "PARALLEL_NODE_STOP_FAILED"
+                                for event in saved["events"]))
+
     def test_parallel_handoff_pass_stops_group_and_returns_to_single_worker(self):
         """A verified parameter ends Parallel: the new config restarts single-worker discovery."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -3502,6 +3704,50 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(self._command_env(v1_starts[0])["FUZZER_NODE_ID"], "101")
             parallel = coordinator.state["versions"][0]["parallel"]
             self.assertEqual(parallel["end_reason"], "HANDOFF_TO_v1")
+
+    def test_parallel_handoff_blocks_child_when_group_cleanup_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator, starts = self._parallel_handoff_run(Path(tmp), log, max_versions=2)
+            node2, node3 = f"{self.NODE1}-n2", f"{self.NODE1}-n3"
+            removals = []
+            docker = coordinator.run_command
+
+            def run_command(command, **kwargs):
+                if command[:3] == ["docker", "rm", "-f"]:
+                    removals.append(command[3])
+                    if command[3] == node2 and removals.count(node2) == 1:
+                        return subprocess.CompletedProcess(command, 1, "", "Cannot connect to the Docker daemon")
+                return docker(command, **kwargs)
+
+            coordinator.run_command = run_command
+            handoff = coordinator.handoff_to_next_worker
+            observed = {}
+
+            def observe_handoff(*args, **kwargs):
+                result = handoff(*args, **kwargs)
+                parallel = coordinator.state["versions"][0]["parallel"]
+                observed.update(deadline=coordinator._deadline, parallel_deadline=parallel["deadline"],
+                                ended_at=parallel["ended_at"])
+                return result
+
+            coordinator.handoff_to_next_worker = observe_handoff
+            coordinator.run()
+
+            parent, child = coordinator.state["versions"]
+            self.assertTrue(child["replay_result"]["passed"])
+            self.assertEqual([command[command.index("--name") + 1] for _, command in starts],
+                             [self.NODE1, node2, node3])
+            self.assertEqual(child["worker_status"], "not_started_parallel_stop_failed")
+            self.assertEqual(child["terminal_reason"], "PARALLEL_NODE_STOP_FAILED")
+            self.assertEqual(coordinator.state["terminal_status"], "PARTIAL")
+            self.assertEqual(coordinator.state["terminal_reason"], "PARALLEL_NODE_STOP_FAILED")
+            self.assertEqual(coordinator._active_version, "v0")
+            self.assertEqual(removals, [node2, node3, node2, self.NODE1])
+            self.assertEqual(observed["deadline"], observed["parallel_deadline"])
+            self.assertIsNone(observed["ended_at"])
+            self.assertIsNotNone(parent["parallel"]["ended_at"])
+            self.assertNotIn("stop_error", parent["parallel"]["nodes"][1])
 
     def test_parallel_replay_fail_releases_group(self):
         """A failed replay resumes every node and keeps the original parallel deadline."""

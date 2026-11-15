@@ -332,8 +332,14 @@ class WorkerRunner:
                 record_replay_event("REJECTED", blocked)
                 self._host._write_state()
                 return False
-            if getattr(self._host, "_parallel_group", None) is not None:
-                self._host._parallel.end_for_handoff(str(child["version"]))
+            if not self._host._parallel.end_for_handoff(str(child["version"])):
+                reason = "PARALLEL_NODE_STOP_FAILED"
+                child.update(worker_status="not_started_parallel_stop_failed", terminal_reason=reason)
+                self._host.state.update(terminal_status="PARTIAL", terminal_reason=reason)
+                replay_result["timing"]["handoff"] = round(self._host.clock() - handoff_started_at, 3)
+                record_replay_event("PASS", reason)
+                self._host._write_state()
+                return False
             if not self._host._stop_worker(parent, "HANDOFF_TO_" + str(child["version"])):
                 child["worker_status"] = "not_started_parent_stop_failed"
                 child["terminal_reason"] = "WORKER_STOP_FAILED"
@@ -511,8 +517,10 @@ class WorkerRunner:
         self._host._pause = {"container": self._host._active_container, "key": key, "token": token}
         try:
             acknowledged = self.await_pause_ack(parent, event, key, token, run_id, deadline, request_id)
-            if acknowledged and getattr(self._host, "_parallel_group", None) is not None:
-                self._host._parallel.pause_nodes(deadline, request_id=request_id)
+            if acknowledged and not self._host._parallel.pause_nodes(deadline, request_id=request_id):
+                self._host.state.update(terminal_status="PARTIAL", terminal_reason="PARALLEL_NODE_STOP_FAILED")
+                self._host._resume_parent()
+                return False
             return acknowledged
         except BaseException:
             self._host._resume_parent()
