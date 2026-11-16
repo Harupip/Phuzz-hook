@@ -51,6 +51,13 @@ def checkpoint_parallel_cleanup_pending(state: Mapping[str, Any]) -> bool:
     )
 
 
+def checkpoint_leftover_workers(state: Mapping[str, Any]) -> bool:
+    """A candidate that ran parallel may hand off to a single worker; that worker must be gone before the batch moves on."""
+    return any("parallel" in row for row in state.get("versions", [])) and any(
+        worker.get("status") in {"started", "stop_failed"} for worker in state.get("workers", [])
+    )
+
+
 class ParallelHost(Protocol):
     state: dict[str, Any]
     clock: Callable[[], float]

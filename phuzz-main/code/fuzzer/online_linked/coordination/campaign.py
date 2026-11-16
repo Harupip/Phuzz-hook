@@ -24,7 +24,10 @@ from online_linked.coordination.candidate_identity import (
     _candidate_context_key,
     _candidate_slug,
 )
-from online_linked.coordination.parallel_runner import checkpoint_parallel_cleanup_pending
+from online_linked.coordination.parallel_runner import (
+    checkpoint_leftover_workers,
+    checkpoint_parallel_cleanup_pending,
+)
 from online_linked.export import export_online_linked_batch
 
 
@@ -252,7 +255,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 if getattr(args, "parallel", False):
                     cleanup_blockers.add(row["index"])
                 continue
-            if checkpoint_parallel_cleanup_pending(interrupted):
+            if checkpoint_parallel_cleanup_pending(interrupted) or checkpoint_leftover_workers(interrupted):
                 cleanup_blockers.add(row["index"])
     while queue:
         queue.sort(key=lambda entry: (
@@ -289,6 +292,7 @@ def run_online_linked(args: argparse.Namespace) -> int:
         }
         if isinstance(raw_item.get("lineage"), Mapping):
             candidate_record["lineage"] = dict(raw_item["lineage"])
+        coordinator = None
         try:
             filesystem_path(candidate_input).write_text(
                 json.dumps({**payload, "suggested_seeds": [dict(raw_item)]}, indent=2) + "\n",
@@ -346,7 +350,9 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 "terminal_reason": coordinator.state.get("terminal_reason"),
                 "versions": len(coordinator.state.get("versions", [])),
             })
-            if index in cleanup_blockers and not coordinator.resume_cleanup_confirmed:
+            # A confirmed resume cleanup says nothing about workers the resumed run started afterwards.
+            if (checkpoint_leftover_workers(coordinator.state)
+                    or (index in cleanup_blockers and not coordinator.resume_cleanup_confirmed)):
                 if candidate_record["terminal_reason"] != "PARALLEL_CLEANUP_PENDING":
                     candidate_record["detail"] = candidate_record["terminal_reason"]
                 candidate_record.update(terminal_status="PARTIAL", terminal_reason="PARALLEL_CLEANUP_PENDING")
@@ -406,16 +412,21 @@ def run_online_linked(args: argparse.Namespace) -> int:
             # Candidate-local failures must not discard the remaining batch.
             skipped = True
             detail = f"CANDIDATE_FAILED: {type(exc).__name__}: {exc}"
+            # A node may still run when the coordinator failed to persist its cleanup marker.
+            cleanup_pending = index in cleanup_blockers or (
+                coordinator is not None and (coordinator.state.get("terminal_reason") == "PARALLEL_CLEANUP_PENDING"
+                                             or checkpoint_leftover_workers(coordinator.state)))
             candidate_record.update({
                 "exit_code": 2,
-                "state_path": candidate_record.get("state_path", ""),
-                "terminal_status": "PARTIAL" if previous else "NOT_VERIFIED",
-                "terminal_reason": "PARALLEL_CLEANUP_PENDING" if index in cleanup_blockers else detail,
+                "state_path": (candidate_record.get("state_path")
+                               or (str(coordinator.state_path) if coordinator is not None else "")),
+                "terminal_status": "PARTIAL" if previous or cleanup_pending else "NOT_VERIFIED",
+                "terminal_reason": "PARALLEL_CLEANUP_PENDING" if cleanup_pending else detail,
                 "versions": candidate_record.get("versions", 0),
             })
-            if index in cleanup_blockers:
+            if cleanup_pending:
                 candidate_record["detail"] = detail
-            if previous:
+            if previous or cleanup_pending:
                 blocked_pending.append((index, dict(raw_item), source))
         active_entry = None
         if candidate_record not in batch_state["candidates"]:

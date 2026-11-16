@@ -67,6 +67,7 @@ from online_linked.coordination.request_matching import (
 )
 from online_linked.coordination.worker import (
     CommandRunner,
+    remove_container,
     worker_exit_code,
 )
 from online_linked.coordination.worker_runner import WorkerRunner
@@ -108,6 +109,17 @@ def _budget_pair(name: str, initial: int, hard: int | None, default: int,
     if hard < initial:
         raise ValueError(f"hard {name} cap must cover initial budget")
     return initial, hard
+
+
+_VULN_VERDICT = {"terminal_status": "VULN_FOUND", "terminal_reason": "VULN_FOUND"}
+
+
+def _found_vulnerability(state: Mapping[str, Any], active_version: str | None) -> bool:
+    """A stop failure may rewrite the verdict, but the active version keeps its vuln_found status."""
+    return state.get("terminal_status") == "VULN_FOUND" or any(
+        row.get("version") == active_version and row.get("status") == "vuln_found"
+        for row in state.get("versions", [])
+    )
 
 
 class OnlineLinkedCoordinator:
@@ -289,14 +301,20 @@ class OnlineLinkedCoordinator:
             result = self._run_candidate()
         finally:
             if self.state.get("terminal_reason") != "PARALLEL_CLEANUP_PENDING":
-                if self._parallel.active():
-                    self._stop_active_worker(self.state.get("terminal_reason") or "CANDIDATE_ENDED")
-                self._mark_parallel_cleanup_pending()
+                try:
+                    if self._parallel.active():
+                        self._stop_active_worker(self.state.get("terminal_reason") or "CANDIDATE_ENDED")
+                finally:
+                    # Mark even when stopping raised, so the campaign sees nodes may still run.
+                    self._mark_parallel_cleanup_pending()
         return 1 if self.state.get("terminal_reason") == "PARALLEL_CLEANUP_PENDING" else result
 
     def _mark_parallel_cleanup_pending(self) -> bool:
         if not self._parallel.active() and not (self._active_container and self._ran_parallel()):
             return False
+        if _found_vulnerability(self.state, self._active_version):
+            # The cleanup marker blocks the batch; keep the finding for resume.
+            self.state.setdefault("verdict_before_cleanup", dict(_VULN_VERDICT))
         self.state.update(terminal_status="PARTIAL", terminal_reason="PARALLEL_CLEANUP_PENDING")
         self._write_state()
         return True
@@ -314,6 +332,17 @@ class OnlineLinkedCoordinator:
                 except OSError:
                     pass
             return 2
+        settled = self._settled_parallel_checkpoint() if self.resume else None
+        if settled is not None:
+            self.state = settled
+            if not self._remove_leftover_workers():
+                return 1
+            active = settled["checkpoint"].get("active_version")
+            if settled.get("terminal_reason") == "WORKER_STOP_FAILED" and _found_vulnerability(settled, active):
+                settled.update(_VULN_VERDICT)
+                _write_json(self.state_path, settled)
+            self.resume_cleanup_confirmed = True
+            return 0 if settled["terminal_status"] in {"VULN_FOUND", "BOUNDED_ONLINE_COMPLETE"} else 1
         resumed = self._load_checkpoint() if self.resume else None
         self._write_state()
         try:
@@ -323,6 +352,11 @@ class OnlineLinkedCoordinator:
                 version, config = resumed
                 if self.state["terminal_reason"] == "PARALLEL_CLEANUP_PENDING":
                     return 1
+                if "verdict_before_cleanup" in self.state:
+                    # Cleanup is confirmed: restore the finding instead of fuzzing again.
+                    self.state.update(self.state.pop("verdict_before_cleanup"))
+                    self._write_state()
+                    return 0
                 deadline = self._candidate_deadline()
                 if self.clock() >= deadline:
                     self.state.update(terminal_status="PARTIAL", terminal_reason="RESUME_BUDGET_EXHAUSTED")
@@ -1184,26 +1218,67 @@ class OnlineLinkedCoordinator:
         }
         _write_json(self.state_path, self.state)
 
-    def _load_checkpoint(self) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _settled_parallel_checkpoint(self) -> dict[str, Any] | None:
+        """The batch may stop after this candidate recorded its verdict; accept it once cleanup is confirmed."""
         saved = json.loads(self.state_path.read_text(encoding="utf-8-sig"))
-        if saved.get("terminal_status") not in {None, "PARTIAL"} and checkpoint_parallel_cleanup_pending(saved):
-            # A stop failure can reach disk before the final candidate verdict.
-            saved = {**saved, "terminal_status": "PARTIAL", "terminal_reason": "PARALLEL_CLEANUP_PENDING"}
-        validate_resume_checkpoint(saved, expected=self.state)
+        if (saved.get("terminal_status") in {None, "PARTIAL"} or checkpoint_parallel_cleanup_pending(saved)
+                or not any("parallel" in row for row in saved.get("versions", []))):
+            return None
+        validate_resume_checkpoint({**saved, "terminal_status": "PARTIAL"}, expected=self.state)
+        self._check_checkpoint_integrity(saved)
+        return saved
+
+    def _remove_leftover_workers(self) -> bool:
+        """Confirm removal of every worker the recorded verdict left running or failed to stop."""
+        leftovers = [worker for worker in self.state.get("workers", [])
+                     if worker.get("status") in {"started", "stop_failed"}]
+        removed = True
+        for worker in leftovers:
+            stopped, error = remove_container(
+                worker["container_name"], clock=self.clock, sleeper=self.sleeper, run_command=self.run_command,
+            )
+            if stopped:
+                worker["status"] = "stopped"
+                worker.pop("stop_error", None)
+            else:
+                worker["stop_error"] = error
+                removed = False
+        if leftovers:
+            # _write_state would rebuild the checkpoint from attributes this path never loaded.
+            _write_json(self.state_path, self.state)
+        return removed
+
+    def _check_checkpoint_integrity(self, saved: Mapping[str, Any]) -> None:
         checkpoint = saved.get("checkpoint", {})
         if checkpoint.get("input_hash") != hashlib.sha256(self.suggested_seeds.read_bytes()).hexdigest():
             raise ValueError("resume candidate input changed")
-        budget = saved["budget"]
         for row in saved["versions"]:
             if self.config_hash(Path(row["config_path"])) != row["config_hash"]:
                 raise ValueError("resume config hash changed")
             if row.get("replay_config_hash") and self.config_hash(Path(row["replay_config_path"])) != row["replay_config_hash"]:
                 raise ValueError("resume replay config hash changed")
-        version = next(row for row in saved["versions"] if row["version"] == checkpoint["active_version"])
         candidate_context_key = saved.get("candidate_context_key")
         if (not isinstance(candidate_context_key, str)
                 or checkpoint.get("candidate_context_key") != candidate_context_key):
             raise ValueError("resume candidate request context changed")
+
+    def _load_checkpoint(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        saved = json.loads(self.state_path.read_text(encoding="utf-8-sig"))
+        # A stop failure can reach disk before the final candidate verdict.
+        final_pending = (saved.get("terminal_status") not in {None, "PARTIAL"}
+                         and checkpoint_parallel_cleanup_pending(saved))
+        # Checkpoints written before verdict_before_cleanup existed keep the finding only on the version.
+        active = (saved.get("checkpoint") or {}).get("active_version")
+        if ((final_pending or saved.get("terminal_reason") == "PARALLEL_CLEANUP_PENDING")
+                and "verdict_before_cleanup" not in saved and _found_vulnerability(saved, active)):
+            saved = {**saved, "verdict_before_cleanup": dict(_VULN_VERDICT)}
+        if final_pending:
+            saved = {**saved, "terminal_status": "PARTIAL", "terminal_reason": "PARALLEL_CLEANUP_PENDING"}
+        validate_resume_checkpoint(saved, expected=self.state)
+        checkpoint = saved.get("checkpoint", {})
+        self._check_checkpoint_integrity(saved)
+        budget = saved["budget"]
+        version = next(row for row in saved["versions"] if row["version"] == checkpoint["active_version"])
         config_path = version.get("replay_config_path") or version["config_path"]
         config = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
         self.state = saved
@@ -1236,19 +1311,17 @@ class OnlineLinkedCoordinator:
         self._progress_keys = {tuple(key) for key in budget["progress_keys"]}
         self.max_versions = saved["max_versions"]
         reason = "RESUME_REVALIDATION"
-        parallel_version = "parallel" in version
+        ran_parallel = any("parallel" in row for row in saved["versions"])
         stopped = self._parallel.remove_leftover_nodes(version, reason)
+        # The checkpoint may still name v0 when an interruption hit right after v1 started: check every worker.
         for worker in reversed(saved["workers"]):
-            if worker.get("version") != version["version"]:
-                continue
             status = worker.get("status")
-            if status == "started" or (parallel_version and status == "stop_failed"):
+            if status == "started" or (ran_parallel and status == "stop_failed"):
                 self._active_container = worker["container_name"]
-                if not self._stop_worker(version, reason):
-                    if not parallel_version:
+                if not self._stop_worker(self._version(str(worker.get("version"))) or version, reason):
+                    if not ran_parallel:
                         raise ValueError("resume previous worker could not be stopped")
                     stopped = False
-                break
         if not stopped:
             self.state.update(terminal_status="PARTIAL", terminal_reason="PARALLEL_CLEANUP_PENDING")
             return version, config

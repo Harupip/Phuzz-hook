@@ -2916,6 +2916,142 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "policy.*new run"):
                 run_online_linked(args)
 
+    def test_parallel_cleanup_write_failure_still_blocks_campaign(self):
+        """A node may still run when the cleanup marker cannot be written; the next callback must not start."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = {"hook_name": "template_redirect", "callback_id": "cb-parent",
+                       "seed": {"method": "GET", "path": "/fixture"}}
+            other = {"hook_name": "template_redirect", "callback_id": "cb-other",
+                     "seed": {"method": "GET", "path": "/other"}}
+            suggested = root / "suggested.json"
+            suggested.write_text(json.dumps({"suggested_seeds": [initial, other]}), encoding="utf-8")
+            registry = root / "registry.json"
+            registry.write_text("{}", encoding="utf-8")
+            runs = []
+
+            class FakeCoordinator:
+                def __init__(self, **kwargs):
+                    self.resume = kwargs["resume"]
+                    self.resume_cleanup_confirmed = False
+                    self.item = json.loads(kwargs["suggested_seeds"].read_text())["suggested_seeds"][0]
+                    self.state_path = root / (self.item["callback_id"] + ".json")
+                    self.state = {}
+
+                def run(self):
+                    runs.append(self.item["callback_id"])
+                    self.state.update(terminal_status="PARTIAL", terminal_reason="PARALLEL_CLEANUP_PENDING")
+                    raise OSError("disk full")
+
+            args = SimpleNamespace(
+                suggested_seeds=str(suggested), bootstrap_config="", config_root=str(root / "configs"),
+                output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="run",
+                max_seconds=60, max_versions=2, max_candidates=2, campaign_seconds=60,
+                callback_registry=str(registry), service="fuzzer-wordpress-plugin",
+            )
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0):
+                run_online_linked(args)
+            self.assertEqual(len(runs), 1)
+            saved = json.loads((root / "output/online-linked/run/batch-state.json").read_text(encoding="utf-8"))
+            self.assertEqual((saved["campaign_status"], saved["terminal_reason"]), ("PARTIAL", "PARALLEL_CLEANUP_PENDING"))
+            record = saved["candidates"][0]
+            self.assertEqual((record["terminal_status"], record["terminal_reason"]), ("PARTIAL", "PARALLEL_CLEANUP_PENDING"))
+            self.assertEqual(record["state_path"], str(root / (runs[0] + ".json")))
+            self.assertIn("OSError: disk full", record["detail"])
+            self.assertIn(runs[0], [row["item"]["callback_id"] for row in saved["pending_candidates"]])
+
+    def test_leftover_single_worker_after_parallel_handoff_blocks_campaign(self):
+        """v0 ran parallel and handed off to single-worker v1; a v1 worker that was not removed must block the queue."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = {"hook_name": "template_redirect", "callback_id": "cb-parent",
+                       "seed": {"method": "GET", "path": "/fixture"}}
+            child = seed_item()  # wp_ajax_* sorts ahead of the parent unless cleanup takes priority
+            suggested = root / "suggested.json"
+            suggested.write_text(json.dumps({"suggested_seeds": [initial]}), encoding="utf-8")
+            registry = root / "registry.json"
+            registry.write_text("{}", encoding="utf-8")
+            runs = []
+            cleanup_ok = False
+            new_worker_stuck = False
+
+            class FakeCoordinator:
+                def __init__(self, **kwargs):
+                    self.resume = kwargs["resume"]
+                    self.resume_cleanup_confirmed = False
+                    self.item = json.loads(kwargs["suggested_seeds"].read_text())["suggested_seeds"][0]
+                    self.state_path = root / (self.item["callback_id"] + ".json")
+                    self.state = {}
+
+                def run(self):
+                    callback = self.item["callback_id"]
+                    runs.append((callback, self.resume))
+                    if callback != initial["callback_id"]:
+                        self.state.update(terminal_status="BOUNDED_ONLINE_COMPLETE", terminal_reason="NO_NEW_PROGRESS")
+                        return 0
+                    worker_status = "stopped" if self.resume and cleanup_ok else "stop_failed"
+                    self.resume_cleanup_confirmed = worker_status == "stopped"
+                    workers = [{"version": "v1", "container_name": "run-v1", "status": worker_status}]
+                    if self.resume and cleanup_ok and new_worker_stuck:
+                        # The old worker was cleaned, then the restarted v1 worker could not be removed.
+                        workers.append({"version": "v1", "container_name": "run-v1-resume", "status": "stop_failed"})
+                    self.state.update(
+                        terminal_status="NOT_VERIFIED", terminal_reason="WORKER_STOP_FAILED",
+                        versions=[{"version": "v0", "parallel": {"nodes": []}}, {"version": "v1"}],
+                        workers=workers,
+                        checkpoint={"active_version": "v1"},
+                        candidate_queue=[] if self.resume else [child],
+                    )
+                    self.state_path.write_text(json.dumps(self.state), encoding="utf-8")
+                    return 1
+
+            args = SimpleNamespace(
+                suggested_seeds=str(suggested), bootstrap_config="", config_root=str(root / "configs"),
+                output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="run",
+                max_seconds=60, max_versions=2, max_candidates=2, campaign_seconds=60,
+                callback_registry=str(registry), service="fuzzer-wordpress-plugin",
+            )
+            batch_path = root / "output/online-linked/run/batch-state.json"
+
+            def batch():
+                return json.loads(batch_path.read_text(encoding="utf-8"))
+
+            with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
+                    patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0):
+                run_online_linked(args)
+                self.assertEqual(runs, [(initial["callback_id"], False)])
+                self.assertEqual((batch()["campaign_status"], batch()["terminal_reason"]),
+                                 ("PARTIAL", "PARALLEL_CLEANUP_PENDING"))
+
+                args.resume = True
+                with self.subTest("interrupted_checkpoint_takes_priority_and_failed_retry_blocks"):
+                    interrupted = batch()
+                    interrupted["candidates"][0]["terminal_reason"] = "CANDIDATE_INTERRUPTED"
+                    for row in interrupted["pending_candidates"]:
+                        if row["item"]["callback_id"] == initial["callback_id"]:
+                            row["terminal_reason"] = "CANDIDATE_INTERRUPTED"
+                    batch_path.write_text(json.dumps(interrupted), encoding="utf-8")
+                    runs.clear()
+                    run_online_linked(args)
+                    self.assertEqual(runs, [(initial["callback_id"], True)])
+                    self.assertEqual((batch()["campaign_status"], batch()["terminal_reason"]),
+                                     ("PARTIAL", "PARALLEL_CLEANUP_PENDING"))
+
+                with self.subTest("restarted_worker_stuck_blocks_despite_confirmed_cleanup"):
+                    cleanup_ok, new_worker_stuck = True, True
+                    runs.clear()
+                    run_online_linked(args)
+                    self.assertEqual(runs, [(initial["callback_id"], True)])
+                    self.assertEqual((batch()["campaign_status"], batch()["terminal_reason"]),
+                                     ("PARTIAL", "PARALLEL_CLEANUP_PENDING"))
+
+                with self.subTest("successful_retry_releases_queue"):
+                    cleanup_ok, new_worker_stuck = True, False
+                    runs.clear()
+                    run_online_linked(args)
+                    self.assertEqual(runs, [(initial["callback_id"], True), (child["callback_id"], False)])
+
     def test_parallel_cleanup_pending_blocks_other_campaign_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3569,6 +3705,303 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator.state["versions"][0]["finding_artifact"], {"run_id": "run-v0-n2"})
             for name in (f"{self.NODE1}-n2", f"{self.NODE1}-n3", self.NODE1):
                 self.assertIn("rm:" + name, log)
+
+    def _vuln_with_stuck_node3(self, root, log, stuck=None):
+        """Node 2 finds a vulnerability while one container (node 3 by default) cannot be removed."""
+        stuck = stuck or f"{self.NODE1}-n3"
+        coordinator = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+        coordinator.load_finding_artifact = lambda name: {"run_id": name[:-5]}
+        vuln = lambda c: STOP_ON_VULN_EXIT_CODE if c._parallel_group is not None else None
+        self._parallel_docker(coordinator, log, exit_codes={f"{self.NODE1}-n2": vuln})
+        docker = coordinator.run_command
+
+        def run_command(command, **kwargs):
+            if command == ["docker", "rm", "-f", stuck]:
+                return subprocess.CompletedProcess(command, 1, "", "Cannot connect to the Docker daemon")
+            return docker(command, **kwargs)
+
+        coordinator.run_command = run_command
+        return coordinator
+
+    def test_parallel_vuln_verdict_survives_node_cleanup_failure(self):
+        """A leftover node blocks the batch, but a found vulnerability must not be forgotten."""
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = self._vuln_with_stuck_node3(Path(tmp), [])
+            self.assertNotEqual(coordinator.run(), 0)
+            saved = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            self.assertEqual((saved["terminal_status"], saved["terminal_reason"]),
+                             ("PARTIAL", "PARALLEL_CLEANUP_PENDING"))
+            self.assertEqual(saved["verdict_before_cleanup"],
+                             {"terminal_status": "VULN_FOUND", "terminal_reason": "VULN_FOUND"})
+            self.assertEqual(saved["versions"][0]["status"], "vuln_found")
+
+    def test_parallel_vuln_verdict_survives_node1_stop_failure(self):
+        """Node 1 stop failure rewrites the verdict to WORKER_STOP_FAILED; resume must still restore the finding."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator = self._vuln_with_stuck_node3(root, [], stuck=self.NODE1)
+            self.assertNotEqual(coordinator.run(), 0)
+            first = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(first["terminal_reason"], "PARALLEL_CLEANUP_PENDING")
+            self.assertEqual(first["verdict_before_cleanup"],
+                             {"terminal_status": "VULN_FOUND", "terminal_reason": "VULN_FOUND"})
+            crashed = {**first, "terminal_status": "NOT_VERIFIED", "terminal_reason": "WORKER_STOP_FAILED"}
+            del crashed["verdict_before_cleanup"]
+
+            for case, state in (("marked", first), ("crashed_before_mark", crashed)):
+                with self.subTest(case):
+                    coordinator.state_path.write_text(json.dumps(state), encoding="utf-8")
+                    log: list[str] = []
+                    restored = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+                    restored.resume = True
+                    self._parallel_docker(restored, log)
+                    restored._gate_v0 = lambda *args, **kwargs: log.append("resume_gate") or True
+                    self.assertEqual(restored.run(), 0)
+                    self.assertIn(f"rm:{self.NODE1}", log)
+                    self.assertNotIn("resume_gate", log)
+                    saved = json.loads(restored.state_path.read_text(encoding="utf-8"))
+                    self.assertEqual((saved["terminal_status"], saved["terminal_reason"]),
+                                     ("VULN_FOUND", "VULN_FOUND"))
+
+    def test_parallel_stop_error_still_marks_cleanup_pending_in_memory(self):
+        """If stopping nodes raises (e.g. a state write fails), the campaign must still see the cleanup marker."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+            self._parallel_docker(coordinator, log)
+            with patch("online_linked.coordination.parallel_runner.ParallelRunner.stop_nodes",
+                       side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    coordinator.run()
+            self.assertEqual((coordinator.state["terminal_status"], coordinator.state["terminal_reason"]),
+                             ("PARTIAL", "PARALLEL_CLEANUP_PENDING"))
+
+    def test_parallel_resume_accepts_verdict_recorded_after_cleanup(self):
+        """The batch can stop after the candidate restored its verdict; the next resume must accept it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._vuln_with_stuck_node3(root, []).run()
+            for attempt in ("cleanup", "batch_crashed_after_restore"):
+                with self.subTest(attempt):
+                    log: list[str] = []
+                    restored = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+                    restored.resume = True
+                    starts = self._parallel_docker(restored, log)
+                    restored._gate_v0 = lambda *args, **kwargs: log.append("resume_gate") or True
+                    self.assertEqual(restored.run(), 0)
+                    self.assertTrue(restored.resume_cleanup_confirmed)
+                    self.assertNotIn("resume_gate", log)
+                    self.assertEqual(starts, [])
+                    self.assertEqual((restored.state["terminal_status"], restored.state["terminal_reason"]),
+                                     ("VULN_FOUND", "VULN_FOUND"))
+
+    def test_parallel_settled_resume_rejects_changed_config(self):
+        """Accepting a recorded verdict must use the same integrity checks as a normal resume."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._vuln_with_stuck_node3(root, []).run()
+            restored = self.make_coordinator(root, [], discovers_parameter=False, parallel=True)
+            restored.resume = True
+            self._parallel_docker(restored, [])
+            self.assertEqual(restored.run(), 0)
+            config_path = Path(restored.state["versions"][0]["config_path"])
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["target"] = "changed-after-verdict"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+
+            again = self.make_coordinator(root, [], discovers_parameter=False, parallel=True)
+            again.resume = True
+            self._parallel_docker(again, [])
+            with self.assertRaisesRegex(ValueError, "config hash changed"):
+                again.run()
+            self.assertFalse(again.resume_cleanup_confirmed)
+
+    def test_parallel_resume_removes_started_child_worker_before_gate(self):
+        """An interruption right after v1 starts leaves active_version=v0; resume must still remove v1 first."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator, _ = self._parallel_handoff_run(root, [], max_versions=2)
+            coordinator.run()
+            saved = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            child = next(w for w in saved["workers"] if w["container_name"].endswith("-v1"))
+            child["status"] = "started"
+            saved["checkpoint"]["active_version"] = "v0"
+            saved.update(terminal_status="PARTIAL", terminal_reason="CANDIDATE_INTERRUPTED")
+            saved["budget"]["remaining_seconds"] = 60
+            coordinator.state_path.write_text(json.dumps(saved), encoding="utf-8")
+
+            for fails in (True, False):
+                with self.subTest(fails=fails):
+                    coordinator.state_path.write_text(json.dumps(saved), encoding="utf-8")
+                    log: list[str] = []
+                    restored = self.make_coordinator(root, log, parallel=True, max_versions=2)
+                    restored.resume = True
+                    self._parallel_docker(restored, log)
+                    docker = restored.run_command
+
+                    def run_command(command, fails=fails, docker=docker, **kwargs):
+                        if command[:3] == ["docker", "rm", "-f"] and command[3] == child["container_name"]:
+                            log.append("rm_child")
+                            if fails:
+                                return subprocess.CompletedProcess(command, 1, "", "Cannot connect to the Docker daemon")
+                        return docker(command, **kwargs)
+
+                    restored.run_command = run_command
+                    restored._gate_v0 = lambda *args, **kwargs: log.append("resume_gate") or True
+                    result = restored.run()
+                    self.assertIn("rm_child", log)
+                    if fails:
+                        self.assertNotIn("resume_gate", log)
+                        self.assertNotEqual(result, 0)
+                        self.assertFalse(restored.resume_cleanup_confirmed)
+                        self.assertEqual(restored.state["terminal_reason"], "PARALLEL_CLEANUP_PENDING")
+                    else:
+                        self.assertLess(log.index("rm_child"), log.index("resume_gate"))
+
+    def test_parallel_settled_resume_retries_leftover_single_worker(self):
+        """After parallel v0 hands off to single-worker v1, a v1 stop failure must be retried before confirming cleanup."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator, _ = self._parallel_handoff_run(root, [], max_versions=2)
+            docker = coordinator.run_command
+
+            def fail_v1_rm(command, docker=docker, **kwargs):
+                if command[:3] == ["docker", "rm", "-f"] and command[3].endswith("-v1"):
+                    return subprocess.CompletedProcess(command, 1, "", "Cannot connect to the Docker daemon")
+                return docker(command, **kwargs)
+
+            coordinator.run_command = fail_v1_rm
+            coordinator.run()
+            saved = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            leftover = [w["container_name"] for w in saved["workers"] if w.get("status") == "stop_failed"]
+            self.assertEqual(len(leftover), 1)
+            self.assertTrue(leftover[0].endswith("-v1"))
+            # v1 ran as a single worker: only v0 carries "parallel", and the v1 stop failure is the final verdict.
+            saved["versions"][1].pop("parallel", None)
+            saved.update(terminal_status="NOT_VERIFIED", terminal_reason="WORKER_STOP_FAILED")
+            coordinator.state_path.write_text(json.dumps(saved), encoding="utf-8")
+
+            for fails in (True, False):
+                with self.subTest(fails=fails):
+                    removals: list[str] = []
+                    restored = self.make_coordinator(root, [], parallel=True, max_versions=2)
+                    restored.resume = True
+                    self._parallel_docker(restored, [])
+                    docker = restored.run_command
+
+                    def run_command(command, fails=fails, docker=docker, **kwargs):
+                        if command[:3] == ["docker", "rm", "-f"]:
+                            removals.append(command[3])
+                            if fails:
+                                return subprocess.CompletedProcess(command, 1, "", "Cannot connect to the Docker daemon")
+                        return docker(command, **kwargs)
+
+                    restored.run_command = run_command
+                    result = restored.run()
+                    self.assertIn(leftover[0], removals)
+                    self.assertEqual(restored.resume_cleanup_confirmed, not fails)
+                    self.assertEqual(result, 1)
+                    self.assertEqual(restored.state["terminal_status"], "NOT_VERIFIED")
+
+    def test_parallel_resume_restores_single_worker_vuln_verdict_after_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator, _ = self._parallel_handoff_run(root, [], max_versions=2)
+            coordinator.load_finding_artifact = lambda name: {"run_id": name[:-5]}
+            child_container = self.NODE1.removesuffix("v0") + "v1"
+            remove_child = ["docker", "rm", "-f", child_container]
+            error = "Cannot connect to the Docker daemon"
+            self._parallel_docker(coordinator, [], exit_codes={child_container: lambda _: STOP_ON_VULN_EXIT_CODE})
+            docker = coordinator.run_command
+
+            def fail_child_removal(command, **kwargs):
+                if command == remove_child:
+                    return subprocess.CompletedProcess(command, 1, "", error)
+                return docker(command, **kwargs)
+
+            coordinator.run_command = fail_child_removal
+            self.assertEqual(coordinator.run(), 1)
+            saved = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["checkpoint"]["active_version"], "v1")
+            self.assertEqual(saved["terminal_reason"], "WORKER_STOP_FAILED")
+            self.assertEqual(saved["versions"][1]["status"], "vuln_found")
+            finding = saved["versions"][1]["finding_artifact"]
+
+            for fails in (True, False):
+                with self.subTest(cleanup_fails=fails):
+                    log: list[str] = []
+                    restored = self.make_coordinator(root, log, parallel=True, max_versions=2)
+                    restored.resume = True
+                    starts = self._parallel_docker(restored, log)
+                    if fails:
+                        restored.run_command = fail_child_removal
+                    with patch.object(restored, "_gate_v0") as gate:
+                        self.assertEqual(restored.run(), 1 if fails else 0)
+                    gate.assert_not_called()
+                    self.assertEqual(starts, [])
+                    self.assertEqual(restored.resume_cleanup_confirmed, not fails)
+                    saved = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+                    self.assertEqual(saved["versions"][1]["finding_artifact"], finding)
+                    if fails:
+                        self.assertEqual(saved["terminal_status"], "NOT_VERIFIED")
+                        self.assertEqual(saved["workers"][-1]["status"], "stop_failed")
+                    else:
+                        self.assertIn(f"rm:{child_container}", log)
+                        self.assertEqual(saved["workers"][-1]["status"], "stopped")
+                        self.assertEqual((saved["terminal_status"], saved["terminal_reason"]),
+                                         ("VULN_FOUND", "VULN_FOUND"))
+
+    def test_parallel_resume_restores_vuln_verdict_after_cleanup(self):
+        """Resume only finishes the cleanup of a found vulnerability; it must not fuzz the candidate again."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            coordinator = self._vuln_with_stuck_node3(root, [])
+            coordinator.run()
+            stuck_state = coordinator.state_path.read_text(encoding="utf-8")
+            crashed = json.loads(stuck_state)
+            crashed.update(terminal_status="VULN_FOUND", terminal_reason="VULN_FOUND")
+            del crashed["verdict_before_cleanup"]
+            # A PARTIAL checkpoint written by f244b8ba, before verdict_before_cleanup existed.
+            legacy = json.loads(stuck_state)
+            del legacy["verdict_before_cleanup"]
+
+            for case, state_text, fails in (
+                ("still_failing", None, True),
+                ("cleanup_succeeds", None, False),
+                ("crashed_before_mark", json.dumps(crashed), False),
+                ("legacy_checkpoint", json.dumps(legacy), False),
+            ):
+                with self.subTest(case):
+                    if state_text is not None:
+                        coordinator.state_path.write_text(state_text, encoding="utf-8")
+                    log: list[str] = []
+                    restored = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+                    restored.resume = True
+                    starts = self._parallel_docker(restored, log)
+                    docker = restored.run_command
+
+                    def run_command(command, fails=fails, docker=docker, **kwargs):
+                        if fails and command == ["docker", "rm", "-f", f"{self.NODE1}-n3"]:
+                            return subprocess.CompletedProcess(command, 1, "", "Cannot connect to the Docker daemon")
+                        return docker(command, **kwargs)
+
+                    restored.run_command = run_command
+                    restored._gate_v0 = lambda *args, **kwargs: log.append("resume_gate") or True
+                    result = restored.run()
+                    saved = json.loads(restored.state_path.read_text(encoding="utf-8"))
+                    self.assertNotIn("resume_gate", log)
+                    self.assertEqual(starts, [])
+                    if fails:
+                        self.assertNotEqual(result, 0)
+                        self.assertEqual(saved["terminal_reason"], "PARALLEL_CLEANUP_PENDING")
+                        self.assertEqual(saved["verdict_before_cleanup"]["terminal_status"], "VULN_FOUND")
+                    else:
+                        self.assertEqual(result, 0)
+                        self.assertTrue(restored.resume_cleanup_confirmed)
+                        self.assertIn(f"rm:{self.NODE1}-n3", log)
+                        self.assertEqual((saved["terminal_status"], saved["terminal_reason"]),
+                                         ("VULN_FOUND", "VULN_FOUND"))
+                        self.assertNotIn("verdict_before_cleanup", saved)
 
     def _parallel_handoff_run(self, root, log, **kwargs):
         """A v0 parameter appears only after Parallel started, from node 3."""
