@@ -12,7 +12,9 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
+from filesystem_paths import filesystem_path
 from hook_energy.seed_generation.generated_config_runner import STOP_ON_VULN_EXIT_CODE
+from online_linked.coordination.parallel_start import run_parallel_start, settle_parallel_start
 from online_linked.coordination.worker import (
     CommandRunner,
     container_running,
@@ -37,7 +39,7 @@ def pending_parallel_nodes(version: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [
         node for node in parallel.get("nodes", [])
         if node.get("node_index", 1) >= 2
-        and ("stop_error" in node or (node.get("started") and node.get("stop_reason") is None))
+        and (node.get("stop_reason") is None or "stop_error" in node)
     ]
 
 
@@ -64,6 +66,7 @@ class ParallelHost(Protocol):
     sleeper: Callable[[float], None]
     run_command: CommandRunner
     config_root: Path
+    state_path: Path
     service: str
     max_seconds: int
     _sender_seconds: float
@@ -152,16 +155,19 @@ class ParallelRunner:
         for node_index in range(2, host.parallel_nodes + 1):
             if host.campaign_deadline is not None and host.clock() >= host.campaign_deadline:
                 break
+            startup_token = uuid.uuid4().hex
             node = {
                 "node_index": node_index,
                 "container_name": parallel_node_name(base_container, node_index),
                 "worker_run_id": parallel_node_name(base_run_id, node_index),
-                "handoff_key": f"{version_name}-n{node_index}-{uuid.uuid4().hex}",
+                "handoff_key": f"{version_name}-n{node_index}-{startup_token}",
+                "startup_token": startup_token,
                 "started": False, "exit_code": None, "stop_reason": None,
             }
             nodes.append(node)
-            # In the group before `compose run`: an interrupted start may still create the container.
+            # Track on disk and in memory: an interrupted start may still create the container.
             started.append(node)
+            host._write_state()
             command = worker_start_command(
                 {**version, "worker_run_id": node["worker_run_id"], "handoff_key": node["handoff_key"]},
                 container_name=node["container_name"], runtime_slug=runtime_slug, service=host.service,
@@ -169,8 +175,8 @@ class ParallelRunner:
             )
             error = ""
             try:
-                result = host.run_command(command, timeout=self._bounded(30.0), check=False,
-                                          capture_output=True, text=True)
+                result = run_parallel_start(self._startup_receipt(startup_token), command,
+                                            timeout=self._bounded(30.0), run_command=host.run_command)
                 if int(getattr(result, "returncode", 1)) != 0:
                     error = str(getattr(result, "stderr", "") or "WORKER_START_FAILED").strip()
             except Exception as exc:
@@ -361,7 +367,19 @@ class ParallelRunner:
             parallel.update(ended_at=self._host.clock(), end_reason=reason)
         return stopped
 
+    def _startup_receipt(self, token: str) -> Path:
+        return filesystem_path(self._host.state_path.with_name(f"parallel-start-{uuid.UUID(token).hex}.json"))
+
     def _remove(self, node: dict[str, Any], reason: str) -> bool:
+        token = node.get("startup_token")
+        if token is not None:
+            try:
+                if not settle_parallel_start(self._startup_receipt(token)):
+                    node["stop_error"] = "PARALLEL_START_UNCONFIRMED"
+                    return False
+            except (OSError, ValueError) as exc:
+                node["stop_error"] = f"PARALLEL_START_UNCONFIRMED: {exc}"
+                return False
         stopped, error = remove_container(
             node["container_name"], clock=self._host.clock, sleeper=self._host.sleeper,
             run_command=self._host.run_command,

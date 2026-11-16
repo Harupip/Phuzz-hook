@@ -8,6 +8,7 @@ from typing import Any
 
 from online_linked.coordination.request_matching import _parameter_key
 from online_linked.export import parameter_replay_failures
+from online_linked.redirect_gate import replay_http_admitted
 
 
 def ajax_branch_continuation(result: Mapping[str, Any], parent: Mapping[str, Any]) -> dict[str, Any]:
@@ -128,11 +129,12 @@ def replay_verdict(
         replay_passed = replay_passed and not transport_failed and not parameter_failures
         non_success_response = False
     else:
-        try:
-            non_success_response = (bool(sender_result.get("error")) or not (200 <= int(response_status) <= 299 or int(response_status) == 302)
-                                    or int(artifact_status) != int(response_status))
-        except (TypeError, ValueError):
-            non_success_response = True
+        proof = baseline or {}
+        non_success_response = not replay_http_admitted(
+            request_payload, proof.get("zend"), callback_id=replay_row.get("callback_id"),
+            request_id=proof.get("request_id"), run_id=proof.get("worker_run_id"),
+            target=sender_result.get("target_url"), transport=sender_result,
+        )
     return ReplayVerdict(
         callback_passed=replay_passed,
         non_success_response=non_success_response,

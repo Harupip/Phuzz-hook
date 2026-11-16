@@ -17,17 +17,18 @@ from hook_energy.seed_generation.online_common import config_hash
 from online_linked.export import (
     export_online_linked_batch,
 )
+from tests.test_redirect_gate import REDIRECT_LOCATION, add_redirect_evidence
 
 
 class OnlineLinkedExportTests(unittest.TestCase):
-    def baseline_version(self, name="v1"):
-        version = self.version(name)
+    def baseline_version(self, name="v1", *, auth_context="guest"):
+        version = self.version(name, config=self.config(auth_context=auth_context))
         proof = {
             "request_id": "baseline-request", "run_id": "baseline-run",
             "plugin_slug": "fixture", "callback_id": version["callback_id"],
-            "http_method": "POST", "auth_context": "guest", "seed_variant_id": "post",
+            "http_method": "POST", "auth_context": auth_context, "seed_variant_id": "post",
         }
-        version.update(plugin_slug="fixture", resolved_method="POST", auth_context="guest", seed_variant_id="post")
+        version.update(plugin_slug="fixture", resolved_method="POST", auth_context=auth_context, seed_variant_id="post")
         gate = {
             "passed": True, "verification_policy": "callback_baseline_v1",
             "baseline_evidence": proof,
@@ -39,7 +40,7 @@ class OnlineLinkedExportTests(unittest.TestCase):
                 "matched_artifact": proof["request_id"] + ".json",
                 "request_payload": {
                     "request_id": proof["request_id"], "run_id": proof["run_id"],
-                    "target_plugin": "fixture", "http_method": "POST", "auth_context": "guest",
+                    "target_plugin": "fixture", "http_method": "POST", "auth_context": auth_context,
                     "response": {"status_code": 200},
                 },
                 "zend_payload": {"request_id": proof["request_id"], "run_id": proof["run_id"]},
@@ -57,13 +58,19 @@ class OnlineLinkedExportTests(unittest.TestCase):
                 candidate, _ = self.write_state(versions=[version])
                 self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / name), 1)
 
-    def test_baseline_302_exports_with_correlated_callback_proof(self):
+    def test_baseline_redirect_exports_only_with_correlated_guard_proof(self):
         for name in ("v0", "v1"):
             with self.subTest(name=name):
-                version = self.baseline_version(name)
+                version = self.baseline_version(name, auth_context="authenticated")
                 gate = version["readiness" if name == "v0" else "replay_result"]
                 row = gate["runner"]["runs"][0]
                 row["request_payload"]["response"]["status_code"] = 302
+                candidate, _ = self.write_state(versions=[version])
+                self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / (name + "-unverified")), 0)
+                add_redirect_evidence(row["request_payload"], row["zend_payload"], callback_id=version["callback_id"],
+                                      callback_repr="Fixture::handle", status=303)
+                if name == "v1":
+                    row.update(response_status=303, response_location=REDIRECT_LOCATION)
                 candidate, _ = self.write_state(versions=[version])
                 self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / name), 1)
                 row["callback_reached"] = False

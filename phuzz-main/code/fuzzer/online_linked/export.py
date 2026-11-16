@@ -9,6 +9,7 @@ from pathlib import Path
 from filesystem_paths import filesystem_path
 
 from hook_energy.seed_generation.online_common import config_hash
+from online_linked.redirect_gate import replay_http_admitted
 from zend_discovery.engine import resolve_request_transport, runtime_parameter_is_accepted
 
 PARAMETER_REPLAY_POLICY = "parameter_replay_v1"
@@ -532,10 +533,16 @@ def _verify_baseline_gate(version: dict, gate: dict, config: dict, *, require_su
         raise ValueError("BASELINE_REQUEST_MISMATCH")
     if request.get("target_plugin") != proof["plugin_slug"] or str(request.get("http_method") or request.get("method") or "").upper() != proof["http_method"]:
         raise ValueError("BASELINE_REQUEST_MISMATCH")
-    response = request.get("response")
-    if require_success_response and (not isinstance(response, dict) or not (
-            200 <= int(response.get("status_code", 0)) < 300 or int(response.get("status_code", 0)) == 302)):
-        raise ValueError("BASELINE_HTTP_NOT_VERIFIED")
+    if require_success_response:
+        transport = None if version.get("version") == "v0" else {
+            "response_status": row.get("response_status"), "response_location": row.get("response_location"),
+            "error": row.get("http_error"),
+        }
+        if not replay_http_admitted(
+            request, zend, callback_id=proof["callback_id"], request_id=proof["request_id"],
+            run_id=proof["run_id"], target=config.get("target"), transport=transport,
+        ):
+            raise ValueError("BASELINE_HTTP_NOT_VERIFIED")
     replay_path = Path(version["replay_config_path"])
     if (gate.get("config_path") != str(replay_path) or gate.get("config_hash") != version.get("replay_config_hash")
             or config_hash(json.loads(filesystem_path(replay_path).read_text(encoding="utf-8-sig"))) != gate["config_hash"]):

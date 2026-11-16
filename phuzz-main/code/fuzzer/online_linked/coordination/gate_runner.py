@@ -27,6 +27,7 @@ from online_linked.coordination.gate_replay import (
 from online_linked.coordination.request_matching import _parameter_key, _safe_parameter_identity
 from online_linked.coordination.worker import CommandRunner
 from online_linked.export import PARAMETER_REPLAY_POLICY, parameter_replay_failures
+from online_linked.redirect_gate import replay_http_admitted
 from seed_generation.config.config_exporter import SeedConfigSkip
 
 
@@ -178,6 +179,7 @@ class GateRunner:
                 gate_evidence["request"], gate_evidence["zend"], version,
             ):
                 raise OnlineLinkedError("V0_PROVENANCE_NOT_VERIFIED")
+            result_row.update(request_payload=gate_evidence["request"], zend_payload=gate_evidence["zend"])
             self._host._gate_evidence = gate_evidence
             self._host._gate_convergence = copy.deepcopy(dict(observation))
             version["gate_evidence"] = {
@@ -200,11 +202,10 @@ class GateRunner:
                     self._host.state.update(terminal_status="PARTIAL", terminal_reason="PARAMETER_REPLAY_NOT_VERIFIED")
                     return False
             elif version["config_type"] == "fuzzing_ready":
-                try:
-                    guard_unknown = not (200 <= int(status) < 300 or int(status) == 302)
-                except (TypeError, ValueError):
-                    guard_unknown = True
-                if guard_unknown:
+                if not replay_http_admitted(
+                    gate_evidence["request"], gate_evidence["zend"], callback_id=version["callback_id"],
+                    request_id=gate_evidence["request_id"], run_id=version["worker_run_id"], target=config.get("target"),
+                ):
                     readiness.update(guard_status="unknown", reason="GUARD_SATISFACTION_UNKNOWN")
                     self._host.state.update(terminal_status="PARTIAL", terminal_reason="GUARD_SATISFACTION_UNKNOWN")
                     return False

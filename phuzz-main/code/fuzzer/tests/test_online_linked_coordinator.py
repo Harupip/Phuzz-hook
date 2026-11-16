@@ -2356,8 +2356,8 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator.state['terminal_reason'], 'GUARD_SATISFACTION_UNKNOWN')
             self.assertNotIn('worker_start', log)
 
-    def test_v0_2xx_and_302_with_callback_evidence_start_fuzzing(self):
-        for status in (200, 201, 204, 302):
+    def test_v0_2xx_with_callback_evidence_starts_fuzzing(self):
+        for status in (200, 201, 204):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
                 log = []
                 coordinator = self.make_coordinator(Path(tmp), log)
@@ -2371,6 +2371,38 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 coordinator.run()
                 self.assertTrue(coordinator.state['versions'][0]['readiness']['passed'])
                 self.assertIn('worker_start', log)
+
+    def test_v0_redirect_requires_request_scoped_guard_proof(self):
+        from tests.test_redirect_gate import add_redirect_evidence
+
+        for status, backed, allowed in ((302, False, False), (303, True, True)):
+            with self.subTest(status=status, backed=backed), tempfile.TemporaryDirectory() as tmp:
+                coordinator = self.make_coordinator(Path(tmp), [])
+                item, config, coordinator._target_key = coordinator._select_v0()
+                version = coordinator._new_version('v0', config, coordinator._write_config('v0', config), None, None, item)
+                version.update(worker_run_id='run-v0', auth_context='authenticated')
+                coordinator.state['versions'].append(version)
+                coordinator._reports['v0'] = coordinator._raw_report
+                original = coordinator.replay_runner
+
+                def replay_redirect(*args, **kwargs):
+                    report = original(*args, **kwargs)
+                    row = report['runs'][0]
+                    request, zend = row.pop('request_payload'), row.pop('zend_payload')
+                    request.update(response={'status_code': status}, run_id='run-v0')
+                    if backed:
+                        add_redirect_evidence(request, zend, callback_id=version['callback_id'],
+                                              callback_repr='fixture_callback', status=status)
+                    coordinator.load_artifact = lambda name: request
+                    coordinator.load_zend_artifact = lambda name: zend
+                    return report
+
+                coordinator.replay_runner = replay_redirect
+                self.assertIs(coordinator._gate_v0(version, config, deadline=2), allowed)
+                if allowed:
+                    row = version['readiness']['runner']['runs'][0]
+                    self.assertEqual(row['request_payload']['response']['status_code'], 303)
+                    self.assertEqual(row['zend_payload']['request_id'], 'v0-probe')
 
     def test_v0_error_response_keeps_replay_only_discovery(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3540,6 +3572,156 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(names, [self.NODE1])
             self.assertIn(f"rm:{self.NODE1}-n2", log)
             self.assertIn(f"rm:{self.NODE1}-n3", log)
+
+    def test_parallel_resume_cleans_node_recorded_before_compose_returns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log: list[str] = []
+            node2 = f"{self.NODE1}-n2"
+            coordinator = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+            self._parallel_docker(coordinator, log)
+            docker = coordinator.run_command
+            snapshot = b""
+
+            def snapshot_during_compose(command, **kwargs):
+                nonlocal snapshot
+                if command[:3] == ["docker", "compose", "run"] and command[command.index("--name") + 1] == node2:
+                    snapshot = coordinator.state_path.read_bytes()
+                return docker(command, **kwargs)
+
+            coordinator.run_command = snapshot_during_compose
+            self.assertEqual(coordinator.run(), 0)
+            saved = json.loads(snapshot)
+            nodes = saved["versions"][0].get("parallel", {}).get("nodes", [])
+            self.assertEqual([node["node_index"] for node in nodes], [1, 2])
+            self.assertEqual(nodes[1]["container_name"], node2)
+            self.assertIs(nodes[1]["started"], False)
+            self.assertIsNone(nodes[1]["stop_reason"])
+
+            def resume(remove_error=""):
+                log.clear()
+                restored = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+                restored.resume = True
+                starts = self._parallel_docker(restored, log)
+                docker = restored.run_command
+
+                def remove_node(command, **kwargs):
+                    result = docker(command, **kwargs)
+                    if remove_error and command == ["docker", "rm", "-f", node2]:
+                        return subprocess.CompletedProcess(command, 1, "", remove_error)
+                    return result
+
+                restored.run_command = remove_node
+                restored._gate_v0 = lambda *args, **kwargs: log.append("resume_gate") or True
+                result = restored.run()
+                state = json.loads(restored.state_path.read_bytes())
+                return result, starts, state
+
+            daemon_error = "Cannot connect to the Docker daemon"
+            for scenario, error in (
+                ("removed", ""),
+                ("absent", f"Error response from daemon: No such container: {node2}"),
+                ("daemon unavailable", daemon_error),
+            ):
+                with self.subTest(scenario=scenario):
+                    # Compose finished, but the coordinator only persisted its pre-launch state.
+                    coordinator.state_path.write_bytes(snapshot)
+                    result, starts, state = resume(error)
+                    if error == daemon_error:
+                        self.assertIn(f"rm:{node2}", log)
+                        self.assertNotEqual(result, 0)
+                        self.assertNotIn("resume_gate", log)
+                        self.assertEqual(starts, [])
+                        self.assertEqual((state["terminal_status"], state["terminal_reason"]),
+                                         ("PARTIAL", "PARALLEL_CLEANUP_PENDING"))
+                        self.assertEqual(state["versions"][0]["parallel"]["nodes"][1]["stop_error"], daemon_error)
+                        result, _, state = resume()
+
+                    self.assertEqual(result, 0)
+                    self.assertIn(f"rm:{node2}", log)
+                    self.assertIn("resume_gate", log)
+                    self.assertLess(log.index(f"rm:{node2}"), log.index("resume_gate"))
+                    node = state["versions"][0]["parallel"]["nodes"][1]
+                    self.assertEqual(node["stop_reason"], "RESUME_REVALIDATION")
+                    self.assertNotIn("stop_error", node)
+
+    def test_parallel_resume_does_not_accept_absence_during_compose_start(self):
+        class Killed(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log: list[str] = []
+            coordinator = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+            self._parallel_docker(coordinator, log)
+            docker = coordinator.run_command
+            node2 = f"{self.NODE1}-n2"
+            snapshot = b""
+
+            def interrupt_during_compose(command, **kwargs):
+                nonlocal snapshot
+                if command[:3] == ["docker", "compose", "run"] and command[command.index("--name") + 1] == node2:
+                    snapshot = coordinator.state_path.read_bytes()
+                    # The original invocation is still in flight. Docker has not created node 2 yet.
+                    raise Killed()
+                return docker(command, **kwargs)
+
+            coordinator.run_command = interrupt_during_compose
+            with self.assertRaises(Killed):
+                coordinator.run()
+            coordinator.state_path.write_bytes(snapshot)
+
+            log.clear()
+            restored = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+            restored.resume = True
+            starts = self._parallel_docker(restored, log)
+            docker = restored.run_command
+
+            def node_absent(command, **kwargs):
+                result = docker(command, **kwargs)
+                if command == ["docker", "rm", "-f", node2]:
+                    return subprocess.CompletedProcess(command, 1, "", f"Error: No such container: {node2}")
+                return result
+
+            restored.run_command = node_absent
+            restored._gate_v0 = lambda *args, **kwargs: log.append("resume_gate") or True
+            result = restored.run()
+            saved = json.loads(restored.state_path.read_bytes())
+
+            self.assertNotEqual(result, 0)
+            self.assertEqual((saved["terminal_status"], saved["terminal_reason"]),
+                             ("PARTIAL", "PARALLEL_CLEANUP_PENDING"))
+            node = saved["versions"][0]["parallel"]["nodes"][1]
+            self.assertIsNone(node["stop_reason"])
+            self.assertIn("stop_error", node)
+            self.assertNotIn(f"rm:{node2}", log)
+            self.assertNotIn("resume_gate", log)
+            self.assertEqual(starts, [])
+
+    def test_parallel_start_skips_compose_if_checkpoint_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+            starts = self._parallel_docker(coordinator, log)
+            write_state = coordinator._write_state
+            write_failed = False
+
+            def fail_start_checkpoint():
+                nonlocal write_failed
+                version = next(iter(coordinator.state["versions"]), {})
+                nodes = version.get("parallel", {}).get("nodes", [])
+                if not write_failed and len(nodes) > 1 and nodes[1]["started"] is False:
+                    write_failed = True
+                    raise OSError("checkpoint write failed")
+                write_state()
+
+            with patch.object(coordinator, "_write_state", side_effect=fail_start_checkpoint):
+                result = coordinator.run()
+
+            names = [command[command.index("--name") + 1] for _, command in starts]
+            self.assertEqual(names, [self.NODE1])
+            self.assertTrue(write_failed)
+            self.assertNotEqual(result, 0)
 
     def test_parallel_resume_retries_failed_removal_before_gate(self):
         with tempfile.TemporaryDirectory() as tmp:

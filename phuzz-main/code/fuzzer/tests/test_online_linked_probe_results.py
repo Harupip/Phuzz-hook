@@ -6,6 +6,7 @@ from online_linked.coordination.probe_results import (
     replay_verdict,
 )
 from online_linked.coordination.request_matching import _parameter_key
+from tests.test_redirect_gate import REDIRECT_LOCATION, add_redirect_evidence
 
 
 def param(name, source="POST", location="form", fuzzable=True):
@@ -102,15 +103,40 @@ class ReplayVerdictTests(unittest.TestCase):
         self.assertTrue(verdict.passed)
         self.assertEqual(verdict.response_status, 200)
 
-    def test_reached_callback_with_302_passes_without_parameter_replay(self):
-        """Callbacks such as Ninja Forms OAuth can complete with an expected redirect."""
+    def test_child_redirect_requires_guard_proof_and_matching_transport(self):
+        for change, allowed in ((None, True), ('guards', False), ('location', False),
+                                ('missing_status', False), ('php_error', False), ('transport', False)):
+            with self.subTest(change=change):
+                row = {**replay_row(303), 'callback_id': 'cb'}
+                request = row['request_payload']
+                request.update(request_id='request', run_id='run', auth_context='authenticated')
+                zend = {'request_id': 'request', 'run_id': 'run'}
+                add_redirect_evidence(request, zend, callback_id='cb', callback_repr='Fixture::callback', status=303)
+                sender = {'response_status': 303, 'response_location': REDIRECT_LOCATION,
+                          'target_url': 'http://web/wp-admin/admin-ajax.php'}
+                if change == 'guards':
+                    request.pop('guard_redirect_events')
+                elif change == 'location':
+                    sender['response_location'] += '-different'
+                elif change == 'missing_status':
+                    sender.pop('response_status')
+                elif change == 'php_error':
+                    request['errors'] = [{'errno': 1}]
+                elif change == 'transport':
+                    sender['error'] = 'connection closed'
+                verdict = replay_verdict(
+                    replay_row=row, sender_result=sender,
+                    baseline={'request_id': 'request', 'worker_run_id': 'run', 'request': request, 'zend': zend},
+                    verified_parameters=[], deadline_expired=False, artifact_error='',
+                )
+                self.assertIs(verdict.passed, allowed)
+
+    def test_child_rejects_302_with_callback_execution_alone(self):
         verdict = replay_verdict(
-            replay_row=replay_row(302), sender_result={"response_status": 302}, baseline={"request": {}, "zend": {}},
-            verified_parameters=[], deadline_expired=False, artifact_error="",
+            replay_row=replay_row(302), sender_result={'response_status': 302},
+            baseline={'request': {}, 'zend': {}}, verified_parameters=[], deadline_expired=False, artifact_error='',
         )
-        self.assertTrue(verdict.callback_passed)
-        self.assertFalse(verdict.non_success_response)
-        self.assertTrue(verdict.passed)
+        self.assertFalse(verdict.passed)
 
     def test_302_still_requires_callback_baseline_and_matching_transport(self):
         cases = [

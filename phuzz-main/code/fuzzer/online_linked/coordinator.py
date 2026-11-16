@@ -1201,9 +1201,16 @@ class OnlineLinkedCoordinator:
                     self.state["terminal_reason"] = "PENDING_RUNTIME_VERIFICATION"
         if self._budget_started_at is not None:
             now = self.clock()
+            deadline = self._deadline
+            parallel = getattr(self, "_parallel_group", None)
+            if parallel is not None and parallel["deadline"] is None:
+                # Preserve the unspent parallel window during startup for resume.
+                deadline = now + self.parallel_seconds
+                if self.campaign_deadline is not None:
+                    deadline = min(deadline, self.campaign_deadline)
             self.state["budget"] = {
                 "elapsed_seconds": self._elapsed_seconds + max(0.0, now - self._budget_started_at),
-                "remaining_seconds": max(0.0, self._deadline - now),
+                "remaining_seconds": max(0.0, deadline - now),
                 "hard_remaining_seconds": max(0.0, self._hard_deadline - now) if self._hard_deadline is not None else None,
                 "progress_keys": sorted(self._progress_keys),
                 "saved_at": time.time(),

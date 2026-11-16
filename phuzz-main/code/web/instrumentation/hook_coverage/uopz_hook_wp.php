@@ -1611,6 +1611,23 @@ register_shutdown_function(function () {
     $GLOBALS['__uopz_request']['response']['status_code'] =
         function_exists('http_response_code') ? http_response_code() : 200;
 
+    if (!empty($GLOBALS['__uopz_request']['guard_redirect_events'])) {
+        $locations = [];
+        foreach (headers_list() as $header) {
+            if (strncasecmp($header, 'Location:', 9) === 0) {
+                $locations[] = trim(substr($header, 9), " \t");
+            }
+        }
+        if (count($locations) === 1 && $locations[0] !== '') {
+            $location = $locations[0];
+            $parts = parse_url($location);
+            if (is_array($parts) && !isset($parts['user']) && !isset($parts['pass'])) {
+                $GLOBALS['__uopz_request']['response']['location_sha256'] = hash('sha256', $location);
+                $GLOBALS['__uopz_request']['response']['location_base'] = substr($location, 0, strcspn($location, '?#'));
+            }
+        }
+    }
+
     $GLOBALS['__uopz_request']['response']['time_ms'] =
         round((microtime(true) - $GLOBALS['__uopz_start_time']) * 1000, 2);
 

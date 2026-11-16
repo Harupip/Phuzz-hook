@@ -1,6 +1,11 @@
 import subprocess
+import sys
+import tempfile
+import time
 import unittest
+from pathlib import Path
 
+from online_linked.coordination.parallel_start import run_parallel_start, settle_parallel_start
 from online_linked.coordination.worker import (
     container_running,
     matching_pause_ack,
@@ -13,6 +18,61 @@ from online_linked.coordination.worker import (
 
 
 class WorkerHelpersTests(unittest.TestCase):
+    def test_parallel_start_receipt_survives_coordinator_kill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt, ready, release = (Path(tmp) / name for name in ("receipt.json", "ready", "release"))
+            command = [sys.executable, "-c", (
+                "import sys, time; from pathlib import Path\n"
+                "Path(sys.argv[1]).touch()\n"
+                "deadline = time.monotonic() + 15\n"
+                "while not Path(sys.argv[2]).exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+            ), str(ready), str(release)]
+            driver = (
+                "import subprocess, sys; from pathlib import Path; "
+                "from online_linked.coordination.parallel_start import run_parallel_start; "
+                "run_parallel_start(Path(sys.argv[1]), sys.argv[2:], timeout=20, run_command=subprocess.run)"
+            )
+
+            def wait_for(path):
+                deadline = time.monotonic() + 10
+                while not path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(path.exists(), path)
+
+            with subprocess.Popen([sys.executable, "-c", driver, str(receipt), *command]) as coordinator:
+                try:
+                    wait_for(ready)
+                    coordinator.kill()
+                    coordinator.wait(timeout=10)
+                    self.assertFalse(settle_parallel_start(receipt))
+                finally:
+                    release.touch()
+                    if ready.exists():
+                        wait_for(receipt)
+            self.assertTrue(settle_parallel_start(receipt))
+
+    def test_parallel_start_can_be_cancelled_before_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = Path(tmp) / "receipt.json"
+            created = Path(tmp) / "container"
+            self.assertTrue(settle_parallel_start(receipt))
+            result = run_parallel_start(
+                receipt, [sys.executable, "-c", "import sys; from pathlib import Path; Path(sys.argv[1]).touch()", str(created)],
+                timeout=10, run_command=subprocess.run,
+            )
+            self.assertEqual(result.stderr, "PARALLEL_START_CANCELLED")
+            self.assertFalse(created.exists())
+
+    def test_parallel_start_records_normal_compose_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = Path(tmp) / "receipt.json"
+            result = run_parallel_start(
+                receipt, [sys.executable, "-c", "raise SystemExit(125)"],
+                timeout=10, run_command=subprocess.run,
+            )
+            self.assertEqual(result.returncode, 125)
+            self.assertTrue(settle_parallel_start(receipt))
+
     def test_worker_container_name_sanitizes_run_id(self):
         """Compose start and subsequent stop must use the same Docker-safe name."""
         for run_id, version, expected in [

@@ -63,6 +63,57 @@ if ($__hookphuzz_auth_context === 'guest') {
     }, true);
 }
 
+if (isset($GLOBALS['__uopz_request']) && function_exists('__uopz_current_parent_callback_metadata')) {
+    $__hookphuzz_record_guard_redirect_event = static function (array $event): void {
+        $callback = __uopz_current_parent_callback_metadata();
+        if (!empty($callback['callback_id'])) {
+            $event['callback_id'] = $callback['callback_id'];
+            $GLOBALS['__uopz_request']['guard_redirect_events'][] = $event;
+        }
+    };
+
+    $__hookphuzz_guard_results = ['current_user_can' => $__hookphuzz_auth_context === 'authenticated'];
+    if (getenv('HOOKPHUZZ_STRICT_NONCE_PROOF') !== '1') {
+        $__hookphuzz_guard_results += [
+            'wp_verify_nonce' => true,
+            'check_ajax_referer' => true,
+            'check_admin_referer' => true,
+        ];
+    }
+    foreach ($__hookphuzz_guard_results as $__hookphuzz_guard => $__hookphuzz_passed) {
+        uopz_set_hook($__hookphuzz_guard, static function () use (
+            $__hookphuzz_record_guard_redirect_event, $__hookphuzz_guard, $__hookphuzz_passed
+        ): void {
+            $__hookphuzz_record_guard_redirect_event([
+                'kind' => 'guard',
+                'function' => $__hookphuzz_guard,
+                'mode' => 'override',
+                'passed' => $__hookphuzz_passed,
+            ]);
+        });
+    }
+
+    // Observe the header emitted by wp_redirect after WordPress filters and sanitization.
+    uopz_set_hook('header', static function ($header = null, $replace = true, $response_code = 0) use (
+        $__hookphuzz_record_guard_redirect_event
+    ): void {
+        if (!is_string($header) || strncasecmp($header, 'Location:', 9) !== 0
+            || !is_int($response_code) || $response_code < 300 || $response_code >= 400 || headers_sent()) {
+            return;
+        }
+        $caller = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1] ?? [];
+        if (($caller['function'] ?? null) === 'wp_redirect' && !isset($caller['class'])) {
+            $__hookphuzz_record_guard_redirect_event([
+                'kind' => 'redirect',
+                'function' => 'wp_redirect',
+                'mode' => 'observed',
+                'status' => $response_code,
+                'location_sha256' => hash('sha256', trim(substr($header, 9), " \t")),
+            ]);
+        }
+    });
+}
+
 if ( getenv( 'HOOKPHUZZ_STRICT_NONCE_PROOF' ) === '1' ) {
     $nonce_proof_dir = '/shared-tmpfs/hook-coverage/nonce-proof';
     if ( ! is_dir( $nonce_proof_dir ) ) {
