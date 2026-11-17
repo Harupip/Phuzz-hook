@@ -1,5 +1,6 @@
 """Conservative admission of redirects in the instrumented WordPress harness."""
 
+import re
 from collections.abc import Mapping
 from hashlib import sha256
 from urllib.parse import unquote, urljoin, urlsplit
@@ -56,7 +57,7 @@ def _executed_callback(payload, callback_id):
     return None
 
 
-def _has_post_guard_continuation(zend, *, request_id, run_id, callback):
+def _has_post_guard_continuation(zend, *, request_id, run_id, callback, guard_reads=frozenset()):
     if not isinstance(zend, Mapping):
         return False
     if (zend.get('request_id') != request_id
@@ -65,6 +66,12 @@ def _has_post_guard_continuation(zend, *, request_id, run_id, callback):
     callback_repr = str(callback.get('callback_repr') or '')
     if not callback_repr or not isinstance(zend.get('events'), list):
         return False
+    if not guard_reads:
+        # wp_verify_nonce() alone gives no point in time: the plugin may read the nonce and its
+        # business fields long before verifying. Without a referer guard read, stay blocked.
+        return False
+    guard_fields = frozenset(field for field, _, _ in guard_reads)
+    guard_files = frozenset(file for _, file, _ in guard_reads)
     nonce_seen = False
     for event in zend['events']:
         if not isinstance(event, Mapping):
@@ -76,27 +83,69 @@ def _has_post_guard_continuation(zend, *, request_id, run_id, callback):
             continue
         path = event.get('path')
         operation = event.get('operation')
-        if operation == 'read' and path == ['nonce']:
+        # Only the referer guard's own read (field, file, line) marks when the guard ran, so a
+        # same-named read earlier in the callback cannot stand in for it.
+        if operation == 'read' and _read_key(event) in guard_reads:
             nonce_seen = True
             continue
         # shortcut: endpoints with no post-nonce input access need a callback-completion event.
-        if nonce_seen and operation in {'read', 'isset'} and path != ['nonce']:
+        if (nonce_seen and operation in {'read', 'isset'} and not _is_nonce_path(path, guard_fields)
+                and _basename(event.get('file')) not in guard_files):
             return True
     return False
+
+
+def _is_nonce_path(path, nonce_fields=frozenset()):
+    if not isinstance(path, list) or not path:
+        return False
+    name = str(path[-1])
+    # Same name rule the config exporter uses, plus fields a referer guard actually read (e.g. `security`).
+    return 'nonce' in name.lower() or name in nonce_fields
+
+
+def _basename(file):
+    # Compare by name only: the container may resolve the override path through a symlink.
+    return re.split(r'[\\/]', file)[-1] if isinstance(file, str) and file else None
+
+
+def _read_key(event):
+    path = event.get('path')
+    if not isinstance(path, list) or not path:
+        return None
+    try:
+        return str(path[-1]), _basename(event.get('file')), int(event.get('line'))
+    except (TypeError, ValueError):
+        return None
+
+
+def _guard_nonce_reads(payload, callback_id):
+    events = payload.get('guard_redirect_events') if isinstance(payload, Mapping) else None
+    reads = set()
+    for event in events if isinstance(events, list) else []:
+        if (not isinstance(event, Mapping) or event.get('kind') != 'nonce_field'
+                or event.get('callback_id') != callback_id):
+            continue
+        key = (event.get('field'), _basename(event.get('file')), event.get('line'))
+        if isinstance(key[0], str) and key[1] and isinstance(key[2], int):
+            reads.add(key)
+    return frozenset(reads)
 
 
 def verified_redirect(payload, *, callback_id, request_id, run_id, status, location, target,
                       zend=None, location_sha256=None):
     if not isinstance(payload, Mapping) or not callback_id or not request_id or not run_id:
         return False
-    if (payload.get('request_id') != request_id or payload.get('run_id') != run_id
+    # Same run identity rule as evidence correlation: legacy_run_id first, then run_id.
+    if (payload.get('request_id') != request_id
+            or (payload.get('legacy_run_id') or payload.get('run_id')) != run_id
             or payload.get('auth_context') != 'authenticated' or payload.get('errors')):
         return False
     if payload.get('callback_id') and payload.get('callback_id') != callback_id:
         return False
     callback = _executed_callback(payload, callback_id)
     if callback is None or not _has_post_guard_continuation(
-            zend, request_id=request_id, run_id=run_id, callback=callback):
+            zend, request_id=request_id, run_id=run_id, callback=callback,
+            guard_reads=_guard_nonce_reads(payload, callback_id)):
         return False
     if not isinstance(target, str) or not isinstance(location, str) or not location:
         return False
@@ -125,8 +174,7 @@ def verified_redirect(payload, *, callback_id, request_id, run_id, status, locat
         if not isinstance(event, Mapping) or event.get('callback_id') != callback_id:
             continue
         if event.get('kind') == 'guard':
-            if event.get('passed') is not True or event.get('mode') != 'override':
-                return False
+            # Guard events exist only for overridden WP checks; auth_context above proves they passed.
             function = event.get('function')
             if not isinstance(function, str):
                 return False

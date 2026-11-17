@@ -478,6 +478,18 @@ def _verified_base(version: dict, versions: dict | None = None) -> tuple[bytes, 
     return content, config
 
 
+def _redirect_rejection(request: dict) -> str:
+    """Name a rejected 3xx baseline that carries no redirect evidence at all, e.g. an artifact from before it was recorded."""
+    response = request.get("response") if isinstance(request.get("response"), dict) else {}
+    try:
+        redirect = 300 <= int(response.get("status_code")) < 400
+    except (TypeError, ValueError):
+        return "BASELINE_HTTP_NOT_VERIFIED"
+    if redirect and not request.get("guard_redirect_events") and not response.get("location_sha256"):
+        return "BASELINE_REDIRECT_EVIDENCE_MISSING"
+    return "BASELINE_HTTP_NOT_VERIFIED"
+
+
 def _verify_baseline_gate(version: dict, gate: dict, config: dict, *, require_success_response: bool = True) -> None:
     proof = gate.get("baseline_evidence")
     fields = {"request_id", "run_id", "plugin_slug", "callback_id", "http_method", "auth_context", "seed_variant_id"}
@@ -542,7 +554,7 @@ def _verify_baseline_gate(version: dict, gate: dict, config: dict, *, require_su
             request, zend, callback_id=proof["callback_id"], request_id=proof["request_id"],
             run_id=proof["run_id"], target=config.get("target"), transport=transport,
         ):
-            raise ValueError("BASELINE_HTTP_NOT_VERIFIED")
+            raise ValueError(_redirect_rejection(request))
     replay_path = Path(version["replay_config_path"])
     if (gate.get("config_path") != str(replay_path) or gate.get("config_hash") != version.get("replay_config_hash")
             or config_hash(json.loads(filesystem_path(replay_path).read_text(encoding="utf-8-sig"))) != gate["config_hash"]):

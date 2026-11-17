@@ -33,15 +33,11 @@ $GLOBALS['callback_metadata'] = null;
 current_user_can('manage_options');
 wp_redirect('/unattributed');
 $expectedEvents = [[
-    'kind' => 'guard', 'function' => 'current_user_can', 'mode' => 'override', 'passed' => $expected,
-    'callback_id' => 'fixture',
+    'kind' => 'guard', 'function' => 'current_user_can', 'callback_id' => 'fixture',
 ]];
 if (!$strict) {
     foreach (['wp_verify_nonce', 'check_ajax_referer', 'check_admin_referer'] as $function) {
-        $expectedEvents[] = [
-            'kind' => 'guard', 'function' => $function, 'mode' => 'override', 'passed' => true,
-            'callback_id' => 'fixture',
-        ];
+        $expectedEvents[] = ['kind' => 'guard', 'function' => $function, 'callback_id' => 'fixture'];
     }
 }
 $expectedEvents[] = [

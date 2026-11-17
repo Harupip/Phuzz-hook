@@ -78,6 +78,13 @@ run/request/plugin, method, auth and seed variant, an accepted HTTP response and
 remaining budget. There are no input trials or active Pass 2 calls; this
 baseline does not prove every admitted parameter was read again.
 
+The [redirect gate](redirect_gate.py) accepts `301/302/303/307/308` with
+same-origin redirect evidence, request-scoped guard checks under the harness
+overrides, and an attributed Zend input access after the recorded referer guard
+read. The child replay also matches the sender's status and `Location` to the
+artifact. A direct `wp_verify_nonce()` call alone does not establish the guard
+boundary. Older redirect artifacts without this evidence may fail re-export.
+
 Handoffs discovered while a worker fuzzes (`evidence_origin: worker_poll`) use
 `verification_policy: parameter_replay_v1`:
 - The coordinator first pauses the running worker. It writes `pause.json` and
@@ -90,6 +97,7 @@ Handoffs discovered while a worker fuzzes (`evidence_origin: worker_poll`) use
   saved artifacts, the version's `canonical_callback` and the fields the version
   adds over `parent_version`.
 - A failed replay resumes the paused worker instead of ending the candidate.
+- During [Parallel](../../docs/guides/online-linked-flow.md#giai-đoạn-fuzz-song-song-n-node-opt-in-2026-11-13), replay uses node 1 after every extra node has acknowledged pause or been removed. An unresolved worker blocks replay and can leave the batch at `PARALLEL_CLEANUP_PENDING`.
 - The new worker receives `HOOKPHUZZ_PRIORITY_SEED`: the replay reference,
   hash, new fuzzable targets, energy mode and ACK snapshot. It sends the
   verified seed first, then mutates only those targets before its normal seeds.

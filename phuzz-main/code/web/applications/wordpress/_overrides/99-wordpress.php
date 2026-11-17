@@ -10,15 +10,53 @@ if ( !function_exists( 'get_current_screen' ) ) {
 // END workaround
 uopz_set_return('is_admin', true); // this appears to "break" the default page/view, but does not affect the API, which we fuzz. => Not if we define the get_current_screen function!
 
+// WP checks forced by this file; guard evidence below records calls to exactly these.
+$__hookphuzz_overridden_guards = ['current_user_can'];
+
+// The referer overrides still read the nonce field the way WordPress does, so Zend records the
+// guard's read in order; the event names the field for the redirect gate (e.g. `security`).
+$__hookphuzz_read_nonce_field = static function (string $guard, array $fields): void {
+    foreach ($fields as $field) {
+        if (!is_string($field) || $field === '' || !isset($_REQUEST[$field])) {
+            continue;
+        }
+        // Keep the read and __LINE__ on one line: the gate matches this exact Zend read event.
+        $scalar = is_scalar($_REQUEST[$field]); $read_line = __LINE__;
+        $callback = function_exists('__uopz_current_parent_callback_metadata')
+            ? __uopz_current_parent_callback_metadata() : null;
+        if (isset($GLOBALS['__uopz_request']) && !empty($callback['callback_id'])) {
+            $GLOBALS['__uopz_request']['guard_redirect_events'][] = [
+                'kind' => 'nonce_field', 'function' => $guard, 'field' => $field, 'scalar' => $scalar,
+                'file' => basename(__FILE__), 'line' => $read_line, 'callback_id' => $callback['callback_id'],
+            ];
+        }
+        return;
+    }
+};
+
 if ( getenv( 'HOOKPHUZZ_STRICT_NONCE_PROOF' ) !== '1' ) {
-    uopz_set_return('check_admin_referer', 1);
+    uopz_set_return('check_admin_referer', static function ($action = -1, $query_arg = '_wpnonce') use (
+        $__hookphuzz_read_nonce_field
+    ) {
+        $__hookphuzz_read_nonce_field('check_admin_referer', [$query_arg]);
+        return 1;
+    }, true);
     uopz_set_return('wp_verify_nonce', function($nonce, $action) {
         return 1; // valid, generated 0-12h ago
     }, true);
+    $__hookphuzz_overridden_guards[] = 'check_admin_referer';
+    $__hookphuzz_overridden_guards[] = 'wp_verify_nonce';
 }
 
 if ( getenv( 'HOOKPHUZZ_STRICT_NONCE_PROOF' ) !== '1' ) {
-    uopz_set_return('check_ajax_referer', 1);
+    // Same field order as WordPress: the named query arg, then _ajax_nonce, then _wpnonce.
+    uopz_set_return('check_ajax_referer', static function ($action = -1, $query_arg = false, $stop = true) use (
+        $__hookphuzz_read_nonce_field
+    ) {
+        $__hookphuzz_read_nonce_field('check_ajax_referer', [$query_arg, '_ajax_nonce', '_wpnonce']);
+        return 1;
+    }, true);
+    $__hookphuzz_overridden_guards[] = 'check_ajax_referer';
 }
 
 // Request-scoped fuzz context; absent headers preserve legacy authenticated mode.
@@ -72,23 +110,13 @@ if (isset($GLOBALS['__uopz_request']) && function_exists('__uopz_current_parent_
         }
     };
 
-    $__hookphuzz_guard_results = ['current_user_can' => $__hookphuzz_auth_context === 'authenticated'];
-    if (getenv('HOOKPHUZZ_STRICT_NONCE_PROOF') !== '1') {
-        $__hookphuzz_guard_results += [
-            'wp_verify_nonce' => true,
-            'check_ajax_referer' => true,
-            'check_admin_referer' => true,
-        ];
-    }
-    foreach ($__hookphuzz_guard_results as $__hookphuzz_guard => $__hookphuzz_passed) {
+    foreach ($__hookphuzz_overridden_guards as $__hookphuzz_guard) {
         uopz_set_hook($__hookphuzz_guard, static function () use (
-            $__hookphuzz_record_guard_redirect_event, $__hookphuzz_guard, $__hookphuzz_passed
+            $__hookphuzz_record_guard_redirect_event, $__hookphuzz_guard
         ): void {
             $__hookphuzz_record_guard_redirect_event([
                 'kind' => 'guard',
                 'function' => $__hookphuzz_guard,
-                'mode' => 'override',
-                'passed' => $__hookphuzz_passed,
             ]);
         });
     }

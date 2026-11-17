@@ -3507,6 +3507,17 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     self.assertIn("rm:" + name, log)
                 self.assertIsNone(coordinator._parallel_group)
 
+    def test_parallel_launch_files_removed_after_confirmed_cleanup(self):
+        """Launch receipts are only needed until removal is confirmed; long campaigns must not pile them up."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+            self._parallel_docker(coordinator, log)
+            self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            for name in (f"{self.NODE1}-n2", f"{self.NODE1}-n3"):
+                self.assertIn("rm:" + name, log)
+            self.assertEqual(sorted(p.name for p in coordinator.state_path.parent.glob("parallel-start-*")), [])
+
     def test_parallel_bounded_by_campaign_deadline(self):
         """The campaign budget still wins over the parallel clock."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -3572,6 +3583,44 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(names, [self.NODE1])
             self.assertIn(f"rm:{self.NODE1}-n2", log)
             self.assertIn(f"rm:{self.NODE1}-n3", log)
+
+    def test_parallel_resume_keeps_finding_read_during_leftover_cleanup(self):
+        """A node that found a vulnerability while the coordinator was down: resume must report it, not re-gate."""
+        class Killed(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log: list[str] = []
+            coordinator = self.make_coordinator(root, log, discovers_parameter=False, parallel=True)
+            self._parallel_docker(coordinator, log)
+            snapshot = root / "killed-state.json"
+            sleep = coordinator.sleeper
+
+            def kill_during_parallel(seconds):
+                if coordinator._parallel_group is not None:
+                    coordinator._write_state()
+                    shutil.copyfile(coordinator.state_path, snapshot)
+                    raise Killed()
+                sleep(seconds)
+
+            coordinator.sleeper = kill_during_parallel
+            with self.assertRaises(Killed):
+                coordinator.run()
+            coordinator.state_path.write_text(snapshot.read_text(), encoding="utf-8")
+
+            restored = self.make_coordinator(root, [], discovers_parameter=False, parallel=True)
+            restored.resume = True
+            restored.load_finding_artifact = lambda name: {"run_id": name[:-5]}
+            self._parallel_docker(restored, [], exit_codes={f"{self.NODE1}-n2": lambda _: STOP_ON_VULN_EXIT_CODE})
+            gates = []
+            restored._gate_v0 = lambda *args, **kwargs: gates.append(args) or True
+            restored.run()
+
+            self.assertEqual((restored.state["terminal_status"], restored.state["terminal_reason"]),
+                             ("VULN_FOUND", "VULN_FOUND"))
+            self.assertEqual(restored.state["versions"][0]["finding_artifact"], {"run_id": "run-v0-n2"})
+            self.assertEqual(gates, [], "a confirmed finding must not be re-gated")
 
     def test_parallel_resume_cleans_node_recorded_before_compose_returns(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3667,7 +3716,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                 return docker(command, **kwargs)
 
             coordinator.run_command = interrupt_during_compose
-            with self.assertRaises(Killed):
+            # The interrupted launch keeps running in its own launcher process.
+            with self.assertRaises(Killed), \
+                    patch("online_linked.coordination.parallel_start.launch_ended", return_value=False):
                 coordinator.run()
             coordinator.state_path.write_bytes(snapshot)
 
@@ -3685,7 +3736,9 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
 
             restored.run_command = node_absent
             restored._gate_v0 = lambda *args, **kwargs: log.append("resume_gate") or True
-            result = restored.run()
+            # The interrupted launcher's process tree is still alive.
+            with patch("online_linked.coordination.parallel_start.launch_ended", return_value=False):
+                result = restored.run()
             saved = json.loads(restored.state_path.read_bytes())
 
             self.assertNotEqual(result, 0)
@@ -3887,6 +3940,98 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator.state["versions"][0]["finding_artifact"], {"run_id": "run-v0-n2"})
             for name in (f"{self.NODE1}-n2", f"{self.NODE1}-n3", self.NODE1):
                 self.assertIn("rm:" + name, log)
+
+    def test_parallel_timed_out_start_still_polled_for_vuln(self):
+        """A start that timed out may still launch a fuzzing node; its finding must not go unseen."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+            coordinator.load_finding_artifact = lambda name: {"run_id": name[:-5]}
+            node2 = f"{self.NODE1}-n2"
+
+            def vuln(c):
+                if c._parallel_group is None:
+                    return None
+                # The detached launcher finishes after the coordinator gave up waiting.
+                for claim in c.state_path.parent.glob("parallel-start-*.started"):
+                    claim.with_suffix(".json").write_text('{"returncode": 0, "stderr": ""}', encoding="utf-8")
+                return STOP_ON_VULN_EXIT_CODE
+
+            self._parallel_docker(coordinator, log, exit_codes={node2: vuln})
+            docker = coordinator.run_command
+
+            def run_command(command, **kwargs):
+                if command[:3] == ["docker", "compose", "run"] and command[command.index("--name") + 1] == node2:
+                    raise subprocess.TimeoutExpired(command, kwargs.get("timeout") or 30)
+                return docker(command, **kwargs)
+
+            coordinator.run_command = run_command
+            # The launcher is still alive until it writes its receipt.
+            with patch("online_linked.coordination.parallel_start.launch_ended", return_value=False):
+                self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+            self.assertEqual(coordinator.state["terminal_status"], "VULN_FOUND")
+            self.assertEqual(coordinator.state["versions"][0]["finding_artifact"], {"run_id": "run-v0-n2"})
+            self.assertIn("rm:" + node2, log)
+
+    def test_parallel_start_node_that_already_exited_keeps_its_finding(self):
+        """A node that started late or exited before the start check is polled, not removed unread."""
+        for case in ("start_timeout", "exited_before_check"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                log: list[str] = []
+                coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+                coordinator.load_finding_artifact = lambda name: {"run_id": name[:-5]}
+                node2 = f"{self.NODE1}-n2"
+                vuln = lambda c: STOP_ON_VULN_EXIT_CODE if c._parallel_group is not None else None
+                self._parallel_docker(coordinator, log, exit_codes={node2: vuln},
+                                      running=lambda name, calls: not name.endswith("-n2"))
+                if case == "start_timeout":
+                    docker = coordinator.run_command
+
+                    def run_command(command, **kwargs):
+                        if command[:3] == ["docker", "compose", "run"] and command[command.index("--name") + 1] == node2:
+                            docker(command, **kwargs)  # the container is created...
+                            raise subprocess.TimeoutExpired(command, 30)  # ...after the coordinator gave up
+                        return docker(command, **kwargs)
+
+                    coordinator.run_command = run_command
+                self.assertEqual(coordinator.run(), 0, coordinator.state["terminal_reason"])
+                self.assertEqual(coordinator.state["terminal_status"], "VULN_FOUND")
+                self.assertEqual(coordinator.state["versions"][0]["finding_artifact"], {"run_id": "run-v0-n2"})
+
+    def test_parallel_start_finding_survives_budget_ending_during_start(self):
+        """No poll runs once the budget is spent, so the exit read at start-up must be recorded then."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True,
+                                                campaign_deadline=4.0)
+            coordinator.load_finding_artifact = lambda name: {"run_id": name[:-5]}
+            node2 = f"{self.NODE1}-n2"
+            vuln = lambda c: STOP_ON_VULN_EXIT_CODE if c._parallel_group is not None else None
+            # Node 2 finds a vulnerability and exits before the start check sees it running.
+            self._parallel_docker(coordinator, log, exit_codes={node2: vuln},
+                                  running=lambda name, calls: not name.endswith("-n2"))
+            coordinator.run()
+            self.assertEqual(coordinator.state["terminal_status"], "VULN_FOUND")
+            self.assertEqual(coordinator.state["versions"][0]["finding_artifact"], {"run_id": "run-v0-n2"})
+
+    def test_parallel_start_counts_only_running_nodes(self):
+        """A node kept only because its removal is unconfirmed is not a running fuzzer."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+            node3 = f"{self.NODE1}-n3"
+            self._parallel_docker(coordinator, log, running=lambda name, calls: not name.endswith("-n3"))
+            docker = coordinator.run_command
+
+            def run_command(command, **kwargs):
+                if command == ["docker", "rm", "-f", node3]:
+                    return subprocess.CompletedProcess(command, 1, "", "Cannot connect to the Docker daemon")
+                return docker(command, **kwargs)
+
+            coordinator.run_command = run_command
+            coordinator.run()
+            start = next(event for event in coordinator.state["events"] if event["kind"] == "PARALLEL_START")
+            self.assertEqual(start["running_nodes"], 2)
 
     def _vuln_with_stuck_node3(self, root, log, stuck=None):
         """Node 2 finds a vulnerability while one container (node 3 by default) cannot be removed."""
@@ -4243,6 +4388,47 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                                 and event.get("node_index") == 2 for event in coordinator.state["events"]))
             self.assertIn("v1", [version["version"] for version in coordinator.state["versions"]])
 
+    def _finding_with_flaky_node3_removal(self, coordinator, log, finding_from):
+        """Node 2 reports a finding once `finding_from()` holds; node 3's first removal fails, later ones work."""
+        coordinator.load_finding_artifact = lambda name: {"run_id": name[:-5]}
+        node2, node3 = f"{self.NODE1}-n2", f"{self.NODE1}-n3"
+        removals = []
+        docker = coordinator.run_command
+
+        def run_command(command, **kwargs):
+            if (finding_from() and command[:2] == ["docker", "inspect"] and command[-1] == node2
+                    and "ExitCode" in command[3]):
+                return subprocess.CompletedProcess(command, 0, f"{STOP_ON_VULN_EXIT_CODE}", "")
+            if command == ["docker", "rm", "-f", node3]:
+                removals.append(node3)
+                if len(removals) == 1:
+                    return subprocess.CompletedProcess(command, 1, "", "Cannot connect to the Docker daemon")
+            return docker(command, **kwargs)
+
+        coordinator.run_command = run_command
+        return removals
+
+    def test_parallel_finding_survives_transient_cleanup_failure(self):
+        """Handoff and pause: a temporary node 3 removal failure must not turn the finding into PARTIAL."""
+        for path in ("handoff", "pause"):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as tmp:
+                log: list[str] = []
+                if path == "handoff":
+                    coordinator, _ = self._parallel_handoff_run(Path(tmp), log, max_versions=2)
+                    finding_from = lambda: len(coordinator.state["versions"]) > 1
+                else:
+                    ack = lambda request: None if request["worker_run_id"].endswith(("-n2", "-n3")) else {
+                        **request, "round_id": 1, "allocated_energy": 20, "attempts_used": 9, "seed_phuzz_energy": 31}
+                    coordinator, _ = self._parallel_handoff_run(Path(tmp), log, pause_ack=ack, parallel_seconds=60)
+                    finding_from = lambda: "pause_requested" in log
+                removals = self._finding_with_flaky_node3_removal(coordinator, log, finding_from)
+                coordinator.run()
+                self.assertEqual((coordinator.state["terminal_status"], coordinator.state["terminal_reason"]),
+                                 ("VULN_FOUND", "VULN_FOUND"))
+                self.assertEqual(coordinator.state["versions"][0]["finding_artifact"], {"run_id": "run-v0-n2"})
+                self.assertGreaterEqual(len(removals), 2, "the final cleanup must retry node 3")
+                self.assertNotIn("verdict_before_cleanup", coordinator.state, "cleanup finished, nothing pending")
+
     def test_parallel_blocks_replay_when_unacked_node_remove_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             log: list[str] = []
@@ -4319,6 +4505,41 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             self.assertEqual(self._command_env(v1_starts[0])["FUZZER_NODE_ID"], "101")
             parallel = coordinator.state["versions"][0]["parallel"]
             self.assertEqual(parallel["end_reason"], "HANDOFF_TO_v1")
+
+    def test_parallel_handoff_stops_when_group_cleanup_reads_a_finding(self):
+        """A finding read while removing the nodes ends the callback; a failed child start must not replace it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list[str] = []
+            coordinator, _ = self._parallel_handoff_run(Path(tmp), log, max_versions=2)
+            coordinator.load_finding_artifact = lambda name: {"run_id": name[:-5]}
+            node2 = f"{self.NODE1}-n2"
+            docker = coordinator.run_command
+
+            def run_command(command, **kwargs):
+                # Node 2 exits with a finding only once the child version exists, i.e. during the handoff.
+                if (len(coordinator.state["versions"]) > 1 and command[:2] == ["docker", "inspect"]
+                        and command[-1] == node2 and "ExitCode" in command[3]):
+                    return subprocess.CompletedProcess(command, 0, f"{STOP_ON_VULN_EXIT_CODE}\n", "")
+                return docker(command, **kwargs)
+
+            coordinator.run_command = run_command
+            started_children = []
+            start_worker = coordinator._start_worker
+
+            def start_or_fail_child(version, **kwargs):
+                if version["version"] == "v0":
+                    return start_worker(version, **kwargs)
+                started_children.append(version["version"])
+                return False  # a failed child start would otherwise become the verdict
+
+            coordinator._start_worker = start_or_fail_child
+            coordinator.run()
+
+            self.assertEqual(started_children, [], "no child may start after a finding")
+            self.assertEqual((coordinator.state["terminal_status"], coordinator.state["terminal_reason"]),
+                             ("VULN_FOUND", "VULN_FOUND"))
+            self.assertEqual(coordinator.state["versions"][0]["finding_artifact"], {"run_id": "run-v0-n2"})
+            self.assertEqual(coordinator.state["versions"][1]["worker_status"], "not_started_vuln_found")
 
     def test_parallel_handoff_blocks_child_when_group_cleanup_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -14,7 +14,11 @@ from typing import Any, Protocol
 
 from filesystem_paths import filesystem_path
 from hook_energy.seed_generation.generated_config_runner import STOP_ON_VULN_EXIT_CODE
-from online_linked.coordination.parallel_start import run_parallel_start, settle_parallel_start
+from online_linked.coordination.parallel_start import (
+    clear_parallel_start,
+    run_parallel_start,
+    settle_parallel_start,
+)
 from online_linked.coordination.worker import (
     CommandRunner,
     container_running,
@@ -182,9 +186,10 @@ class ParallelRunner:
             except Exception as exc:
                 error = f"WORKER_START_FAILED: {exc}"
             if error:
-                # A timed-out `compose run -d` may still have created the container.
-                started.remove(node)
-                self._remove(node, "START_FAILED")
+                # A timed-out `compose run -d` may still have created the container: until removal
+                # is confirmed, keep the node in the group so its exits are still polled.
+                if self._remove(node, "START_FAILED"):
+                    started.remove(node)
                 node["start_error"] = error
                 self._event("PARALLEL_NODE_START_FAILED", "REJECTED", "WORKER_START_FAILED", version, node,
                             detail=error)
@@ -204,9 +209,9 @@ class ParallelRunner:
             if pending:
                 host.sleeper(min(0.5, max(0.0, wait_until - host.clock())))
         for node in pending:
-            started.remove(node)
             node["started"] = False
-            self._remove(node, "NOT_RUNNING")
+            if self._remove(node, "NOT_RUNNING"):
+                started.remove(node)
             self._event("PARALLEL_NODE_START_FAILED", "REJECTED", "NODE_NOT_RUNNING", version, node)
 
         all_running_at = host.clock()
@@ -219,7 +224,8 @@ class ParallelRunner:
         host._deadline = deadline
         host._record_event({
             "kind": "PARALLEL_START", "status": "STARTED", "reason": "QUIET_WINDOW_EXPIRED",
-            "version": version_name, "requested_nodes": host.parallel_nodes, "running_nodes": 1 + len(started),
+            "version": version_name, "requested_nodes": host.parallel_nodes,
+            "running_nodes": 1 + sum(node not in pending for node in started),
             "all_running_at": all_running_at, "deadline": deadline,
         })
         host._write_state()
@@ -236,15 +242,9 @@ class ParallelRunner:
             code = worker_exit_code(node["container_name"], timeout=None, run_command=host.run_command)
             if code is None:
                 continue
-            node["exit_code"] = code
             group["nodes"].remove(node)
-            self._event("PARALLEL_NODE_EXIT", "EXITED", f"EXIT_CODE_{code}", version, node, exit_code=code)
+            self._record_exit(node, code, version)
             if code == STOP_ON_VULN_EXIT_CODE:
-                host._attach_finding_artifact(version, run_id=node["worker_run_id"])
-                if version is not None:
-                    version["status"] = "vuln_found"
-                    version["terminal_reason"] = "VULN_FOUND"
-                host.state.update(terminal_status="VULN_FOUND", terminal_reason="VULN_FOUND")
                 self._remove(node, "VULN_FOUND")
                 host._stop_active_worker("VULN_FOUND")
                 host._write_state()
@@ -370,6 +370,22 @@ class ParallelRunner:
     def _startup_receipt(self, token: str) -> Path:
         return filesystem_path(self._host.state_path.with_name(f"parallel-start-{uuid.UUID(token).hex}.json"))
 
+    def _record_exit(self, node: dict[str, Any], code: int, version: dict[str, Any] | None) -> None:
+        """Record a node exit when it is read; a vulnerability exit is the callback's verdict."""
+        host = self._host
+        node["exit_code"] = code
+        self._event("PARALLEL_NODE_EXIT", "EXITED", f"EXIT_CODE_{code}", version, node, exit_code=code)
+        if code == STOP_ON_VULN_EXIT_CODE:
+            host._attach_finding_artifact(version, run_id=node["worker_run_id"])
+            if version is not None:
+                version["status"] = "vuln_found"
+                version["terminal_reason"] = "VULN_FOUND"
+            host.state.update(terminal_status="VULN_FOUND", terminal_reason="VULN_FOUND")
+
+    def _version_of(self, node: Mapping[str, Any]) -> dict[str, Any] | None:
+        return next((version for version in self._host.state.get("versions", [])
+                     if any(row is node for row in (version.get("parallel") or {}).get("nodes", []))), None)
+
     def _remove(self, node: dict[str, Any], reason: str) -> bool:
         token = node.get("startup_token")
         if token is not None:
@@ -380,6 +396,12 @@ class ParallelRunner:
             except (OSError, ValueError) as exc:
                 node["stop_error"] = f"PARALLEL_START_UNCONFIRMED: {exc}"
                 return False
+        if node.get("exit_code") is None:
+            # Read the exit before `docker rm` erases it: a finding must not depend on a later poll.
+            code = worker_exit_code(node["container_name"], timeout=None, run_command=self._host.run_command)
+            if code is not None:
+                self._record_exit(node, code, self._version_of(node))
+                self._host._write_state()
         stopped, error = remove_container(
             node["container_name"], clock=self._host.clock, sleeper=self._host.sleeper,
             run_command=self._host.run_command,
@@ -387,6 +409,12 @@ class ParallelRunner:
         if stopped:
             node["stop_reason"] = reason
             node.pop("stop_error", None)
+            if token is not None:
+                try:
+                    clear_parallel_start(self._startup_receipt(token))
+                except OSError as exc:
+                    # Removal is confirmed; leftover files only cost disk space, so record and go on.
+                    node["receipt_cleanup_error"] = str(exc)
         else:
             node["stop_error"] = error
         return stopped

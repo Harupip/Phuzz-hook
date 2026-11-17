@@ -335,9 +335,19 @@ class WorkerRunner:
             if not self._host._parallel.end_for_handoff(str(child["version"])):
                 reason = "PARALLEL_NODE_STOP_FAILED"
                 child.update(worker_status="not_started_parallel_stop_failed", terminal_reason=reason)
-                self._host.state.update(terminal_status="PARTIAL", terminal_reason=reason)
+                if self._host.state.get("terminal_status") != "VULN_FOUND":
+                    # A finding read during this cleanup outranks the stop failure: the final cleanup
+                    # decides whether the batch continues or waits (_mark_parallel_cleanup_pending).
+                    self._host.state.update(terminal_status="PARTIAL", terminal_reason=reason)
                 replay_result["timing"]["handoff"] = round(self._host.clock() - handoff_started_at, 3)
                 record_replay_event("PASS", reason)
+                self._host._write_state()
+                return False
+            if self._host.state.get("terminal_status") == "VULN_FOUND":
+                # Removing the extra nodes read a finding: that verdict ends the callback, not a handoff.
+                child.update(worker_status="not_started_vuln_found", terminal_reason="VULN_FOUND")
+                replay_result["timing"]["handoff"] = round(self._host.clock() - handoff_started_at, 3)
+                record_replay_event("PASS", "VULN_FOUND")
                 self._host._write_state()
                 return False
             if not self._host._stop_worker(parent, "HANDOFF_TO_" + str(child["version"])):
@@ -518,7 +528,13 @@ class WorkerRunner:
         try:
             acknowledged = self.await_pause_ack(parent, event, key, token, run_id, deadline, request_id)
             if acknowledged and not self._host._parallel.pause_nodes(deadline, request_id=request_id):
-                self._host.state.update(terminal_status="PARTIAL", terminal_reason="PARALLEL_NODE_STOP_FAILED")
+                if self._host.state.get("terminal_status") != "VULN_FOUND":
+                    # Keep a finding read while removing nodes; the final cleanup settles the batch.
+                    self._host.state.update(terminal_status="PARTIAL", terminal_reason="PARALLEL_NODE_STOP_FAILED")
+                self._host._resume_parent()
+                return False
+            if acknowledged and self._host.state.get("terminal_status") == "VULN_FOUND":
+                # A node removed during the pause had a finding: keep it, skip the replay.
                 self._host._resume_parent()
                 return False
             return acknowledged

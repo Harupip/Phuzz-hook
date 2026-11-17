@@ -858,7 +858,8 @@ class OnlineLinkedCoordinator:
             defer_reason = "INSUFFICIENT_VERIFICATION_BUDGET"
         elif owns_pause and not self._pause_parent(parent, deadline, request_id=str(discovery.get("request_id") or "")):
             defer_reason = (
-                "PARALLEL_NODE_STOP_FAILED" if self.state["terminal_reason"] == "PARALLEL_NODE_STOP_FAILED"
+                self.state["terminal_reason"]
+                if self.state["terminal_reason"] in {"PARALLEL_NODE_STOP_FAILED", "VULN_FOUND"}
                 else "PARENT_PAUSE_NOT_ACKNOWLEDGED"
             )
         elif deadline is not None and deadline - self.clock() < 2 * self._sender_seconds:
@@ -1320,6 +1321,10 @@ class OnlineLinkedCoordinator:
         reason = "RESUME_REVALIDATION"
         ran_parallel = any("parallel" in row for row in saved["versions"])
         stopped = self._parallel.remove_leftover_nodes(version, reason)
+        if self.state.get("terminal_status") == "VULN_FOUND":
+            # The verdict was reset above, so only this cleanup can have read the finding: keep it
+            # through the cleanup gate exactly like a finding recorded before the interruption.
+            self.state["verdict_before_cleanup"] = dict(_VULN_VERDICT)
         # The checkpoint may still name v0 when an interruption hit right after v1 started: check every worker.
         for worker in reversed(saved["workers"]):
             status = worker.get("status")

@@ -1,12 +1,12 @@
 # Luồng online của HookPhuzz
 
-Cập nhật: **2026-11-04**, đối chiếu commit `350df27b` (gom tham số theo trace AJAX) và replay-guard discovery (2026-11-04). Tài liệu mô tả runtime discovery, một callback baseline, budget thích ứng, checkpoint/resume, export nhiều context và config comparison. Các phần kiểm chứng có ngày bên dưới là snapshot lịch sử; kết quả kiểm chứng baseline và giới hạn campaign Docker ở [báo cáo 2026-11-02](../reports/2026-11-02-callback-baseline-verification.md), không phải real-plugin fuzzing PASS. Xem [kiến trúc/source map](../reference/architecture.md) và [review record](../reports/2026-10-09-documentation-review.md).
+Cập nhật **2026-11-17** cho Parallel, theo code trên `feature/single-callback-baseline` tại `39ec0808` và các thay đổi đang có trong working tree. Các số liệu kiểm chứng có ngày bên dưới thuộc các lượt chạy lịch sử. Xem [kiến trúc/source map](../reference/architecture.md) và [báo cáo kiểm chứng baseline 2026-11-02](../reports/2026-11-02-callback-baseline-verification.md).
 
 Kế hoạch bổ sung: [Online-linked completion](../../../../docs/superpowers/plans/2026-09-06-online-linked-completion.md). Những phần ghi “còn thiếu” bên dưới là công việc tương lai, không phải tính năng đã hoạt động.
 
 ## 1. Workflow được hỗ trợ
 
-`online-linked` là workflow WordPress duy nhất và mặc định trên nhánh `feature/separate-online-linked`. `generated`, `online`, `zend`, `default`, `seed-config` không còn là mode CLI. Các thư viện generated replay/Zend vẫn là dependency nội bộ; sự tồn tại của module không có nghĩa mode cũ còn chạy được.
+`online-linked` là workflow WordPress mặc định. CLI hỗ trợ workflow này, còn các thư viện generated replay/Zend phục vụ các bước nội bộ.
 
 Các đường dẫn source bên dưới tính từ `phuzz-main/code`.
 
@@ -49,7 +49,7 @@ flowchart TD
     Y --> D
 ```
 
-Sơ đồ biểu diễn đường đi thành công và nhánh phục hồi chính. Hết thời gian, hết số phiên bản, worker lỗi hoặc tìm thấy vulnerability có xử lý kết thúc riêng. Các worker đã chạy không được sửa config tại chỗ.
+Sơ đồ mô tả Discovery với một worker. Khi bật Parallel, coordinator có thêm [vòng chạy song song](#giai-đoạn-fuzz-song-song-n-node-opt-in-2026-11-13) sau cửa sổ yên lặng. Mỗi worker dùng config bất biến của version đang chạy.
 
 ## 3. Đối chiếu mục tiêu 10 bước
 
@@ -89,38 +89,48 @@ Child baseline thất bại ghi `terminal_reason` của version (`REPLAY_ARTIFAC
 
 ### Giai đoạn fuzz song song N node (opt-in, 2026-11-13)
 
-Mặc định **tắt** (`ONLINE_PARALLEL=0`): mỗi callback chỉ có 1 worker, hành vi giống trước. Bật thì, khi callback đã yên (hết cửa sổ `OnlineTimeoutSeconds` mà không có param mới), coordinator không kết thúc ngay mà fuzz config hiện tại bằng N node như PHUZZ cũ. Spec: `docs/superpowers/specs/2026-11-13-online-linked-parallel-fuzz-phase-design.md`.
+Parallel mặc định **tắt**. Khi bật, coordinator giữ worker Discovery làm node 1 và thêm node cho **cùng config `vN` của candidate hiện tại**. Điều kiện vào phase gồm hết cửa sổ yên lặng hiện tại, worker chính còn chạy, không có pause đang giữ, campaign còn giờ và version chưa từng vào Parallel. Các candidate trong batch vẫn chạy tuần tự.
 
 ```
-[Discovery – 1 worker]  param mới → replay → handoff version mới → cửa sổ yên lặng đếm lại
-   └─ hết cửa sổ yên lặng
-        ▼
-[Parallel – N node, cùng config/queue, tối đa ONLINE_PARALLEL_SECONDS]
-   ├─ param mới từ node bất kỳ → pause cả N → replay
-   │     ├─ PASS → dừng N node → 1 worker version mới → quay lại Discovery
-   │     └─ FAIL → release cả N, chạy tiếp tới deadline cũ
-   ├─ node bất kỳ thoát STOP_ON_VULN → dừng cả nhóm, VULN_FOUND
-   └─ hết giờ → dừng cả nhóm → BOUNDED_ONLINE_COMPLETE / NO_NEW_PROGRESS → callback kế tiếp
+Discovery (1 worker) → hết cửa sổ yên lặng → Parallel (tối đa N node)
+  ├─ Param mới → pause hoặc gỡ các node → replay qua node 1
+  │    ├─ Đạt → dọn nhóm → khởi chạy 1 worker version con → Discovery
+  │    └─ Trượt → release các node đã pause → tiếp tục tới deadline Parallel
+  ├─ STOP_ON_VULN → ghi VULN_FOUND → dọn nhóm
+  └─ Hết giờ → dọn nhóm → chốt trạng thái theo budget và pending work
+Chưa xác nhận dọn xong → PARTIAL / PARALLEL_CLEANUP_PENDING → chặn batch
 ```
 
 | Setting (`phuzz.env` / CLI wrapper / CLI Python) | Mặc định | Ý nghĩa |
 | --- | ---: | --- |
-| `ONLINE_PARALLEL` / `-OnlineParallel` / `--parallel` | 0 | 1 = bật giai đoạn song song. Không có `--parallel` thì coordinator không bao giờ vào Parallel. |
+| `ONLINE_PARALLEL` / `-OnlineParallel` / `--parallel` | 0 | Đặt `1` qua env/PowerShell hoặc thêm `--parallel` khi gọi Python. |
 | `ONLINE_PARALLEL_NODES` / `-OnlineParallelNodes` / `--parallel-nodes` | 10 | Tổng số node, **tính cả worker đang chạy** (2–50). |
-| `ONLINE_PARALLEL_SECONDS` / `-OnlineParallelSeconds` / `--parallel-seconds` | 240 | Thời gian Parallel, tính từ lúc **mọi node đã start được đều `running`**; thời gian chờ container lên không bị trừ. |
+| `ONLINE_PARALLEL_SECONDS` / `-OnlineParallelSeconds` / `--parallel-seconds` | 240 | Cửa sổ fuzz của mỗi phase (1–86400 giây), tính sau bước kiểm tra startup. |
 
-- **Node.** Node 1 là worker Discovery đang chạy (giữ tên container, run ID, handoff key). Node k ≥ 2: container `<tên node 1>-n{k}`, `HOOKPHUZZ_LEGACY_RUN_ID=<run node 1>-n{k}`, handoff key riêng, finding artifact `/shared-tmpfs/fuzzer-findings/<run>-n{k}.json`, **cùng** `HOOKPHUZZ_SYNC_NAMESPACE` với node 1 nên chung queue như PHUZZ cũ, không nhận `HOOKPHUZZ_PRIORITY_SEED` (lượt ưu tiên chỉ thuộc lần kích hoạt đầu, đã chạy ở node 1). Khác biệt chỉ qua env; `fuzzer.py`/`core/*` không đổi.
-- **`FUZZER_NODE_ID`.** Tắt Parallel: `1 + version_index` như cũ. Bật: node k của `vX` là `1 + X*100 + (k − 1)` (v0: 1..50, v1: 101..150…). Thư mục `fuzzer/output/workers/fuzzer-<id>` và `cookies_node<id>.json` đổi tên theo. `100` dành cho gate replay nên tối đa 50 node.
-- **Deadline.** `min(all_running_at + parallel_seconds, campaign deadline)`. Hard cap per-candidate (`--hard-candidate-seconds`) **không** áp lên Parallel, nên hết Parallel không thành `PARTIAL/HARD_CANDIDATE_TIME_CAP`; Discovery vẫn giữ hard cap. Mỗi lần vào Parallel (sau mỗi handoff) được đủ `parallel_seconds`.
-- **Node lỗi.** Start lỗi hoặc không `running` trong 30s: ghi `PARALLEL_NODE_START_FAILED`, `docker rm` node đó, chạy tiếp với số node đã lên (có thể chỉ còn node 1). Node k ≥ 2 thoát bất thường: `PARALLEL_NODE_EXIT`, bỏ khỏi nhóm, không làm callback `NOT_VERIFIED`. Node 1 thoát xử lý như trước (dừng cả nhóm).
-- **Evidence.** Mỗi vòng đọc batch của node 1 rồi từng node còn sống, mỗi node theo run ID của chính nó. Evidence của node k được correlate và converge dưới run ID của node k (admission so `run_id` của param với run ID của evidence), nên param chỉ node k thấy vẫn được admit và handoff như evidence node 1. Dedupe theo `(version, run_id/request_id)` vì request ID chỉ duy nhất trong một node.
-- **Pause trước replay.** Sau ACK của node 1, coordinator gửi pause tới từng node (key riêng) và chờ ACK đúng token/run ID, tối đa 30s (không vượt giới hạn chờ của node 1). Node không ACK bị `docker rm` trước replay (`PARALLEL_PAUSE REJECTED NODE_REMOVED`) để replay không lẫn request của node khác. Replay vẫn chạy qua node 1.
-- **PASS/FAIL.** PASS: dừng node 2..N (`PARALLEL_END HANDOFF_TO_vN`), rồi dừng node 1 và start 1 worker cho version mới; cửa sổ Discovery tính lại từ lúc param được xác minh, không mang theo thời gian Parallel còn dư. FAIL: release mọi node đã pause, giữ nguyên deadline Parallel.
-- **Không để container mồ côi.** Mọi đường kết thúc (hết giờ, vuln, node 1 lỗi, lỗi coordinator, campaign hết, handoff) đều xóa node 2..N trước node 1.
-- **Resume.** Checkpoint giữa Parallel chỉ resume Discovery: xóa các node cũ còn ghi trong `version.parallel`, không dựng lại nhóm, và version đó không vào Parallel lần nữa.
-- **Tải.** N node + replay + probe dùng **chung một web container WordPress**. Nếu replay timeout khi nhiều node, giảm `ONLINE_PARALLEL_NODES`; không đổi kiến trúc.
+#### Worker, budget và evidence
 
-State: version có `parallel = {started_at, all_running_at, deadline, requested_nodes, nodes[{node_index, container_name, worker_run_id, started, exit_code, stop_reason}], ended_at, end_reason}` (thời gian theo đồng hồ monotonic của coordinator); state candidate có `parallel_settings` khi bật. Event: `PARALLEL_START`, `PARALLEL_NODE_START_FAILED`, `PARALLEL_NODE_EXIT`, `PARALLEL_PAUSE`, `PARALLEL_END`.
+- Node 1 giữ container, run ID và handoff key của Discovery. Các node bổ sung có tên container và run ID hậu tố `-n{k}`, handoff key riêng, cùng `HOOKPHUZZ_SYNC_NAMESPACE` của config. Lượt `HOOKPHUZZ_PRIORITY_SEED` thuộc lần kích hoạt version trên node 1. Mọi node chia sẻ queue theo config hash và dùng chung web container WordPress. Nếu web bị quá tải, có thể giảm số node.
+- Khi bật Parallel, `FUZZER_NODE_ID` của node `k` thuộc `vX` là `1 + X*100 + (k − 1)`. Khi tắt, ID là `1 + version_index`. ID quyết định thư mục `fuzzer/output/workers/fuzzer-<id>` và tên `cookies_node<id>.json`. Gate replay dùng ID `100`.
+- Deadline là `min(all_running_at + parallel_seconds, campaign_deadline)`. `all_running_at` được ghi sau bước chờ readiness và xử lý node chưa lên. Coordinator có tối đa 30 giây chờ mỗi lệnh launch và một cửa sổ readiness tối đa 30 giây cho nhóm mới, đều bị giới hạn bởi campaign. Startup dùng thời gian campaign trước khi cửa sổ Parallel bắt đầu. `--hard-candidate-seconds` giới hạn Discovery. Mỗi version đủ điều kiện có tối đa một cửa sổ Parallel, vẫn chịu deadline campaign.
+- Coordinator đọc evidence theo run ID của từng node. Request/Zend pair từ node phụ phải khớp run ID, request ID và callback của evidence đó. Khử trùng lặp theo version và cặp run/request. Một phát hiện từ node phụ có thể mở handoff cho cả nhóm.
+- Node phụ start lỗi hoặc chưa `running` sau readiness sinh `PARALLEL_NODE_START_FAILED`. Coordinator có thể tiếp tục với các node đã lên, kể cả chỉ còn node 1. Node đã thoát sinh `PARALLEL_NODE_EXIT`. Node phụ còn chờ xác nhận cleanup vẫn được theo dõi; `PARALLEL_START.running_nodes` chỉ đếm các node đã xác nhận chạy ở cuối bước startup, gồm node 1.
+
+#### Startup, pause và handoff
+
+1. **Ghi checkpoint trước Docker.** Trước mỗi `docker compose run -d`, coordinator ghi node, tên container và `startup_token` vào `state.json`. Launcher tách riêng có thể hoàn thành sau khi coordinator hết thời gian chờ. Launcher có timeout riêng 120 giây; việc hết timeout tự nó chưa xác nhận cây tiến trình Compose đã dừng.
+2. **Xác nhận startup đã kết thúc trước khi xóa container.** Cạnh `state.json`, `parallel-start-<token>.started` ghi claim `launch_guard_v1`, `.json` ghi kết quả launch và `.cancelled` chặn launcher chưa bắt đầu lệnh Compose. Nếu thiếu receipt, guard xác minh cây tiến trình đã kết thúc. Windows dùng Job Object, POSIX dùng file lock kế thừa. Dấu hủy được giữ cho đến khi có receipt hoặc guard xác nhận launcher không thể chạy tiếp. Claim kiểu cũ thiếu cả receipt lẫn guard bị chặn với detail `PARALLEL_START_LEGACY_UNCONFIRMED`.
+3. **Pause trước replay.** Sau ACK của node 1, coordinator yêu cầu từng node phụ pause, kiểm tra token/run ID và chờ tối đa 30 giây trong phần budget còn dành cho pause. Node không ACK phải được xác nhận đã gỡ trước replay. Nếu còn node chưa xác nhận gỡ, không gửi replay. Replay hợp lệ chạy trong node 1 theo [policy handoff](#handoff-do-phát-hiện-param-khi-đang-fuzz-2026-11-09).
+4. **Kết quả replay.** Replay trượt thì release các node đã ACK và dùng tiếp deadline Parallel cũ. Replay đạt thì dọn các node bổ sung (`PARALLEL_END`, `HANDOFF_TO_vN`), dừng node 1, rồi khởi chạy một worker version con nếu còn ngân sách và chưa có finding. Version con quay về Discovery với cửa sổ riêng.
+
+#### Cleanup, resume và cách đọc kết quả
+
+- **Finding trong lúc dọn.** Coordinator thử đọc mã thoát trước `docker rm`. Mã `STOP_ON_VULN_EXIT_CODE` (`57`) từ bất kỳ node nào đặt `VULN_FOUND`. Khi một worker đạt ngưỡng `-StopOnVulnCount`, nó ghi cờ chung `/sync-tmpfs/vuln_found` để các worker có bật ngưỡng cũng dừng. Mặc định `0` vẫn lưu finding và tiếp tục fuzz. Coordinator tìm artifact theo run ID của node báo mã thoát, gồm cả hậu tố node phụ. Verdict được giữ qua lỗi xóa tạm thời ở pause/handoff, kể cả khi mã thoát được đọc đúng lúc hết budget. Dùng artifact để kiểm tra và tái hiện finding.
+- **Cleanup chưa xác nhận.** Khi startup hoặc gỡ worker còn chưa xác nhận, candidate và batch báo `PARTIAL / PARALLEL_CLEANUP_PENDING` và không chạy candidate kế tiếp. Nếu đã có finding, `verdict_before_cleanup` giữ `VULN_FOUND`. Điều này cũng áp dụng cho worker đơn còn sót sau khi một candidate đã chạy Parallel và chuyển version.
+- **Resume cùng run.** Dùng [Python `--resume`](#checkpoint-và-resume) với cùng input và Compose context. Coordinator ưu tiên dọn các worker đã lưu. Dọn xong thì khôi phục finding đã ghi, hoặc nếu còn budget, revalidate và tiếp tục Discovery với một worker. Nhóm cũ không được dựng lại, version đã có `parallel` dùng lại checkpoint đó. Claim cũ thiếu receipt có thể cần đối chiếu thủ công cây tiến trình và container. Đọc `stop_error` và giữ nguyên marker/checkpoint trong lúc xác minh.
+- **Quan sát.** Mở `batch-state.json`, theo `state_path` tới `state.json` và `events.jsonl`. Xem `parallel_settings`, `versions[].parallel` (`requested_nodes`, `started_at`, `all_running_at`, `deadline`, `ended_at`, `end_reason`) và từng `nodes[]` (`container_name`, `worker_run_id`, `startup_token`, `started`, `exit_code`, `stop_reason`, `stop_error` nếu có). `deadline` là monotonic; dùng `budget.remaining_seconds` cùng `budget.saved_at` để ước lượng thời gian còn lại.
+- **Phân biệt trạng thái.** `PARALLEL_START`, `PARALLEL_PAUSE` và `PARALLEL_END` ghi diễn biến phase. `PARALLEL_END / REJECTED / NODE_STOP_FAILED` chỉ ra bước dọn lỗi. Hết cửa sổ với cleanup thành công có thể kết thúc `BOUNDED_ONLINE_COMPLETE / NO_NEW_PROGRESS`. Pending work hoặc campaign hết budget có thể cho trạng thái `PARTIAL`. CLI batch có thể trả 0 sau khi lưu cả trạng thái `PARTIAL`, nên đọc lý do trong `batch-state.json`.
+
+Code chính gồm [ParallelRunner](../../fuzzer/online_linked/coordination/parallel_runner.py), [launcher](../../fuzzer/online_linked/coordination/parallel_start.py), [guard tiến trình](../../fuzzer/online_linked/coordination/launch_guard.py), [handoff](../../fuzzer/online_linked/coordination/worker_runner.py) và [batch](../../fuzzer/online_linked/coordination/campaign.py). Lượt kiểm chứng thay đổi cleanup gần nhất dùng test tập trung và mock trên Windows; chưa có campaign Docker/WordPress thật hoặc kiểm chứng nhánh POSIX.
 
 ### Gom tham số theo trace AJAX
 
@@ -294,7 +304,7 @@ Từ `phuzz-main/code/fuzzer`, mẫu lệnh cho **run đã có**, thay mọi pla
 python -m online_linked --suggested-seeds <original-seeds.json> --bootstrap-config <original-bootstrap.json> --config-root <original-config-root> --output-root <original-output-root> --plugin-slug <slug> --legacy-run-id <original-run-id> --callback-registry <original-registry.json> --max-seconds <initial-seconds> --max-versions <initial-versions> --max-candidates <initial-candidates> --campaign-seconds <initial-campaign-seconds> --sync-registry --resume
 ```
 
-Truyền lại custom hard caps, COOKIE opt-in và service nếu run gốc có. Runner xóa override tạm khi kết thúc; cần khôi phục cùng Compose context trước resume, không chỉ thêm `--resume` vào `phuzz.ps1`. Đây là contract code, không xác nhận mọi checkpoint cũ đều tương thích hoặc có thể phục hồi.
+Truyền lại custom hard caps, COOKIE opt-in và service nếu run gốc có. Với run bật Parallel, thêm `--parallel --parallel-nodes <original-nodes> --parallel-seconds <original-seconds>` để giữ cấu hình ban đầu cho phần campaign còn lại. Runner xóa override tạm khi kết thúc, nên khôi phục cùng Compose context trước khi dùng Python `--resume`.
 
 ### Discovery từ error response
 
@@ -321,6 +331,7 @@ fuzzer/output/online-linked/<batch-run-id>/callback-registry.json
 | --- | --- |
 | `complete_with_skips` | Batch đã xử lý hết hàng đợi nhưng có candidate lỗi/chưa xác minh hoặc child bị chặn. CLI trả 0 để wrapper hoàn tất; xem trạng thái và mã lỗi từng candidate, không coi đây là xác minh PASS. |
 | `BOUNDED_ONLINE_COMPLETE` / `BUDGET_EXPIRED` | Kết thúc phần chạy có giới hạn; không chứng minh discovery đã đầy đủ hay có vulnerability. |
+| `PARTIAL` / `PARALLEL_CLEANUP_PENDING` | Batch chờ xác nhận launcher/worker cũ đã dừng. Mở candidate state để xem `stop_error` và `verdict_before_cleanup`, rồi dùng resume cùng run. |
 | `NOT_VERIFIED` / `V0_PREREQUISITE_GATE_FAILED` | Chưa có v0 thỏa điều kiện; cần xem seed, method, callback và config. |
 | `NOT_VERIFIED` / `WORKER_STOP_FAILED` | Không xác nhận được worker đã dừng; giữ tên container, chặn handoff, trả mã lỗi. Xem `stop_error`. |
 | `NOT_VERIFIED` / `CHILD_REPLAY_FAILED` | Chỉ còn ở state lịch sử hoặc khi không có pause: callback baseline của child không đạt, lý do nằm ở `terminal_reason` của version. Từ 2026-11-09, child trượt khi parent đang pause chỉ ghi lỗi trên child; parent được resume và candidate tiếp tục. |
@@ -442,7 +453,7 @@ fuzzer/output/online-linked/<batch-run-id>/final-configs/fuzzer-config.<hook>.<i
 ```
 
 Exporter xét **mọi version hợp lệ** theo thứ tự số giảm dần (`v10` trước `v2`). Mỗi version mới cần `fuzzing_ready`, gate `passed=true`, baseline evidence/identity và config hash đúng. Theo từng policy:
-- `callback_baseline_v1` cần HTTP 2xx.
+- `callback_baseline_v1` chấp nhận HTTP 2xx hoặc redirect `301/302/303/307/308` đủ bằng chứng. Redirect phải cùng origin, tránh `wp-login.php`, có guard quyền và nonce dưới cùng callback trong harness, có Zend read/isset input nghiệp vụ sau lần đọc nonce xác định từ referer guard, và có `Location` khớp artifact. Replay con còn so status và `Location` của sender với artifact. Chỉ dùng `wp_verify_nonce()` trực tiếp chưa đủ chứng minh thứ tự sau guard. [Redirect gate](../../fuzzer/online_linked/redirect_gate.py).
 - `parameter_replay_v1` bỏ điều kiện 2xx nhưng kiểm lại Zend proof của từng `verified_parameters`. Callback trong proof phải trùng `canonical_callback` của version (coi `->` và `::` là như nhau), và proof phải phủ đủ field mà version thêm so với `parent_version`.
 - State lịch sử không có policy vẫn cần Pass 2 `accepted == total > 0`.
 

@@ -67,12 +67,25 @@ class OnlineLinkedExportTests(unittest.TestCase):
                 row["request_payload"]["response"]["status_code"] = 302
                 candidate, _ = self.write_state(versions=[version])
                 self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / (name + "-unverified")), 0)
+                # Artifacts from before redirect evidence existed must say so, not look like a failed check.
+                summary = json.loads((self.root / f"{name}-unverified-summary.json").read_text())
+                self.assertEqual(summary["candidates"][0]["skipped_versions"][0]["reason"],
+                                 "BASELINE_REDIRECT_EVIDENCE_MISSING")
                 add_redirect_evidence(row["request_payload"], row["zend_payload"], callback_id=version["callback_id"],
                                       callback_repr="Fixture::handle", status=303)
                 if name == "v1":
                     row.update(response_status=303, response_location=REDIRECT_LOCATION)
                 candidate, _ = self.write_state(versions=[version])
                 self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / name), 1)
+                row["request_payload"]["guard_redirect_events"].pop(0)
+                candidate, _ = self.write_state(versions=[version])
+                self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / (name + "-bad-proof")), 0)
+                # Evidence that is present but fails stays a verification failure.
+                summary = json.loads((self.root / f"{name}-bad-proof-summary.json").read_text())
+                self.assertEqual(summary["candidates"][0]["skipped_versions"][0]["reason"],
+                                 "BASELINE_HTTP_NOT_VERIFIED")
+                add_redirect_evidence(row["request_payload"], row["zend_payload"], callback_id=version["callback_id"],
+                                      callback_repr="Fixture::handle", status=303)
                 row["callback_reached"] = False
                 candidate, _ = self.write_state(versions=[version])
                 self.assertEqual(export_online_linked_batch(self.batch([candidate]), self.root / (name + "-no-callback")), 0)

@@ -5,7 +5,11 @@ import time
 import unittest
 from pathlib import Path
 
-from online_linked.coordination.parallel_start import run_parallel_start, settle_parallel_start
+from online_linked.coordination.parallel_start import (
+    clear_parallel_start,
+    run_parallel_start,
+    settle_parallel_start,
+)
 from online_linked.coordination.worker import (
     container_running,
     matching_pause_ack,
@@ -62,6 +66,91 @@ class WorkerHelpersTests(unittest.TestCase):
             )
             self.assertEqual(result.stderr, "PARALLEL_START_CANCELLED")
             self.assertFalse(created.exists())
+
+    def test_parallel_start_straggler_outliving_compose_cannot_create_later(self):
+        """P1: a Compose child that outlives the CLI must be dead before the launch counts as settled."""
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt, marker = Path(tmp) / "receipt.json", Path(tmp) / "late-container"
+            straggler = "import sys, time; time.sleep(7); open(sys.argv[1], 'w').close()"
+            # The CLI exits at once and leaves a child that would "create the container" 7s later.
+            cli = ("import subprocess, sys; "
+                   f"subprocess.Popen([sys.executable, '-c', {straggler!r}, sys.argv[1]])")
+            started = time.monotonic()
+            run_parallel_start(receipt, [sys.executable, "-c", cli, str(marker)],
+                               timeout=20, run_command=subprocess.run)
+            deadline = time.monotonic() + 10
+            while not settle_parallel_start(receipt) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertTrue(settle_parallel_start(receipt))
+            time.sleep(max(0.0, started + 9 - time.monotonic()))
+            self.assertFalse(marker.exists(), "a settled launch must not create anything afterwards")
+
+    def test_parallel_start_launch_timeout_kills_hung_compose(self):
+        """A hung Compose is killed with its tree, then recorded, instead of blocking cleanup forever."""
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = Path(tmp) / "receipt.json"
+            result = run_parallel_start(
+                receipt, [sys.executable, "-c", "import time; time.sleep(30)"],
+                timeout=20, run_command=subprocess.run, launch_timeout=1,
+            )
+            self.assertEqual((result.returncode, result.stderr), (-1, "PARALLEL_START_TIMEOUT"))
+            self.assertTrue(settle_parallel_start(receipt))
+
+    def test_late_launcher_still_sees_cancellation_after_cleanup(self):
+        """Cleanup that ran before the launcher claimed must not erase the only thing that stops it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt, worker = Path(tmp) / "receipt.json", Path(tmp) / "worker-created"
+            self.assertTrue(settle_parallel_start(receipt))
+            clear_parallel_start(receipt)  # done by _remove once the container is confirmed absent
+            result = run_parallel_start(
+                receipt, [sys.executable, "-c", "import sys; open(sys.argv[1], 'w').close()", str(worker)],
+                timeout=20, run_command=subprocess.run,
+            )
+            self.assertEqual(result.stderr, "PARALLEL_START_CANCELLED")
+            self.assertFalse(worker.exists(), "a cancelled launch must not create a worker")
+
+    def test_cleanup_keeps_cancellation_while_launcher_is_mid_claim(self):
+        """Launcher wrote `.started` but has not read `.cancelled` yet: cleanup must not erase the marker."""
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt, ready, release = (Path(tmp) / name for name in ("receipt.json", "ready", "release"))
+            # A guarded launcher paused between the two halves of its claim.
+            launcher = "\n".join([
+                "import sys, time; from pathlib import Path",
+                "from online_linked.coordination.launch_guard import open_guard",
+                "from online_linked.coordination.parallel_start import GUARDED_CLAIM",
+                "receipt, ready, release = map(Path, sys.argv[1:4])",
+                "guard = open_guard(receipt)",
+                "receipt.with_suffix('.started').write_text(GUARDED_CLAIM, encoding='utf-8')",
+                "ready.touch()",
+                "deadline = time.monotonic() + 15",
+                "while not release.exists() and time.monotonic() < deadline: time.sleep(0.01)",
+                "sys.exit(0 if receipt.with_suffix('.cancelled').exists() else 3)",
+            ])
+            self.assertTrue(settle_parallel_start(receipt))  # before the claim: nothing to wait for
+            with subprocess.Popen([sys.executable, "-c", launcher, str(receipt), str(ready), str(release)],
+                                  cwd=Path(__file__).resolve().parents[1]) as process:
+                deadline = time.monotonic() + 10
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                clear_parallel_start(receipt)  # cleanup after `docker rm` found nothing
+                release.touch()
+                self.assertEqual(process.wait(timeout=20), 0, "the launcher must still see its cancellation")
+
+    def test_unguarded_claim_from_older_launcher_is_never_assumed_ended(self):
+        """A 39ec0808 launcher left `.started` empty and held no guard; only its receipt proves it ended."""
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = Path(tmp) / "receipt.json"
+            receipt.with_suffix(".started").touch()
+            with self.assertRaisesRegex(ValueError, "PARALLEL_START_LEGACY_UNCONFIRMED"):
+                settle_parallel_start(receipt)
+            receipt.write_text('{"returncode": 0, "stderr": ""}', encoding="utf-8")
+            self.assertTrue(settle_parallel_start(receipt))
+
+    def test_parallel_start_settles_when_launch_never_ran(self):
+        """No claim means nothing was launched, so cleanup may proceed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(settle_parallel_start(Path(tmp) / "receipt.json"))
 
     def test_parallel_start_records_normal_compose_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
