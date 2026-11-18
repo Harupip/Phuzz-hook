@@ -41,17 +41,29 @@ def parallel_node_name(base: str, node_index: int) -> str:
 
 
 def container_running(container_name: str, *, timeout: float, run_command: CommandRunner) -> bool:
-    if not container_name or timeout <= 0:
-        return False
+    return container_state(container_name, timeout=timeout, run_command=run_command)[0] is True
+
+
+def container_state(
+    container_name: str, *, timeout: float, run_command: CommandRunner,
+) -> tuple[bool | None, str]:
+    """Return (running, error); running is None when Docker could not answer."""
+    if not container_name:
+        return False, ""
+    if timeout <= 0:
+        return None, "NO_TIME_LEFT"
     try:
         result = run_command(
             ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
             timeout=timeout, check=False, capture_output=True, text=True,
         )
-    except Exception:
-        return False
-    return (int(getattr(result, "returncode", 1)) == 0
-            and str(getattr(result, "stdout", "") or "").strip().lower() == "true")
+    except Exception as exc:
+        return None, str(exc) or type(exc).__name__
+    stderr = str(getattr(result, "stderr", "") or "").strip()
+    if int(getattr(result, "returncode", 1)) != 0:
+        # Only an explicit "no such container" proves absence; anything else is an unanswered check.
+        return (False if "no such" in stderr.lower() else None), stderr or "DOCKER_INSPECT_FAILED"
+    return str(getattr(result, "stdout", "") or "").strip().lower() == "true", ""
 
 
 def worker_start_command(

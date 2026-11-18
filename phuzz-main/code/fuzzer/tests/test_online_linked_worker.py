@@ -12,6 +12,7 @@ from online_linked.coordination.parallel_start import (
 )
 from online_linked.coordination.worker import (
     container_running,
+    container_state,
     matching_pause_ack,
     remove_container,
     parallel_node_id,
@@ -248,3 +249,24 @@ class WorkerHelpersTests(unittest.TestCase):
         self.assertFalse(container_running("c", timeout=5, run_command=runner("false")))
         self.assertFalse(container_running(
             "c", timeout=5, run_command=runner(error=subprocess.TimeoutExpired("docker", 5))))
+
+    def test_container_state_separates_stopped_from_unverifiable(self):
+        """Only Docker saying "false" or "no such container" proves a node is not running."""
+        def runner(code=0, stdout="", stderr="", error=None):
+            def run(command, **kwargs):
+                if error is not None:
+                    raise error
+                return subprocess.CompletedProcess(command, code, stdout=stdout, stderr=stderr)
+            return run
+        self.assertEqual(container_state("c", timeout=5, run_command=runner(stdout="true\n")), (True, ""))
+        self.assertEqual(container_state("c", timeout=5, run_command=runner(stdout="false\n")), (False, ""))
+        self.assertEqual(container_state("c", timeout=5, run_command=runner(
+            1, stderr="Error: No such object: c")), (False, "Error: No such object: c"))
+        state, error = container_state("c", timeout=5, run_command=runner(1, stderr="error during connect"))
+        self.assertIsNone(state)
+        self.assertIn("error during connect", error)
+        state, error = container_state("c", timeout=5, run_command=runner(
+            error=subprocess.TimeoutExpired("docker", 5)))
+        self.assertIsNone(state)
+        self.assertIn("timed out", error)
+        self.assertEqual(container_state("c", timeout=0, run_command=runner(stdout="true")), (None, "NO_TIME_LEFT"))

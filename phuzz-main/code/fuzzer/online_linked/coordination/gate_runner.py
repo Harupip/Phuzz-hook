@@ -145,10 +145,14 @@ class GateRunner:
             if result_row.get("process_status") == "vuln_found":
                 self._host.state.update(terminal_status="VULN_FOUND", terminal_reason="VULN_FOUND")
                 return False
-            if result_row.get("callback_reached") is not True or result_row.get("validation_status") != "callback_reached":
-                raise OnlineLinkedError(reason)
+            # A failed replay process or a missing artifact says nothing about the callback:
+            # report them apart so a full tmpfs or a stalled Docker is not read as plugin behaviour.
             if result_row.get("process_status") in {"failed", "runner_error"}:
                 raise OnlineLinkedError("V0_REPLAY_PROCESS_FAILED")
+            if result_row.get("validation_status") == "no_artifact":
+                raise OnlineLinkedError("V0_REPLAY_NO_ARTIFACT")
+            if result_row.get("callback_reached") is not True or result_row.get("validation_status") != "callback_reached":
+                raise OnlineLinkedError(reason)
             probe_dir = gate_name + "-probe" if reactivation else "probe"
             request_dir = self._host.run_dir / "versions" / str(version["version"]) / probe_dir / "request"
             zend_dir = request_dir.parent / "zend"

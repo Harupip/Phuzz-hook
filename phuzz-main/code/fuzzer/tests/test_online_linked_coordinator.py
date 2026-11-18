@@ -4033,6 +4033,35 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
             start = next(event for event in coordinator.state["events"] if event["kind"] == "PARALLEL_START")
             self.assertEqual(start["running_nodes"], 2)
 
+    def test_parallel_failed_inspect_is_unknown_not_stopped(self):
+        """2026-11-18: Docker swap exhaustion made inspect fail while nodes kept fuzzing for minutes.
+        A failed check must not be reported as a stopped node; the node is still removed."""
+        for failure in ("timeout", "daemon"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                log: list[str] = []
+                coordinator = self.make_coordinator(Path(tmp), log, discovers_parameter=False, parallel=True)
+                node2, node3 = f"{self.NODE1}-n2", f"{self.NODE1}-n3"
+                self._parallel_docker(coordinator, log, running=lambda name, calls: not name.endswith("-n2"))
+                docker = coordinator.run_command
+
+                def run_command(command, **kwargs):
+                    if command == ["docker", "inspect", "-f", "{{.State.Running}}", node3]:
+                        if failure == "timeout":
+                            raise subprocess.TimeoutExpired(command, 10)
+                        return subprocess.CompletedProcess(command, 1, "", "error during connect: daemon busy")
+                    return docker(command, **kwargs)
+
+                coordinator.run_command = run_command
+                coordinator.run()
+                rejected = {event["container_name"]: event for event in coordinator.state["events"]
+                            if event["kind"] == "PARALLEL_NODE_START_FAILED"}
+                self.assertEqual(rejected[node2]["reason"], "NODE_NOT_RUNNING")
+                self.assertEqual(rejected[node3]["reason"], "NODE_STATE_UNKNOWN")
+                self.assertIn("timed out" if failure == "timeout" else "daemon busy", rejected[node3]["detail"])
+                self.assertIn("rm:" + node3, log, "an unverifiable node must not keep fuzzing unmanaged")
+                start = next(event for event in coordinator.state["events"] if event["kind"] == "PARALLEL_START")
+                self.assertEqual(start["running_nodes"], 1)
+
     def _vuln_with_stuck_node3(self, root, log, stuck=None):
         """Node 2 finds a vulnerability while one container (node 3 by default) cannot be removed."""
         stuck = stuck or f"{self.NODE1}-n3"
@@ -8532,6 +8561,25 @@ class OnlineLinkedCoordinatorTests(unittest.TestCase):
                     rejected = [event for event in coordinator.state["events"]
                                 if event.get("kind") == "V0_READINESS" and event.get("status") == "REJECTED"]
                     self.assertEqual([event["reason"] for event in rejected], ["BLOCKED_X"])
+
+    def test_gate_v0_reports_infrastructure_failures_apart_from_unreached_callback(self):
+        """2026-11-13/18 runs: a full tmpfs or a stalled Docker left no artifact or no replay
+        process, yet the gate said the callback was not reached. Those are not plugin evidence."""
+        cases = (
+            ({"process_status": "window_elapsed", "validation_status": "no_artifact", "requests_created": 0},
+             "V0_REPLAY_NO_ARTIFACT"),
+            ({"process_status": "runner_error", "validation_status": "runner_error"}, "V0_REPLAY_PROCESS_FAILED"),
+            ({"process_status": "stopped_on_callback", "validation_status": "registered_not_executed"},
+             "V0_CALLBACK_NOT_REACHED"),
+        )
+        for row, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                coordinator, version, config = self._gate_ready_v0(tmp)
+                coordinator.replay_runner = lambda *args, row=row, **kwargs: {
+                    "runs": [{"callback_reached": False, **row}]}
+                self.assertFalse(coordinator._gate_v0(version, config, deadline=coordinator.clock() + 100))
+                self.assertEqual(coordinator.state["terminal_status"], "NOT_VERIFIED")
+                self.assertEqual(coordinator.state["terminal_reason"], expected)
 
     def test_gate_v0_row_error_after_replay_config_is_recorded(self):
         """The gate records replay_config_* before it builds the row, and readiness only after.

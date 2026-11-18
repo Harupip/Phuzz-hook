@@ -21,7 +21,7 @@ from online_linked.coordination.parallel_start import (
 )
 from online_linked.coordination.worker import (
     CommandRunner,
-    container_running,
+    container_state,
     handoff_command,
     matching_pause_ack,
     parallel_node_id,
@@ -200,19 +200,35 @@ class ParallelRunner:
         if host.campaign_deadline is not None:
             wait_until = min(wait_until, host.campaign_deadline)
         pending = list(started)
+        # Last inspect answer per node: a failed `docker inspect` is not proof the node stopped.
+        check_errors: dict[str, str] = {}
         while pending and host.clock() < wait_until:
-            pending = [
-                node for node in pending
-                if not container_running(node["container_name"], run_command=host.run_command,
-                                         timeout=min(10.0, max(0.0, wait_until - host.clock())))
-            ]
+            still_pending = []
+            for node in pending:
+                running, error = container_state(
+                    node["container_name"], run_command=host.run_command,
+                    timeout=min(10.0, max(0.0, wait_until - host.clock())),
+                )
+                if running is True:
+                    continue
+                still_pending.append(node)
+                if running is None:
+                    check_errors[node["container_name"]] = error
+                else:
+                    check_errors.pop(node["container_name"], None)
+            pending = still_pending
             if pending:
                 host.sleeper(min(0.5, max(0.0, wait_until - host.clock())))
         for node in pending:
             node["started"] = False
-            if self._remove(node, "NOT_RUNNING"):
+            error = check_errors.get(node["container_name"])
+            if self._remove(node, "NOT_RUNNING" if error is None else "STATE_UNKNOWN"):
                 started.remove(node)
-            self._event("PARALLEL_NODE_START_FAILED", "REJECTED", "NODE_NOT_RUNNING", version, node)
+            if error is None:
+                self._event("PARALLEL_NODE_START_FAILED", "REJECTED", "NODE_NOT_RUNNING", version, node)
+            else:
+                self._event("PARALLEL_NODE_START_FAILED", "REJECTED", "NODE_STATE_UNKNOWN", version, node,
+                            detail=error)
 
         all_running_at = host.clock()
         deadline = all_running_at + host.parallel_seconds
