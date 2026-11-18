@@ -723,6 +723,9 @@ def select_auto_probes(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _callback_executed(artifact: dict[str, Any], callback_id: str) -> bool:
     callbacks = artifact.get("hook_coverage", {}).get("executed_callbacks", {})
+    if not isinstance(callbacks, dict):
+        # PHP json_encode turns an empty map into []: no executed callback, no proof.
+        return False
     return callback_id in callbacks or any(value.get("callback_id") == callback_id for value in callbacks.values() if isinstance(value, dict))
 
 

@@ -2069,17 +2069,21 @@ class ZendDiscoveryTests(unittest.TestCase):
                 ),
                 field,
             )
-        rejected = dict(artifact)
-        rejected["hook_coverage"] = {"executed_callbacks": {}}
-        self.assertIsNone(
-            correlate_pass1_artifact(
-                candidate,
-                rejected,
-                legacy_run_id="legacy-1",
-                pass1_request_id="pass1-1",
-                plugin_slug="demo-plugin",
+        # PHP json_encode writes an empty callback map as [] (2026-11-18 run crashed the
+        # coordinator on it); no executed callback is still "no proof", never an exception.
+        for executed in ({}, [], None):
+            rejected = dict(artifact)
+            rejected["hook_coverage"] = {"executed_callbacks": executed}
+            self.assertIsNone(
+                correlate_pass1_artifact(
+                    candidate,
+                    rejected,
+                    legacy_run_id="legacy-1",
+                    pass1_request_id="pass1-1",
+                    plugin_slug="demo-plugin",
+                ),
+                repr(executed),
             )
-        )
         legacy_artifact = dict(artifact)
         legacy_artifact.pop("legacy_run_id")
         legacy_artifact["run_id"] = "legacy-1"
