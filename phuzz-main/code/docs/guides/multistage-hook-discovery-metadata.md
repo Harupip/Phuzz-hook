@@ -15,6 +15,18 @@ registered callbacks in the same request with
 `seed_validator.request_blindspot_callbacks()`. Historical v3 files and aggregate
 coverage keep their full maps. See the [compaction record, checks and rollback](../reports/2026-10-26-request-artifact-compaction.md).
 
+2026-11-18: with `FUZZER_COMPACT_REQUEST_ARTIFACTS=1` (the `web` default in
+`docker-compose.yml`), each request file keeps only `callback_id`, `hook_name`,
+`type`, `priority`, `callback_repr`, `is_active`, `status`,
+`registered_inside_callback` and `hook_level` for static callbacks. Callbacks
+with `registered_inside_callback` or `hook_level > 0` keep full descriptors for
+runtime discovery, and `total_coverage.json` keeps full descriptors for all
+callbacks. `hook_coverage_summary.registered_callbacks_detail` is `compact` or
+`full`. Reason: static descriptors repeated in every request used about 490 of
+738 MB of the 1 GB shared tmpfs in run `cookie-notice-20261118T091655Z`.
+Set the variable to `0` before `docker compose up` when a reader needs full
+static descriptors per request, for example hook-aware scoring mode 2.
+
 ## Scope
 
 Implemented scope:

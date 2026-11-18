@@ -195,5 +195,122 @@ class CompactPhpProducerTests(unittest.TestCase):
         self.assertIn(actual["path"], stderr)
 
 
+def static_heavy_request():
+    """Static callbacks repeat in every request and filled the 1 GB tmpfs (2026-11-18 run)."""
+    payload = legacy_request()
+    payload["schema_version"] = "uopz-request-v4"
+    del payload["hook_coverage"]["blindspot_callbacks"]
+    heavy = {
+        "source_file": "/var/www/html/wp-content/plugins/fixture/fixture.php", "source_line": 10,
+        "registered_from": "fixture.php:10", "registered_at": "2026-11-18T02:27:47+00:00",
+        "endpoint": "ADMIN_AJAX:" + "x" * 200, "input_signature": "a" * 40, "request_id": "req-compact",
+        "stable_id": "s" * 40, "runtime_id": "r" * 40, "callback_runtime_id": "c" * 40,
+        "formal_parameters": [{"name": "arg", "position": 0, "optional": False}],
+        "start_line": 10, "end_line": 40, "class_name": "Fixture", "method_name": "handler",
+    }
+    registered = payload["hook_coverage"]["registered_callbacks"]
+    registered["parent"].update(heavy, type="action", priority=10, is_active=True, status="covered",
+                                registered_inside_callback=False, hook_level=0, callback_repr="Fixture->parent")
+    registered["static_blind"] = {
+        **heavy, "callback_id": "static_blind", "hook_name": "wp_ajax_static", "type": "action", "priority": 5,
+        "callback_repr": "Fixture->blind", "is_active": True, "status": "registered_only",
+        "registered_inside_callback": False, "hook_level": 0,
+    }
+    registered["nested_level"] = {
+        **heavy, "callback_id": "nested_level", "hook_name": "wp_ajax_nested", "is_active": True,
+        "status": "registered_only", "registered_inside_callback": False, "hook_level": 1,
+        "parent_callback_id": "parent",
+    }
+    payload["blindspot_callback_ids"] = ["child", "static_blind", "nested_level"]
+    return payload
+
+
+@unittest.skipUnless(shutil.which("php") or os.environ.get("HOOKPHUZZ_REQUEST_TEST_CONTAINER"),
+                     "requires PHP CLI or HOOKPHUZZ_REQUEST_TEST_CONTAINER")
+class CompactRegisteredCallbackTests(unittest.TestCase):
+    """FUZZER_COMPACT_REQUEST_ARTIFACTS trims static descriptors without changing any decision."""
+
+    php = CompactPhpProducerTests.php
+
+    def export(self, payload, flag):
+        encoded = base64.b64encode(json.dumps(payload).encode()).decode()
+        setenv = "" if flag is None else f"putenv('FUZZER_COMPACT_REQUEST_ARTIFACTS={flag}');\n"
+        actual, _ = self.php(
+            setenv + f"$GLOBALS['__uopz_request'] = json_decode(base64_decode('{encoded}'), true);\n"
+            "echo json_encode(__uopz_build_request_export());"
+        )
+        return actual
+
+    def test_static_descriptors_shrink_but_runtime_children_stay_full(self):
+        payload = static_heavy_request()
+        compact = self.export(payload, "1")["hook_coverage"]["registered_callbacks"]
+        full = payload["hook_coverage"]["registered_callbacks"]
+        # Runtime A->B discovery and child-hook summaries read every field of these entries.
+        self.assertEqual(compact["child"], full["child"])
+        self.assertEqual(compact["nested_level"], full["nested_level"])
+        self.assertEqual(set(compact["static_blind"]), {
+            "callback_id", "hook_name", "type", "priority", "callback_repr", "is_active", "status",
+            "registered_inside_callback", "hook_level",
+        })
+        for callback_id in ("static_blind", "parent"):
+            for field in compact[callback_id]:
+                self.assertEqual(compact[callback_id][field], full[callback_id][field])
+        self.assertEqual(compact["removed"], full["removed"])  # no heavy fields to drop
+        self.assertLess(len(json.dumps(compact["static_blind"])), len(json.dumps(full["static_blind"])) / 3)
+
+    def test_gate_observations_and_diagnostics_are_unchanged(self):
+        payload = static_heavy_request()
+        full = self.export(payload, None)
+        compact = self.export(payload, "1")
+        self.assertEqual(_collect_observed_payloads([full]), _collect_observed_payloads([compact]))
+        # A static callback that was registered but not executed must keep that diagnosis.
+        for candidate in (
+            {"callback_id": "static_blind", "hook_name": "wp_ajax_static"},
+            {"callback_id": "parent", "hook_name": "wp_ajax_parent"},
+            {"callback_id": "child", "hook_name": "wp_ajax_child"},
+        ):
+            with self.subTest(candidate=candidate["callback_id"]):
+                self.assertEqual(evaluate_artifact_payloads(candidate, [full]),
+                                 evaluate_artifact_payloads(candidate, [compact]))
+        self.assertEqual(
+            evaluate_artifact_payloads({"callback_id": "static_blind", "hook_name": "wp_ajax_static"},
+                                       [compact])["status"],
+            "registered_not_executed",
+        )
+
+    def test_runtime_discovery_and_callback_identity_match_full_artifact(self):
+        from hook_energy.seed_generation.generated_config_runner import _artifact_matches_callback
+        from online_linked.coordination.runtime_discovery import registered_child_callback
+
+        payload = static_heavy_request()
+        full = self.export(payload, None)
+        compact = self.export(payload, "1")
+
+        def children(artifact):
+            return [
+                registered_child_callback(key, value, parent_callback_id="parent", parent_hook_name="wp_ajax_parent",
+                                          request_id="req-compact", plugin_slug="fixture")
+                for key, value in artifact["hook_coverage"]["registered_callbacks"].items()
+            ]
+
+        self.assertEqual(children(full), children(compact))
+        for hook_name, callback_id in (("wp_ajax_parent", "parent"), ("wp_ajax_static", "static_blind")):
+            self.assertEqual(
+                _artifact_matches_callback(full, full["hook_coverage"], hook_name=hook_name, callback_id=callback_id),
+                _artifact_matches_callback(compact, compact["hook_coverage"], hook_name=hook_name,
+                                           callback_id=callback_id),
+            )
+
+    def test_flag_off_keeps_full_descriptors_and_reports_detail_level(self):
+        payload = static_heavy_request()
+        for flag in (None, "0", "false"):
+            with self.subTest(flag=flag):
+                actual = self.export(payload, flag)
+                self.assertEqual(actual["hook_coverage"]["registered_callbacks"],
+                                 payload["hook_coverage"]["registered_callbacks"])
+                self.assertEqual(actual["hook_coverage_summary"]["registered_callbacks_detail"], "full")
+        self.assertEqual(self.export(payload, "1")["hook_coverage_summary"]["registered_callbacks_detail"], "compact")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1436,16 +1436,37 @@ function __uopz_write_json_atomic(string $path, array $data): void
     }
 }
 
+// Static callbacks repeat the same full descriptor in every request artifact and can fill
+// the shared tmpfs. Full descriptors stay in total_coverage.json; callbacks registered at
+// runtime (inside another callback or below hook level 0) keep every field for discovery.
+function __uopz_compact_registered_callbacks(array $registered): array
+{
+    $keep = array_flip([
+        'callback_id', 'hook_name', 'type', 'priority', 'callback_repr', 'is_active', 'status',
+        'registered_inside_callback', 'hook_level',
+    ]);
+    foreach ($registered as $callbackId => $data) {
+        if (!is_array($data) || !empty($data['registered_inside_callback']) || (int) ($data['hook_level'] ?? 0) > 0) {
+            continue;
+        }
+        $registered[$callbackId] = array_intersect_key($data, $keep);
+    }
+    return $registered;
+}
+
 function __uopz_build_request_export(): array
 {
     $requestExport = $GLOBALS['__uopz_request'];
     if (isset($requestExport['debug']) && is_array($requestExport['debug'])) {
         unset($requestExport['debug']['install_failures']);
     }
+    $compactFlag = strtolower((string) getenv('FUZZER_COMPACT_REQUEST_ARTIFACTS'));
+    $compactRegistered = in_array($compactFlag, ['1', 'true', 'yes', 'on'], true);
     $requestExport['hook_coverage_summary'] = [
         'registered_callbacks' => count($GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'] ?? []),
         'executed_callbacks' => count($GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'] ?? []),
         'blindspot_callbacks' => count($GLOBALS['__uopz_request']['hook_coverage']['blindspot_callbacks'] ?? []),
+        'registered_callbacks_detail' => $compactRegistered ? 'compact' : 'full',
     ];
 
     $executedHookNames = [];
@@ -1456,8 +1477,9 @@ function __uopz_build_request_export(): array
         }
     }
 
+    $registered = $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'] ?? [];
     $requestExport['hook_coverage'] = [
-        'registered_callbacks' => $GLOBALS['__uopz_request']['hook_coverage']['registered_callbacks'] ?? [],
+        'registered_callbacks' => $compactRegistered ? __uopz_compact_registered_callbacks($registered) : $registered,
         'executed_callbacks' => $GLOBALS['__uopz_request']['hook_coverage']['executed_callbacks'] ?? [],
     ];
     // v4 blindspot IDs refer to full descriptors in registered_callbacks in this request.

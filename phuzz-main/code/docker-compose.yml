@@ -44,6 +44,8 @@ services:
       FUZZER_COMPRESS: 1
       FUZZER_ENABLE_UOPZ: 1
       FUZZER_HOOK_OUTPUT_DIR: /shared-tmpfs/hook-coverage
+      # 1: request artifacts keep only id/hook/status for static callbacks (full copy in total_coverage.json).
+      FUZZER_COMPACT_REQUEST_ARTIFACTS: ${FUZZER_COMPACT_REQUEST_ARTIFACTS:-1}
       REQUIRES_DB: 1
       WP_TARGET_PLUGIN: show-all-comments-in-one-page
     volumes:
