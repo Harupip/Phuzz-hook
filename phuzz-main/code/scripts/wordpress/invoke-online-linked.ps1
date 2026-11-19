@@ -14,6 +14,7 @@ function Invoke-OnlineLinked {
         [int]$OnlineParallel = 0,
         [int]$OnlineParallelNodes = 10,
         [int]$OnlineParallelSeconds = 240,
+        [int]$OnlineKeepRuntimeArtifacts = 0,
         [bool]$OnlineComparePrompt = $false,
         [Parameter(Mandatory)][string]$OverridePath,
         [Parameter(Mandatory)][string[]]$ComposeArgs
@@ -45,6 +46,9 @@ function Invoke-OnlineLinked {
     )
     if ($OnlineParallel -eq 1) {
         $onlineLinkedArgs += "--parallel"
+    }
+    if ($OnlineKeepRuntimeArtifacts -eq 1) {
+        $onlineLinkedArgs += "--keep-runtime-artifacts"
     }
 
     $previousComposeFile = $env:COMPOSE_FILE

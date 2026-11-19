@@ -26,6 +26,8 @@ param(
     [int]$OnlineParallelNodes,
     [ValidateRange(1, 86400)]
     [int]$OnlineParallelSeconds,
+    [ValidateRange(0, 1)]
+    [int]$OnlineKeepRuntimeArtifacts,
     [ValidateRange(0, 100000)]
     [int]$StopOnVulnCount
 )
@@ -48,6 +50,7 @@ $OnlineCampaignTimeoutSeconds = $runtimeSettings["OnlineCampaignTimeoutSeconds"]
 $OnlineParallel = $runtimeSettings["OnlineParallel"]
 $OnlineParallelNodes = $runtimeSettings["OnlineParallelNodes"]
 $OnlineParallelSeconds = $runtimeSettings["OnlineParallelSeconds"]
+$OnlineKeepRuntimeArtifacts = $runtimeSettings["OnlineKeepRuntimeArtifacts"]
 $StopOnVulnCount = $runtimeSettings["StopOnVulnCount"]
 $pluginScript = Join-Path $scriptRoot "web\applications\wordpress\_plugins\download-plugins.ps1"
 $fuzzerService = "fuzzer-wordpress-plugin"
@@ -793,6 +796,7 @@ try {
         -OnlineParallel $OnlineParallel `
         -OnlineParallelNodes $OnlineParallelNodes `
         -OnlineParallelSeconds $OnlineParallelSeconds `
+        -OnlineKeepRuntimeArtifacts $OnlineKeepRuntimeArtifacts `
         -OnlineComparePrompt ([bool]$runtimeSettings["OnlineComparePrompt"] -and -not $NoComparePrompt) `
         -OverridePath $overridePath `
         -ComposeArgs $composeArgs

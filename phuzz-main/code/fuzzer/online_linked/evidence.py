@@ -145,6 +145,93 @@ echo json_encode(
 '''
 
 
+RUNTIME_PURGE_SCRIPT = r'''
+$prefix = (string) ($argv[1] ?? '');
+$pluginSlug = (string) ($argv[2] ?? '');
+$requestDir = (string) ($argv[3] ?? '');
+$zendDir = (string) ($argv[4] ?? '');
+$stats = ['scanned' => 0, 'deleted_requests' => 0, 'deleted_zend' => 0, 'failed' => 0, 'freed_bytes' => 0];
+// One run: the candidate run ID itself or a child run ID after a "-" boundary (v0, v2-n3, ...).
+$ownedRun = function ($payload) use ($prefix): bool {
+    foreach (['run_id', 'legacy_run_id'] as $field) {
+        $value = (string) ($payload[$field] ?? '');
+        if ($value === $prefix || strncmp($value, $prefix . '-', strlen($prefix) + 1) === 0) {
+            return true;
+        }
+    }
+    return false;
+};
+$remove = function (string $path, string $counter) use (&$stats): void {
+    $size = @filesize($path);
+    if (@unlink($path)) {
+        $stats[$counter]++;
+        $stats['freed_bytes'] += $size === false ? 0 : $size;
+    } else {
+        $stats['failed']++;
+    }
+};
+$artifacts = function (string $dir): array {
+    return array_values(array_filter(glob($dir . '/*.json') ?: [], 'is_file'));
+};
+if ($prefix !== '' && $pluginSlug !== '' && $requestDir !== '' && $zendDir !== '') {
+    foreach ($artifacts($requestDir) as $path) {
+        $stats['scanned']++;
+        $payload = json_decode((string) @file_get_contents($path), true);
+        if (!is_array($payload) || (string) ($payload['target_plugin'] ?? '') !== $pluginSlug || !$ownedRun($payload)) {
+            continue;
+        }
+        $remove($path, 'deleted_requests');
+    }
+    // Each Zend file is judged by its own metadata, paired or not: a same-named file from
+    // another run is never removed, and one whose request was never written still is.
+    foreach ($artifacts($zendDir) as $path) {
+        $payload = json_decode((string) @file_get_contents($path), true);
+        if (!is_array($payload) || !$ownedRun($payload)) {
+            continue;
+        }
+        $plugin = (string) ($payload['target_plugin'] ?? '');
+        if ($plugin !== '' && $plugin !== $pluginSlug) {
+            continue;
+        }
+        $remove($path, 'deleted_zend');
+    }
+}
+echo json_encode($stats);
+'''
+
+
+def purge_runtime_artifacts(
+    *,
+    run_prefix: str,
+    plugin_slug: str,
+    timeout: float,
+    run_command: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Delete one finished candidate's request/Zend artifacts from the shared tmpfs."""
+    if not run_prefix or not plugin_slug:
+        raise ValueError("RUNTIME_PURGE_SCOPE_MISSING")
+    command = [
+        "docker", "compose", "exec", "-T", "web", "php",
+        "-d", "display_errors=0", "-d", "log_errors=1", "-r",
+        RUNTIME_PURGE_SCRIPT, "--", str(run_prefix), str(plugin_slug),
+        "/shared-tmpfs/hook-coverage/requests", "/shared/opcode-events",
+    ]
+    try:
+        result = run_command(command, timeout=float(timeout), check=False, capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"RUNTIME_PURGE_FAILED: {exc}") from exc
+    if int(getattr(result, "returncode", 1)) != 0:
+        detail = str(getattr(result, "stderr", "") or "").strip()
+        raise RuntimeError(f"RUNTIME_PURGE_FAILED: {detail or 'docker command failed'}")
+    try:
+        stats = json.loads(getattr(result, "stdout", "") or "")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("RUNTIME_PURGE_INVALID_OUTPUT") from exc
+    if not isinstance(stats, Mapping):
+        raise RuntimeError("RUNTIME_PURGE_INVALID_OUTPUT")
+    return dict(stats)
+
+
 def read_runtime_batch(
     *,
     run_id: str,

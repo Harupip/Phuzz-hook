@@ -28,6 +28,7 @@ from online_linked.coordination.parallel_runner import (
     checkpoint_leftover_workers,
     checkpoint_parallel_cleanup_pending,
 )
+from online_linked.evidence import purge_runtime_artifacts
 from online_linked.export import export_online_linked_batch
 
 
@@ -257,6 +258,20 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 continue
             if checkpoint_parallel_cleanup_pending(interrupted) or checkpoint_leftover_workers(interrupted):
                 cleanup_blockers.add(row["index"])
+
+    def purge_candidate_artifacts(record: dict[str, Any]) -> None:
+        try:
+            stats = purge_runtime_artifacts(run_prefix=record["run_id"], plugin_slug=args.plugin_slug, timeout=60)
+            # Files that could not be removed still occupy tmpfs: keep the purge retryable.
+            record["runtime_artifact_purge"] = {**stats, "status": "failed" if stats.get("failed") else "done"}
+        except (OSError, RuntimeError, ValueError) as exc:
+            record["runtime_artifact_purge"] = {"status": "failed", "error": str(exc)}
+        checkpoint()
+
+    if resume and not getattr(args, "keep_runtime_artifacts", True):
+        for row in batch_state["candidates"]:
+            if (row.get("runtime_artifact_purge") or {}).get("status") in {"pending", "failed"}:
+                purge_candidate_artifacts(row)
     while queue:
         queue.sort(key=lambda entry: (
             entry[0] not in cleanup_blockers, not str(entry[1].get("hook_name") or "").startswith("wp_ajax_"),
@@ -431,7 +446,17 @@ def run_online_linked(args: argparse.Namespace) -> int:
         active_entry = None
         if candidate_record not in batch_state["candidates"]:
             batch_state["candidates"].append(candidate_record)
+        # Free the shared tmpfs once a candidate is final. PARTIAL may still resume or own
+        # running nodes, and VULN_FOUND keeps its requests for reproduction. A missing
+        # attribute (programmatic callers) keeps artifacts; the CLI defaults to deleting.
+        # "pending" is saved with the final state, so --resume retries an interrupted purge.
+        purge_due = (not getattr(args, "keep_runtime_artifacts", True)
+                     and candidate_record.get("terminal_status") not in {"PARTIAL", "VULN_FOUND"})
+        if purge_due:
+            candidate_record["runtime_artifact_purge"] = {"status": "pending"}
         checkpoint()
+        if purge_due:
+            purge_candidate_artifacts(candidate_record)
         if (candidate_record.get("terminal_status") == "PARTIAL"
                 and candidate_record.get("terminal_reason") == "PARALLEL_CLEANUP_PENDING"):
             batch_state["campaign_status"] = "PARALLEL_CLEANUP_PENDING"
@@ -498,6 +523,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
                         help="Total nodes in the parallel phase, including the running worker (default 10)")
     parser.add_argument("--parallel-seconds", type=int, choices=range(1, 86401), default=240,
                         help="Parallel phase seconds, counted once every node runs (default 240)")
+    parser.add_argument("--keep-runtime-artifacts", action="store_true",
+                        help="Keep finished candidates' request/Zend artifacts in the shared tmpfs (default: delete)")
     parser.add_argument("--resume", action="store_true", help="Reload this run's checkpoint; retain caps and credits, recheck gates")
     parser.add_argument("--sync-registry", action="store_true")
     parser.add_argument("--runtime-cookie-probes", action="store_true")

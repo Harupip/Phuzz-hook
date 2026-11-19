@@ -96,6 +96,15 @@ Write-Output ('RESULT=' + ($global:captured | ConvertTo-Json -Compress -Depth 5)
             self.assertEqual(payload['python'][payload['python'].index('--parallel-nodes') + 1], '10')
             self.assertEqual(payload['python'][payload['python'].index('--parallel-seconds') + 1], '240')
 
+    @unittest.skipUnless(shutil.which('pwsh'), 'PowerShell 7 is required')
+    def test_launcher_keeps_runtime_artifacts_only_when_asked(self):
+        """Finished candidates' tmpfs artifacts are deleted unless the user keeps them for debugging."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertNotIn('--keep-runtime-artifacts', self._run_launcher(Path(tmp), 0)['python'])
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = self._run_launcher(Path(tmp), 0, '-OnlineKeepRuntimeArtifacts 1')
+            self.assertIn('--keep-runtime-artifacts', payload['python'])
+
     def test_parser_parallel_defaults_off(self):
         """Without --parallel the coordinator must never enter the parallel phase."""
         from online_linked.coordination.campaign import build_argument_parser

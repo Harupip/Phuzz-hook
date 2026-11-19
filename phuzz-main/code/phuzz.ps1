@@ -26,6 +26,8 @@ param(
     [int]$OnlineParallelNodes,
     [ValidateRange(1, 86400)]
     [int]$OnlineParallelSeconds,
+    [ValidateRange(0, 1)]
+    [int]$OnlineKeepRuntimeArtifacts,
     [ValidateRange(0, 100000)]
     [int]$StopOnVulnCount,
     [switch]$DryRun,
@@ -65,6 +67,7 @@ Options:
   -OnlineParallel <0|1>            Fuzz with several nodes after the quiet window. Default: 0.
   -OnlineParallelNodes <count>     Parallel nodes including the running worker (2-50). Default: 10.
   -OnlineParallelSeconds <seconds> Parallel phase length once all nodes run. Default: 240.
+  -OnlineKeepRuntimeArtifacts <0|1> Keep finished candidates' tmpfs request/Zend artifacts. Default: 0.
   -StopOnVulnCount <count>         Stop after this many findings; 0 keeps fuzzing.
   -UseZendDiscovery                Accepted for existing online-linked commands; always enabled.
   -NoFollowLogs                    Accepted for existing online-linked commands; campaigns are bounded.
@@ -153,6 +156,7 @@ $OnlineCampaignTimeoutSeconds = $runtimeSettings["OnlineCampaignTimeoutSeconds"]
 $OnlineParallel = $runtimeSettings["OnlineParallel"]
 $OnlineParallelNodes = $runtimeSettings["OnlineParallelNodes"]
 $OnlineParallelSeconds = $runtimeSettings["OnlineParallelSeconds"]
+$OnlineKeepRuntimeArtifacts = $runtimeSettings["OnlineKeepRuntimeArtifacts"]
 $StopOnVulnCount = $runtimeSettings["StopOnVulnCount"]
 
 if ($AllPlugins -and $PSBoundParameters.ContainsKey("PluginSlug")) {
@@ -195,6 +199,7 @@ $runnerParams["OnlineCampaignTimeoutSeconds"] = $OnlineCampaignTimeoutSeconds
 $runnerParams["OnlineParallel"] = $OnlineParallel
 $runnerParams["OnlineParallelNodes"] = $OnlineParallelNodes
 $runnerParams["OnlineParallelSeconds"] = $OnlineParallelSeconds
+$runnerParams["OnlineKeepRuntimeArtifacts"] = $OnlineKeepRuntimeArtifacts
 
 if ($AllPlugins) {
     $batchDirectory = if ($pluginZipDir) { $pluginZipDir } else { $pluginDir }

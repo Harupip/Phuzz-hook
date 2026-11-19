@@ -90,6 +90,7 @@ function Resolve-PhuzzRuntimeSettings {
         OnlineParallel = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineParallel" -Key "ONLINE_PARALLEL" -Default 0 -Minimum 0 -Maximum 1
         OnlineParallelNodes = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineParallelNodes" -Key "ONLINE_PARALLEL_NODES" -Default 10 -Minimum 2 -Maximum 50
         OnlineParallelSeconds = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineParallelSeconds" -Key "ONLINE_PARALLEL_SECONDS" -Default 240 -Minimum 1 -Maximum 86400
+        OnlineKeepRuntimeArtifacts = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "OnlineKeepRuntimeArtifacts" -Key "ONLINE_KEEP_RUNTIME_ARTIFACTS" -Default 0 -Minimum 0 -Maximum 1
         StopOnVulnCount = Get-PhuzzIntSetting -Settings $settings -BoundParameters $BoundParameters -ParameterName "StopOnVulnCount" -Key "HOOKPHUZZ_STOP_ON_VULN" -Default 0 -Minimum 0 -Maximum 100000
     }
 }

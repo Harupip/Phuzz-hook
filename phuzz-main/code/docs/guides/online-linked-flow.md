@@ -314,6 +314,8 @@ Pending probe có thể giữ Zend reads sau HTTP 400–599 nếu request/Zend/c
 
 ## 5. Artifact và cách đọc kết quả
 
+**Dọn tmpfs theo candidate (2026-11-19).** Request artifact (`/shared-tmpfs/hook-coverage/requests`) và Zend artifact (`/shared/opcode-events`) nằm chung một tmpfs 1 GB trong RAM của VM Docker. Khi một candidate kết thúc với `BOUNDED_ONLINE_COMPLETE` hoặc `NOT_VERIFIED`, batch xóa các artifact có `run_id` bằng run ID của candidate, hoặc bắt đầu bằng run ID đó cộng dấu `-` (ví dụ `-v0`, `-v2-n3`, `-v1-replay`), và có `target_plugin` khớp plugin. Không xóa request bootstrap, `total_coverage.json`, `fuzzer-findings`, cũng như artifact của candidate `PARTIAL` (còn có thể resume hoặc còn node) và `VULN_FOUND` (giữ để tái hiện). Kết quả ghi ở `batch-state.json` → `candidates[].runtime_artifact_purge`. `status` là `pending` (đã lưu cùng trạng thái cuối, chưa xóa xong), `done` (đã xóa hết, kèm `deleted_requests`, `deleted_zend`, `failed`, `freed_bytes`) hoặc `failed` (lệnh xóa lỗi và có `error`, hoặc còn file không xóa được khi `failed > 0`). `--resume` xóa lại các candidate còn `pending` hoặc `failed`. Lỗi khi xóa chỉ được ghi lại, không chặn batch. File Zend chỉ bị xóa khi `run_id` và `target_plugin` của chính nó khớp, kể cả khi trùng tên với request vừa xóa. Exporter chỉ đọc bản copy trên host nên không bị ảnh hưởng. Muốn giữ artifact để phân tích sau run thì đặt `ONLINE_KEEP_RUNTIME_ARTIFACTS=1`, `-OnlineKeepRuntimeArtifacts 1` hoặc `--keep-runtime-artifacts`.
+
 ```text
 fuzzer/output/online-seed-generation/<run-id>/suggested_seeds.json
 fuzzer/output/online-linked/<run-id>/batch-state.json
