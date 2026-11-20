@@ -381,19 +381,75 @@ class BaselineAndCliTests(BenchmarkFixture):
                     summary.write_text(json.dumps(content), encoding="utf-8")
                 plugin = self.score()["plugins"]["beta"]
                 if name == "exports-not-list":
-                    # One bad candidate is a plugin error; the rest of the run is still scored.
-                    self.assertEqual(plugin["status"], "SCORED")
+                    # The summary is readable, but its only selected export is not: nothing was scored.
+                    self.assertEqual(plugin["status"], "INVALID_EXPORTS")
                     self.assertTrue(any("exported_configs" in error for error in plugin["errors"]))
                 else:
                     self.assertEqual(plugin["status"], "INVALID_EXPORT_SUMMARY")
                     self.assertTrue(plugin["errors"])
+                # Callers must see a failure when bad input left nothing to score; the report is still written.
                 out = self.root / f"{name}.json"
                 self.assertEqual(benchmark.main(
-                    ["--runs", str(self.runs), "--references", str(self.refs), "--output", str(out)]), 0)
+                    ["--runs", str(self.runs), "--references", str(self.refs), "--output", str(out)]), 2)
+                self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["plugins"]["beta"]["status"],
+                                 plugin["status"])
                 shutil.rmtree(self.runs)
                 shutil.rmtree(self.refs)
                 self.runs.mkdir()
                 self.refs.mkdir()
+
+    def test_malformed_export_record_is_a_plugin_error_not_a_crash(self) -> None:
+        """One bad record must not lose the whole batch report."""
+        good = {"hook_name": "wp_ajax_do-b", "selected_version": "v2",
+                "exported_configs": [{"version": "v2", "config_path": "C:/x/final-configs/fuzzer-config.wp_ajax_do-b.json"}]}
+        for name, bad in (
+            ("missing-config-path", {"hook_name": "wp_ajax_x", "selected_version": "v2",
+                                     "exported_configs": [{"version": "v2"}]}),
+            ("numeric-config-path", {"hook_name": "wp_ajax_x", "selected_version": "v2",
+                                     "exported_configs": [{"version": "v2", "config_path": 7}]}),
+            ("missing-hook-name", {"selected_version": "v2", "exported_configs": [
+                {"version": "v2", "config_path": "C:/x/final-configs/fuzzer-config.wp_ajax_do-b.json"}]}),
+        ):
+            with self.subTest(name=name):
+                self._setup_beta([{"name": "nonce", "value": "x"}, {"name": "other", "value": "x"}])
+                summary = next(self.runs.rglob("final-config-summary.json"))
+                summary.write_text(json.dumps({"candidates": [bad, good]}), encoding="utf-8")
+                plugin = self.score()["plugins"]["beta"]
+                self.assertEqual(plugin["status"], "SCORED")
+                self.assertEqual(plugin["metrics"]["hook_recall"], 1.0, "the valid record is still scored")
+                self.assertEqual(len(plugin["errors"]), 1)
+                shutil.rmtree(self.runs)
+                shutil.rmtree(self.refs)
+                self.runs.mkdir()
+                self.refs.mkdir()
+
+    def test_run_whose_every_selected_export_is_unreadable_fails(self) -> None:
+        """0 pairs + 1 error must not pass as a SCORED run with exit 0."""
+        self._setup_beta([{"name": "nonce", "value": "x"}])
+        summary = next(self.runs.rglob("final-config-summary.json"))
+        summary.write_text(json.dumps({"candidates": [
+            {"hook_name": "wp_ajax_do-b", "selected_version": "v2", "exported_configs": [{"version": "v2"}]}]}),
+            encoding="utf-8")
+        plugin = self.score()["plugins"]["beta"]
+        self.assertEqual(plugin["status"], "INVALID_EXPORTS")
+        self.assertEqual(len(plugin["errors"]), 1)
+        out = self.root / "report.json"
+        self.assertEqual(benchmark.main(
+            ["--runs", str(self.runs), "--references", str(self.refs), "--output", str(out)]), 2)
+        self.assertTrue(out.exists(), "the report is still written for inspection")
+
+    def test_valid_summary_without_selected_exports_is_scored_as_zero_coverage(self) -> None:
+        """A campaign that exported nothing is a real (bad) result, not broken input."""
+        self._setup_beta([{"name": "nonce", "value": "x"}])
+        summary = next(self.runs.rglob("final-config-summary.json"))
+        summary.write_text(json.dumps({"candidates": [
+            {"hook_name": "wp_ajax_do-b", "selected_version": None}]}), encoding="utf-8")
+        plugin = self.score()["plugins"]["beta"]
+        self.assertEqual(plugin["status"], "SCORED")
+        self.assertEqual(plugin["metrics"]["hook_recall"], 0.0)
+        out = self.root / "report.json"
+        self.assertEqual(benchmark.main(
+            ["--runs", str(self.runs), "--references", str(self.refs), "--output", str(out)]), 0)
 
     def test_output_must_not_overwrite_baseline(self) -> None:
         self._setup_beta([{"name": "nonce", "value": "x"}])

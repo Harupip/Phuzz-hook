@@ -10,10 +10,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 FUZZER_DIR = Path(__file__).resolve().parents[1]
 if str(FUZZER_DIR) not in sys.path:
@@ -123,7 +124,8 @@ class PurgeTransportTests(unittest.TestCase):
 class CampaignPurgeTests(unittest.TestCase):
     STATUSES = ("BOUNDED_ONLINE_COMPLETE", "NOT_VERIFIED", "VULN_FOUND", "PARTIAL")
 
-    def run_batch(self, root, *, keep, purge, statuses=None, resume=False, item_count=None):
+    def run_batch(self, root, *, keep, purge, statuses=None, resume=False, item_count=None, clock=None,
+                  purge_only=False, sync_registry=False):
         statuses = self.STATUSES if statuses is None else statuses
         items = [{"hook_name": f"wp_ajax_fixture_{i}", "callback_id": f"cb-{i}", "seed": {"method": "GET"}}
                  for i in range(len(statuses) if item_count is None else item_count)]
@@ -146,12 +148,14 @@ class CampaignPurgeTests(unittest.TestCase):
             suggested_seeds=str(suggested), bootstrap_config="", config_root=str(root / "configs"),
             output_root=str(root / "output"), plugin_slug="fixture", legacy_run_id="run", max_seconds=2,
             max_versions=2, max_candidates=8, campaign_seconds=60, callback_registry=str(registry),
-            service="fixture", keep_runtime_artifacts=keep, resume=resume,
+            service="fixture", keep_runtime_artifacts=keep, resume=resume, purge_only=purge_only,
+            sync_registry=sync_registry,
         )
         with patch("online_linked.coordination.campaign.OnlineLinkedCoordinator", FakeCoordinator), \
                 patch("online_linked.coordination.campaign.purge_runtime_artifacts", purge), \
-                patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0):
-            run_online_linked(args)
+                patch("online_linked.coordination.campaign.export_online_linked_batch", return_value=0), \
+                patch("online_linked.coordination.campaign.time.monotonic", clock or time.monotonic):
+            self.exit_code = run_online_linked(args)
         return json.loads((root / "output/online-linked/run/batch-state.json").read_text())
 
     def test_finished_candidates_free_their_artifacts_unless_partial_or_vulnerable(self):
@@ -229,6 +233,107 @@ class CampaignPurgeTests(unittest.TestCase):
                                        {"deleted_requests": 1, "deleted_zend": 0, "failed": 0, "freed_bytes": 1})
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(state["candidates"][0]["runtime_artifact_purge"]["status"], "done")
+
+    def test_resume_purge_retries_stay_within_the_campaign_budget(self):
+        """Retries run before the queue resumes: they must not spend time the campaign no longer has.
+        A retry skipped for lack of budget keeps its status for the next resume."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_run = iter([RuntimeError("busy"), RuntimeError("busy"), KeyboardInterrupt()])
+
+            def failing(**kwargs):
+                raise next(first_run)
+
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_batch(root, keep=False, purge=failing, statuses=("NOT_VERIFIED",) * 3)
+            before = [row["runtime_artifact_purge"]["status"]
+                      for row in json.loads((root / "output/online-linked/run/batch-state.json").read_text())
+                      ["candidates"]]
+            self.assertEqual(before, ["failed", "failed", "pending"])
+
+            now = [1000.0]
+            calls = []
+
+            def slow(**kwargs):
+                calls.append(kwargs)
+                now[0] += 10_000  # this retry alone uses up the whole remaining budget
+                return {"deleted_requests": 1, "deleted_zend": 1, "failed": 0, "freed_bytes": 2}
+
+            state = self.run_batch(root, keep=False, purge=slow, statuses=(), resume=True, item_count=3,
+                                   clock=lambda: now[0])
+            self.assertEqual(len(calls), 1)
+            self.assertLessEqual(calls[0]["timeout"], 60)
+            self.assertGreater(calls[0]["timeout"], 0)
+            after = [row["runtime_artifact_purge"]["status"] for row in state["candidates"]]
+            self.assertEqual(after, ["done", "failed", "pending"])
+
+            # The checkpoint now has no campaign time left, so a plain resume can never retry them.
+            # --purge-only is the way out: cleanup is not campaign work and gets its own 60 s per candidate.
+            calls.clear()
+            campaign_status = state["campaign_status"]
+            state = self.run_batch(root, keep=False, purge=lambda **kw: calls.append(kw) or {
+                "deleted_requests": 1, "deleted_zend": 0, "failed": 0, "freed_bytes": 1},
+                statuses=(), resume=True, item_count=3, clock=lambda: now[0], purge_only=True)
+            self.assertEqual([call["timeout"] for call in calls], [60.0, 60.0])
+            self.assertEqual([row["runtime_artifact_purge"]["status"] for row in state["candidates"]],
+                             ["done", "done", "done"])
+            self.assertEqual(state["campaign_status"], campaign_status, "cleanup must not rewrite the verdict")
+            self.assertEqual(self.exit_code, 0)
+
+    def test_purge_only_reports_purges_it_could_not_finish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_run = iter([RuntimeError("busy"), KeyboardInterrupt()])
+
+            def failing(**kwargs):
+                raise next(first_run)
+
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_batch(root, keep=False, purge=failing, statuses=("NOT_VERIFIED",) * 2)
+
+            def still_busy(**kwargs):
+                raise RuntimeError("RUNTIME_PURGE_FAILED: still busy")
+
+            state = self.run_batch(root, keep=False, purge=still_busy, statuses=(), resume=True, item_count=2,
+                                   purge_only=True)
+            self.assertEqual([row["runtime_artifact_purge"]["status"] for row in state["candidates"]],
+                             ["failed", "failed"])
+            self.assertEqual(self.exit_code, 1, "a cleanup that left files behind must not report success")
+
+    def test_purge_only_does_not_sync_the_callback_registry(self):
+        """Cleanup must not write the registry into the web container; a sync failure must not block it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_run = iter([RuntimeError("busy"), KeyboardInterrupt()])
+
+            def failing(**kwargs):
+                raise next(first_run)
+
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_batch(root, keep=False, purge=failing, statuses=("NOT_VERIFIED",) * 2, item_count=3)
+            saved = json.loads((root / "output/online-linked/run/batch-state.json").read_text())
+            self.assertTrue(saved["pending_candidates"], "fixture needs a queued candidate to trigger the sync")
+
+            calls = []
+            sync = MagicMock(side_effect=RuntimeError("CALLBACK_REGISTRY_REFRESH_FAILED: web container is unavailable"))
+            with patch("online_linked.coordination.campaign._sync_callback_registry_to_web", sync):
+                state = self.run_batch(root, keep=False, purge=lambda **kw: calls.append(kw) or {
+                    "deleted_requests": 1, "deleted_zend": 0, "failed": 0, "freed_bytes": 1},
+                    statuses=(), resume=True, item_count=3, purge_only=True, sync_registry=True)
+            sync.assert_not_called()
+            self.assertEqual(len(calls), 2)
+            self.assertEqual([row["runtime_artifact_purge"]["status"] for row in state["candidates"]],
+                             ["done", "done"])
+
+    def test_purge_only_requires_resume_and_purging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for keep, resume in ((False, False), (True, True)):
+                with self.subTest(keep=keep, resume=resume):
+                    calls = []
+                    with self.assertRaises(SystemExit):
+                        self.run_batch(Path(tmp), keep=keep, purge=lambda **kw: calls.append(kw),
+                                       statuses=(), resume=resume, item_count=0, purge_only=True)
+                    self.assertEqual(calls, [])
 
     def test_keep_flag_disables_purge(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -99,6 +99,9 @@ def run_online_linked(args: argparse.Namespace) -> int:
                     max_candidates, hard_max_candidates, campaign_seconds, hard_campaign_seconds],
     }
     resume = bool(getattr(args, "resume", False))
+    purge_only = bool(getattr(args, "purge_only", False))
+    if purge_only and (not resume or getattr(args, "keep_runtime_artifacts", True)):
+        raise SystemExit("--purge-only needs --resume and cannot be combined with --keep-runtime-artifacts")
     if not resume:
         filesystem_path(batch_registry).write_text(filesystem_path(registry_source).read_text(encoding="utf-8-sig"), encoding="utf-8")
     batch_state: dict[str, Any] = {
@@ -172,7 +175,8 @@ def run_online_linked(args: argparse.Namespace) -> int:
         queue = [(row["index"], row["item"], row["source"]) for row in saved["pending_candidates"]]
         queued_ids = set(saved["queued_ids"])
         queued_context_keys = set(saved["queued_context_keys"])
-        batch_state.update(campaign_status="running", terminal_reason=None)
+        if not purge_only:  # cleanup alone must keep the saved verdict
+            batch_state.update(campaign_status="running", terminal_reason=None)
         # The saved mode wins; a checkpoint from before the option uses the default.
         batch_state["priority_energy_mode"] = _priority_energy_mode(saved.get("priority_energy_mode"))
         skipped = any(row.get("terminal_status") == "NOT_VERIFIED" for row in saved["candidates"])
@@ -216,7 +220,8 @@ def run_online_linked(args: argparse.Namespace) -> int:
                 or hashlib.sha256(snapshot).hexdigest() != batch_state["registry_snapshot_hash"]):
             raise ValueError("resume campaign registry snapshot changed")
         _write_json(batch_registry, json.loads(snapshot))
-    if resume and bool(getattr(args, "sync_registry", False)) and queue:
+    # --purge-only runs no candidate, so it has no reason to write the registry into the container.
+    if resume and bool(getattr(args, "sync_registry", False)) and queue and not purge_only:
         _sync_callback_registry_to_web(batch_registry)
 
     initial_context_keys = {_candidate_context_key(item, args.plugin_slug)
@@ -259,9 +264,9 @@ def run_online_linked(args: argparse.Namespace) -> int:
             if checkpoint_parallel_cleanup_pending(interrupted) or checkpoint_leftover_workers(interrupted):
                 cleanup_blockers.add(row["index"])
 
-    def purge_candidate_artifacts(record: dict[str, Any]) -> None:
+    def purge_candidate_artifacts(record: dict[str, Any], *, timeout: float = 60) -> None:
         try:
-            stats = purge_runtime_artifacts(run_prefix=record["run_id"], plugin_slug=args.plugin_slug, timeout=60)
+            stats = purge_runtime_artifacts(run_prefix=record["run_id"], plugin_slug=args.plugin_slug, timeout=timeout)
             # Files that could not be removed still occupy tmpfs: keep the purge retryable.
             record["runtime_artifact_purge"] = {**stats, "status": "failed" if stats.get("failed") else "done"}
         except (OSError, RuntimeError, ValueError) as exc:
@@ -270,8 +275,23 @@ def run_online_linked(args: argparse.Namespace) -> int:
 
     if resume and not getattr(args, "keep_runtime_artifacts", True):
         for row in batch_state["candidates"]:
-            if (row.get("runtime_artifact_purge") or {}).get("status") in {"pending", "failed"}:
-                purge_candidate_artifacts(row)
+            if (row.get("runtime_artifact_purge") or {}).get("status") not in {"pending", "failed"}:
+                continue
+            if purge_only:
+                # Cleanup is not campaign work: it still runs once the campaign budget is gone.
+                purge_candidate_artifacts(row, timeout=60.0)
+                continue
+            # Retries run before the queue: they may only use campaign time that is left.
+            # A skipped retry keeps its status for a later resume or --purge-only.
+            remaining = campaign_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            purge_candidate_artifacts(row, timeout=min(60.0, remaining))
+    if purge_only:
+        left = sum((row.get("runtime_artifact_purge") or {}).get("status") in {"pending", "failed"}
+                   for row in batch_state["candidates"])
+        print(f"Online-linked purge-only: {left} candidate purge(s) still pending or failed")
+        return 1 if left else 0
     while queue:
         queue.sort(key=lambda entry: (
             entry[0] not in cleanup_blockers, not str(entry[1].get("hook_name") or "").startswith("wp_ajax_"),
@@ -526,6 +546,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-runtime-artifacts", action="store_true",
                         help="Keep finished candidates' request/Zend artifacts in the shared tmpfs (default: delete)")
     parser.add_argument("--resume", action="store_true", help="Reload this run's checkpoint; retain caps and credits, recheck gates")
+    parser.add_argument("--purge-only", action="store_true",
+                        help="With --resume: retry pending/failed tmpfs purges (60 s each, outside the campaign budget), then exit")
     parser.add_argument("--sync-registry", action="store_true")
     parser.add_argument("--runtime-cookie-probes", action="store_true")
     parser.add_argument("--service", default="fuzzer-wordpress-plugin")

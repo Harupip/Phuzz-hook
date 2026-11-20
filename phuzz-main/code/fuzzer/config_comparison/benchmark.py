@@ -175,10 +175,13 @@ def _load_exports(run_dir: Path, errors: list[str], counts: Counter) -> list[tup
         if not isinstance(exported, list) or not all(isinstance(e, dict) for e in exported):
             errors.append(f"{hook}: exported_configs must be a list of objects")
             continue
+        if not isinstance(hook, str) or not hook:
+            errors.append(f"candidate with selected_version {selected!r}: hook_name must be a non-empty string")
+            continue
         entry = next((e for e in exported if e.get("version") == selected), None)
         # Older summaries (before exported_configs) carry the selected path on the candidate itself.
-        config_path = entry["config_path"] if entry else candidate.get("config_path")
-        if not config_path:
+        config_path = (entry or candidate).get("config_path")
+        if not isinstance(config_path, str) or not config_path:
             errors.append(f"{hook}: selected_version {selected!r} has no exported config path")
             continue
         path = run_dir / "final-configs" / PureWindowsPath(config_path).name
@@ -228,6 +231,7 @@ def _score_plugin(run_dir: Path, batch: dict, reference_dir: Path) -> dict:
     errors: list[str] = []
     references = _load_references(reference_dir, errors)
     counts: Counter = Counter({"reference_hooks": len(references), "unexported_candidates": 0})
+    errors_before_exports = len(errors)
     exports = _load_exports(run_dir, errors, counts)
     if exports is None:
         return {"status": "INVALID_EXPORT_SUMMARY", "run": run_dir.name, "reference_dir": str(reference_dir),
@@ -249,6 +253,10 @@ def _score_plugin(run_dir: Path, batch: dict, reference_dir: Path) -> dict:
             continue
         paired_keys.add(key)
         pairs.append(_score_pair(references[key], export, counts))
+    if not pairs and not unreferenced and len(errors) > errors_before_exports:
+        # Every selected export failed to load: nothing was scored, so 0 coverage would be a lie.
+        return {"status": "INVALID_EXPORTS", "run": run_dir.name, "reference_dir": str(reference_dir),
+                "errors": errors}
     counts["paired_reference_hooks"] = len(paired_keys)
     reasons = Counter(c.get("terminal_reason") for c in batch.get("candidates", []) if c.get("terminal_reason"))
     return {
@@ -415,6 +423,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Benchmark error: cannot write {args.output}: {exc}", file=sys.stderr)
         return 2
     _print_summary(report, args.output)
+    statuses = report["aggregate"]["status_counts"]
+    if not statuses.get("SCORED") and (statuses.get("INVALID_EXPORT_SUMMARY") or statuses.get("INVALID_EXPORTS")):
+        # Bad input left nothing scored: the report is written, but the run is not a success.
+        print("Benchmark error: no run could be scored; see INVALID_EXPORT_SUMMARY/INVALID_EXPORTS errors",
+              file=sys.stderr)
+        return 2
     return 1 if baseline is not None and report["baseline_diff"]["regressions"] else 0
 
 
